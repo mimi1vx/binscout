@@ -2,7 +2,13 @@
 
 Requires a Rust toolchain (stable).
 
-From the Git repository:
+From crates.io:
+
+```sh
+cargo install binscout
+```
+
+From the Git repository (latest `master`):
 
 ```sh
 cargo install --git https://github.com/mimi1vx/binscout

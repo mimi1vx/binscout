@@ -12,6 +12,14 @@ Full docs live in the [book](https://mimi1vx.github.io/binscout/).
 
 ## Install
 
+From crates.io:
+
+```sh
+cargo install binscout
+```
+
+Or from git (latest `master`):
+
 ```sh
 cargo install --git https://github.com/mimi1vx/binscout
 ```

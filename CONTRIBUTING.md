@@ -23,6 +23,15 @@ br close <id> --reason="..."
 br sync --flush-only         # export before commit
 ```
 
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/).
+Releases are automated by [release-plz](https://release-plz.dev), which
+derives the version bump from merged commit messages: `feat:` triggers a
+minor bump, `fix:` a patch bump. `chore:`, `docs:`, `test:`, and
+`refactor:` trigger no release, so vague messages (`update stuff`)
+produce wrong or missing bumps.
+
 ## Pull requests
 
 - Keep changes small and scoped; every changed line should trace to the
