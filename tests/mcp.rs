@@ -57,6 +57,31 @@ fn tool_text(resp: &Value) -> &str {
     result["content"][0]["text"].as_str().expect("text content")
 }
 
+/// One tool call in a fresh server process: handshake plus a single
+/// `tools/call`, returning the parsed JSON text payload. Each call reopens
+/// the same DB file, so sequential `tool_once` calls prove writes survive a
+/// DB reopen.
+fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(tool_id, tool, args),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    let text = tool_text(by_id[&tool_id]).to_owned();
+    serde_json::from_str(&text).expect("tool json")
+}
+
 #[test]
 fn handshake_lists_twelve_tools() {
     let lines = vec![
@@ -509,5 +534,92 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     let paged: Value = serde_json::from_str(tool_text(by_id[&14])).expect("paged json");
     assert_eq!(paged["total"], 4);
     assert_eq!(paged["xrefs"].as_array().expect("xrefs array").len(), 1);
+    cleanup(&dir);
+}
+
+// O2/A10: annotation round-trip lock-in over MCP. Rename and comment share
+// one function entry so each tool's `annotation_json` response point-queries
+// the other's field (there is no dedicated annotate-read tool). Every step
+// runs in a fresh server process, so each read proves the prior write
+// survived a DB reopen; clearing restores nulls.
+#[test]
+fn annotate_round_trip_rename_comment_reopen_clear() {
+    let dir = tmpdir("mcp-annotate");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "annotate").display().to_string();
+    let entry = common::builders::BASIC_ENTRY_VA;
+    let entry_hex = format!("{entry:#x}");
+
+    // Rename: addr->name, response is the immediate point-query.
+    let v = tool_once(
+        10,
+        "rename",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "name": "mcp_renamed"}),
+    );
+    assert_eq!(v["name"], "mcp_renamed");
+    assert!(v["comment"].is_null());
+
+    // Comment the same addr in a fresh session: the response still carries
+    // the rename, proving it survived a reopen.
+    let v = tool_once(
+        11,
+        "comment",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "comment": "mcp note"}),
+    );
+    assert_eq!(v["comment"], "mcp note");
+    assert_eq!(v["name"], "mcp_renamed", "rename must survive reopen");
+
+    // Idempotent rename in a fresh session: proves the comment survived.
+    let v = tool_once(
+        12,
+        "rename",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "name": "mcp_renamed"}),
+    );
+    assert_eq!(v["name"], "mcp_renamed");
+    assert_eq!(v["comment"], "mcp note", "comment must survive reopen");
+
+    // The rename resolves through listings after a reopen.
+    let v = tool_once(
+        13,
+        "functions",
+        json!({"binary": bin, "db": db, "query": "mcp_renamed"}),
+    );
+    let rows = v.as_array().expect("functions array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["entry"].as_u64(), Some(entry));
+    assert_eq!(rows[0]["name"], "mcp_renamed");
+
+    // Clear the rename: name nulls, comment remains.
+    let v = tool_once(
+        14,
+        "rename",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "name": ""}),
+    );
+    assert!(v["name"].is_null());
+    assert_eq!(v["comment"], "mcp note");
+
+    // Clear the comment: both null.
+    let v = tool_once(
+        15,
+        "comment",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "comment": ""}),
+    );
+    assert!(v["name"].is_null() && v["comment"].is_null());
+
+    // Cleared state survives a reopen: no query hit, name falls back to the
+    // export.
+    let v = tool_once(
+        16,
+        "functions",
+        json!({"binary": bin, "db": db, "query": "mcp_renamed"}),
+    );
+    assert_eq!(v.as_array().expect("array").len(), 0);
+    let v = tool_once(
+        17,
+        "func",
+        json!({"binary": bin, "db": db, "addr": entry_hex}),
+    );
+    assert_eq!(v["entry"].as_u64(), Some(entry));
+    assert_eq!(v["name"], common::builders::BASIC_EXPORT);
     cleanup(&dir);
 }

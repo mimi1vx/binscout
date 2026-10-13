@@ -66,6 +66,8 @@ pub fn arch_name(arch: Arch) -> &'static str {
         Arch::X86_64 => "x86_64",
         Arch::X86_32 => "x86_32",
         Arch::Aarch64 => "aarch64",
+        Arch::Arm32 => "arm32",
+        Arch::Thumb => "thumb",
     }
 }
 
@@ -78,6 +80,8 @@ pub fn parse_arch(s: &str) -> Result<Arch> {
         "x86_64" => Ok(Arch::X86_64),
         "x86_32" => Ok(Arch::X86_32),
         "aarch64" => Ok(Arch::Aarch64),
+        "arm32" => Ok(Arch::Arm32),
+        "thumb" => Ok(Arch::Thumb),
         other => Err(Error::Storage(format!(
             "unknown arch in project db: {other}"
         ))),
@@ -193,7 +197,10 @@ impl Annotation {
 }
 
 /// Agent-facing project summary; always JSON-serializable (M6 CLI/MCP).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON pairs `entry` with `entry_hex` (`null` on both sides when the
+/// container names no entry).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ProjectInfo {
     /// Analyzed binary path.
     pub binary: String,
@@ -235,6 +242,34 @@ pub struct ProjectInfo {
     pub strings: usize,
     /// Stored annotations.
     pub annotations: usize,
+}
+
+impl Serialize for ProjectInfo {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("ProjectInfo", 17)?;
+        st.serialize_field("binary", &self.binary)?;
+        st.serialize_field("db_path", &self.db_path)?;
+        st.serialize_field("version", &self.version)?;
+        st.serialize_field("arch", &self.arch)?;
+        st.serialize_field("format", &self.format)?;
+        st.serialize_field("entry", &self.entry)?;
+        st.serialize_field("entry_hex", &self.entry.map(crate::addr_hex))?;
+        st.serialize_field("content_hash", &self.content_hash)?;
+        st.serialize_field("size", &self.size)?;
+        st.serialize_field("supported", &self.supported)?;
+        st.serialize_field("reason", &self.reason)?;
+        st.serialize_field("functions", &self.functions)?;
+        st.serialize_field("blocks", &self.blocks)?;
+        st.serialize_field("insns", &self.insns)?;
+        st.serialize_field("xrefs", &self.xrefs)?;
+        st.serialize_field("strings", &self.strings)?;
+        st.serialize_field("annotations", &self.annotations)?;
+        st.end()
+    }
 }
 
 /// Snapshot read back by [`load`]: metadata, rebuilt analysis, annotations.
@@ -582,7 +617,13 @@ mod tests {
 
     #[test]
     fn arch_and_format_round_trip() {
-        for a in [Arch::X86_64, Arch::X86_32, Arch::Aarch64] {
+        for a in [
+            Arch::X86_64,
+            Arch::X86_32,
+            Arch::Aarch64,
+            Arch::Arm32,
+            Arch::Thumb,
+        ] {
             assert_eq!(parse_arch(arch_name(a)).unwrap(), a);
         }
         for f in [

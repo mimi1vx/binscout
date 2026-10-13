@@ -267,6 +267,16 @@ fn unsupported_arch_errors() {
 }
 
 #[test]
+fn arm_elf_maps_to_arm32() {
+    // Same headers with an ARM machine id: parses to the ARM32 target.
+    let mut elf = minimal_elf();
+    put16(&mut elf, 18, 40);
+    let bin = load(&elf).expect("arm ELF must load");
+    assert_eq!(bin.format, BinaryFormat::Elf);
+    assert_eq!(bin.arch, Arch::Arm32);
+}
+
+#[test]
 fn pe32_ordinals_carry_unresolved_and_demangled() {
     // L3/A8: ordinal-only imports resolve-or-`unresolved:true`, C++ names
     // carry `demangled` alongside the raw mangling.

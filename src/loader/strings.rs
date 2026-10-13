@@ -31,7 +31,10 @@ pub enum Encoding {
 }
 
 /// One extracted string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON pairs `vaddr` with `vaddr_hex` (`null` on both sides for whole-file
+/// scans with no base); old rows without the twin still deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StringHit {
     /// Byte offset within the scanned buffer.
     pub offset: usize,
@@ -52,6 +55,24 @@ pub struct StringHit {
     /// Old sidecar rows predate this field and decode as `false` (shown).
     #[serde(default)]
     pub executable: bool,
+}
+
+impl Serialize for StringHit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("StringHit", 7)?;
+        st.serialize_field("offset", &self.offset)?;
+        st.serialize_field("vaddr", &self.vaddr)?;
+        st.serialize_field("vaddr_hex", &self.vaddr.map(crate::addr_hex))?;
+        st.serialize_field("encoding", &self.encoding)?;
+        st.serialize_field("value", &self.value)?;
+        st.serialize_field("section", &self.section)?;
+        st.serialize_field("executable", &self.executable)?;
+        st.end()
+    }
 }
 
 /// Test `value` against a `strings` query pattern.

@@ -13,6 +13,20 @@ fn arm(bytes: &[u8], va: u64) -> Vec<binscout::ir::IrInsn> {
     lift(Arch::Aarch64, &insns[0])
 }
 
+fn arm32(bytes: &[u8], va: u64) -> Vec<binscout::ir::IrInsn> {
+    let insns = disasm_range(Arch::Arm32, bytes, va, 100).expect("valid arm32 must decode");
+    assert_eq!(insns.len(), 1);
+    lift(Arch::Arm32, &insns[0])
+}
+
+fn thumb(bytes: &[u8], va: u64) -> Vec<binscout::ir::IrInsn> {
+    let dis = Arch::Thumb.disassembler();
+    let insns = dis
+        .disasm_range(bytes, va)
+        .expect("valid thumb must decode");
+    lift(Arch::Thumb, &insns[0])
+}
+
 #[test]
 fn x86_mov_lifts_copy() {
     let v = x86(&[0x48, 0x89, 0xd8], 0x1000);
@@ -115,6 +129,48 @@ fn arm_cbz_lifts_cbranch() {
     let v = arm(&[0x00, 0x00, 0x00, 0xb4], 0x4000);
     assert_eq!(v[0].op, IrOp::CBranch);
     assert_eq!(v[0].target, Some(0x4000));
+}
+
+#[test]
+fn arm32_mov_lifts_copy() {
+    // mov r0, r1
+    let v = arm32(&[0x01, 0x00, 0xa0, 0xe1], 0x10000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Copy);
+    assert_eq!(v[0].outputs, ["r0"]);
+    assert_eq!(v[0].inputs, ["r1"]);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
+fn arm32_bl_lifts_call() {
+    // bl with a zero field at 0x10000 targets 0x10008.
+    let v = arm32(&[0x00, 0x00, 0x00, 0xeb], 0x10000);
+    assert_eq!(v[0].op, IrOp::Call);
+    assert_eq!(v[0].target, Some(0x10008));
+}
+
+#[test]
+fn arm32_bx_lr_lifts_return() {
+    let v = arm32(&[0x1e, 0xff, 0x2f, 0xe1], 0x10000);
+    assert_eq!(v[0].op, IrOp::Return);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
+fn thumb_cbz_lifts_cbranch() {
+    // cbz r0, #4 at 0x20000 targets 0x20008.
+    let v = thumb(&[0x08, 0xb1], 0x20000);
+    assert_eq!(v[0].op, IrOp::CBranch);
+    assert_eq!(v[0].target, Some(0x20008));
+}
+
+#[test]
+fn thumb_bl_lifts_call() {
+    // bl #0 at 0x20000 targets 0x20004.
+    let v = thumb(&[0x00, 0xf0, 0x00, 0xf8], 0x20000);
+    assert_eq!(v[0].op, IrOp::Call);
+    assert_eq!(v[0].target, Some(0x20004));
 }
 
 #[test]

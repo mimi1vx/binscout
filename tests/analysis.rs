@@ -125,6 +125,63 @@ fn arm64_adr_reports_data_target() {
 }
 
 #[test]
+fn arm32_bl_discovers_callee() {
+    // bl 0x5008 | bx lr | bx lr
+    let b = vec![
+        0x00, 0x00, 0x00, 0xEB, 0x1E, 0xFF, 0x2F, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1,
+    ];
+    let a = analyze_raw(&b, 0x5000, Arch::Arm32, Some(0x5000)).expect("arm32 blob analyzes");
+    assert_eq!(a.summary().functions, 2);
+    assert_eq!(a.call_edges(), [(0x5000, 0x5008)]);
+    let codes = a.xrefs_page(Some(XrefKind::Code), 0, 64);
+    assert!(codes.iter().any(|x| x.from == 0x5000 && x.to == 0x5008));
+}
+
+#[test]
+fn arm32_prologue_scan_seeds_unreachable_function() {
+    // bx lr | push {r4-r7, lr} | bx lr: the middle function is only found
+    // via the prologue scan.
+    let b = vec![
+        0x1E, 0xFF, 0x2F, 0xE1, 0xF0, 0x40, 0x2D, 0xE9, 0x1E, 0xFF, 0x2F, 0xE1,
+    ];
+    let a = analyze_raw(&b, 0x5000, Arch::Arm32, Some(0x5000)).expect("arm32 blob analyzes");
+    assert_eq!(a.summary().functions, 2);
+    assert!(a.functions.contains_key(&0x5004));
+}
+
+#[test]
+fn thumb_bl_discovers_callee() {
+    // bl #0 | bx lr: bl at 0x5000 targets 0x5004.
+    let b = vec![0x00, 0xF0, 0x00, 0xF8, 0x70, 0x47];
+    let a = analyze_raw(&b, 0x5000, Arch::Thumb, Some(0x5000)).expect("thumb blob analyzes");
+    assert_eq!(a.summary().functions, 2);
+    assert_eq!(a.call_edges(), [(0x5000, 0x5004)]);
+    let codes = a.xrefs_page(Some(XrefKind::Code), 0, 64);
+    assert!(codes.iter().any(|x| x.from == 0x5000 && x.to == 0x5004));
+}
+
+#[test]
+fn thumb_prologue_scan_seeds_unreachable_function() {
+    // bx lr | push {r4-r7, lr} | bx lr, all 16-bit.
+    let b = vec![0x70, 0x47, 0xF0, 0xB5, 0x70, 0x47];
+    let a = analyze_raw(&b, 0x5000, Arch::Thumb, Some(0x5000)).expect("thumb blob analyzes");
+    assert_eq!(a.summary().functions, 2);
+    assert!(a.functions.contains_key(&0x5002));
+}
+
+#[test]
+fn arm32_literal_ldr_reports_data_xref() {
+    // ldr r0, [pc, #4] at 0x5000 reads 0x500c; bx lr ends the function.
+    let b = vec![
+        0x04, 0x00, 0x9F, 0xE5, 0x1E, 0xFF, 0x2F, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let a = analyze_raw(&b, 0x5000, Arch::Arm32, Some(0x5000)).expect("arm32 blob analyzes");
+    let data = a.xrefs_page(Some(XrefKind::Data), 0, 64);
+    assert!(data.iter().any(|x| x.from == 0x5000 && x.to == 0x500c));
+}
+
+#[test]
 fn containing_function_snaps_mid_function_but_not_gaps() {
     let a = x64(&two_funcs(), 0x1000, Some(0x1000));
     assert_eq!(a.containing_function(0x1000), Some(0x1000));

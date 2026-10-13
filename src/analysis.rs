@@ -53,7 +53,10 @@ pub enum XrefKind {
 }
 
 /// One cross-reference: instruction at `from` refers to `to`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON pairs each endpoint with its `0x`-hex twin (`from_hex`, `to_hex`);
+/// old rows without the twins still deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct Xref {
     /// Address of the referring instruction.
     pub from: u64,
@@ -61,6 +64,22 @@ pub struct Xref {
     pub to: u64,
     /// How the reference is made.
     pub kind: XrefKind,
+}
+
+impl Serialize for Xref {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("Xref", 5)?;
+        st.serialize_field("from", &self.from)?;
+        st.serialize_field("from_hex", &crate::addr_hex(self.from))?;
+        st.serialize_field("to", &self.to)?;
+        st.serialize_field("to_hex", &crate::addr_hex(self.to))?;
+        st.serialize_field("kind", &self.kind)?;
+        st.end()
+    }
 }
 
 /// One basic block: a maximal run with a single entry at `start`.
@@ -255,7 +274,10 @@ pub struct AnalysisSummary {
 }
 
 /// One function row for list views.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON pairs `entry` with `entry_hex`; `calls` stays a plain integer array
+/// (positional address lists have no per-element twins).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FunctionSummary {
     /// Stable ID (`func@0x...`).
     pub id: String,
@@ -271,8 +293,29 @@ pub struct FunctionSummary {
     pub calls: Vec<u64>,
 }
 
+impl Serialize for FunctionSummary {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("FunctionSummary", 7)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("entry", &self.entry)?;
+        st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("blocks", &self.blocks)?;
+        st.serialize_field("insns", &self.insns)?;
+        st.serialize_field("calls", &self.calls)?;
+        st.end()
+    }
+}
+
 /// One block row for list views (instructions come via [`Analysis::block_insns`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON pairs `start`/`end` with `start_hex`/`end_hex`; `succs` stays a
+/// plain integer array.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BlockSummary {
     /// Stable ID (`block@func+start`, both hex).
     pub id: String,
@@ -284,6 +327,24 @@ pub struct BlockSummary {
     pub insns: usize,
     /// Successor block starts.
     pub succs: Vec<u64>,
+}
+
+impl Serialize for BlockSummary {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("BlockSummary", 7)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("start", &self.start)?;
+        st.serialize_field("start_hex", &crate::addr_hex(self.start))?;
+        st.serialize_field("end", &self.end)?;
+        st.serialize_field("end_hex", &crate::addr_hex(self.end))?;
+        st.serialize_field("insns", &self.insns)?;
+        st.serialize_field("succs", &self.succs)?;
+        st.end()
+    }
 }
 
 fn truncate_limit(limit: usize) -> usize {
@@ -594,7 +655,7 @@ fn decode_one(arch: Arch, space: &AddrSpace, va: u64) -> Result<Option<Insn>> {
                 }
             }
         }
-        Arch::Aarch64 => {
+        Arch::Aarch64 | Arch::Arm32 => {
             if bytes.len() < 4 {
                 return Ok(None);
             }
@@ -605,6 +666,35 @@ fn decode_one(arch: Arch, space: &AddrSpace, va: u64) -> Result<Option<Insn>> {
                 Err(e) => Err(e),
             }
         }
+        Arch::Thumb => decode_one_thumb(&dis, bytes, va),
+    }
+}
+
+/// Decode the single Thumb instruction at `va`.
+///
+/// A 4-byte window decodes both 16- and 32-bit forms; only when it fails is
+/// a lone halfword tried, so a 32-bit prefix is never misread as 16-bit.
+/// The fallback can still misread a 32-bit instruction with a bad second
+/// halfword whose first halfword happens to be valid 16-bit code — best
+/// effort, same class of ambiguity as the x86 shrink window.
+fn decode_one_thumb(dis: &crate::disasm::AnyDisasm, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    if bytes.len() >= 4 {
+        match dis.disasm_range(&bytes[..4], va) {
+            Ok(mut v) if !v.is_empty() => return Ok(Some(v.remove(0))),
+            Ok(_) => return Ok(None),
+            Err(Error::Invalid(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if bytes.len() >= 2 {
+        match dis.disasm_range(&bytes[..2], va) {
+            Ok(mut v) if !v.is_empty() => Ok(Some(v.remove(0))),
+            Ok(_) => Ok(None),
+            Err(Error::Invalid(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -670,13 +760,16 @@ fn prologue_patterns(arch: Arch) -> &'static [&'static [u8]] {
             &[0xF3, 0x0F, 0x1E, 0xFA],
         ],
         Arch::X86_32 => &[&[0x89, 0xE5], &[0x83, 0xEC], &[0x81, 0xEC]],
-        Arch::Aarch64 => &[],
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => &[],
     }
 }
 
 /// Scan executable segments for function prologues. AArch64 matches
-/// `stp x29, x30, [sp, #imm]!` words under a mask; x86 matches byte
-/// patterns, stepping back over a leading `push rbp`/`push ebp`.
+/// `stp x29, x30, [sp, #imm]!` words under a mask; ARM32 matches
+/// `stmdb sp!, {..., lr}` words under a mask; Thumb matches 16-bit
+/// `push {..., lr}` halfwords plus 32-bit `stmdb sp!, {..., lr}` words at
+/// halfword steps; x86 matches byte patterns, stepping back over a
+/// leading `push rbp`/`push ebp`.
 fn prologue_scan(arch: Arch, space: &AddrSpace) -> Vec<u64> {
     let mut out = Vec::new();
     for seg in &space.exec {
@@ -688,6 +781,33 @@ fn prologue_scan(arch: Arch, space: &AddrSpace) -> Vec<u64> {
                     out.push(seg.vaddr.wrapping_add(off as u64));
                 }
                 off += 4;
+            }
+            continue;
+        }
+        if arch == Arch::Arm32 {
+            let mut off = 0usize;
+            while off + 4 <= seg.data.len() {
+                let w = u32::from_le_bytes(seg.data[off..off + 4].try_into().unwrap());
+                if is_arm_push_lr(w) {
+                    out.push(seg.vaddr.wrapping_add(off as u64));
+                }
+                off += 4;
+            }
+            continue;
+        }
+        if arch == Arch::Thumb {
+            let mut off = 0usize;
+            while off + 2 <= seg.data.len() {
+                let hw = u16::from_le_bytes(seg.data[off..off + 2].try_into().unwrap());
+                if (hw & 0xFF00) == 0xB500 && (hw & 0x0100) != 0 {
+                    out.push(seg.vaddr.wrapping_add(off as u64));
+                } else if off + 4 <= seg.data.len() {
+                    let w = u32::from_le_bytes(seg.data[off..off + 4].try_into().unwrap());
+                    if is_arm_push_lr(w) {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    }
+                }
+                off += 2;
             }
             continue;
         }
@@ -711,6 +831,12 @@ fn prologue_scan(arch: Arch, space: &AddrSpace) -> Vec<u64> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Whether a word is `stmdb sp!, {..., lr}` (any condition): the ARM32
+/// frame-setup push, also valid as the 32-bit Thumb `push` encoding.
+fn is_arm_push_lr(word: u32) -> bool {
+    (word & 0x0FFF_4000) == 0x092D_4000
 }
 
 /// Recursive-descent worklist state shared across seed rounds.

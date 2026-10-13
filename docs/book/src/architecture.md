@@ -8,8 +8,8 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   flat raw bytes with a caller-supplied architecture and base. Produces
   segments, sections, imports/exports, and printable strings (ASCII plus
   UTF-16LE/BE over the ASCII subset).
-- **Disassembler** (`disasm`): x86_64 and 32-bit x86 via iced-x86, AArch64
-  via yaxpeax-arm. Each instruction becomes an `Insn` with its bytes,
+- **Disassembler** (`disasm`): x86_64 and 32-bit x86 via iced-x86, AArch64,
+  32-bit ARM, and Thumb via yaxpeax-arm. Each instruction becomes an `Insn` with its bytes,
   mnemonic, operand strings, and resolved branch/data targets.
 - **IR** (`ir`): lifts one instruction to one P-code-inspired `IrInsn`
   (`COPY`, `LOAD`, `BRANCH`, `CALL`, ...). Unknown mnemonics become `NOP`

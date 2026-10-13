@@ -13,6 +13,14 @@ fn arm(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::Aarch64, bytes, va, 100).expect("valid aarch64 must decode")
 }
 
+fn arm32(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
+    disasm_range(Arch::Arm32, bytes, va, 100).expect("valid arm32 must decode")
+}
+
+fn thumb(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
+    disasm_range(Arch::Thumb, bytes, va, 100).expect("valid thumb must decode")
+}
+
 #[test]
 fn x86_32_prologue_snapshot() {
     // push ebp ; mov ebp, esp
@@ -158,7 +166,13 @@ fn arm_cap_errors() {
 
 #[test]
 fn empty_range_decodes_empty() {
-    for arch in [Arch::X86_64, Arch::X86_32, Arch::Aarch64] {
+    for arch in [
+        Arch::X86_64,
+        Arch::X86_32,
+        Arch::Aarch64,
+        Arch::Arm32,
+        Arch::Thumb,
+    ] {
         let v = disasm_range(arch, &[], 0x1000, 100).expect("empty must decode");
         assert!(v.is_empty());
     }
@@ -176,6 +190,16 @@ fn trait_dispatch_per_arch() {
         .disasm_range(&[0x1f, 0x20, 0x03, 0xd5], 0x4000)
         .expect("arm trait dispatch must work");
     assert_eq!(a[0].mnem, "nop");
+    let a32 = Arch::Arm32
+        .disassembler()
+        .disasm_range(&[0x01, 0x00, 0xa0, 0xe1], 0x10000)
+        .expect("arm32 trait dispatch must work");
+    assert_eq!(a32[0].mnem, "mov");
+    let t = Arch::Thumb
+        .disassembler()
+        .disasm_range(&[0x00, 0xbf], 0x20000)
+        .expect("thumb trait dispatch must work");
+    assert_eq!(t[0].mnem, "nop");
 }
 
 // --- D2/A6: partial prefix + error_at ---
@@ -281,4 +305,163 @@ fn partial_trait_dispatch_per_arch() {
         .expect("trait partial must work");
     assert_eq!(p.insns.len(), 1);
     assert_eq!(p.error_at.expect("error_at").addr, 0x1001);
+}
+
+#[test]
+fn arm32_prologue_snapshot() {
+    // mov r0, r1 ; bx lr
+    let v = arm32(&[0x01, 0x00, 0xa0, 0xe1, 0x1e, 0xff, 0x2f, 0xe1], 0x10000);
+    assert_eq!(v.len(), 2);
+    assert_eq!(
+        v.iter().map(|i| (i.addr, i.size)).collect::<Vec<_>>(),
+        [(0x10000, 4), (0x10004, 4)]
+    );
+    assert_eq!(
+        v.iter().map(|i| i.mnem.as_str()).collect::<Vec<_>>(),
+        ["mov", "bx"]
+    );
+    assert_eq!(v[0].ops, ["r0", "r1"]);
+    assert_eq!(v[1].ops, ["lr"]);
+    assert!(v.iter().all(|i| i.branch_target.is_none()));
+}
+
+#[test]
+fn arm32_b_bl_branch_targets() {
+    // b . targets itself; bl with a zero field targets addr+8.
+    let v = arm32(&[0xfe, 0xff, 0xff, 0xea], 0x10000);
+    assert_eq!(v[0].mnem, "b");
+    assert_eq!(v[0].branch_target, Some(0x10000));
+    let v = arm32(&[0x00, 0x00, 0x00, 0xeb], 0x10000);
+    assert_eq!(v[0].mnem, "bl");
+    assert_eq!(v[0].branch_target, Some(0x10008));
+}
+
+#[test]
+fn arm32_invalid_opcode_errors() {
+    let err = disasm_range(Arch::Arm32, &[0xff, 0xff, 0xff, 0xff], 0x10000, 100).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+}
+
+#[test]
+fn arm32_truncated_tail_errors() {
+    let err = disasm_range(Arch::Arm32, &[0x01, 0x00], 0x10000, 100).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+}
+
+#[test]
+fn arm32_cap_errors() {
+    let err = disasm_range(
+        Arch::Arm32,
+        &[0x01, 0x00, 0xa0, 0xe1, 0x1e, 0xff, 0x2f, 0xe1],
+        0x10000,
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+}
+
+#[test]
+fn thumb_mixed_width_snapshot() {
+    // nop (2B) ; bl #0 (4B) ; bx lr (2B)
+    let v = thumb(&[0x00, 0xbf, 0x00, 0xf0, 0x00, 0xf8, 0x70, 0x47], 0x20000);
+    assert_eq!(v.len(), 3);
+    assert_eq!(
+        v.iter().map(|i| (i.addr, i.size)).collect::<Vec<_>>(),
+        [(0x20000, 2), (0x20002, 4), (0x20006, 2)]
+    );
+    assert_eq!(
+        v.iter().map(|i| i.mnem.as_str()).collect::<Vec<_>>(),
+        ["nop", "bl.w", "bx"]
+    );
+    assert_eq!(v[1].branch_target, Some(0x20006));
+    assert_eq!(v[1].bytes, [0x00, 0xf0, 0x00, 0xf8]);
+}
+
+#[test]
+fn thumb_b_and_cbz_branch_targets() {
+    // b . targets itself (halfword offset -2 from PC).
+    let v = thumb(&[0xfe, 0xe7], 0x20000);
+    assert_eq!(v[0].mnem, "b");
+    assert_eq!(v[0].branch_target, Some(0x20000));
+    // cbz r0, #4 targets PC+4.
+    let v = thumb(&[0x08, 0xb1], 0x20000);
+    assert_eq!(v[0].mnem, "cbz");
+    assert_eq!(v[0].branch_target, Some(0x20008));
+}
+
+#[test]
+fn thumb_invalid_opcode_errors() {
+    let err = disasm_range(Arch::Thumb, &[0xff, 0xff, 0xff, 0xff], 0x20000, 100).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+}
+
+#[test]
+fn thumb_truncated_tail_errors() {
+    // Lone first halfword of a 32-bit instruction.
+    let err = disasm_range(Arch::Thumb, &[0x00, 0xf0], 0x20000, 100).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+    let err = disasm_range(Arch::Thumb, &[0x00], 0x20000, 100).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+}
+
+#[test]
+fn thumb_cap_errors() {
+    let err = disasm_range(Arch::Thumb, &[0x00, 0xbf, 0x00, 0xbf], 0x20000, 1).unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+}
+
+#[test]
+fn partial_arm32_invalid_and_truncated_tail() {
+    let p = disasm_range_partial(Arch::Arm32, &[0xff, 0xff, 0xff, 0xff], 0x10000, 100)
+        .expect("partial on bad word");
+    assert!(p.insns.is_empty());
+    assert_eq!(p.error_at.expect("error_at").addr, 0x10000);
+    // mov then a short tail: prefix of 1 plus error at the tail word.
+    let p = disasm_range_partial(
+        Arch::Arm32,
+        &[0x01, 0x00, 0xa0, 0xe1, 0x01, 0x00],
+        0x10000,
+        100,
+    )
+    .expect("partial on truncated tail");
+    assert_eq!(p.insns.len(), 1);
+    assert_eq!(p.error_at.expect("error_at").addr, 0x10004);
+}
+
+#[test]
+fn partial_thumb_mixed_prefix_and_split_tail() {
+    // nop (2B) ; bl #0 (4B) ; then a 32-bit prefix with no second half.
+    let p = disasm_range_partial(
+        Arch::Thumb,
+        &[0x00, 0xbf, 0x00, 0xf0, 0x00, 0xf8, 0x00, 0xf0],
+        0x20000,
+        100,
+    )
+    .expect("partial keeps the mixed prefix");
+    assert_eq!(p.insns.len(), 2);
+    assert_eq!(p.insns[1].size, 4);
+    assert_eq!(p.error_at.expect("error_at").addr, 0x20006);
+    // Strict aborts on the same bytes.
+    let strict = disasm_range(
+        Arch::Thumb,
+        &[0x00, 0xbf, 0x00, 0xf0, 0x00, 0xf8, 0x00, 0xf0],
+        0x20000,
+        100,
+    )
+    .unwrap_err();
+    assert!(matches!(strict, Error::Invalid(_)), "got {strict:?}");
+}
+
+#[test]
+fn partial_thumb_cap_still_errors() {
+    let err = disasm_range_partial(Arch::Thumb, &[0x00, 0xbf, 0x00, 0xbf], 0x20000, 1).unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+    let err = disasm_range_partial(
+        Arch::Arm32,
+        &[0x01, 0x00, 0xa0, 0xe1, 0x1e, 0xff, 0x2f, 0xe1],
+        0x10000,
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
 }

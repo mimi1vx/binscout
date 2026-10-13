@@ -394,8 +394,9 @@ impl Project {
             .skip(offset)
             .take(limit.min(MAX_ROWS))
             .map(|f| {
+                let (entry, entry_hex) = addr_pair(f.entry);
                 serde_json::json!({
-                    "id": f.id(), "entry": f.entry,
+                    "id": f.id(), "entry": entry, "entry_hex": entry_hex,
                     "name": self.function_name(f.entry),
                     "blocks": f.blocks.len(), "insns": f.insn_count(), "calls": self.analysis.calls_of(f.entry),
                 })
@@ -425,14 +426,20 @@ impl Project {
             .blocks
             .values()
             .map(|b| {
+                let (start, start_hex) = addr_pair(b.start);
+                let (end, end_hex) = addr_pair(b.end());
                 serde_json::json!({
-                    "id": b.id(entry), "start": b.start, "end": b.end(),
+                    "id": b.id(entry), "start": start, "start_hex": start_hex,
+                    "end": end, "end_hex": end_hex,
                     "insns": b.insns, "succs": f.successors(b.start),
                 })
             })
             .collect();
+        let (entry_json, entry_hex) = addr_pair(f.entry);
+        let (_, containing_hex) = addr_pair(entry);
         Ok(serde_json::json!({
-            "id": f.id(), "entry": f.entry, "containing_entry": entry,
+            "id": f.id(), "entry": entry_json, "entry_hex": entry_hex,
+            "containing_entry": entry, "containing_entry_hex": containing_hex,
             "name": self.function_name(entry),
             "blocks": blocks, "edges": f.edges(),
             "calls": self.analysis.calls_of(entry),
@@ -461,14 +468,18 @@ impl Project {
             .blocks
             .values()
             .map(|b| {
+                let (start, start_hex) = addr_pair(b.start);
+                let (end, end_hex) = addr_pair(b.end());
                 serde_json::json!({
-                    "start": b.start, "end": b.end(),
+                    "start": start, "start_hex": start_hex,
+                    "end": end, "end_hex": end_hex,
                     "insns": b.insns.len(), "succs": f.successors(b.start),
                 })
             })
             .collect();
+        let (_, entry_hex) = addr_pair(entry);
         Ok(
-            serde_json::json!({ "entry": entry, "containing_entry": entry, "nodes": nodes, "edges": f.edges() }),
+            serde_json::json!({ "entry": entry, "entry_hex": entry_hex, "containing_entry": entry, "containing_entry_hex": entry_hex, "nodes": nodes, "edges": f.edges() }),
         )
     }
 
@@ -482,8 +493,9 @@ impl Project {
     pub fn ir_at(&self, addr: u64, len: usize) -> Result<serde_json::Value> {
         let partial = self.disasm_at(addr, len)?;
         let lifted = crate::ir::lift_range(self.binary.arch, &partial.insns);
+        let (addr_json, addr_hex) = addr_pair(addr);
         Ok(
-            serde_json::json!({ "addr": addr, "insns": partial.insns.len(), "ir": lifted, "error_at": partial.error_at }),
+            serde_json::json!({ "addr": addr_json, "addr_hex": addr_hex, "insns": partial.insns.len(), "ir": lifted, "error_at": partial.error_at }),
         )
     }
 
@@ -552,8 +564,9 @@ impl Project {
             .sections
             .iter()
             .map(|s| {
+                let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
                 serde_json::json!({
-                    "name": s.name, "vaddr": s.vaddr, "size": s.size,
+                    "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
                     "file_off": s.file_off, "file_size": s.data.len(),
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
@@ -578,9 +591,14 @@ impl Project {
     /// Current annotation at `addr`.
     #[must_use]
     pub fn annotation_json(&self, addr: u64) -> serde_json::Value {
+        let (addr_json, addr_hex) = addr_pair(addr);
         match self.annotation(addr) {
-            Some(a) => serde_json::json!({ "addr": addr, "name": a.name, "comment": a.comment }),
-            None => serde_json::json!({ "addr": addr, "name": null, "comment": null }),
+            Some(a) => {
+                serde_json::json!({ "addr": addr_json, "addr_hex": addr_hex, "name": a.name, "comment": a.comment })
+            }
+            None => {
+                serde_json::json!({ "addr": addr_json, "addr_hex": addr_hex, "name": null, "comment": null })
+            }
         }
     }
 }
@@ -589,6 +607,34 @@ impl Project {
 pub const MAX_RANGE_BYTES: usize = 1 << 20;
 /// Cap on rows per paged query.
 const MAX_ROWS: usize = 1024;
+
+/// Format a virtual address as canonical `0x`-hex (`0x401000`).
+///
+/// Every JSON address field pairs its integer value with this string form
+/// (`addr` + `addr_hex`, `entry` + `entry_hex`, `from` + `from_hex`, ...),
+/// so agents can join outputs without guessing the base. Lowercase, no
+/// leading zeros (except `0x0` itself).
+#[must_use]
+pub fn addr_hex(addr: u64) -> String {
+    format!("{addr:#x}")
+}
+
+/// Dual address encoding: integer value plus canonical `0x`-hex string.
+///
+/// Returns `(addr, addr_hex(addr))` for spreading into JSON envelopes; the
+/// integer keeps numeric range queries working, the string keeps joins
+/// unambiguous.
+#[must_use]
+pub fn addr_pair(addr: u64) -> (u64, String) {
+    (addr, addr_hex(addr))
+}
+
+/// Dual encoding for optional addresses: `(None, None)` stays null on both
+/// sides instead of inventing an address.
+#[must_use]
+pub fn opt_addr_pair(addr: Option<u64>) -> (Option<u64>, Option<String>) {
+    (addr, addr.map(addr_hex))
+}
 
 /// Parse a CLI/MCP address: `0x`-prefixed hex or plain decimal.
 ///

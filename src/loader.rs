@@ -131,8 +131,9 @@ pub struct ImportRef {
 ///
 /// Ordinal-only exports carry `ordinal: Some(n)` with `name` as `#n`;
 /// named exports carry `ordinal: None`. C++ names additionally carry
-/// `demangled: Some(...)` when the demangler succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `demangled: Some(...)` when the demangler succeeds. JSON pairs `address`
+/// with `address_hex` (`null` on both sides for address-less exports).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ExportRef {
     /// Symbol name (LE: decimal ordinal).
     pub name: String,
@@ -144,6 +145,37 @@ pub struct ExportRef {
     /// Demangled C++ name, when `name` is a recognized mangling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
+}
+
+impl Serialize for ExportRef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut len = 3;
+        if self.ordinal.is_some() {
+            len += 1;
+        }
+        if self.demangled.is_some() {
+            len += 1;
+        }
+        let mut st = serializer.serialize_struct("ExportRef", len)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("address", &self.address)?;
+        st.serialize_field("address_hex", &self.address.map(crate::addr_hex))?;
+        if self.ordinal.is_some() {
+            st.serialize_field("ordinal", &self.ordinal)?;
+        } else {
+            st.skip_field("ordinal")?;
+        }
+        if self.demangled.is_some() {
+            st.serialize_field("demangled", &self.demangled)?;
+        } else {
+            st.skip_field("demangled")?;
+        }
+        st.end()
+    }
 }
 
 /// A parsed binary ready for disassembly and analysis.
@@ -237,18 +269,18 @@ pub fn load_raw(bytes: &[u8], opts: RawOptions) -> Result<LoadedBinary> {
 
 /// Map an `object` architecture to a disassembler target.
 ///
+/// 32-bit ARM containers default to ARM mode; Thumb regions decode through
+/// [`Arch::Thumb`] raw mappings.
+///
 /// # Errors
-/// [`Error::Unsupported`] for 32-bit ARM (deferred to `rsdbg-0bw`) and any
-/// other architecture without a disassembler.
+/// [`Error::Unsupported`] for any architecture without a disassembler.
 pub fn arch_from_object(arch: object::Architecture) -> Result<Arch> {
     use object::Architecture as A;
     match arch {
         A::X86_64 | A::X86_64_X32 => Ok(Arch::X86_64),
         A::I386 => Ok(Arch::X86_32),
         A::Aarch64 | A::Aarch64_Ilp32 => Ok(Arch::Aarch64),
-        A::Arm => Err(Error::Unsupported(
-            "armv7/thumb deferred to rsdbg-0bw".to_string(),
-        )),
+        A::Arm => Ok(Arch::Arm32),
         other => Err(Error::Unsupported(format!("architecture {other:?}"))),
     }
 }
@@ -564,10 +596,7 @@ mod tests {
         assert_eq!(arch_from_object(A::X86_64).unwrap(), Arch::X86_64);
         assert_eq!(arch_from_object(A::I386).unwrap(), Arch::X86_32);
         assert_eq!(arch_from_object(A::Aarch64).unwrap(), Arch::Aarch64);
-        assert!(matches!(
-            arch_from_object(A::Arm).unwrap_err(),
-            Error::Unsupported(_)
-        ));
+        assert_eq!(arch_from_object(A::Arm).unwrap(), Arch::Arm32);
         assert!(matches!(
             arch_from_object(A::Mips).unwrap_err(),
             Error::Unsupported(_)

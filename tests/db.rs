@@ -6,6 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod common;
+
 use binscout::Project;
 use binscout::error::Error;
 
@@ -231,4 +233,93 @@ fn meta_without_support_fields_loads_as_supported() {
         serde_json::from_value(old).expect("old meta shape must decode");
     assert!(meta.supported);
     assert!(meta.reason.is_none());
+}
+
+// O2/A10: annotation round-trip lock-in. Rename flows entry->name and comment
+// flows addr->comment through point-query, DB reopen, and clear->nulls.
+#[test]
+fn annotate_round_trip_rename_comment_reopen_clear() {
+    let dir = common::tmpdir("annotate-roundtrip");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let db = common::temp_db(&dir, "annotate");
+    let entry = common::builders::BASIC_ENTRY_VA;
+    let string_va = common::builders::BASIC_STRING_VA;
+
+    let mut p = Project::open_with_db(&bin, &db).expect("open");
+    assert!(p.analysis().functions.contains_key(&entry));
+    assert_eq!(
+        p.function_name(entry).as_deref(),
+        Some(common::builders::BASIC_EXPORT)
+    );
+
+    // Rename: addr->name, point-query reflects immediately.
+    p.rename_function(entry, "renamed_entry").expect("rename");
+    assert_eq!(p.function_name(entry).as_deref(), Some("renamed_entry"));
+    assert_eq!(
+        p.annotation(entry).and_then(|a| a.name.as_deref()),
+        Some("renamed_entry")
+    );
+    assert_eq!(p.annotation_json(entry)["name"], "renamed_entry");
+    assert!(p.annotation_json(entry)["comment"].is_null());
+    let rows = p.functions_resolved(0, 50);
+    let row = rows
+        .iter()
+        .find(|r| r["entry"].as_u64() == Some(entry))
+        .expect("renamed row in listing");
+    assert_eq!(row["name"], "renamed_entry");
+
+    // Comment: any address, point-query reflects immediately.
+    p.set_comment(string_va, "string note").expect("comment");
+    assert_eq!(p.annotation_json(string_va)["comment"], "string note");
+    assert!(p.annotation_json(string_va)["name"].is_null());
+    assert_eq!(
+        p.annotation(string_va).and_then(|a| a.comment.as_deref()),
+        Some("string note")
+    );
+
+    // Both survive a DB reopen.
+    drop(p);
+    let mut q = Project::open_with_db(&bin, &db).expect("reopen");
+    assert_eq!(q.function_name(entry).as_deref(), Some("renamed_entry"));
+    assert_eq!(q.annotation_json(entry)["name"], "renamed_entry");
+    assert_eq!(q.annotation_json(string_va)["comment"], "string note");
+    let rows = q.functions_resolved(0, 50);
+    let row = rows
+        .iter()
+        .find(|r| r["entry"].as_u64() == Some(entry))
+        .expect("renamed row after reopen");
+    assert_eq!(row["name"], "renamed_entry");
+
+    // Clear restores nulls; rename falls back to the export name.
+    q.rename_function(entry, "").expect("clear rename");
+    assert!(q.annotation(entry).is_none());
+    assert!(q.annotation_json(entry)["name"].is_null());
+    assert_eq!(
+        q.function_name(entry).as_deref(),
+        Some(common::builders::BASIC_EXPORT)
+    );
+    q.set_comment(string_va, "").expect("clear comment");
+    assert!(q.annotation(string_va).is_none());
+    let cleared = q.annotation_json(string_va);
+    assert!(cleared["name"].is_null() && cleared["comment"].is_null());
+
+    // Cleared state survives a reopen too.
+    drop(q);
+    let r = Project::open_with_db(&bin, &db).expect("reopen after clear");
+    assert!(r.annotation(entry).is_none());
+    assert!(r.annotation_json(entry)["name"].is_null());
+    assert_eq!(
+        r.function_name(entry).as_deref(),
+        Some(common::builders::BASIC_EXPORT)
+    );
+    assert!(r.annotation(string_va).is_none());
+    assert!(r.annotation_json(string_va)["comment"].is_null());
+    assert_eq!(r.project_info().annotations, 0);
+
+    assert_eq!(
+        std::fs::read(&bin).expect("reread"),
+        common::fixture_bytes(common::builders::BASIC_NAME),
+        "binary untouched"
+    );
+    common::cleanup(&dir);
 }
