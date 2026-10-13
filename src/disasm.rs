@@ -429,6 +429,26 @@ pub fn disasm_range_partial(
     }
 }
 
+/// Decode only the first instruction in `bytes` (loaded at `va`).
+///
+/// Uses the same decoder options and the same [`Insn`] conversion as the
+/// range decoders, but stops after one instruction: trailing bytes are never
+/// formatted or allocated, and trailing garbage cannot change the first
+/// result. An empty input reports `Ok(None)`; an undecodable or truncated
+/// first instruction is [`Error::Invalid`], never a partial result.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first instruction does not decode.
+pub fn disasm_first(arch: Arch, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    match arch {
+        Arch::X86_64 => disasm_first_x86(bytes, va, 64),
+        Arch::X86_32 => disasm_first_x86(bytes, va, 32),
+        Arch::Aarch64 => disasm_first_aarch64(bytes, va),
+        Arch::Arm32 => disasm_first_arm32(bytes, va),
+        Arch::Thumb => disasm_first_thumb(bytes, va),
+    }
+}
+
 fn limit_err(max_insns: usize) -> Error {
     Error::Limit(format!("more than {max_insns} instructions in range"))
 }
@@ -499,6 +519,91 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
     }
 }
 
+/// Decode only the first x86 instruction in `bytes` (loaded at `va`).
+///
+/// Uses the same [`Decoder`] options (`DecoderOptions::NONE`, IP `va`) and
+/// the same [`x86_insn`] conversion as [`disasm_x86_partial`], but stops
+/// after one instruction instead of formatting the whole window. Returns
+/// [`Error::Invalid`] with the same message the range decoder reports when
+/// the first instruction is undecodable or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first instruction does not decode.
+fn disasm_first_x86(bytes: &[u8], va: u64, bitness: u32) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    // x86 instructions are at most 15 bytes; the window bound mirrors the
+    // old shrink-and-retry prefix and cannot change the first decode.
+    let win = &bytes[..bytes.len().min(15)];
+    let mut decoder = Decoder::new(bitness, win, DecoderOptions::NONE);
+    decoder.set_ip(va);
+    let addr = decoder.ip();
+    let start = decoder.position();
+    let insn = decoder.decode();
+    if insn.is_invalid() {
+        return Err(Error::Invalid(format!(
+            "x86 invalid opcode at {addr:#x} ({bitness}-bit)"
+        )));
+    }
+    let size = insn.len();
+    let Some(raw) = win.get(start..start + size).map(<[u8]>::to_vec) else {
+        return Err(Error::Invalid(format!(
+            "x86 invalid opcode at {addr:#x} ({bitness}-bit)"
+        )));
+    };
+    let mut formatter = IntelFormatter::new();
+    let mut text = String::new();
+    Ok(Some(x86_insn(
+        &insn,
+        addr,
+        raw,
+        bitness,
+        &mut formatter,
+        &mut text,
+    )))
+}
+
+/// Convert one decoded iced-x86 instruction to [`Insn`].
+///
+/// Shared by the range prefix decoder and the first-instruction decoder so
+/// both report identical mnemonics, operands, and branch/memory targets.
+fn x86_insn(
+    insn: &Instruction,
+    addr: u64,
+    raw: Vec<u8>,
+    bitness: u32,
+    formatter: &mut IntelFormatter,
+    text: &mut String,
+) -> Insn {
+    text.clear();
+    formatter.format(insn, text);
+    let (mnem, ops) = split_asm(text);
+    let branch_target = match insn.op0_kind() {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
+            Some(insn.near_branch_target())
+        }
+        _ => None,
+    };
+    let mem_target = insn
+        .is_ip_rel_memory_operand()
+        .then(|| insn.ip_rel_memory_address());
+    let mem_target = match mem_target {
+        Some(_) => mem_target,
+        None if bitness == 32 => absolute_target32(insn),
+        None => None,
+    };
+    Insn {
+        addr,
+        size: insn.len() as u8,
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target,
+        mem_target,
+    }
+}
+
 /// Prefix decode over x86 bytes: each position decodes independently via
 /// iced-x86, so trailing garbage cannot change the first decode (the same
 /// prefix property [`crate::analysis`] relies on for single-instruction
@@ -543,32 +648,14 @@ fn disasm_x86_partial(
                 });
             }
         };
-        text.clear();
-        formatter.format(&insn, &mut text);
-        let (mnem, ops) = split_asm(&text);
-        let branch_target = match insn.op0_kind() {
-            OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-                Some(insn.near_branch_target())
-            }
-            _ => None,
-        };
-        let mem_target = insn
-            .is_ip_rel_memory_operand()
-            .then(|| insn.ip_rel_memory_address());
-        let mem_target = match mem_target {
-            Some(_) => mem_target,
-            None if bitness == 32 => absolute_target32(&insn),
-            None => None,
-        };
-        out.push(Insn {
+        out.push(x86_insn(
+            &insn,
             addr,
-            size: size as u8,
-            bytes: raw,
-            mnem,
-            ops,
-            branch_target,
-            mem_target,
-        });
+            raw,
+            bitness,
+            &mut formatter,
+            &mut text,
+        ));
     }
     Ok(PartialDisasm {
         insns: out,
@@ -609,6 +696,56 @@ fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> 
     }
 }
 
+/// Decode only the first AArch64 instruction in `bytes` (loaded at `va`).
+///
+/// Decodes the leading 4-byte word with the same decoder and the same
+/// [`aarch64_insn`] conversion as [`disasm_aarch64_partial`]; trailing bytes
+/// cannot change the first word decode. Returns [`Error::Invalid`] with the
+/// same message the range decoder reports when the first word is undecodable
+/// or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first word does not decode.
+fn disasm_first_aarch64(bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut reader =
+        <&[u8] as yaxpeax_arch::ReaderBuilder<u64, u8>>::read_from(&bytes[..4.min(bytes.len())]);
+    let decoder = InstDecoder::default();
+    let inst = match ArmDecoder::decode(&decoder, &mut reader) {
+        Ok(inst) => inst,
+        Err(e) => {
+            return Err(Error::Invalid(format!(
+                "aarch64 decode error at {va:#x}: {e:?}"
+            )));
+        }
+    };
+    let Some(raw) = bytes.get(..4).map(<[u8]>::to_vec) else {
+        return Err(Error::Invalid(format!(
+            "aarch64 decode error at {va:#x}: truncated word"
+        )));
+    };
+    Ok(Some(aarch64_insn(va, raw, &inst)))
+}
+
+/// Convert one decoded AArch64 instruction to [`Insn`].
+///
+/// Shared by the range prefix decoder and the first-instruction decoder so
+/// both report identical mnemonics, operands, and branch/memory targets.
+fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruction) -> Insn {
+    let (mnem, ops) = split_asm(&inst.to_string());
+    Insn {
+        addr,
+        size: 4,
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target: arm_branch_target(inst, addr),
+        mem_target: arm_data_target(inst, addr),
+    }
+}
+
 /// Prefix decode over AArch64 bytes: fixed 4-byte words decode
 /// independently, so the first bad word ends the prefix with `error_at`.
 /// A short tail (< 4 bytes) fails its word decode the same way.
@@ -634,7 +771,6 @@ fn disasm_aarch64_partial(bytes: &[u8], va: u64, max_insns: usize) -> Result<Par
                 });
             }
         };
-        let (mnem, ops) = split_asm(&inst.to_string());
         let Some(raw) = bytes.get(off..off + 4).map(<[u8]>::to_vec) else {
             return Ok(PartialDisasm {
                 insns: out,
@@ -644,15 +780,7 @@ fn disasm_aarch64_partial(bytes: &[u8], va: u64, max_insns: usize) -> Result<Par
                 }),
             });
         };
-        out.push(Insn {
-            addr,
-            size: 4,
-            bytes: raw,
-            mnem,
-            ops,
-            branch_target: arm_branch_target(&inst, addr),
-            mem_target: arm_data_target(&inst, addr),
-        });
+        out.push(aarch64_insn(addr, raw, &inst));
         addr = addr.wrapping_add(4);
         off += 4;
     }
@@ -707,6 +835,101 @@ fn arm_branch_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> 
         Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
         _ => None,
     })
+}
+
+/// Decode exactly one ARMv7 instruction from the start of `bytes`
+/// (`thumb` selects the decoder mode), with the same decoder and the same
+/// [`armv7_insn`] conversion as [`disasm_armv7_partial`].
+///
+/// Returns [`Error::Invalid`] with the same message the range decoder
+/// reports when the instruction is undecodable or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first instruction does not decode.
+fn decode_single_armv7(bytes: &[u8], va: u64, thumb: bool) -> Result<Insn> {
+    let mut reader = <&[u8] as yaxpeax_arch::ReaderBuilder<u32, u8>>::read_from(bytes);
+    let decoder = ArmV7Decoder::default().with_thumb_mode(thumb);
+    let label = if thumb { "thumb" } else { "arm32" };
+    let inst = match ArmDecoder::decode(&decoder, &mut reader) {
+        Ok(inst) => inst,
+        Err(e) => {
+            return Err(Error::Invalid(format!(
+                "{label} decode error at {va:#x}: {e:?}"
+            )));
+        }
+    };
+    let size: usize = if inst.thumb() && !inst.wide() { 2 } else { 4 };
+    let Some(raw) = bytes.get(..size).map(<[u8]>::to_vec) else {
+        return Err(Error::Invalid(format!(
+            "{label} decode error at {va:#x}: truncated word"
+        )));
+    };
+    Ok(armv7_insn(va, raw, &inst))
+}
+
+/// Decode only the first ARM32 instruction in `bytes` (loaded at `va`).
+///
+/// Decodes the leading 4-byte word; trailing bytes cannot change the first
+/// word decode. A short tail fails the word decode the same way the range
+/// decoder reports it.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first word does not decode.
+fn disasm_first_arm32(bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode_single_armv7(
+        &bytes[..4.min(bytes.len())],
+        va,
+        false,
+    )?))
+}
+
+/// Decode only the first Thumb instruction in `bytes` (loaded at `va`).
+///
+/// A 4-byte window decodes both 16- and 32-bit forms; only when it fails is
+/// a lone halfword tried, so a 32-bit prefix is never misread as 16-bit —
+/// the same fallback [`disasm_thumb`] relies on, minus decoding the rest of
+/// the window.
+///
+/// # Errors
+/// [`Error::Invalid`] when neither the 4-byte nor the 2-byte window decodes.
+fn disasm_first_thumb(bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() >= 4 {
+        match decode_single_armv7(&bytes[..4], va, true) {
+            Ok(insn) => return Ok(Some(insn)),
+            Err(Error::Invalid(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if bytes.len() >= 2 {
+        return Ok(Some(decode_single_armv7(&bytes[..2], va, true)?));
+    }
+    Err(Error::Invalid(format!(
+        "thumb decode error at {va:#x}: truncated word"
+    )))
+}
+
+/// Convert one decoded ARMv7 instruction to [`Insn`].
+///
+/// Shared by the range prefix decoder and the first-instruction decoder so
+/// both report identical mnemonics, operands, and branch/memory targets.
+fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
+    let size: usize = if inst.thumb() && !inst.wide() { 2 } else { 4 };
+    let (mnem, ops) = split_asm(&inst.to_string());
+    Insn {
+        addr,
+        size: size as u8,
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target: armv7_branch_target(inst, addr),
+        mem_target: armv7_data_target(inst, addr),
+    }
 }
 
 fn disasm_arm32(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> {
@@ -776,7 +999,6 @@ fn disasm_armv7_partial(
             }
         };
         let size: usize = if inst.thumb() && !inst.wide() { 2 } else { 4 };
-        let (mnem, ops) = split_asm(&inst.to_string());
         let Some(raw) = bytes.get(off..off + size).map(<[u8]>::to_vec) else {
             return Ok(PartialDisasm {
                 insns: out,
@@ -786,15 +1008,7 @@ fn disasm_armv7_partial(
                 }),
             });
         };
-        out.push(Insn {
-            addr,
-            size: size as u8,
-            bytes: raw,
-            mnem,
-            ops,
-            branch_target: armv7_branch_target(&inst, addr),
-            mem_target: armv7_data_target(&inst, addr),
-        });
+        out.push(armv7_insn(addr, raw, &inst));
         addr = addr.wrapping_add(size as u64);
         off += size;
     }

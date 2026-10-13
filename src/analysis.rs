@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{Arch, Disassembler, Insn};
+use crate::disasm::{Arch, Insn};
 use crate::error::{Error, Result};
 use crate::ir::IrOp;
 use crate::loader::strings::{self, Encoding, StringHit};
@@ -671,68 +671,19 @@ impl<'a> AddrSpace<'a> {
 /// Decode the single instruction at `va`.
 ///
 /// Returns `None` when `va` has no executable bytes or they do not decode;
-/// undecodable bytes end that path, they are not an error. A trailing-garbage
-/// window on x86 shrinks until the first instruction decodes, since later
-/// bytes cannot change the first decode.
+/// undecodable bytes end that path, they are not an error. Decodes only the
+/// first instruction via [`crate::disasm::disasm_first`]: trailing bytes
+/// cannot change the first decode, so no shrink-and-retry window over the
+/// whole executable tail is needed.
 fn decode_one(arch: Arch, space: &AddrSpace, va: u64) -> Result<Option<Insn>> {
     let bytes = match space.code_bytes(va) {
         Some(b) if !b.is_empty() => b,
         _ => return Ok(None),
     };
-    let dis = arch.disassembler();
-    match arch {
-        Arch::X86_64 | Arch::X86_32 => {
-            let mut len = bytes.len().min(15);
-            loop {
-                match dis.disasm_range(&bytes[..len], va) {
-                    Ok(mut v) if !v.is_empty() => return Ok(Some(v.remove(0))),
-                    Ok(_) => return Ok(None),
-                    Err(Error::Invalid(_)) if len > 1 => len -= 1,
-                    Err(Error::Invalid(_)) => return Ok(None),
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-        Arch::Aarch64 | Arch::Arm32 => {
-            if bytes.len() < 4 {
-                return Ok(None);
-            }
-            match dis.disasm_range(&bytes[..4], va) {
-                Ok(mut v) if !v.is_empty() => Ok(Some(v.remove(0))),
-                Ok(_) => Ok(None),
-                Err(Error::Invalid(_)) => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
-        Arch::Thumb => decode_one_thumb(&dis, bytes, va),
-    }
-}
-
-/// Decode the single Thumb instruction at `va`.
-///
-/// A 4-byte window decodes both 16- and 32-bit forms; only when it fails is
-/// a lone halfword tried, so a 32-bit prefix is never misread as 16-bit.
-/// The fallback can still misread a 32-bit instruction with a bad second
-/// halfword whose first halfword happens to be valid 16-bit code — best
-/// effort, same class of ambiguity as the x86 shrink window.
-fn decode_one_thumb(dis: &crate::disasm::AnyDisasm, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
-    if bytes.len() >= 4 {
-        match dis.disasm_range(&bytes[..4], va) {
-            Ok(mut v) if !v.is_empty() => return Ok(Some(v.remove(0))),
-            Ok(_) => return Ok(None),
-            Err(Error::Invalid(_)) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    if bytes.len() >= 2 {
-        match dis.disasm_range(&bytes[..2], va) {
-            Ok(mut v) if !v.is_empty() => Ok(Some(v.remove(0))),
-            Ok(_) => Ok(None),
-            Err(Error::Invalid(_)) => Ok(None),
-            Err(e) => Err(e),
-        }
-    } else {
-        Ok(None)
+    match crate::disasm::disasm_first(arch, bytes, va) {
+        Ok(v) => Ok(v),
+        Err(Error::Invalid(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
