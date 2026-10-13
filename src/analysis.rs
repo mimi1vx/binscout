@@ -521,6 +521,10 @@ impl Analysis {
     /// expression fails to compile.
     pub fn strings_page_filtered(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
         let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
+        // Compiled once, lazily at the first row reaching pattern evaluation:
+        // a malformed/overlong pattern errors only when a row survives the
+        // earlier filters, and costs zero compilations otherwise.
+        let mut matcher: Option<strings::PatternMatcher<'_>> = None;
         let mut rows: Vec<StringHit> = Vec::new();
         for h in &self.strings {
             if h.executable && !show_code {
@@ -536,10 +540,17 @@ impl Analysis {
             {
                 continue;
             }
-            if let Some(pat) = &filter.pattern
-                && !strings::matches_pattern(&h.value, pat)?
-            {
-                continue;
+            if let Some(pat) = &filter.pattern {
+                if matcher.is_none() {
+                    matcher = Some(strings::PatternMatcher::compile(pat)?);
+                }
+                if !matcher
+                    .as_ref()
+                    .expect("matcher compiled above")
+                    .is_match(&h.value)
+                {
+                    continue;
+                }
             }
             rows.push(h.clone());
         }

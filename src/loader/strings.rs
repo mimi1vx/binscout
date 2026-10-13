@@ -88,19 +88,59 @@ impl Serialize for StringHit {
 /// `regex:` expression fails to compile. A bad regex is an error, never a
 /// silent fallback to substring matching.
 pub fn matches_pattern(value: &str, pattern: &str) -> Result<bool> {
-    if pattern.len() > MAX_PATTERN_LEN {
-        return Err(Error::Invalid(format!(
-            "pattern exceeds {MAX_PATTERN_LEN} bytes"
-        )));
+    Ok(PatternMatcher::compile(pattern)?.is_match(value))
+}
+
+/// A `strings` query pattern compiled once and reused for every row.
+///
+/// Compiling per row pays one [`regex`] compilation per eligible hit;
+/// compiling eagerly per query changes observable behavior (a malformed or
+/// overlong pattern would error even when `section`/`min_len` prefilter every
+/// row). Callers therefore compile lazily at the first row reaching pattern
+/// evaluation and reuse the matcher after; this type owns the single
+/// compilation, the query loop owns the laziness.
+#[derive(Debug, Clone)]
+pub enum PatternMatcher<'a> {
+    /// Empty pattern matches every value without touching the regex engine.
+    All,
+    /// Case-sensitive substring (`value.contains(pattern)`).
+    Substring(&'a str),
+    /// `regex:`-prefixed expression, compiled once.
+    Regex(regex::Regex),
+}
+
+impl<'a> PatternMatcher<'a> {
+    /// Compile `pattern` once per query.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the pattern exceeds [`MAX_PATTERN_LEN`] or a
+    /// `regex:` expression fails to compile. A bad regex is an error, never
+    /// a silent fallback to substring matching.
+    pub fn compile(pattern: &'a str) -> Result<Self> {
+        if pattern.len() > MAX_PATTERN_LEN {
+            return Err(Error::Invalid(format!(
+                "pattern exceeds {MAX_PATTERN_LEN} bytes"
+            )));
+        }
+        if pattern.is_empty() {
+            return Ok(Self::All);
+        }
+        match pattern.strip_prefix(REGEX_PREFIX) {
+            Some(expr) => regex::Regex::new(expr)
+                .map(Self::Regex)
+                .map_err(|e| Error::Invalid(format!("bad regex pattern {pattern:?}: {e}"))),
+            None => Ok(Self::Substring(pattern)),
+        }
     }
-    if pattern.is_empty() {
-        return Ok(true);
-    }
-    match pattern.strip_prefix(REGEX_PREFIX) {
-        Some(expr) => regex::Regex::new(expr)
-            .map(|re| re.is_match(value))
-            .map_err(|e| Error::Invalid(format!("bad regex pattern {pattern:?}: {e}"))),
-        None => Ok(value.contains(pattern)),
+
+    /// Test one row's value against the compiled pattern.
+    #[must_use]
+    pub fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Substring(needle) => value.contains(needle),
+            Self::Regex(re) => re.is_match(value),
+        }
     }
 }
 
@@ -384,6 +424,66 @@ mod tests {
         assert!(matches_pattern("x", "regex:([").is_err());
         assert!(matches_pattern("x", &"y".repeat(MAX_PATTERN_LEN + 1)).is_err());
         assert!(matches_pattern("x", &"y".repeat(MAX_PATTERN_LEN)).is_ok());
+    }
+
+    #[test]
+    fn matcher_agrees_with_matches_pattern() {
+        let values = [
+            "SAVE%d.GAM is invalid",
+            "save game",
+            "",
+            "regex:SAVE",
+            "zzz",
+        ];
+        let patterns = [
+            "SAVE",
+            "save",
+            "zzz",
+            "",
+            "regex:SAVE.*invalid",
+            "regex:(?i)save",
+            "regex:^invalid",
+            "regex:([",
+        ];
+        for pattern in patterns {
+            let single: Vec<Result<bool>> =
+                values.iter().map(|v| matches_pattern(v, pattern)).collect();
+            let reused = PatternMatcher::compile(pattern);
+            match (single, reused) {
+                (results, Ok(matcher)) => {
+                    for (value, expected) in values.iter().zip(results) {
+                        assert_eq!(
+                            matcher.is_match(value),
+                            expected.expect("compiled pattern must match per-row"),
+                            "value={value:?} pattern={pattern:?}"
+                        );
+                    }
+                }
+                (results, Err(_)) => {
+                    assert!(
+                        results.iter().all(|r| r.is_err()),
+                        "failed compile must fail every row: {pattern:?}"
+                    );
+                }
+            }
+        }
+        let overlong = "y".repeat(MAX_PATTERN_LEN + 1);
+        assert!(PatternMatcher::compile(&overlong).is_err());
+    }
+
+    #[test]
+    fn matcher_modes_match_everything_or_substring() {
+        assert!(
+            PatternMatcher::compile("")
+                .expect("empty compiles")
+                .is_match("anything")
+        );
+        let sub = PatternMatcher::compile("SAVE").expect("substring compiles");
+        assert!(sub.is_match("SAVE%d.GAM is invalid"));
+        assert!(!sub.is_match("save game"));
+        let re = PatternMatcher::compile("regex:SAVE.*invalid").expect("regex compiles");
+        assert!(re.is_match("SAVE%d.GAM is invalid"));
+        assert!(!re.is_match("save game"));
     }
 
     #[test]
