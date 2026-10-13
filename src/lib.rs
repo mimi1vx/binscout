@@ -187,6 +187,24 @@ impl Project {
         }
     }
 
+    /// Persist one changed annotation row, falling back to a full snapshot.
+    ///
+    /// Tries [`db::save_annotation`](crate::db::save_annotation) first: when
+    /// the sidecar holds a snapshot for this binary, only the `annotations`
+    /// row changes. Otherwise (fresh DB or content mismatch) rewrites the
+    /// full snapshot via [`Project::save`].
+    fn persist_annotation(&self, addr: u64) -> Result<()> {
+        let db = db::open_db(&self.db_path)?;
+        let ann = self.annotations.get(&addr).filter(|a| !a.is_empty());
+        match db::save_annotation(&db, &self.meta(), addr, ann)? {
+            db::AnnotationSave::Fast => Ok(()),
+            db::AnnotationSave::NeedsFull => {
+                db::save(&db, &self.meta(), &self.analysis, &self.annotations)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Agent-facing summary; always JSON-serializable.
     #[must_use]
     pub fn project_info(&self) -> ProjectInfo {
@@ -299,7 +317,9 @@ impl Project {
 
     /// Rename a function in the DB only; the binary is never modified.
     ///
-    /// An empty `name` clears the rename. Persists immediately.
+    /// An empty `name` clears the rename. Persists immediately via a
+    /// single-row transaction when the cached snapshot matches, else a full
+    /// snapshot rewrite.
     ///
     /// # Errors
     /// [`Error::NotFound`] for unknown function entries, [`Error::Storage`]
@@ -313,13 +333,15 @@ impl Project {
         if ann.is_empty() {
             self.annotations.remove(&entry);
         }
-        self.save()
+        self.persist_annotation(entry)
     }
 
     /// Comment an address in the DB only; the binary is never modified.
     ///
     /// Any address is commentable (instructions, functions, strings, data).
-    /// An empty `comment` clears the comment. Persists immediately.
+    /// An empty `comment` clears the comment. Persists immediately via a
+    /// single-row transaction when the cached snapshot matches, else a full
+    /// snapshot rewrite.
     ///
     /// # Errors
     /// [`Error::Storage`] when the annotation cannot be persisted.
@@ -329,7 +351,7 @@ impl Project {
         if ann.is_empty() {
             self.annotations.remove(&addr);
         }
-        self.save()
+        self.persist_annotation(addr)
     }
 
     /// File-backed bytes mapped at `va` (zero-padded past file data).
@@ -362,7 +384,9 @@ impl Project {
         let mut out = vec![0u8; len];
         let off = (va - seg.vaddr) as usize;
         let have = seg.data.len().saturating_sub(off).min(len);
-        out[..have].copy_from_slice(&seg.data[off..off + have]);
+        if have > 0 {
+            out[..have].copy_from_slice(&seg.data[off..off + have]);
+        }
         Ok(out)
     }
 

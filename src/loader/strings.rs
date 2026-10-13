@@ -108,6 +108,9 @@ pub fn matches_pattern(value: &str, pattern: &str) -> Result<bool> {
 ///
 /// `min_len` below 1 is treated as 1. `base_va` maps hit offsets to virtual
 /// addresses (pass `Some(seg.vaddr)` for segment scans, `None` for files).
+/// Only the first `max_hits` hits in offset order are decoded, so a small
+/// cap bounds intermediate owned strings even on dense inputs; `max_hits`
+/// of zero returns empty without scanning.
 #[must_use]
 pub fn extract(
     bytes: &[u8],
@@ -115,13 +118,29 @@ pub fn extract(
     max_hits: usize,
     base_va: Option<u64>,
 ) -> Vec<StringHit> {
+    if max_hits == 0 {
+        return Vec::new();
+    }
     let min = min_len.max(1);
+    let mut pos_ascii = 0usize;
+    let mut pos_le = 0usize;
+    let mut pos_be = 0usize;
+    let mut next_ascii = next_ascii_run(bytes, min, &mut pos_ascii);
+    let mut next_le = next_utf16_run(bytes, min, true, &mut pos_le);
+    let mut next_be = next_utf16_run(bytes, min, false, &mut pos_be);
     let mut hits = Vec::new();
-    scan_ascii(bytes, min, &mut hits, base_va);
-    scan_utf16(bytes, min, true, &mut hits, base_va);
-    scan_utf16(bytes, min, false, &mut hits, base_va);
-    hits.sort_by_key(|h| h.offset);
-    hits.truncate(max_hits);
+    while hits.len() < max_hits {
+        let pick = pick_next(next_ascii, next_le, next_be);
+        let Some((order, run)) = pick else {
+            break;
+        };
+        hits.push(decode_run(bytes, run, base_va));
+        match order {
+            0 => next_ascii = next_ascii_run(bytes, min, &mut pos_ascii),
+            1 => next_le = next_utf16_run(bytes, min, true, &mut pos_le),
+            _ => next_be = next_utf16_run(bytes, min, false, &mut pos_be),
+        }
+    }
     hits
 }
 
@@ -153,63 +172,125 @@ fn va(base_va: Option<u64>, offset: usize) -> Option<u64> {
     base_va.map(|b| b.wrapping_add(offset as u64))
 }
 
-fn scan_ascii(bytes: &[u8], min: usize, out: &mut Vec<StringHit>, base_va: Option<u64>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        if is_print(bytes[i]) {
-            let start = i;
-            while i < bytes.len() && is_print(bytes[i]) {
-                i += 1;
-            }
-            if i - start >= min {
-                out.push(StringHit {
-                    offset: start,
-                    vaddr: va(base_va, start),
-                    encoding: Encoding::Ascii,
-                    value: String::from_utf8_lossy(&bytes[start..i]).into_owned(),
-                    section: None,
-                    executable: false,
-                });
-            }
-        } else {
-            i += 1;
-        }
-    }
+/// Byte span of one candidate run, decoded only when selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    offset: usize,
+    end: usize,
+    encoding: Encoding,
 }
 
-fn scan_utf16(
-    bytes: &[u8],
-    min: usize,
-    little: bool,
-    out: &mut Vec<StringHit>,
-    base_va: Option<u64>,
-) {
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if unit_at(bytes, i, little).is_some() {
-            let start = i;
-            let mut value = String::new();
-            while let Some(c) = unit_at(bytes, i, little) {
-                value.push(c as char);
-                i += 2;
+/// Next ASCII run at or after `*pos`, advancing `*pos` past it.
+fn next_ascii_run(bytes: &[u8], min: usize, pos: &mut usize) -> Option<Run> {
+    while *pos < bytes.len() {
+        if is_print(bytes[*pos]) {
+            let start = *pos;
+            while *pos < bytes.len() && is_print(bytes[*pos]) {
+                *pos += 1;
             }
-            if value.len() >= min {
-                out.push(StringHit {
+            if *pos - start >= min {
+                return Some(Run {
                     offset: start,
-                    vaddr: va(base_va, start),
-                    encoding: if little {
-                        Encoding::Utf16Le
-                    } else {
-                        Encoding::Utf16Be
-                    },
-                    value,
-                    section: None,
-                    executable: false,
+                    end: *pos,
+                    encoding: Encoding::Ascii,
                 });
             }
         } else {
-            i += 1;
+            *pos += 1;
         }
+    }
+    None
+}
+
+/// Next UTF-16 run at or after `*pos`, advancing `*pos` past it.
+///
+/// Counts units before allocating, so rejected short runs never build a
+/// `String`; the end position matches the old push-then-check scan.
+fn next_utf16_run(bytes: &[u8], min: usize, little: bool, pos: &mut usize) -> Option<Run> {
+    let encoding = if little {
+        Encoding::Utf16Le
+    } else {
+        Encoding::Utf16Be
+    };
+    while *pos + 1 < bytes.len() {
+        if unit_at(bytes, *pos, little).is_some() {
+            let start = *pos;
+            let mut count = 0usize;
+            while unit_at(bytes, *pos, little).is_some() {
+                count += 1;
+                *pos += 2;
+            }
+            if count >= min {
+                return Some(Run {
+                    offset: start,
+                    end: *pos,
+                    encoding,
+                });
+            }
+        } else {
+            *pos += 1;
+        }
+    }
+    None
+}
+
+/// Smallest pending run by `(offset, encoding order)`; ASCII (0) then
+/// LE (1) then BE (2) reproduces the old append-plus-stable-sort tie-break.
+fn pick_next(ascii: Option<Run>, le: Option<Run>, be: Option<Run>) -> Option<(u8, Run)> {
+    let mut best: Option<(u8, Run)> = None;
+    for (order, cand) in [(0u8, ascii), (1u8, le), (2u8, be)] {
+        let Some(run) = cand else {
+            continue;
+        };
+        let replace = match best {
+            None => true,
+            Some((best_order, best_run)) => (run.offset, order) < (best_run.offset, best_order),
+        };
+        if replace {
+            best = Some((order, run));
+        }
+    }
+    best
+}
+
+/// Decode a selected run; spans come from the same scans as before.
+fn decode_run(bytes: &[u8], run: Run, base_va: Option<u64>) -> StringHit {
+    let value = match run.encoding {
+        Encoding::Ascii => String::from_utf8_lossy(&bytes[run.offset..run.end]).into_owned(),
+        Encoding::Utf16Le => {
+            let mut value = String::with_capacity((run.end - run.offset) / 2);
+            let mut i = run.offset;
+            while i < run.end {
+                if let Some(c) = unit_at(bytes, i, true) {
+                    value.push(c as char);
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            value
+        }
+        Encoding::Utf16Be => {
+            let mut value = String::with_capacity((run.end - run.offset) / 2);
+            let mut i = run.offset;
+            while i < run.end {
+                if let Some(c) = unit_at(bytes, i, false) {
+                    value.push(c as char);
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            value
+        }
+    };
+    StringHit {
+        offset: run.offset,
+        vaddr: va(base_va, run.offset),
+        encoding: run.encoding,
+        value,
+        section: None,
+        executable: false,
     }
 }
 

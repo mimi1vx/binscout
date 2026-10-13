@@ -365,6 +365,92 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
     }
 }
 
+/// Outcome of [`save_annotation`]: whether the single-row fast path applied.
+///
+/// [`AnnotationSave::Fast`] means only the `annotations` table changed;
+/// [`AnnotationSave::NeedsFull`] means there is no matching snapshot and the
+/// caller must fall back to [`save`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnotationSave {
+    /// Single annotation row inserted/deleted; analysis tables untouched.
+    Fast,
+    /// No matching snapshot (fresh DB or metadata mismatch); needs full save.
+    NeedsFull,
+}
+
+/// Persist one annotation row when the durable snapshot matches `meta`.
+///
+/// Reads the persisted `meta`/`binaries` rows inside the same write
+/// transaction that would modify `annotations`, so an annotation never lands
+/// on a snapshot written for different bytes by another process. On match,
+/// inserts (`Some` non-empty) or deletes (`None`/empty) only that row and
+/// commits; the `functions`/`blocks`/`xrefs`/`strings` tables are never
+/// opened for writing. On a fresh DB or any metadata mismatch, aborts
+/// without writing and returns [`AnnotationSave::NeedsFull`]. Never touches
+/// the analyzed binary.
+///
+/// # Errors
+/// [`Error::Storage`] on any `redb` or encoding failure (including write
+/// contention with another process).
+pub fn save_annotation(
+    db: &Database,
+    meta: &BinaryMeta,
+    addr: u64,
+    ann: Option<&Annotation>,
+) -> Result<AnnotationSave> {
+    let encoded: Option<String> = match ann {
+        Some(a) if !a.is_empty() => Some(json(a)?),
+        _ => None,
+    };
+    let wtxn = db
+        .begin_write()
+        .map_err(|e| Error::Storage(format!("begin write: {e}")))?;
+    {
+        let meta_table = wtxn
+            .open_table(META)
+            .map_err(|e| Error::Storage(format!("open meta: {e}")))?;
+        let version = meta_table
+            .get("version")
+            .map_err(|e| Error::Storage(format!("read meta: {e}")))?;
+        if version.is_none() {
+            return Ok(AnnotationSave::NeedsFull);
+        }
+    }
+    {
+        let binaries = wtxn
+            .open_table(BINARIES)
+            .map_err(|e| Error::Storage(format!("open binaries: {e}")))?;
+        let row = binaries
+            .get(0u64)
+            .map_err(|e| Error::Storage(format!("read binaries: {e}")))?;
+        let Some(row) = row else {
+            return Ok(AnnotationSave::NeedsFull);
+        };
+        let persisted: BinaryMeta = decode(&row.value())?;
+        if persisted != *meta {
+            return Ok(AnnotationSave::NeedsFull);
+        }
+    }
+    {
+        let mut t = wtxn
+            .open_table(ANNOTATIONS)
+            .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
+        match encoded {
+            Some(s) => {
+                t.insert(addr, s)
+                    .map_err(|e| Error::Storage(format!("write annotations: {e}")))?;
+            }
+            None => {
+                t.remove(addr)
+                    .map_err(|e| Error::Storage(format!("remove annotations: {e}")))?;
+            }
+        }
+    }
+    wtxn.commit()
+        .map_err(|e| Error::Storage(format!("commit: {e}")))?;
+    Ok(AnnotationSave::Fast)
+}
+
 /// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
 ///
 /// Clears all seven tables first so a smaller re-analysis leaves no stale

@@ -19,7 +19,8 @@
 //! to the nearest entry at or below its start. Shared tails can therefore be
 //! attributed to one function only.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
@@ -734,12 +735,41 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
 /// Prologue-scan hits outside `reached` that decode. These seed the second
 /// round and become entries; hits inside already-reached code stay plain code
 /// so mid-function frame setups never split their function.
+///
+/// Candidates stream in ascending address order through a bounded k-way
+/// merge over the executable segments (see [`CandStream`]): only the heap
+/// (one entry per segment), the last address, and the accepted seeds are
+/// stored, so dense prologue runs cannot inflate collection memory.
+/// Rejected candidates (reached or undecodable) consume no budget: the
+/// emitted seeds equal the sorted, deduped, filtered prefix the old
+/// collect-all pass produced. x86 inputs past the budget previously stopped
+/// in collection order; they now stop in the same sorted order as
+/// below-budget inputs.
 fn prologue_seeds(arch: Arch, space: &AddrSpace, reached: &BTreeSet<u64>) -> Result<Vec<u64>> {
-    let mut seeds: Vec<u64> = Vec::new();
-    for va in prologue_scan(arch, space) {
-        if seeds.len() >= MAX_SEEDS {
-            break;
+    let mut streams: Vec<CandStream<'_>> = space
+        .exec
+        .iter()
+        .map(|seg| CandStream::new(seg, arch))
+        .collect();
+    let mut heap: BinaryHeap<(Reverse<u64>, usize)> = BinaryHeap::with_capacity(streams.len());
+    for (idx, stream) in streams.iter_mut().enumerate() {
+        if let Some(va) = stream.next_candidate() {
+            heap.push((Reverse(va), idx));
         }
+    }
+    let mut seeds: Vec<u64> = Vec::new();
+    let mut last: Option<u64> = None;
+    while seeds.len() < MAX_SEEDS {
+        let Some((Reverse(va), idx)) = heap.pop() else {
+            break;
+        };
+        if let Some(nxt) = streams[idx].next_candidate() {
+            heap.push((Reverse(nxt), idx));
+        }
+        if last == Some(va) {
+            continue;
+        }
+        last = Some(va);
         if !reached.contains(&va) && decode_one(arch, space, va)?.is_some() {
             seeds.push(va);
         }
@@ -764,73 +794,169 @@ fn prologue_patterns(arch: Arch) -> &'static [&'static [u8]] {
     }
 }
 
-/// Scan executable segments for function prologues. AArch64 matches
-/// `stp x29, x30, [sp, #imm]!` words under a mask; ARM32 matches
-/// `stmdb sp!, {..., lr}` words under a mask; Thumb matches 16-bit
-/// `push {..., lr}` halfwords plus 32-bit `stmdb sp!, {..., lr}` words at
-/// halfword steps; x86 matches byte patterns, stepping back over a
-/// leading `push rbp`/`push ebp`.
-fn prologue_scan(arch: Arch, space: &AddrSpace) -> Vec<u64> {
-    let mut out = Vec::new();
-    for seg in &space.exec {
-        if arch == Arch::Aarch64 {
-            let mut off = 0usize;
-            while off + 4 <= seg.data.len() {
-                let w = u32::from_le_bytes(seg.data[off..off + 4].try_into().unwrap());
-                if (w & 0xFFC0_7FFF) == 0xA980_7BFD {
-                    out.push(seg.vaddr.wrapping_add(off as u64));
-                }
-                off += 4;
-            }
-            continue;
+/// How one [`CandStream`] recognizes a prologue at a byte offset.
+#[derive(Debug, Clone, Copy)]
+enum CandMatch {
+    /// AArch64 `stp x29, x30, [sp, #imm]!` word under a mask.
+    Aarch64,
+    /// ARM32 `stmdb sp!, {..., lr}` word under a mask (any condition,
+    /// including never-executed ones the decoder rejects).
+    ArmPush,
+    /// Thumb 16-bit `push {..., lr}` halfword, else the 32-bit ARM-form
+    /// word, at halfword steps.
+    Thumb,
+    /// x86 byte patterns with a one-byte `push rbp`/`push ebp` step-back.
+    X86,
+}
+
+/// One executable segment's prologue candidates in ascending address order.
+///
+/// Streams pattern matches without materializing them: offsets are visited
+/// in the order their wrapped addresses sort, so merging streams with a
+/// min-heap reproduces the old collect-sort-dedup order. Each address maps
+/// as `vaddr.wrapping_add(offset)` (x86 additionally `wrapping_sub(1)` over
+/// a leading `0x55`); offsets at or past `2^64 - vaddr` wrap low and sort
+/// first, so iteration runs in two phases split at that boundary. Holds
+/// only a cursor plus at most one deferred x86 edge address.
+struct CandStream<'a> {
+    data: &'a [u8],
+    vaddr: u64,
+    arch: Arch,
+    kind: CandMatch,
+    stride: usize,
+    min_width: usize,
+    split: usize,
+    cur: usize,
+    phase: u8,
+    stash: Option<u64>,
+}
+
+impl<'a> CandStream<'a> {
+    /// Stream over `seg`'s matches for `arch`, starting at the lowest
+    /// sorting address.
+    fn new(seg: &'a Segment, arch: Arch) -> Self {
+        let (kind, stride, min_width) = match arch {
+            Arch::Aarch64 => (CandMatch::Aarch64, 4, 4),
+            Arch::Arm32 => (CandMatch::ArmPush, 4, 4),
+            Arch::Thumb => (CandMatch::Thumb, 2, 2),
+            Arch::X86_64 | Arch::X86_32 => (CandMatch::X86, 1, 2),
+        };
+        let len = seg.data.len();
+        // First offset whose wrapped address sorts low (`0` when `vaddr`
+        // is `0`: no wrap, everything sorts in offset order).
+        let wrap_off = u64::MAX.wrapping_sub(seg.vaddr).wrapping_add(1);
+        let split = (wrap_off.min(len as u64) as usize)
+            .div_ceil(stride)
+            .saturating_mul(stride)
+            .min(len);
+        Self {
+            data: &seg.data,
+            vaddr: seg.vaddr,
+            arch,
+            kind,
+            stride,
+            min_width,
+            split,
+            cur: split,
+            phase: 0,
+            stash: None,
         }
-        if arch == Arch::Arm32 {
-            let mut off = 0usize;
-            while off + 4 <= seg.data.len() {
-                let w = u32::from_le_bytes(seg.data[off..off + 4].try_into().unwrap());
-                if is_arm_push_lr(w) {
-                    out.push(seg.vaddr.wrapping_add(off as u64));
-                }
-                off += 4;
-            }
-            continue;
-        }
-        if arch == Arch::Thumb {
-            let mut off = 0usize;
-            while off + 2 <= seg.data.len() {
-                let hw = u16::from_le_bytes(seg.data[off..off + 2].try_into().unwrap());
-                if (hw & 0xFF00) == 0xB500 && (hw & 0x0100) != 0 {
-                    out.push(seg.vaddr.wrapping_add(off as u64));
-                } else if off + 4 <= seg.data.len() {
-                    let w = u32::from_le_bytes(seg.data[off..off + 4].try_into().unwrap());
-                    if is_arm_push_lr(w) {
-                        out.push(seg.vaddr.wrapping_add(off as u64));
-                    }
-                }
-                off += 2;
-            }
-            continue;
-        }
-        for pat in prologue_patterns(arch) {
-            for (i, win) in seg.data.windows(pat.len()).enumerate() {
-                if win != *pat {
+    }
+
+    /// Next candidate address in ascending order, if any.
+    fn next_candidate(&mut self) -> Option<u64> {
+        loop {
+            if self.phase == 0 {
+                if self.cur >= self.data.len() {
+                    self.phase = 1;
+                    self.cur = 0;
                     continue;
                 }
-                let mut va = seg.vaddr.wrapping_add(i as u64);
-                // `push rbp`/`push ebp` is 0x55 on both x86 targets.
-                if i > 0 && seg.data[i - 1] == 0x55 {
-                    va = va.wrapping_sub(1);
+                let off = self.cur;
+                self.cur += self.stride;
+                if off + self.min_width > self.data.len() {
+                    self.cur = self.data.len();
+                    continue;
                 }
-                out.push(va);
-                if out.len() >= MAX_SEEDS {
-                    return out;
+                if let Some(va) = self.match_at(off) {
+                    // An x86 step-back exactly on the wrap point lands on
+                    // `u64::MAX`, which sorts after the high run: defer it
+                    // past phase 1. Only x86 adjusts, so other kinds never
+                    // take this branch.
+                    if matches!(self.kind, CandMatch::X86)
+                        && va == u64::MAX
+                        && self.vaddr.wrapping_add(off as u64) == 0
+                    {
+                        self.stash = Some(va);
+                        continue;
+                    }
+                    return Some(va);
                 }
+            } else if self.phase == 1 {
+                if self.cur >= self.split {
+                    self.phase = 2;
+                    continue;
+                }
+                let off = self.cur;
+                self.cur += self.stride;
+                if off + self.min_width > self.data.len() {
+                    self.cur = self.split;
+                    continue;
+                }
+                if let Some(va) = self.match_at(off) {
+                    return Some(va);
+                }
+            } else {
+                return self.stash.take();
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    out
+
+    /// Candidate address at `off`, if the bytes match. Bounds-checked per
+    /// pattern; mirrors the old eager scan's match rules exactly.
+    fn match_at(&self, off: usize) -> Option<u64> {
+        let va = self.vaddr.wrapping_add(off as u64);
+        match self.kind {
+            CandMatch::Aarch64 => {
+                let raw = self.data.get(off..off + 4)?;
+                let w = u32::from_le_bytes(raw.try_into().ok()?);
+                ((w & 0xFFC0_7FFF) == 0xA980_7BFD).then_some(va)
+            }
+            CandMatch::ArmPush => {
+                let raw = self.data.get(off..off + 4)?;
+                let w = u32::from_le_bytes(raw.try_into().ok()?);
+                is_arm_push_lr(w).then_some(va)
+            }
+            CandMatch::Thumb => {
+                let raw = self.data.get(off..off + 2)?;
+                let hw = u16::from_le_bytes(raw.try_into().ok()?);
+                if (hw & 0xFF00) == 0xB500 && (hw & 0x0100) != 0 {
+                    Some(va)
+                } else if off + 4 <= self.data.len() {
+                    let raw = self.data.get(off..off + 4)?;
+                    let w = u32::from_le_bytes(raw.try_into().ok()?);
+                    is_arm_push_lr(w).then_some(va)
+                } else {
+                    None
+                }
+            }
+            CandMatch::X86 => {
+                for pat in prologue_patterns(self.arch) {
+                    let Some(win) = self.data.get(off..off + pat.len()) else {
+                        continue;
+                    };
+                    if win == *pat {
+                        // `push rbp`/`push ebp` is 0x55 on both x86 targets.
+                        if off > 0 && self.data[off - 1] == 0x55 {
+                            return Some(va.wrapping_sub(1));
+                        }
+                        return Some(va);
+                    }
+                }
+                None
+            }
+        }
+    }
 }
 
 /// Whether a word is `stmdb sp!, {..., lr}` (any condition): the ARM32
@@ -911,6 +1037,89 @@ impl<'a> Walker<'a> {
     }
 }
 
+/// Owner entry for an address: greatest entry at or below `va`.
+///
+/// `entries` must be sorted ascending and non-empty (as built in
+/// [`analyze`]); addresses below the first entry fall back to it, matching
+/// the old reverse scan. Binary search, so block/edge attribution is
+/// `O(log F)` per lookup instead of `O(F)`.
+///
+/// # Panics
+/// Panics on an empty `entries` slice.
+#[must_use]
+pub fn function_owner(entries: &[u64], va: u64) -> u64 {
+    let idx = entries.partition_point(|e| *e <= va);
+    if idx == 0 {
+        entries[0]
+    } else {
+        entries[idx - 1]
+    }
+}
+
+/// Index over string spans preserving the linear scan's first-match rule.
+///
+/// Holds `(start, exclusive end)` spans sorted ascending by start, with ends
+/// computed by the caller via `wrapping_add` (as in [`analyze`]).
+/// [`StringSpanIndex::lookup`] returns the start of the earliest span with
+/// `start <= target < end`, using plain `u64` comparisons exactly like the
+/// old linear scan. A naive last-start predecessor lookup misses nested spans
+/// (an early wide span can contain a target past a later narrow span's end);
+/// the prefix-maximum ends array recovers the earliest span with `end >
+/// target`, and the starts upper bound enforces `start <= target`. Build is
+/// `O(S)`, each query `O(log S)`.
+#[derive(Debug, Clone, Default)]
+pub struct StringSpanIndex {
+    spans: Vec<(u64, u64)>,
+    prefix_max: Vec<u64>,
+}
+
+impl StringSpanIndex {
+    /// Build the index over `spans` sorted ascending by start.
+    #[must_use]
+    pub fn new(spans: Vec<(u64, u64)>) -> Self {
+        let mut prefix_max = Vec::with_capacity(spans.len());
+        let mut running: u64 = 0;
+        for (_, e) in &spans {
+            running = running.max(*e);
+            prefix_max.push(running);
+        }
+        Self { spans, prefix_max }
+    }
+
+    /// Start of the earliest span containing `target`, if any.
+    ///
+    /// `None` when no span satisfies `start <= target < end`; empty and
+    /// wrapped-empty (`end <= start` in plain `u64` order) spans never match,
+    /// matching the old linear scan.
+    #[must_use]
+    pub fn lookup(&self, target: u64) -> Option<u64> {
+        let cand = self.prefix_max.partition_point(|&m| m <= target);
+        if cand >= self.spans.len() {
+            return None;
+        }
+        let upto = self.spans.partition_point(|&(s, _)| s <= target);
+        if cand < upto {
+            let (s, e) = self.spans[cand];
+            if target >= s && target < e {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// Number of indexed spans.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Whether the index holds no spans.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+}
+
 /// Run recursive descent and build functions, CFGs, callgraph, and xrefs.
 ///
 /// # Errors
@@ -970,12 +1179,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         return Err(Error::Limit(format!("more than {MAX_FUNCTIONS} functions")));
     }
     let entry_list: Vec<u64> = entries.iter().copied().collect();
-    let owner = |va: u64| -> u64 {
-        match entry_list.iter().rfind(|e| **e <= va) {
-            Some(e) => *e,
-            None => entry_list[0],
-        }
-    };
+    let owner = |va: u64| -> u64 { function_owner(&entry_list, va) };
 
     // Pass B: split decoded runs into blocks at seeds, targets, fallthroughs.
     let mut starts: BTreeSet<u64> = BTreeSet::new();
@@ -1153,17 +1357,15 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             })
         })
         .collect();
+    let span_index = StringSpanIndex::new(spans);
     let data_tos: Vec<(u64, u64)> = xrefs
         .iter()
         .filter(|(_, k, _)| *k == XrefKind::Data)
         .map(|(f, _, t)| (*f, *t))
         .collect();
     for (from, to) in data_tos {
-        for (s, e) in &spans {
-            if to >= *s && to < *e {
-                xrefs.insert((from, XrefKind::String, *s));
-                break;
-            }
+        if let Some(s) = span_index.lookup(to) {
+            xrefs.insert((from, XrefKind::String, s));
         }
     }
     let xrefs: Vec<Xref> = xrefs
@@ -1241,5 +1443,244 @@ mod tests {
             insns: Vec::new(),
         };
         assert_eq!(b.id(0x2000), "block@0x2000+0x2007");
+    }
+
+    /// Eager pre-fix oracle: collect every candidate, sort, dedup, filter,
+    /// cap. For ARM this is verbatim the old behavior; for x86 it is the
+    /// specified sorted-prefix contract (the old code stopped over-budget
+    /// inputs in collection order instead of sorting).
+    fn oracle_seeds(arch: Arch, space: &AddrSpace, reached: &BTreeSet<u64>) -> Result<Vec<u64>> {
+        let mut out: Vec<u64> = Vec::new();
+        for seg in &space.exec {
+            if arch == Arch::Aarch64 {
+                let mut off = 0usize;
+                while off + 4 <= seg.data.len() {
+                    let raw = seg.data.get(off..off + 4).expect("word in bounds");
+                    let w = u32::from_le_bytes(raw.try_into().expect("word converts"));
+                    if (w & 0xFFC0_7FFF) == 0xA980_7BFD {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    }
+                    off += 4;
+                }
+                continue;
+            }
+            if arch == Arch::Arm32 {
+                let mut off = 0usize;
+                while off + 4 <= seg.data.len() {
+                    let raw = seg.data.get(off..off + 4).expect("word in bounds");
+                    let w = u32::from_le_bytes(raw.try_into().expect("word converts"));
+                    if is_arm_push_lr(w) {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    }
+                    off += 4;
+                }
+                continue;
+            }
+            if arch == Arch::Thumb {
+                let mut off = 0usize;
+                while off + 2 <= seg.data.len() {
+                    let raw = seg.data.get(off..off + 2).expect("halfword in bounds");
+                    let hw = u16::from_le_bytes(raw.try_into().expect("halfword converts"));
+                    if (hw & 0xFF00) == 0xB500 && (hw & 0x0100) != 0 {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    } else if off + 4 <= seg.data.len() {
+                        let raw = seg.data.get(off..off + 4).expect("word in bounds");
+                        let w = u32::from_le_bytes(raw.try_into().expect("word converts"));
+                        if is_arm_push_lr(w) {
+                            out.push(seg.vaddr.wrapping_add(off as u64));
+                        }
+                    }
+                    off += 2;
+                }
+                continue;
+            }
+            for pat in prologue_patterns(arch) {
+                for (i, win) in seg.data.windows(pat.len()).enumerate() {
+                    if win != *pat {
+                        continue;
+                    }
+                    let mut va = seg.vaddr.wrapping_add(i as u64);
+                    if i > 0 && seg.data[i - 1] == 0x55 {
+                        va = va.wrapping_sub(1);
+                    }
+                    out.push(va);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        let mut seeds: Vec<u64> = Vec::new();
+        for va in out {
+            if seeds.len() >= MAX_SEEDS {
+                break;
+            }
+            if !reached.contains(&va) && decode_one(arch, space, va)?.is_some() {
+                seeds.push(va);
+            }
+        }
+        Ok(seeds)
+    }
+
+    fn seed_test_binary(arch: Arch, entry: Option<u64>, segs: Vec<(u64, Vec<u8>)>) -> LoadedBinary {
+        LoadedBinary {
+            format: crate::loader::BinaryFormat::Raw,
+            arch,
+            entry,
+            segments: segs
+                .into_iter()
+                .map(|(vaddr, data)| Segment {
+                    vaddr,
+                    mem_size: data.len() as u64,
+                    data,
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                })
+                .collect(),
+            sections: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+        }
+    }
+
+    /// One match (`M`), decoder-rejected match (`U`), or junk (`J`) unit.
+    fn seed_words(arch: Arch) -> (&'static [u8], &'static [u8], &'static [u8]) {
+        match arch {
+            Arch::Aarch64 => (
+                &[0xFD, 0x7B, 0x80, 0xA9],
+                &[0xFD, 0x7B, 0x80, 0xA9],
+                &[0x1F, 0x20, 0x03, 0xD5],
+            ),
+            Arch::Arm32 => (
+                &[0xF0, 0x40, 0x2D, 0xE9],
+                &[0xF0, 0x40, 0x2D, 0xF9],
+                &[0x1E, 0xFF, 0x2F, 0xE1],
+            ),
+            Arch::Thumb => (&[0xF0, 0xB5], &[0xF0, 0xB5], &[0x00, 0xBF]),
+            Arch::X86_64 => (&[0x48, 0x89, 0xE5], &[0x48, 0x89, 0xE5], &[0x90]),
+            Arch::X86_32 => (&[0x89, 0xE5], &[0x89, 0xE5], &[0x90]),
+        }
+    }
+
+    /// Adversarial layout: out-of-order file order, an overlap with
+    /// identical bytes (duplicate addresses), a wrapped segment, empty and
+    /// short segments, and a zero-based segment.
+    fn tricky_segments(arch: Arch) -> Vec<(u64, Vec<u8>)> {
+        let (m, u, j) = seed_words(arch);
+        let mut hi = Vec::new();
+        for w in [m, j, m, u, j, m] {
+            hi.extend_from_slice(w);
+        }
+        hi.push(0x00);
+        if arch == Arch::Thumb {
+            // 32-bit ARM-form word where the halfword is not a push; kept
+            // halfword-aligned so the scan's word branch can hit it.
+            hi.push(0x00);
+            hi.extend_from_slice(&[0xF0, 0x40, 0x2D, 0xE9]);
+        }
+        if arch == Arch::X86_64 || arch == Arch::X86_32 {
+            // Leading `push rbp`/`push ebp` steps the next match back a byte.
+            hi.push(0x55);
+            hi.extend_from_slice(m);
+        }
+        let mut lo = Vec::new();
+        lo.extend_from_slice(j);
+        lo.extend_from_slice(j);
+        lo.extend_from_slice(&hi[..0x18.min(hi.len())]);
+        let mut wrap = Vec::new();
+        while wrap.len() + m.len() + j.len() <= 16 {
+            wrap.extend_from_slice(m);
+            wrap.extend_from_slice(j);
+        }
+        // End on a match so the wrapped-low tail holds a candidate.
+        wrap.truncate(16 - m.len());
+        wrap.extend_from_slice(m);
+        let mut zero = Vec::new();
+        for w in [m, j, m] {
+            zero.extend_from_slice(w);
+        }
+        vec![
+            (0x5000, hi),
+            (0x4FF0, lo),
+            (u64::MAX - 8, wrap),
+            (0x6000, Vec::new()),
+            (0x6100, vec![0x90]),
+            (0, zero),
+        ]
+    }
+
+    #[test]
+    fn seed_streams_match_eager_oracle() {
+        for arch in [
+            Arch::Aarch64,
+            Arch::Arm32,
+            Arch::Thumb,
+            Arch::X86_64,
+            Arch::X86_32,
+        ] {
+            let bin = seed_test_binary(arch, None, tricky_segments(arch));
+            let space = AddrSpace::new(&bin);
+            let reached: BTreeSet<u64> = [0x5000, 0x5001, 0x5002, 0x5003, 0x4FF0, u64::MAX, 1]
+                .into_iter()
+                .collect();
+            let got = prologue_seeds(arch, &space, &reached).expect("streaming seeds");
+            let want = oracle_seeds(arch, &space, &reached).expect("oracle seeds");
+            assert_eq!(got, want, "seed mismatch for {arch:?}");
+            assert!(
+                got.windows(2).all(|w| w[0] < w[1]),
+                "seeds must be sorted and deduped for {arch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn x86_wrap_edge_step_back_sorts_last() {
+        // Pattern at the wrap point with a `0x55` step-back lands on
+        // `u64::MAX`; it must sort after the high run, not first.
+        let vaddr = u64::MAX - 4;
+        let data = vec![
+            0x48, 0x89, 0xE5, 0x90, 0x55, 0x48, 0x89, 0xE5, 0x48, 0x89, 0xE5,
+        ];
+        let bin = seed_test_binary(Arch::X86_64, None, vec![(vaddr, data)]);
+        let space = AddrSpace::new(&bin);
+        let reached = BTreeSet::new();
+        let got = prologue_seeds(Arch::X86_64, &space, &reached).expect("seeds");
+        // `vaddr + 8` wraps to `3`, which is unmapped (`seg_at` uses plain
+        // comparison), so it is offered first and rejected; the stashed
+        // `u64::MAX` still sorts after the high run.
+        assert_eq!(got, [vaddr, u64::MAX]);
+        let want = oracle_seeds(Arch::X86_64, &space, &reached).expect("oracle");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn seed_budget_truncates_accepted_prefix() {
+        // 120k raw candidates with the first 12k reached: rejected rows must
+        // not consume budget, so seeds are the next 100k accepted addresses.
+        for arch in [
+            Arch::Aarch64,
+            Arch::Arm32,
+            Arch::Thumb,
+            Arch::X86_64,
+            Arch::X86_32,
+        ] {
+            let (m, _, _) = seed_words(arch);
+            let base: u64 = 0x1_0000;
+            let period = m.len() as u64;
+            let raw: usize = 120_000;
+            let mut data = Vec::with_capacity(raw * m.len());
+            for _ in 0..raw {
+                data.extend_from_slice(m);
+            }
+            let bin = seed_test_binary(arch, None, vec![(base, data)]);
+            let space = AddrSpace::new(&bin);
+            let reached: BTreeSet<u64> = (0..12_000).map(|i| base + i * period).collect();
+            let got = prologue_seeds(arch, &space, &reached).expect("streaming seeds");
+            let want = oracle_seeds(arch, &space, &reached).expect("oracle seeds");
+            assert_eq!(got.len(), MAX_SEEDS, "budget must fill for {arch:?}");
+            assert_eq!(got, want, "truncated prefix mismatch for {arch:?}");
+            assert_eq!(got[0], base + 12_000 * period);
+            assert!(got.windows(2).all(|w| w[0] < w[1]));
+        }
     }
 }

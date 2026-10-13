@@ -1,6 +1,6 @@
 mod common;
 
-use binscout::analysis::{XrefKind, analyze_raw};
+use binscout::analysis::{XrefKind, analyze_raw, function_owner};
 use binscout::disasm::{Arch, disasm_range};
 
 use common::builders;
@@ -296,4 +296,120 @@ fn garbage_fixture_yields_no_string_xrefs() {
         "garbage must produce zero false string xrefs"
     );
     common::cleanup(&dir);
+}
+
+// Reference linear scan the old `owner` closure used.
+fn linear_owner(entries: &[u64], va: u64) -> u64 {
+    match entries.iter().rfind(|e| **e <= va) {
+        Some(e) => *e,
+        None => entries[0],
+    }
+}
+
+#[test]
+fn function_owner_boundary_cases() {
+    let entries = vec![0x1000, 0x1010, 0x1030];
+    // Below first falls back to first.
+    assert_eq!(function_owner(&entries, 0x0FFF), 0x1000);
+    assert_eq!(function_owner(&entries, 0x0000), 0x1000);
+    // Exactly at entries.
+    assert_eq!(function_owner(&entries, 0x1000), 0x1000);
+    assert_eq!(function_owner(&entries, 0x1010), 0x1010);
+    assert_eq!(function_owner(&entries, 0x1030), 0x1030);
+    // In gaps snaps to greatest entry below.
+    assert_eq!(function_owner(&entries, 0x1005), 0x1000);
+    assert_eq!(function_owner(&entries, 0x101F), 0x1010);
+    assert_eq!(function_owner(&entries, 0x102F), 0x1010);
+    // Above last snaps to last.
+    assert_eq!(function_owner(&entries, 0x1031), 0x1030);
+    assert_eq!(function_owner(&entries, 0xFFFF), 0x1030);
+    // Single entry always wins.
+    let single = vec![0x2000];
+    assert_eq!(function_owner(&single, 0x1FFF), 0x2000);
+    assert_eq!(function_owner(&single, 0x2000), 0x2000);
+    assert_eq!(function_owner(&single, 0x2001), 0x2000);
+}
+
+#[test]
+fn function_owner_matches_linear_scan_on_generated_set() {
+    let entries: Vec<u64> = (0..128).map(|i| 0x1000 + i * 0x11).collect();
+    let last = *entries.last().expect("non-empty");
+    let mut addrs: Vec<u64> = vec![0, 0x0FFF, last + 1, last + 0x20, u64::MAX];
+    for e in &entries {
+        addrs.push(*e);
+        addrs.push(e.wrapping_sub(1));
+        addrs.push(e.wrapping_add(1));
+    }
+    // Deterministic xorshift sweep across and beyond the entry range.
+    let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+    for _ in 0..4096 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        addrs.push(0x0F00 + (x % (last - 0x0F00 + 0x40)));
+    }
+    for va in addrs {
+        assert_eq!(
+            function_owner(&entries, va),
+            linear_owner(&entries, va),
+            "owner mismatch at {va:#x}"
+        );
+    }
+}
+
+// One 11-byte frame function: push rbp; mov rbp,rsp; mov eax,1; pop rbp; ret.
+// Holds `48 89 E5` with a leading `55`, so the prologue scan seeds every copy.
+fn frame_func() -> Vec<u8> {
+    vec![
+        0x55, 0x48, 0x89, 0xE5, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x5D, 0xC3,
+    ]
+}
+
+fn many_frame_blob(n: usize) -> Vec<u8> {
+    let mut b = Vec::with_capacity(n * 11);
+    for _ in 0..n {
+        b.extend(frame_func());
+    }
+    b
+}
+
+#[test]
+fn many_function_ownership_matches_reference_and_golden() {
+    const N: usize = 256;
+    const BASE: u64 = 0x1000;
+    const STRIDE: u64 = 11;
+    let blob = many_frame_blob(N);
+    let a = x64(&blob, BASE, Some(BASE));
+    let entries: Vec<u64> = (0..N as u64).map(|i| BASE + i * STRIDE).collect();
+    assert_eq!(a.summary().functions, N);
+    assert_eq!(a.summary().blocks, N);
+    let found: Vec<u64> = a.functions.keys().copied().collect();
+    assert_eq!(found, entries, "every frame copy is its own function");
+    // Golden: one single-block function each, no CFG/callgraph edges.
+    for e in &entries {
+        let f = &a.functions[e];
+        assert_eq!(f.blocks.len(), 1, "func {e:#x} holds one block");
+        assert!(f.blocks.contains_key(e), "block starts at entry {e:#x}");
+        assert_eq!(f.insn_count(), 5);
+        assert!(f.edges().is_empty());
+        assert!(a.calls_of(*e).is_empty());
+    }
+    assert!(a.call_edges().is_empty());
+    // Every block start attributes to the reference linear owner.
+    for (entry, f) in &a.functions {
+        for start in f.blocks.keys() {
+            assert_eq!(function_owner(&entries, *start), *entry);
+            assert_eq!(linear_owner(&entries, *start), *entry);
+        }
+    }
+    // Generated sweep across the whole span agrees differentially.
+    let last = BASE + (N as u64 - 1) * STRIDE;
+    let mut x: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    for _ in 0..2048 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let va = (BASE - 0x10).wrapping_add(x % (last - BASE + 0x30));
+        assert_eq!(function_owner(&entries, va), linear_owner(&entries, va));
+    }
 }
