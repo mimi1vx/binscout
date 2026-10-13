@@ -1,15 +1,15 @@
-use rsdbg::disasm::{Arch, Disassembler, disasm_range};
-use rsdbg::error::Error;
+use binscout::disasm::{Arch, Disassembler, disasm_range};
+use binscout::error::Error;
 
-fn x86(bytes: &[u8], va: u64) -> Vec<rsdbg::disasm::Insn> {
+fn x86(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::X86_64, bytes, va, 100).expect("valid x86_64 must decode")
 }
 
-fn x86_32(bytes: &[u8], va: u64) -> Vec<rsdbg::disasm::Insn> {
+fn x86_32(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::X86_32, bytes, va, 100).expect("valid x86_32 must decode")
 }
 
-fn arm(bytes: &[u8], va: u64) -> Vec<rsdbg::disasm::Insn> {
+fn arm(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::Aarch64, bytes, va, 100).expect("valid aarch64 must decode")
 }
 

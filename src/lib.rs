@@ -1,4 +1,4 @@
-//! rsdbg core: headless agent-first binary analysis (M0 scaffold).
+//! binscout core: headless agent-first binary analysis (M0 scaffold).
 
 pub mod disasm;
 pub mod error;

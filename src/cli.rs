@@ -7,7 +7,7 @@ use serde_json::json;
 /// Agent-first CLI: every command prints valid JSON to stdout.
 #[derive(Debug, Parser)]
 #[command(
-    name = "rsdbg",
+    name = "binscout",
     version,
     about = "headless agent-first binary analysis"
 )]
@@ -28,11 +28,11 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.cmd {
             Cmd::ProjectInfo { binary } => {
-                let p = rsdbg::Project::open(&binary)
+                let p = binscout::Project::open(&binary)
                     .with_context(|| format!("open {}", binary.display()))?;
                 println!(
                     "{}",
-                    json!({"binary": p.path().display().to_string(), "version": rsdbg::version()})
+                    json!({"binary": p.path().display().to_string(), "version": binscout::version()})
                 );
             }
             Cmd::Functions { .. } => {
