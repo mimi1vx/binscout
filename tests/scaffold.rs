@@ -91,6 +91,8 @@ fn pe32_basic_loads_with_expected_shape() {
         [binscout::loader::ExportRef {
             name: builders::BASIC_EXPORT.to_string(),
             address: Some(builders::BASIC_ENTRY_VA),
+            ordinal: None,
+            demangled: None,
         }]
     );
     // Ground truth for X2/A4: the marker string sits at its VA and `.text`

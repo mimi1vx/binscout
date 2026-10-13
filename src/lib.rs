@@ -517,6 +517,10 @@ impl Project {
     }
 
     /// Imports plus exports for symbol views.
+    ///
+    /// Ordinal-only imports carry `ordinal` plus `unresolved: true`;
+    /// C++ imports/exports carry `demangled` when [`crate::loader::demangle_cpp`]
+    /// recognizes the mangling.
     #[must_use]
     pub fn symbols_json(&self) -> serde_json::Value {
         serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })

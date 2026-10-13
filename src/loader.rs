@@ -104,21 +104,46 @@ pub struct Section {
 
 /// One imported symbol: `library!name`, where `name` is `#ordinal` for
 /// ordinal-only imports and `@0xoff` for LE name-table references.
+///
+/// Ordinal-only imports carry `ordinal: Some(n)` plus `unresolved: true`
+/// because the providing DLL's export names are not visible from the
+/// importing image; named imports carry `ordinal: None` and
+/// `unresolved: false`. C++ names (MSVC `?...` and Itanium `_Z...`)
+/// additionally carry `demangled: Some(...)` when the demangler succeeds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportRef {
     /// Providing module (`""` when the format names none).
     pub library: String,
     /// Symbol name, `#ordinal`, or `@0xoff`.
     pub name: String,
+    /// Ordinal number for ordinal-only imports (`None` for named imports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u32>,
+    /// True when the import has no name to resolve (ordinal-only).
+    #[serde(default)]
+    pub unresolved: bool,
+    /// Demangled C++ name, when `name` is a recognized mangling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demangled: Option<String>,
 }
 
 /// One exported symbol.
+///
+/// Ordinal-only exports carry `ordinal: Some(n)` with `name` as `#n`;
+/// named exports carry `ordinal: None`. C++ names additionally carry
+/// `demangled: Some(...)` when the demangler succeeds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRef {
     /// Symbol name (LE: decimal ordinal).
     pub name: String,
     /// Export address (`None` for re-exports, TLS, and resolver stubs).
     pub address: Option<u64>,
+    /// Ordinal number for ordinal-only exports (`None` for named exports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<u32>,
+    /// Demangled C++ name, when `name` is a recognized mangling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demangled: Option<String>,
 }
 
 /// A parsed binary ready for disassembly and analysis.
@@ -304,10 +329,10 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         if imports.len() >= MAX_IMPORTS {
             return Err(Error::Limit("imports exceed cap".to_string()));
         }
-        imports.push(ImportRef {
-            library: String::from_utf8_lossy(imp.library()).into_owned(),
-            name: name_or_ordinal(imp.name()),
-        });
+        imports.push(import_from_object(
+            String::from_utf8_lossy(imp.library()).into_owned(),
+            imp.name(),
+        ));
     }
 
     let mut exports = Vec::new();
@@ -319,13 +344,13 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         if exports.len() >= MAX_EXPORTS {
             return Err(Error::Limit("exports exceed cap".to_string()));
         }
-        exports.push(ExportRef {
-            name: name_or_ordinal(exp.name()),
-            address: match exp.target() {
+        exports.push(export_from_object(
+            exp.name(),
+            match exp.target() {
                 object::ExportTarget::Address { address } => Some(address),
                 _ => None,
             },
-        });
+        ));
     }
 
     Ok(LoadedBinary {
@@ -359,20 +384,26 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
     } = img;
     let mut imports = Vec::new();
     for fix in &fixups {
-        let (library, name) = match &fix.target {
+        let imp = match &fix.target {
             LeTarget::Internal { .. } | LeTarget::Entry { .. } => continue,
-            LeTarget::ImportOrdinal { module, ordinal } => {
-                (le_module(&import_modules, *module), format!("#{ordinal}"))
-            }
+            LeTarget::ImportOrdinal { module, ordinal } => ImportRef {
+                library: le_module(&import_modules, *module),
+                name: format!("#{ordinal}"),
+                ordinal: Some(*ordinal),
+                unresolved: true,
+                demangled: None,
+            },
             LeTarget::ImportName {
                 module,
                 name_offset,
-            } => (
-                le_module(&import_modules, *module),
-                format!("@{name_offset:#x}"),
-            ),
+            } => ImportRef {
+                library: le_module(&import_modules, *module),
+                name: format!("@{name_offset:#x}"),
+                ordinal: None,
+                unresolved: false,
+                demangled: None,
+            },
         };
-        let imp = ImportRef { library, name };
         if !imports.contains(&imp) {
             imports.push(imp);
         }
@@ -391,6 +422,8 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         exports.push(ExportRef {
             name: e.ordinal.to_string(),
             address: Some(obj.reloc_base as u64 + e.offset as u64),
+            ordinal: Some(e.ordinal),
+            demangled: None,
         });
     }
     let sections = objects
@@ -425,11 +458,86 @@ fn le_module(modules: &[String], module: u32) -> String {
         .unwrap_or_else(|| format!("mod#{module}"))
 }
 
-fn name_or_ordinal(name: object::NameOrOrdinal<&[u8]>) -> String {
+fn import_from_object(library: String, name: object::NameOrOrdinal<&[u8]>) -> ImportRef {
     match name {
-        object::NameOrOrdinal::Name(b) => String::from_utf8_lossy(b).into_owned(),
-        object::NameOrOrdinal::Ordinal(o) => format!("#{o}"),
+        object::NameOrOrdinal::Ordinal(o) => ImportRef {
+            library,
+            name: format!("#{o}"),
+            ordinal: Some(u32::from(o)),
+            unresolved: true,
+            demangled: None,
+        },
+        object::NameOrOrdinal::Name(b) => {
+            let raw = String::from_utf8_lossy(b).into_owned();
+            let demangled = demangle_cpp(&raw);
+            ImportRef {
+                library,
+                name: raw,
+                ordinal: None,
+                unresolved: false,
+                demangled,
+            }
+        }
     }
+}
+
+fn export_from_object(name: object::NameOrOrdinal<&[u8]>, address: Option<u64>) -> ExportRef {
+    match name {
+        object::NameOrOrdinal::Ordinal(o) => ExportRef {
+            name: format!("#{o}"),
+            address,
+            ordinal: Some(u32::from(o)),
+            demangled: None,
+        },
+        object::NameOrOrdinal::Name(b) => {
+            let raw = String::from_utf8_lossy(b).into_owned();
+            let demangled = demangle_cpp(&raw);
+            ExportRef {
+                name: raw,
+                address,
+                ordinal: None,
+                demangled,
+            }
+        }
+    }
+}
+
+/// Demangle a C++ symbol to a human-readable form.
+///
+/// Tries MSVC undecoration (`?...`, `.?AV...@@`) via `msvc-demangler`
+/// then Itanium (`_Z...`, including one leading-underscore Mach-O form)
+/// via `cpp_demangle`. Returns `None` for plain C names, ordinal
+/// placeholders (`#n`), LE offsets (`@0x...`), and failed decodes.
+/// Both demanglers are dependency-light MIT crates with no transitive
+/// dependencies (no `cargo-deny` exception needed).
+#[must_use]
+pub fn demangle_cpp(name: &str) -> Option<String> {
+    if name.is_empty() || name.starts_with('#') || name.starts_with('@') {
+        return None;
+    }
+    if let Ok(d) = msvc_demangler::demangle(name, msvc_demangler::DemangleFlags::llvm())
+        && !d.is_empty()
+        && d != name
+    {
+        return Some(d);
+    }
+    if name.contains("_Z") {
+        let mut candidates = [name, ""];
+        let stripped = name.strip_prefix('_').unwrap_or(name);
+        if stripped != name {
+            candidates[1] = stripped;
+        }
+        for cand in candidates.into_iter().filter(|c| !c.is_empty()) {
+            if let Ok(sym) = cpp_demangle::Symbol::new(cand.as_bytes())
+                && let Ok(d) = sym.demangle()
+                && !d.is_empty()
+                && d != name
+            {
+                return Some(d);
+            }
+        }
+    }
+    None
 }
 
 fn is_bss(kind: object::SectionKind) -> bool {
@@ -518,6 +626,9 @@ mod tests {
             [ImportRef {
                 library: "KERNEL".to_string(),
                 name: "#7".to_string(),
+                ordinal: Some(7),
+                unresolved: true,
+                demangled: None,
             }]
         );
         assert_eq!(
@@ -525,6 +636,8 @@ mod tests {
             [ExportRef {
                 name: "1".to_string(),
                 address: Some(0x10000),
+                ordinal: Some(1),
+                demangled: None,
             }]
         );
         assert_eq!(bin.sections.len(), 1);
@@ -555,5 +668,16 @@ mod tests {
             load(b"this is not a binary at all..........").unwrap_err(),
             Error::Invalid(_)
         ));
+    }
+
+    #[test]
+    fn demangle_cpp_handles_msvc_itanium_and_plain() {
+        let msvc = demangle_cpp("?myfunc@@YAXH@Z").expect("MSVC demangles");
+        assert!(msvc.contains("myfunc"), "got {msvc:?}");
+        let itanium = demangle_cpp("_ZN5space3fooEibc").expect("Itanium demangles");
+        assert_eq!(itanium, "space::foo(int, bool, char)");
+        assert_eq!(demangle_cpp("plain_c_func"), None);
+        assert_eq!(demangle_cpp("#1"), None);
+        assert_eq!(demangle_cpp("@0x10"), None);
     }
 }

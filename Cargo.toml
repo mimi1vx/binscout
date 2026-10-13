@@ -14,8 +14,10 @@ exclude = [".beads/"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+cpp_demangle = "0.5"
 iced-x86 = "1.21"
 memmap2 = "0.9"
+msvc-demangler = "0.11"
 object = "0.40"
 petgraph = "0.8"
 redb = "4.3"

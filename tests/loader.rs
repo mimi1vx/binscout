@@ -2,12 +2,15 @@
 //! license-clean in-memory binaries per format, plus the committed
 //! `raw-x64.bin` for raw mode).
 
+mod common;
+
 use binscout::disasm::{Arch, disasm_range};
 use binscout::error::Error;
 use binscout::loader::{
     BinaryFormat, RawOptions, load, load_raw,
     strings::{Encoding, extract, extract_page},
 };
+use common::builders;
 
 fn put16(v: &mut [u8], off: usize, x: u16) {
     v[off..off + 2].copy_from_slice(&x.to_le_bytes());
@@ -261,4 +264,64 @@ fn unsupported_arch_errors() {
     put16(&mut elf, 18, 8);
     let err = load(&elf).unwrap_err();
     assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+#[test]
+fn pe32_ordinals_carry_unresolved_and_demangled() {
+    // L3/A8: ordinal-only imports resolve-or-`unresolved:true`, C++ names
+    // carry `demangled` alongside the raw mangling.
+    let bytes = common::fixture_bytes(builders::ORDINALS_NAME);
+    let bin = load(&bytes).expect("ordinals PE32 must load");
+    assert_eq!(bin.format, BinaryFormat::Pe);
+
+    let ordinals: Vec<_> = bin.imports.iter().filter(|i| i.ordinal.is_some()).collect();
+    assert!(
+        ordinals.len() >= 2,
+        "2+ ordinal rows expected: {:?}",
+        bin.imports
+    );
+    for imp in &ordinals {
+        assert!(imp.unresolved, "ordinal import must be unresolved: {imp:?}");
+        assert!(imp.demangled.is_none(), "ordinals never demangle: {imp:?}");
+        assert_eq!(imp.library, builders::ORDINALS_DLL);
+    }
+    let names: Vec<&str> = ordinals.iter().map(|i| i.name.as_str()).collect();
+    for ord in builders::ORDINALS_ORDINALS {
+        assert!(
+            names.contains(&format!("#{ord}").as_str()),
+            "ordinal #{ord} missing: {names:?}"
+        );
+    }
+
+    let mangled = bin
+        .imports
+        .iter()
+        .find(|i| i.name == builders::ORDINALS_MANGLED)
+        .expect("mangled import present");
+    assert!(!mangled.unresolved, "named import resolves: {mangled:?}");
+    assert_eq!(mangled.ordinal, None);
+    let demangled = mangled.demangled.as_ref().expect("C++ demangled");
+    assert!(
+        demangled.contains("myfunc"),
+        "demangled names myfunc: {demangled:?}"
+    );
+
+    // `symbols_json` surfaces the same rows agents see via CLI/MCP.
+    let dir = common::tmpdir("l3-symbols");
+    let p = common::open_test_project(&dir, builders::ORDINALS_NAME);
+    let symbols = p.symbols_json();
+    let imports = symbols["imports"].as_array().expect("imports array");
+    assert_eq!(imports.len(), bin.imports.len());
+    let unresolved = imports
+        .iter()
+        .filter(|r| r["unresolved"].as_bool().unwrap_or(false))
+        .count();
+    assert!(unresolved >= 2, "2+ unresolved rows: {imports:?}");
+    assert!(
+        imports.iter().any(|r| r["demangled"]
+            .as_str()
+            .is_some_and(|d| d.contains("myfunc"))),
+        "one demangled C++ row: {imports:?}"
+    );
+    common::cleanup(&dir);
 }
