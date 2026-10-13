@@ -19,6 +19,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range |
+| `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 
 Addresses accept `0x`-hex or decimal strings. `annotate` without flags

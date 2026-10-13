@@ -17,3 +17,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
       - run: cargo doc --no-deps
+      - name: DB size gate (fixture sidecars < 5 MiB, no checked-in sidecars)
+        run: |
+          set -euo pipefail
+          cargo build --bin binscout
+          cap=$((5 * 1024 * 1024))
+          tmp=$(mktemp -d)
+          for f in tests/fixtures/pe32-basic.exe tests/fixtures/pe32-ordinals.exe tests/fixtures/text-garbage.bin tests/fixtures/raw-x64.bin; do
+            db="$tmp/$(basename "$f").redb"
+            ./target/debug/binscout --db "$db" load "$f" > /dev/null
+            size=$(wc -c < "$db")
+            echo "$f -> $size bytes (cap $cap)"
+            if [ "$size" -gt "$cap" ]; then
+              echo "DB size gate failed: $f snapshot is $size bytes, over the $cap-byte cap"
+              exit 1
+            fi
+          done
+          if git ls-files | grep -q '\.rsdbg\.redb$'; then
+            echo "DB size gate failed: checked-in *.rsdbg.redb sidecars must not exist"
+            git ls-files | grep '\.rsdbg\.redb$'
+            exit 1
+          fi

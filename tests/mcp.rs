@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 12 tools, and call every one against fixtures.
+//! list the 13 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_twelve_tools() {
+fn handshake_lists_thirteen_tools() {
     let lines = vec![
         req(
             1,
@@ -118,11 +118,12 @@ fn handshake_lists_twelve_tools() {
             "project_info",
             "rename",
             "sections",
+            "stats",
             "strings",
             "symbols",
             "xrefs",
         ],
-        "exactly the 12 tools"
+        "exactly the 13 tools"
     );
 }
 
@@ -215,6 +216,38 @@ fn all_tools_return_json_over_stdio() {
         fixture,
         "binary untouched"
     );
+    cleanup(&dir);
+}
+
+// O3/A11: MCP `stats` reports db_size plus the project_info counts.
+#[test]
+fn stats_reports_db_size_and_counts() {
+    let dir = tmpdir("mcp-stats");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "stats").display().to_string();
+
+    let v = tool_once(10, "stats", json!({"binary": bin, "db": db}));
+    // No save yet: db_size 0, counts still report.
+    assert_eq!(v["db_size"], 0);
+    assert_eq!(v["functions"], 1);
+
+    let info = tool_once(11, "project_info", json!({"binary": bin, "db": db}));
+    let v = tool_once(12, "stats", json!({"binary": bin, "db": db}));
+    for k in ["functions", "blocks", "insns", "xrefs", "strings"] {
+        assert_eq!(v[k], info[k], "stats {k} matches project_info");
+    }
+
+    // A rename persists the sidecar; stats then matches the file on disk.
+    let entry_hex = format!("{:#x}", common::builders::BASIC_ENTRY_VA);
+    tool_once(
+        13,
+        "rename",
+        json!({"binary": bin, "db": db, "addr": entry_hex, "name": "stats_probe"}),
+    );
+    let v = tool_once(14, "stats", json!({"binary": bin, "db": db}));
+    let file_size = std::fs::metadata(&db).expect("sidecar").len();
+    assert!(file_size > 0);
+    assert_eq!(v["db_size"], file_size);
     cleanup(&dir);
 }
 

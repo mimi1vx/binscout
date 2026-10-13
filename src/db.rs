@@ -59,6 +59,38 @@ pub fn default_db_path(binary: &Path) -> PathBuf {
     p
 }
 
+/// Size of the project DB file in bytes.
+///
+/// Returns `0` when no sidecar exists yet (a project opened but never
+/// saved has no file to measure). Used by the `stats` command so
+/// operators see the storage cost of a cached snapshot.
+///
+/// # Errors
+/// [`Error::Storage`] when the path exists but its metadata is unreadable.
+pub fn db_file_size(path: &Path) -> Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(Error::Storage(format!("stat {}: {e}", path.display()))),
+    }
+}
+
+/// Reclaim free pages in the project DB file (`redb` compaction).
+///
+/// `save` rewrites every table, so repeated re-analysis can leave free
+/// pages behind; compaction shrinks the file back down. Returns `true`
+/// when compaction reclaimed space. There is no separate vacuum step:
+/// `redb` has no `VACUUM` command, `compact` is the equivalent.
+///
+/// # Errors
+/// [`Error::Storage`] when the file cannot be opened or compacted
+/// (e.g. another process holds a live transaction on it).
+pub fn compact_db(path: &Path) -> Result<bool> {
+    let mut db = open_db(path)?;
+    db.compact()
+        .map_err(|e| Error::Storage(format!("compact {}: {e}", path.display())))
+}
+
 /// Canonical arch string used in [`BinaryMeta`] and [`ProjectInfo`].
 #[must_use]
 pub fn arch_name(arch: Arch) -> &'static str {

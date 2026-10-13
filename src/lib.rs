@@ -211,6 +211,36 @@ impl Project {
         }
     }
 
+    /// Storage stats for the project: binary size plus sidecar DB size
+    /// and the same analysis counts as [`Project::project_info`].
+    ///
+    /// Opens without saving like the other read paths; `db_size` is `0`
+    /// when no sidecar exists yet. The `stats` CLI/MCP surface reports
+    /// this verbatim so operators see the cost of a cached snapshot.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] when the sidecar exists but cannot be statted.
+    pub fn stats_json(&self) -> Result<serde_json::Value> {
+        let s = self.analysis.summary();
+        let db_size = db::db_file_size(&self.db_path)?;
+        Ok(serde_json::json!({
+            "binary": self.path.display().to_string(),
+            "db_path": self.db_path.display().to_string(),
+            "version": version(),
+            "arch": db::arch_name(self.binary.arch),
+            "format": db::format_name(self.binary.format),
+            "content_hash": self.content_hash,
+            "size": self.size,
+            "db_size": db_size,
+            "functions": s.functions,
+            "blocks": s.blocks,
+            "insns": s.insns,
+            "xrefs": s.xrefs,
+            "strings": s.strings,
+            "annotations": self.annotations.values().filter(|a| !a.is_empty()).count(),
+        }))
+    }
+
     /// Path of the analyzed binary.
     #[must_use]
     pub fn path(&self) -> &Path {

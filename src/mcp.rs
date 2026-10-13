@@ -1,4 +1,4 @@
-//! binscout MCP server: 12 stateless tools over [`Project`].
+//! binscout MCP server: 13 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -42,7 +42,7 @@ fn all_params<T>(p: Parameters<T>) -> T {
     p.0
 }
 
-/// Parameters for single-binary tools (`project_info`, `symbols`, `sections`).
+/// Parameters for single-binary tools (`project_info`, `symbols`, `sections`, `stats`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BinaryParams {
     /// Path to the analyzed binary.
@@ -332,6 +332,19 @@ impl BinscoutMcp {
         let _guard = self.guard();
         let p = all_params(p);
         ok(open(&p.binary, p.db.as_deref())?.symbols_json())
+    }
+
+    #[tool(
+        name = "stats",
+        description = "Storage stats: binary size, sidecar DB size, and analysis counts"
+    )]
+    fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        open(&p.binary, p.db.as_deref())?
+            .stats_json()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(ok)
     }
 
     #[tool(

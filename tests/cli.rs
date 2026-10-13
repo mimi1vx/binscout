@@ -66,6 +66,7 @@ fn all_query_commands_return_json() {
         vec!["symbols".into(), bin.clone()],
         vec!["sections".into(), bin.clone()],
         vec!["ir".into(), bin.clone(), "0x0".into(), "3".into()],
+        vec!["stats".into(), bin.clone()],
         vec!["annotate".into(), bin.clone(), "0x0".into()],
     ];
     for mut c in cases {
@@ -158,6 +159,38 @@ fn disasm_partial_returns_prefix_and_error_at() {
     assert!(ok, "{v}");
     assert_eq!(v["insns"], 2);
     assert_eq!(v["error_at"]["addr"], 4);
+    cleanup(&dir);
+}
+
+// O3/A11: `stats` prints db_size plus the project_info counts; db_size
+// is 0 before the first save and matches the sidecar file after `load`.
+#[test]
+fn stats_prints_db_size_and_counts() {
+    let dir = tmpdir("stats");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "stats").display().to_string();
+    let d = db.as_str();
+
+    // Before any save there is no sidecar: db_size 0, counts still report.
+    let (ok, v) = run(&["--db", d, "stats", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v["db_size"], 0);
+    assert_eq!(v["db_path"].as_str(), Some(db.as_str()));
+    assert_eq!(v["functions"], 1);
+    assert!(v["content_hash"].is_number());
+
+    // `load` caches the snapshot; stats then matches the file on disk.
+    let (ok, info) = run(&["--db", d, "load", &bin_s]);
+    assert!(ok, "{info}");
+    let file_size = std::fs::metadata(&db).expect("sidecar").len();
+    assert!(file_size > 0);
+    let (ok, v) = run(&["--db", d, "stats", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v["db_size"], file_size);
+    for k in ["functions", "blocks", "insns", "xrefs", "strings"] {
+        assert_eq!(v[k], info[k], "stats {k} matches load");
+    }
     cleanup(&dir);
 }
 

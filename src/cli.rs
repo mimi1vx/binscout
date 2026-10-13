@@ -112,6 +112,8 @@ pub enum Cmd {
         addr: String,
         len: usize,
     },
+    /// Storage stats: binary size, sidecar DB size, and analysis counts.
+    Stats { binary: PathBuf },
     /// Read or write the annotation at `addr`.
     Annotate {
         binary: PathBuf,
@@ -188,6 +190,7 @@ impl Cli {
             Cmd::Symbols { binary } => symbols(&binary, db),
             Cmd::Sections { binary } => sections(&binary, db),
             Cmd::Ir { binary, addr, len } => ir(&binary, db, &addr, len),
+            Cmd::Stats { binary } => stats(&binary, db),
             Cmd::Annotate {
                 binary,
                 addr,
@@ -340,6 +343,13 @@ fn ir(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db)?;
     p.ir_at(binscout::parse_addr(addr)?, len)
+}
+
+fn stats(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+) -> binscout::error::Result<serde_json::Value> {
+    open(binary, db)?.stats_json()
 }
 
 fn annotate(

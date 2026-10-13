@@ -67,6 +67,7 @@ binscout [--db PATH] <command> <binary> [args]
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range |
+| `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 
 Annotate without flags reads; `--rename ""` / omitting `--comment` clears.
@@ -74,9 +75,9 @@ Annotate without flags reads; `--rename ""` / omitting `--comment` clears.
 
 ## MCP server
 
-`binscout-mcp` serves 12 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 13 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `functions`, `func`, `disasm`, `cfg`, `xrefs`, `strings`,
-`symbols`, `sections`, `ir`, `rename`, `comment`. Each takes `binary` plus optional `db`
+`symbols`, `sections`, `ir`, `stats`, `rename`, `comment`. Each takes `binary` plus optional `db`
 and returns one JSON document as text; failures are tool errors.
 
 ```json
@@ -93,6 +94,24 @@ and returns one JSON document as text; failures are tool errors.
 cargo test          # full suite (unit + CLI/MCP e2e over fixtures)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+```
+
+## Project database
+
+Analysis snapshots live in a `redb` sidecar next to the binary:
+`<binary>.rsdbg.redb` by default, overridden per-invocation with `--db
+PATH` (CLI) or the `db` parameter (MCP). `load` writes the snapshot;
+`rename`/`comment` persist immediately; every other command only reads.
+`binscout stats <binary>` reports the binary size, the sidecar size
+(`db_size`, `0` before the first `load`), and the analysis counts, so the
+storage cost of a snapshot stays visible.
+
+The sidecar is a cache: delete it to drop analysis and annotations, and
+it is rebuilt on the next `load`. Never commit sidecars — keep them out
+of version control:
+
+```gitignore
+*.rsdbg.redb
 ```
 
 ## License

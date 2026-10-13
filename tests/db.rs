@@ -235,6 +235,92 @@ fn meta_without_support_fields_loads_as_supported() {
     assert!(meta.reason.is_none());
 }
 
+// O3/A11: stats reports db size plus the project_info counts, and the
+// synthetic fixture snapshots stay far under the 5 MiB CI cap.
+#[test]
+fn stats_reports_db_size_and_matching_counts() {
+    let dir = common::tmpdir("stats");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let db = common::temp_db(&dir, "stats");
+
+    // No sidecar yet: db_size is 0 but counts still report.
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    let before = p.stats_json().expect("stats");
+    assert_eq!(before["db_size"], 0);
+    assert_eq!(
+        before["db_path"].as_str(),
+        Some(db.display().to_string().as_str())
+    );
+
+    // After a save the sidecar exists and db_size matches the file.
+    p.save().expect("save");
+    let file_size = std::fs::metadata(&db).expect("sidecar").len();
+    assert!(file_size > 0);
+    let v = p.stats_json().expect("stats");
+    assert_eq!(v["db_size"], file_size);
+    assert_eq!(v["content_hash"], p.content_hash());
+    assert_eq!(v["size"], std::fs::metadata(&bin).expect("binary").len());
+    let info = serde_json::to_value(p.project_info()).expect("info serializes");
+    for k in [
+        "functions",
+        "blocks",
+        "insns",
+        "xrefs",
+        "strings",
+        "annotations",
+    ] {
+        assert_eq!(v[k], info[k], "stats {k} matches project_info");
+    }
+    common::cleanup(&dir);
+}
+
+#[test]
+fn fixture_snapshots_stay_under_size_cap() {
+    // Mirrors the CI size gate: every loadable synthetic fixture must
+    // snapshot far below 5 MiB (the 136 MB real-world snapshot is the
+    // cautionary datum, not the gate value). LE is unsupported by design.
+    const CAP: u64 = 5 * 1024 * 1024;
+    for name in [
+        common::builders::BASIC_NAME,
+        common::builders::ORDINALS_NAME,
+        common::builders::GARBAGE_NAME,
+    ] {
+        let dir = common::tmpdir("size-cap");
+        let bin = common::write_fixture(&dir, name);
+        let db = common::temp_db(&dir, "cap");
+        let p = Project::open_with_db(&bin, &db).expect("fixture must open");
+        p.save().expect("save");
+        let size = std::fs::metadata(&db).expect("sidecar").len();
+        assert!(
+            size < CAP,
+            "{name} snapshot is {size} bytes, over the {CAP}-byte cap"
+        );
+        common::cleanup(&dir);
+    }
+}
+
+#[test]
+fn compact_db_reclaims_and_keeps_snapshot_loadable() {
+    let dir = common::tmpdir("compact");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let db = common::temp_db(&dir, "compact");
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    p.save().expect("save");
+    let before = std::fs::metadata(&db).expect("sidecar").len();
+    // Compact on a fresh snapshot is a no-op or a shrink, never a failure,
+    // and the snapshot stays loadable afterwards.
+    let _ = binscout::db::compact_db(&db).expect("compact");
+    let after = std::fs::metadata(&db).expect("sidecar").len();
+    assert!(after <= before, "compact must not grow the file");
+    let q = Project::open_with_db(&bin, &db).expect("reopen after compact");
+    assert_eq!(
+        q.analysis().summary(),
+        p.analysis().summary(),
+        "snapshot survives compaction"
+    );
+    common::cleanup(&dir);
+}
+
 // O2/A10: annotation round-trip lock-in. Rename flows entry->name and comment
 // flows addr->comment through point-query, DB reopen, and clear->nulls.
 #[test]
