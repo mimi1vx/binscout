@@ -9,6 +9,8 @@
 pub mod le;
 pub mod strings;
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use object::{FileKind, Object, ObjectSection, ObjectSegment};
@@ -126,6 +128,12 @@ pub struct ImportRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
 }
+
+/// Identity key for LE import dedupe: the [`ImportRef`] fields compared by
+/// [`convert_le`]'s membership index, so index hits equal `Vec::contains`
+/// hits, including distinct module indices decoding to one `library` and
+/// real names colliding with the `mod#N` fallback.
+type LeImportKey = (String, String, Option<u32>, bool, Option<String>);
 
 /// One exported symbol.
 ///
@@ -415,6 +423,12 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         ..
     } = img;
     let mut imports = Vec::new();
+    // Identity index over the resolved import fields. `Vec::contains` made
+    // U uniques cost U*(U-1)/2 comparisons; the default-hasher `HashSet`
+    // keeps membership O(1) without trusting hostile names to a fixed seed.
+    // (`demangled` is always `None` here; it rides along so the key stays
+    // a faithful image of the equality predicate.)
+    let mut seen: HashSet<LeImportKey> = HashSet::with_capacity(fixups.len().min(MAX_IMPORTS));
     for fix in &fixups {
         let imp = match &fix.target {
             LeTarget::Internal { .. } | LeTarget::Entry { .. } => continue,
@@ -436,7 +450,14 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
                 demangled: None,
             },
         };
-        if !imports.contains(&imp) {
+        let key: LeImportKey = (
+            imp.library.clone(),
+            imp.name.clone(),
+            imp.ordinal,
+            imp.unresolved,
+            imp.demangled.clone(),
+        );
+        if seen.insert(key) {
             imports.push(imp);
         }
         if imports.len() >= MAX_IMPORTS {
