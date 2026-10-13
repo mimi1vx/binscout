@@ -656,10 +656,16 @@ fn parse_names(bytes: &[u8], start: usize, end: usize) -> Result<Vec<String>> {
     while pos < end {
         let len = u8_at(bytes, pos)? as usize & 0x7F;
         pos += 1;
-        let s = bytes
-            .get(pos..pos + len)
+        let name_end = pos
+            .checked_add(len)
             .ok_or_else(|| invalid("LE name entry out of range"))?;
-        pos += len;
+        if name_end > end {
+            return Err(invalid("LE name entry crosses table boundary"));
+        }
+        let s = bytes
+            .get(pos..name_end)
+            .ok_or_else(|| invalid("LE name entry out of range"))?;
+        pos = name_end;
         out.push(String::from_utf8_lossy(s).into_owned());
         if out.len() > MAX_STRINGS {
             return Err(Error::Limit("LE name table too large".to_string()));
