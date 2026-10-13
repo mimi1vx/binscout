@@ -89,6 +89,9 @@ pub struct Section {
     pub vaddr: u64,
     /// In-memory size.
     pub size: u64,
+    /// File offset of the raw data (`0` when the section has no on-disk
+    /// range, e.g. `bss`, or the container has no section table).
+    pub file_off: u64,
     /// File-backed bytes starting at `vaddr`.
     pub data: Vec<u8>,
     /// Section is readable.
@@ -274,10 +277,12 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
             .filter(|m| *m <= MAX_MAPPED_BYTES)
             .ok_or_else(|| Error::Limit("section bytes exceed 256 MiB".to_string()))?;
         let (readable, writable, executable) = section_perms(sec.kind());
+        let (file_off, _) = sec.file_range().unwrap_or((0, 0));
         sections.push(Section {
             name,
             vaddr: sec.address(),
             size: sec.size(),
+            file_off,
             data: data.to_vec(),
             readable,
             writable,
@@ -395,6 +400,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
             name: format!("obj{}", o.index),
             vaddr: o.reloc_base as u64,
             size: o.virtual_size as u64,
+            file_off: 0,
             data: s.data.clone(),
             readable: o.readable,
             writable: o.writable,

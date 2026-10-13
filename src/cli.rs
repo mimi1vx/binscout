@@ -102,6 +102,10 @@ pub enum Cmd {
     },
     /// Imports and exports.
     Symbols { binary: PathBuf },
+    /// Section table: name, virtual address, in-memory and file sizes,
+    /// permissions. `vaddr` is the flat virtual address (PE:
+    /// `IMAGE_BASE + RVA`); `file_off` locates the raw bytes in the file.
+    Sections { binary: PathBuf },
     /// Lift `len` bytes at `addr` to IR.
     Ir {
         binary: PathBuf,
@@ -182,6 +186,7 @@ impl Cli {
                 )
             }
             Cmd::Symbols { binary } => symbols(&binary, db),
+            Cmd::Sections { binary } => sections(&binary, db),
             Cmd::Ir { binary, addr, len } => ir(&binary, db, &addr, len),
             Cmd::Annotate {
                 binary,
@@ -318,6 +323,13 @@ fn symbols(
     db: Option<&std::path::Path>,
 ) -> binscout::error::Result<serde_json::Value> {
     Ok(open(binary, db)?.symbols_json())
+}
+
+fn sections(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+) -> binscout::error::Result<serde_json::Value> {
+    Ok(open(binary, db)?.sections_json())
 }
 
 fn ir(

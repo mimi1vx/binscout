@@ -65,6 +65,7 @@ binscout [--db PATH] <command> <binary> [args]
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | filtered/paged cross-references |
 | `strings` | `binscout strings fw.elf --limit 20` | extracted strings by address |
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
+| `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 
@@ -73,9 +74,9 @@ Annotate without flags reads; `--rename ""` / omitting `--comment` clears.
 
 ## MCP server
 
-`binscout-mcp` serves 11 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 12 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `functions`, `func`, `disasm`, `cfg`, `xrefs`, `strings`,
-`symbols`, `ir`, `rename`, `comment`. Each takes `binary` plus optional `db`
+`symbols`, `sections`, `ir`, `rename`, `comment`. Each takes `binary` plus optional `db`
 and returns one JSON document as text; failures are tool errors.
 
 ```json

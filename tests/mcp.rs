@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 11 tools, and call every one against fixtures.
+//! list the 12 tools, and call every one against fixtures.
 
 mod common;
 
@@ -58,7 +58,7 @@ fn tool_text(resp: &Value) -> &str {
 }
 
 #[test]
-fn handshake_lists_eleven_tools() {
+fn handshake_lists_twelve_tools() {
     let lines = vec![
         req(
             1,
@@ -92,11 +92,12 @@ fn handshake_lists_eleven_tools() {
             "ir",
             "project_info",
             "rename",
+            "sections",
             "strings",
             "symbols",
             "xrefs",
         ],
-        "exactly the 11 M6 tools"
+        "exactly the 12 tools"
     );
 }
 
@@ -129,29 +130,30 @@ fn all_tools_return_json_over_stdio() {
         call(15, "xrefs", json!({"binary": b(), "db": d()})),
         call(16, "strings", json!({"binary": b(), "db": d()})),
         call(17, "symbols", json!({"binary": b(), "db": d()})),
+        call(18, "sections", json!({"binary": b(), "db": d()})),
         call(
-            18,
+            19,
             "ir",
             json!({"binary": b(), "db": d(), "addr": "0x0", "len": 3}),
         ),
         call(
-            19,
+            20,
             "rename",
             json!({"binary": b(), "db": d(), "addr": "0x0", "name": "main"}),
         ),
         call(
-            20,
+            21,
             "comment",
             json!({"binary": b(), "db": d(), "addr": "1", "comment": "via mcp"}),
         ),
         call(
-            21,
+            22,
             "func",
             json!({"binary": b(), "db": d(), "addr": "0xdead"}),
         ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 13, "{resps:?}");
+    assert_eq!(resps.len(), 14, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -166,14 +168,21 @@ fn all_tools_return_json_over_stdio() {
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
     assert_eq!(dis.as_array().expect("array").len(), 3);
 
-    let renamed: Value = serde_json::from_str(tool_text(by_id[&19])).expect("rename json");
+    let renamed: Value = serde_json::from_str(tool_text(by_id[&20])).expect("rename json");
     assert_eq!(renamed["name"], "main");
-    let commented: Value = serde_json::from_str(tool_text(by_id[&20])).expect("comment json");
+    let commented: Value = serde_json::from_str(tool_text(by_id[&21])).expect("comment json");
     assert_eq!(commented["comment"], "via mcp");
 
+    let sections: Value = serde_json::from_str(tool_text(by_id[&18])).expect("sections json");
+    assert_eq!(
+        sections,
+        serde_json::json!([]),
+        "raw blob has no section table"
+    );
+
     // Unknown function is a protocol-level error, not a result.
-    assert!(by_id[&21].get("error").is_some(), "{:?}", by_id[&21]);
-    assert!(by_id[&21].get("result").is_none());
+    assert!(by_id[&22].get("error").is_some(), "{:?}", by_id[&22]);
+    assert!(by_id[&22].get("result").is_none());
 
     assert_eq!(
         std::fs::read(dir.join("m.bin")).expect("reread"),

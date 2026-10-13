@@ -522,6 +522,32 @@ impl Project {
         serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })
     }
 
+    /// Section table in file order: name, virtual address, in-memory size,
+    /// file offset/size of the raw bytes, and permissions.
+    ///
+    /// `vaddr` is the flat virtual address the loader mapped the section at
+    /// (PE: `IMAGE_BASE + RVA`, so `.text` at RVA `0x1000` in a
+    /// `0x400000`-based image lives at `0x401000`); `file_off` locates the
+    /// section's raw bytes in the file. Raw blobs have no table and report
+    /// an empty array.
+    #[must_use]
+    pub fn sections_json(&self) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .binary
+            .sections
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name, "vaddr": s.vaddr, "size": s.size,
+                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "readable": s.readable, "writable": s.writable,
+                    "executable": s.executable,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(rows)
+    }
+
     /// Extracted strings, filtered then paged (the `strings` command query).
     ///
     /// See [`Analysis::strings_page_filtered`] for the filter semantics:

@@ -1,4 +1,4 @@
-//! binscout MCP server: 11 stateless tools over [`Project`].
+//! binscout MCP server: 12 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -42,7 +42,7 @@ fn all_params<T>(p: Parameters<T>) -> T {
     p.0
 }
 
-/// Parameters for single-binary tools (`project_info`, `symbols`).
+/// Parameters for single-binary tools (`project_info`, `symbols`, `sections`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BinaryParams {
     /// Path to the analyzed binary.
@@ -332,6 +332,16 @@ impl BinscoutMcp {
         let _guard = self.guard();
         let p = all_params(p);
         ok(open(&p.binary, p.db.as_deref())?.symbols_json())
+    }
+
+    #[tool(
+        name = "sections",
+        description = "Section table: name, virtual address (PE: IMAGE_BASE + RVA), in-memory and file sizes, permissions"
+    )]
+    fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        ok(open(&p.binary, p.db.as_deref())?.sections_json())
     }
 
     #[tool(

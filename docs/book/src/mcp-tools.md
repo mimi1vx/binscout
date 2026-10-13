@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 11 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 12 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
@@ -22,6 +22,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind, paged |
 | `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given |
 | `symbols` | binary | Imports and exports of the binary |
+| `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears |

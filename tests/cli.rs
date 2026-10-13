@@ -64,6 +64,7 @@ fn all_query_commands_return_json() {
         vec!["xrefs".into(), bin.clone()],
         vec!["strings".into(), bin.clone()],
         vec!["symbols".into(), bin.clone()],
+        vec!["sections".into(), bin.clone()],
         vec!["ir".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["annotate".into(), bin.clone(), "0x0".into()],
     ];
