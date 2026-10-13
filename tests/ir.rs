@@ -185,3 +185,11 @@ fn lift_range_preserves_order() {
     assert_eq!((v[0].op, v[0].addr), (IrOp::Nop, 0x1000));
     assert_eq!((v[1].op, v[1].addr), (IrOp::Return, 0x1001));
 }
+
+#[test]
+fn x86_popcnt_is_not_a_load() {
+    // popcnt eax, eax decodes but is a bit-count, not a stack pop.
+    let v = x86(&[0xf3, 0x0f, 0xb8, 0xc0], 0x1000);
+    assert_eq!(v[0].op, IrOp::Nop);
+    assert!(v[0].warning.is_some());
+}

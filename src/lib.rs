@@ -341,12 +341,23 @@ impl Project {
         if len == 0 || len > MAX_RANGE_BYTES {
             return Err(Error::Limit(format!("range length {len} out of bounds")));
         }
-        let end = va.wrapping_add(len as u64);
+        let len_u64 = len as u64;
         let seg = self
             .binary
             .segments
             .iter()
-            .find(|s| va >= s.vaddr && end <= s.vaddr.wrapping_add(s.mem_size))
+            .find(|s| {
+                if va < s.vaddr {
+                    return false;
+                }
+                let Some(off) = va.checked_sub(s.vaddr) else {
+                    return false;
+                };
+                let Some(need) = off.checked_add(len_u64) else {
+                    return false;
+                };
+                need <= s.mem_size
+            })
             .ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
         let mut out = vec![0u8; len];
         let off = (va - seg.vaddr) as usize;

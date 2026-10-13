@@ -448,7 +448,11 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         if exports.len() >= MAX_EXPORTS {
             break;
         }
-        let Some(obj) = objects.get(e.object as usize - 1) else {
+        let Some(obj) = e
+            .object
+            .checked_sub(1)
+            .and_then(|i| objects.get(i as usize))
+        else {
             continue;
         };
         exports.push(ExportRef {
@@ -484,8 +488,9 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
 }
 
 fn le_module(modules: &[String], module: u32) -> String {
-    modules
-        .get(module as usize - 1)
+    module
+        .checked_sub(1)
+        .and_then(|i| modules.get(i as usize))
         .cloned()
         .unwrap_or_else(|| format!("mod#{module}"))
 }

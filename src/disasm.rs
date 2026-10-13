@@ -531,6 +531,18 @@ fn disasm_x86_partial(
             });
         }
         let size = insn.len();
+        let raw = match bytes.get(start..start + size) {
+            Some(b) => b.to_vec(),
+            None => {
+                return Ok(PartialDisasm {
+                    insns: out,
+                    error_at: Some(DecodeError {
+                        addr,
+                        message: format!("x86 invalid opcode at {addr:#x} ({bitness}-bit)"),
+                    }),
+                });
+            }
+        };
         text.clear();
         formatter.format(&insn, &mut text);
         let (mnem, ops) = split_asm(&text);
@@ -551,7 +563,7 @@ fn disasm_x86_partial(
         out.push(Insn {
             addr,
             size: size as u8,
-            bytes: bytes[start..start + size].to_vec(),
+            bytes: raw,
             mnem,
             ops,
             branch_target,
@@ -623,10 +635,19 @@ fn disasm_aarch64_partial(bytes: &[u8], va: u64, max_insns: usize) -> Result<Par
             }
         };
         let (mnem, ops) = split_asm(&inst.to_string());
+        let Some(raw) = bytes.get(off..off + 4).map(<[u8]>::to_vec) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("aarch64 decode error at {addr:#x}: truncated word"),
+                }),
+            });
+        };
         out.push(Insn {
             addr,
             size: 4,
-            bytes: bytes[off..off + 4].to_vec(),
+            bytes: raw,
             mnem,
             ops,
             branch_target: arm_branch_target(&inst, addr),
@@ -756,10 +777,19 @@ fn disasm_armv7_partial(
         };
         let size: usize = if inst.thumb() && !inst.wide() { 2 } else { 4 };
         let (mnem, ops) = split_asm(&inst.to_string());
+        let Some(raw) = bytes.get(off..off + size).map(<[u8]>::to_vec) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("{label} decode error at {addr:#x}: truncated word"),
+                }),
+            });
+        };
         out.push(Insn {
             addr,
             size: size as u8,
-            bytes: bytes[off..off + size].to_vec(),
+            bytes: raw,
             mnem,
             ops,
             branch_target: armv7_branch_target(&inst, addr),

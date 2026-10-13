@@ -335,3 +335,64 @@ fn pe32_ordinals_carry_unresolved_and_demangled() {
     );
     common::cleanup(&dir);
 }
+
+#[test]
+fn le_zero_module_and_object_do_not_panic() {
+    use binscout::loader::Segment;
+    use binscout::loader::convert_le;
+    use binscout::loader::le::{LeEntry, LeFixup, LeImage, LeObject, LeTarget};
+
+    let img = LeImage {
+        page_size: 0x1000,
+        cpu: 2,
+        os: 3,
+        module_flags: 0,
+        objects: vec![LeObject {
+            index: 1,
+            virtual_size: 0x1000,
+            reloc_base: 0x10000,
+            flags: 0x2005,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        segments: vec![Segment {
+            vaddr: 0x10000,
+            mem_size: 0x1000,
+            data: vec![0x90],
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        entry: Some(0x10000),
+        fixups: vec![LeFixup {
+            page: 1,
+            sources: vec![0],
+            target: LeTarget::ImportOrdinal {
+                module: 0,
+                ordinal: 7,
+            },
+            additive: None,
+        }],
+        entries: vec![
+            LeEntry {
+                ordinal: 1,
+                object: 0,
+                offset: 0,
+                exported: true,
+            },
+            LeEntry {
+                ordinal: 2,
+                object: 9,
+                offset: 0,
+                exported: true,
+            },
+        ],
+        import_modules: vec!["KERNEL".to_string()],
+        import_procs: Vec::new(),
+    };
+    let bin = convert_le(img);
+    assert_eq!(bin.imports.len(), 1);
+    assert_eq!(bin.imports[0].library, "mod#0");
+    assert!(bin.exports.is_empty());
+}

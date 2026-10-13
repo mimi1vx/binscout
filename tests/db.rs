@@ -409,3 +409,16 @@ fn annotate_round_trip_rename_comment_reopen_clear() {
     );
     common::cleanup(&dir);
 }
+
+#[test]
+fn bytes_at_rejects_wrapping_ranges() {
+    let dir = common::tmpdir("bytes-wrap");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let db = common::temp_db(&dir, "wrap");
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    let err = p.bytes_at(u64::MAX, 16).unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    let err = p.bytes_at(u64::MAX - 5, 16).unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    common::cleanup(&dir);
+}

@@ -17,7 +17,7 @@
 //!
 //! - `COPY`: `mov`, `movsx`, `movsxd`, `movzx`, `movabs`, `xchg`, `leave`,
 //!   `enter`.
-//! - `LOAD`: `pop`, `popa`, `popad`, `popcnt`. `STORE`: `push`, `pusha`,
+//! - `LOAD`: `pop`, `popa`, `popad`. `STORE`: `push`, `pusha`,
 //!   `pushad`.
 //! - `ADD`: `add`, `adc`, `adcx`, `adox`, `lea` (address math, not a load),
 //!   `inc`. `SUB`: `sub`, `sbb`, `dec`, `neg`. `MUL`: `mul`, `imul`.
@@ -526,7 +526,7 @@ fn is_x86_copy(s: &str) -> bool {
 }
 
 fn is_x86_load(s: &str) -> bool {
-    matches!(s, "pop" | "popa" | "popad" | "popcnt")
+    matches!(s, "pop" | "popa" | "popad")
 }
 
 fn is_x86_store(s: &str) -> bool {
