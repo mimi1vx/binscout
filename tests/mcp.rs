@@ -182,3 +182,38 @@ fn all_tools_return_json_over_stdio() {
     );
     cleanup(&dir);
 }
+
+#[test]
+fn le_project_info_is_a_tool_error() {
+    let dir = tmpdir("mcp-le");
+    let bin = write_bin(
+        &dir,
+        "le.exe",
+        &common::fixture_bytes(common::builders::LE_NAME),
+    )
+    .display()
+    .to_string();
+    let db = temp_db(&dir, "le").display().to_string();
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(10, "project_info", json!({"binary": bin, "db": db})),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let resp = &resps[1];
+    assert!(
+        resp.get("result").is_none(),
+        "LE must not return info: {resp}"
+    );
+    let msg = resp["error"]["message"].as_str().expect("error message");
+    assert!(msg.contains("unsupported"), "{resp}");
+    assert!(msg.contains("LE"), "{resp}");
+    cleanup(&dir);
+}

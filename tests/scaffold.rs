@@ -117,6 +117,8 @@ fn pe32_basic_opens_end_to_end() {
     assert_eq!(info.format, "pe");
     assert_eq!(info.arch, "x86_32");
     assert_eq!(info.entry, Some(builders::BASIC_ENTRY_VA));
+    assert!(info.supported, "supported formats report supported:true");
+    assert!(info.reason.is_none());
     assert!(info.functions >= 1, "entry func must be found");
     assert!(
         p.analysis()
@@ -162,6 +164,54 @@ fn le_fixture_parses_as_le() {
     assert!(le::is_le(&bytes));
     let bin = load(&bytes).expect("LE must parse at loader level");
     assert_eq!(bin.format, BinaryFormat::Le);
+}
+
+#[test]
+fn le_fixture_open_is_explicitly_unsupported() {
+    let dir = common::tmpdir("l1-le");
+    let bin = common::write_fixture(&dir, builders::LE_NAME);
+    let db = common::temp_db(&dir, "le");
+    let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
+    assert!(
+        matches!(err, binscout::error::Error::Unsupported(_)),
+        "LE must be explicit-unsupported, never raw: got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unsupported") && msg.contains("LE"),
+        "error must name LE as unsupported: {msg:?}"
+    );
+    assert!(!db.exists(), "unsupported open must not create a sidecar");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn truncated_le_never_falls_back_to_raw() {
+    use binscout::loader::le::is_le;
+
+    let dir = common::tmpdir("l1-trunc");
+    let mut bytes = common::fixture_bytes(builders::LE_NAME);
+    // Keep MZ + e_lfanew + LE magic so the image is still recognized,
+    // but truncate the header so the parse fails.
+    bytes.truncate(0x44);
+    assert!(is_le(&bytes), "truncated prefix must still read as LE");
+    let bin = common::write_bin(&dir, "trunc-le.bin", &bytes);
+    let db = common::temp_db(&dir, "trunc");
+    let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
+    assert!(
+        matches!(err, binscout::error::Error::Unsupported(_)),
+        "recognized LE must stay unsupported, never raw fallback: got {err:?}"
+    );
+    common::cleanup(&dir);
+}
+
+#[test]
+fn unrecognized_bytes_still_fall_back_to_raw() {
+    let dir = common::tmpdir("l1-raw");
+    let p = common::open_test_project(&dir, builders::GARBAGE_NAME);
+    assert_eq!(p.binary().format, binscout::loader::BinaryFormat::Raw);
+    assert_eq!(p.binary().arch, binscout::disasm::Arch::X86_64);
+    common::cleanup(&dir);
 }
 
 #[test]

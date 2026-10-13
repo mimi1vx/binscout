@@ -155,6 +155,10 @@ fn project_info_is_json_with_matching_counts() {
     assert_eq!(v["arch"], "x86_64");
     assert_eq!(v["format"], "elf");
     assert_eq!(v["entry"], 0x400000);
+    assert!(info.supported, "supported formats report supported:true");
+    assert!(info.reason.is_none());
+    assert_eq!(v["supported"], true);
+    assert!(v["reason"].is_null());
     let s = p.analysis().summary();
     assert_eq!(info.functions, s.functions);
     assert_eq!(info.blocks, s.blocks);
@@ -208,4 +212,23 @@ fn save_only_writes_db_path() {
         "binary length untouched by db writes"
     );
     cleanup(&dir);
+}
+
+#[test]
+fn meta_without_support_fields_loads_as_supported() {
+    // Snapshots written before the L1 `supported`/`reason` fields stay
+    // loadable: missing fields default to supported with no reason.
+    let old = serde_json::json!({
+        "version": 1,
+        "binary_path": "old.bin",
+        "content_hash": 42,
+        "size": 7,
+        "arch": "x86_64",
+        "format": "elf",
+        "entry": 0x400000u64,
+    });
+    let meta: binscout::db::BinaryMeta =
+        serde_json::from_value(old).expect("old meta shape must decode");
+    assert!(meta.supported);
+    assert!(meta.reason.is_none());
 }

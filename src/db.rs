@@ -130,6 +130,20 @@ pub struct BinaryMeta {
     pub format: String,
     /// Entry-point address, if known.
     pub entry: Option<u64>,
+    /// Whether the format is supported for analysis.
+    ///
+    /// Always true for persisted snapshots: recognized-but-unsupported
+    /// formats (LE) are rejected at open and never saved. Defaults to true
+    /// so pre-L1 snapshots without the field still decode.
+    #[serde(default = "default_supported")]
+    pub supported: bool,
+    /// Why `supported` is false, if so.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn default_supported() -> bool {
+    true
 }
 
 /// One function row: export name plus sorted direct callees.
@@ -197,6 +211,18 @@ pub struct ProjectInfo {
     pub content_hash: u64,
     /// File size in bytes.
     pub size: u64,
+    /// Whether the format is supported for analysis.
+    ///
+    /// Always true for successfully opened projects: recognized-but-
+    /// unsupported formats (LE) fail at open with [`Error::Unsupported`]
+    /// instead of returning a `supported:false` project.
+    ///
+    /// [`Error::Unsupported`]: crate::error::Error::Unsupported
+    #[serde(default = "default_supported")]
+    pub supported: bool,
+    /// Why `supported` is false, if so.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Discovered functions.
     pub functions: usize,
     /// Basic blocks across all functions.
