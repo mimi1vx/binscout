@@ -9,6 +9,8 @@
 pub mod le;
 pub mod strings;
 
+use serde::{Deserialize, Serialize};
+
 use object::{FileKind, Object, ObjectSection, ObjectSegment};
 
 use crate::disasm::Arch;
@@ -94,7 +96,7 @@ pub struct Section {
 
 /// One imported symbol: `library!name`, where `name` is `#ordinal` for
 /// ordinal-only imports and `@0xoff` for LE name-table references.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportRef {
     /// Providing module (`""` when the format names none).
     pub library: String,
@@ -103,7 +105,7 @@ pub struct ImportRef {
 }
 
 /// One exported symbol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportRef {
     /// Symbol name (LE: decimal ordinal).
     pub name: String,

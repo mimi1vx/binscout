@@ -1,10 +1,11 @@
-//! binscout-mcp: MCP server entry (M0 stub, full tools land in M6).
+//! binscout-mcp: MCP server over stdio (M6).
+
+use rmcp::ServiceExt;
+use rmcp::transport::io::stdio;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!(
-        "{}",
-        serde_json::json!({"name": "binscout-mcp", "version": binscout::version(), "status": "stub-m0"})
-    );
+    let service = binscout::mcp::BinscoutMcp::new().serve(stdio()).await?;
+    service.waiting().await?;
     Ok(())
 }

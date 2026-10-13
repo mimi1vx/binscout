@@ -10,10 +10,12 @@
 //! merges. Unknown mnemonics become [`IrOp::Nop`] with `warning` set instead
 //! of failing, so analysis can proceed over partial lifts.
 
+use serde::{Deserialize, Serialize};
+
 use crate::disasm::{Arch, Insn};
 
 /// Minimal P-code-inspired operation set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IrOp {
     Copy,
     Load,
@@ -74,7 +76,7 @@ impl IrOp {
 }
 
 /// One lifted IR operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrInsn {
     /// Address of the source machine instruction.
     pub addr: u64,

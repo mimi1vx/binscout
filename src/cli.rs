@@ -1,10 +1,13 @@
+//! binscout CLI: every command prints exactly one JSON value to stdout.
+//!
+//! Success prints the result with exit 0; failure prints
+//! `{"error": "..."}` with exit 1, so stdout is always valid JSON.
+
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde_json::json;
 
-/// Agent-first CLI: every command prints valid JSON to stdout.
+/// Agent-first CLI: JSON on stdout, always.
 #[derive(Debug, Parser)]
 #[command(
     name = "binscout",
@@ -12,33 +15,253 @@ use serde_json::json;
     about = "headless agent-first binary analysis"
 )]
 pub struct Cli {
+    /// Explicit project DB path (default: `<binary>.binscout.redb` sidecar).
+    #[arg(long, global = true)]
+    pub db: Option<PathBuf>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// Show project/binary info (M0: path + version only).
-    ProjectInfo { binary: PathBuf },
-    /// List functions (M0: unimplemented, reserved for M4).
-    Functions { binary: PathBuf },
+    /// Open a binary, cache the analysis snapshot, print project info.
+    Load { binary: PathBuf },
+    /// List functions (rename-resolved), paged.
+    Functions {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Full detail of one function: blocks with instructions.
+    Func { binary: PathBuf, addr: String },
+    /// Disassemble `len` bytes at `addr`.
+    Disasm {
+        binary: PathBuf,
+        addr: String,
+        len: usize,
+    },
+    /// Control-flow graph of one function.
+    Cfg { binary: PathBuf, addr: String },
+    /// Cross-references, optionally filtered by endpoint/kind.
+    Xrefs {
+        binary: PathBuf,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Extracted strings, paged.
+    Strings {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Imports and exports.
+    Symbols { binary: PathBuf },
+    /// Lift `len` bytes at `addr` to IR.
+    Ir {
+        binary: PathBuf,
+        addr: String,
+        len: usize,
+    },
+    /// Read or write the annotation at `addr`.
+    Annotate {
+        binary: PathBuf,
+        addr: String,
+        /// Rename a function (empty string clears).
+        #[arg(long)]
+        rename: Option<String>,
+        /// Comment any address (empty string clears).
+        #[arg(long)]
+        comment: Option<String>,
+    },
 }
 
 impl Cli {
-    pub fn run(self) -> Result<()> {
-        match self.cmd {
-            Cmd::ProjectInfo { binary } => {
-                let p = binscout::Project::open(&binary)
-                    .with_context(|| format!("open {}", binary.display()))?;
-                println!(
-                    "{}",
-                    json!({"binary": p.path().display().to_string(), "version": binscout::version()})
-                );
+    pub fn run(self) -> ! {
+        let db = self.db.as_deref();
+        let result = match self.cmd {
+            Cmd::Load { binary } => load(&binary, db),
+            Cmd::Functions {
+                binary,
+                offset,
+                limit,
+            } => functions(&binary, db, offset, limit),
+            Cmd::Func { binary, addr } => func(&binary, db, &addr),
+            Cmd::Disasm { binary, addr, len } => disasm(&binary, db, &addr, len),
+            Cmd::Cfg { binary, addr } => cfg(&binary, db, &addr),
+            Cmd::Xrefs {
+                binary,
+                to,
+                from,
+                kind,
+                offset,
+                limit,
+            } => xrefs(
+                &binary,
+                db,
+                to.as_deref(),
+                from.as_deref(),
+                kind.as_deref(),
+                offset,
+                limit,
+            ),
+            Cmd::Strings {
+                binary,
+                offset,
+                limit,
+            } => strings(&binary, db, offset, limit),
+            Cmd::Symbols { binary } => symbols(&binary, db),
+            Cmd::Ir { binary, addr, len } => ir(&binary, db, &addr, len),
+            Cmd::Annotate {
+                binary,
+                addr,
+                rename,
+                comment,
+            } => annotate(&binary, db, &addr, rename.as_deref(), comment.as_deref()),
+        };
+        match result {
+            Ok(value) => {
+                println!("{value}");
+                std::process::exit(0);
             }
-            Cmd::Functions { .. } => {
-                anyhow::bail!("functions: not implemented until M4 (analysis)");
+            Err(e) => {
+                println!("{}", serde_json::json!({ "error": e.to_string() }));
+                std::process::exit(1);
             }
         }
-        Ok(())
     }
+}
+
+fn open(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+) -> binscout::error::Result<binscout::Project> {
+    binscout::Project::open_any(binary, db)
+}
+
+fn opt_addr(s: Option<&str>) -> binscout::error::Result<Option<u64>> {
+    s.map(binscout::parse_addr).transpose()
+}
+
+fn load(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    p.save()?;
+    Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
+}
+
+fn functions(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    Ok(serde_json::Value::Array(
+        p.functions_resolved(offset, limit),
+    ))
+}
+
+fn func(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    addr: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    p.func_detail(binscout::parse_addr(addr)?)
+}
+
+fn disasm(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    addr: &str,
+    len: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    let addr = binscout::parse_addr(addr)?;
+    Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("insns serialize"))
+}
+
+fn cfg(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    addr: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    p.cfg_of(binscout::parse_addr(addr)?)
+}
+
+fn xrefs(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    to: Option<&str>,
+    from: Option<&str>,
+    kind: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    let kind = kind.map(binscout::parse_xref_kind).transpose()?;
+    let rows = p.query_xrefs(opt_addr(to)?, opt_addr(from)?, kind, offset, limit);
+    Ok(serde_json::to_value(rows).expect("xrefs serialize"))
+}
+
+fn strings(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    let rows = p.analysis().strings_page(offset, limit.min(1024));
+    Ok(serde_json::to_value(rows).expect("strings serialize"))
+}
+
+fn symbols(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+) -> binscout::error::Result<serde_json::Value> {
+    Ok(open(binary, db)?.symbols_json())
+}
+
+fn ir(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    addr: &str,
+    len: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db)?;
+    p.ir_at(binscout::parse_addr(addr)?, len)
+}
+
+fn annotate(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    addr: &str,
+    rename: Option<&str>,
+    comment: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    let mut p = open(binary, db)?;
+    let addr = binscout::parse_addr(addr)?;
+    if let Some(name) = rename {
+        p.rename_function(addr, name)?;
+    }
+    if let Some(text) = comment {
+        p.set_comment(addr, text)?;
+    }
+    Ok(p.annotation_json(addr))
 }

@@ -97,6 +97,7 @@ dependencies = [
  "petgraph",
  "redb",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",

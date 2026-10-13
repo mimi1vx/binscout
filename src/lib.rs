@@ -6,12 +6,14 @@ pub mod disasm;
 pub mod error;
 pub mod ir;
 pub mod loader;
+pub mod mcp;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{Analysis, analyze};
+use crate::analysis::{Analysis, Xref, XrefKind, analyze};
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
+use crate::disasm::{Disassembler, Insn};
 use crate::error::{Error, Result};
 use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
 
@@ -37,6 +39,17 @@ pub struct Project {
 }
 
 impl Project {
+    /// [`Project::open`] with an optional explicit DB path (`None` = sidecar).
+    ///
+    /// # Errors
+    /// Same as [`Project::open`].
+    pub fn open_any(binary: &Path, db: Option<&Path>) -> Result<Self> {
+        match db {
+            Some(d) => Self::open_with_db(binary, d),
+            None => Self::open(binary),
+        }
+    }
+
     /// Open a container binary (ELF/PE/Mach-O/LE) with the default sidecar DB.
     ///
     /// Unrecognized bytes fall back to raw x86-64 at base 0 so fixture blobs
@@ -256,6 +269,185 @@ impl Project {
             self.annotations.remove(&addr);
         }
         self.save()
+    }
+
+    /// File-backed bytes mapped at `va` (zero-padded past file data).
+    ///
+    /// # Errors
+    /// [`Error::Limit`] for empty/oversize ranges, [`Error::NotFound`] when
+    /// the range is not fully mapped.
+    pub fn bytes_at(&self, va: u64, len: usize) -> Result<Vec<u8>> {
+        if len == 0 || len > MAX_RANGE_BYTES {
+            return Err(Error::Limit(format!("range length {len} out of bounds")));
+        }
+        let end = va.wrapping_add(len as u64);
+        let seg = self
+            .binary
+            .segments
+            .iter()
+            .find(|s| va >= s.vaddr && end <= s.vaddr.wrapping_add(s.mem_size))
+            .ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
+        let mut out = vec![0u8; len];
+        let off = (va - seg.vaddr) as usize;
+        let have = seg.data.len().saturating_sub(off).min(len);
+        out[..have].copy_from_slice(&seg.data[off..off + have]);
+        Ok(out)
+    }
+
+    /// Disassemble `len` bytes at `va` with the binary's architecture.
+    ///
+    /// # Errors
+    /// Same as [`Project::bytes_at`], plus [`Error::Invalid`] on undecodable
+    /// bytes.
+    pub fn disasm_at(&self, addr: u64, len: usize) -> Result<Vec<Insn>> {
+        let bytes = self.bytes_at(addr, len)?;
+        self.binary.arch.disassembler().disasm_range(&bytes, addr)
+    }
+
+    /// Function rows with annotation renames resolved, ordered by entry.
+    #[must_use]
+    pub fn functions_resolved(&self, offset: usize, limit: usize) -> Vec<serde_json::Value> {
+        self.analysis
+            .functions_page(offset, limit.min(MAX_ROWS))
+            .into_iter()
+            .map(|f| {
+                serde_json::json!({
+                    "id": f.id, "entry": f.entry,
+                    "name": self.function_name(f.entry),
+                    "blocks": f.blocks, "insns": f.insns, "calls": f.calls,
+                })
+            })
+            .collect()
+    }
+
+    /// Full function detail: blocks with instructions in address order.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for unknown function entries.
+    pub fn func_detail(&self, entry: u64) -> Result<serde_json::Value> {
+        let f = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {entry:#x}")))?;
+        let blocks: Vec<serde_json::Value> = f
+            .blocks
+            .values()
+            .map(|b| {
+                serde_json::json!({
+                    "id": b.id(entry), "start": b.start, "end": b.end(),
+                    "insns": b.insns, "succs": f.successors(b.start),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "id": f.id(), "entry": f.entry,
+            "name": self.function_name(entry),
+            "blocks": blocks, "edges": f.edges(),
+            "calls": self.analysis.calls_of(entry),
+        }))
+    }
+
+    /// CFG of one function: block nodes plus `(from, to)` block edges.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for unknown function entries.
+    pub fn cfg_of(&self, entry: u64) -> Result<serde_json::Value> {
+        let f = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {entry:#x}")))?;
+        let nodes: Vec<serde_json::Value> = f
+            .blocks
+            .values()
+            .map(|b| {
+                serde_json::json!({
+                    "start": b.start, "end": b.end(),
+                    "insns": b.insns.len(), "succs": f.successors(b.start),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "entry": entry, "nodes": nodes, "edges": f.edges() }))
+    }
+
+    /// Lift `len` bytes at `va` to IR.
+    ///
+    /// # Errors
+    /// Same as [`Project::disasm_at`].
+    pub fn ir_at(&self, addr: u64, len: usize) -> Result<serde_json::Value> {
+        let insns = self.disasm_at(addr, len)?;
+        let lifted = crate::ir::lift_range(self.binary.arch, &insns);
+        Ok(serde_json::json!({ "addr": addr, "insns": insns.len(), "ir": lifted }))
+    }
+
+    /// Xrefs filtered by endpoint/kind, paged.
+    #[must_use]
+    pub fn query_xrefs(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<Xref> {
+        self.analysis
+            .xrefs
+            .iter()
+            .copied()
+            .filter(|x| to.is_none_or(|t| x.to == t))
+            .filter(|x| from.is_none_or(|f| x.from == f))
+            .filter(|x| kind.is_none_or(|k| x.kind == k))
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .collect()
+    }
+
+    /// Imports plus exports for symbol views.
+    #[must_use]
+    pub fn symbols_json(&self) -> serde_json::Value {
+        serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })
+    }
+
+    /// Current annotation at `addr`.
+    #[must_use]
+    pub fn annotation_json(&self, addr: u64) -> serde_json::Value {
+        match self.annotation(addr) {
+            Some(a) => serde_json::json!({ "addr": addr, "name": a.name, "comment": a.comment }),
+            None => serde_json::json!({ "addr": addr, "name": null, "comment": null }),
+        }
+    }
+}
+
+/// Cap on raw bytes per [`Project::bytes_at`] call.
+pub const MAX_RANGE_BYTES: usize = 1 << 20;
+/// Cap on rows per paged query.
+const MAX_ROWS: usize = 1024;
+
+/// Parse a CLI/MCP address: `0x`-prefixed hex or plain decimal.
+///
+/// # Errors
+/// [`Error::Invalid`] when the string is neither.
+pub fn parse_addr(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u64>()
+    };
+    v.map_err(|_| Error::Invalid(format!("bad address: {s:?}")))
+}
+
+/// Parse an xref kind filter: `code`, `data`, or `string`.
+///
+/// # Errors
+/// [`Error::Invalid`] for anything else.
+pub fn parse_xref_kind(s: &str) -> Result<XrefKind> {
+    match s.to_lowercase().as_str() {
+        "code" => Ok(XrefKind::Code),
+        "data" => Ok(XrefKind::Data),
+        "string" => Ok(XrefKind::String),
+        _ => Err(Error::Invalid(format!("bad xref kind: {s:?}"))),
     }
 }
 
