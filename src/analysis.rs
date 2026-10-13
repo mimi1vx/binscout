@@ -120,6 +120,33 @@ impl Function {
     pub fn edges(&self) -> Vec<(u64, u64)> {
         self.cfg.all_edges().map(|(a, b, _)| (a, b)).collect()
     }
+
+    /// Rebuild a function from persisted rows (M5 redb round-trip).
+    ///
+    /// `edges` are `(from_block, to_block)` pairs within this function.
+    #[must_use]
+    pub fn from_parts(
+        entry: u64,
+        name: Option<String>,
+        blocks: BTreeMap<u64, BasicBlock>,
+        edges: &[(u64, u64)],
+    ) -> Self {
+        let mut cfg = DiGraphMap::new();
+        for &start in blocks.keys() {
+            cfg.add_node(start);
+        }
+        for &(a, b) in edges {
+            if blocks.contains_key(&a) && blocks.contains_key(&b) {
+                cfg.add_edge(a, b, ());
+            }
+        }
+        Self {
+            entry,
+            name,
+            blocks,
+            cfg,
+        }
+    }
 }
 
 /// Whole-binary analysis result.
@@ -149,6 +176,35 @@ impl Analysis {
     #[must_use]
     pub fn call_edges(&self) -> Vec<(u64, u64)> {
         self.callgraph.all_edges().map(|(a, b, _)| (a, b)).collect()
+    }
+
+    /// Rebuild analysis from persisted rows (M5 redb round-trip).
+    ///
+    /// Drops call edges pointing at unknown functions, mirroring [`analyze`].
+    #[must_use]
+    pub fn from_parts(
+        arch: Arch,
+        functions: BTreeMap<u64, Function>,
+        call_edges: &[(u64, u64)],
+        xrefs: Vec<Xref>,
+        strings: Vec<StringHit>,
+    ) -> Self {
+        let mut callgraph = DiGraphMap::<u64, ()>::new();
+        for e in functions.keys() {
+            callgraph.add_node(*e);
+        }
+        for &(a, b) in call_edges {
+            if functions.contains_key(&a) && functions.contains_key(&b) {
+                callgraph.add_edge(a, b, ());
+            }
+        }
+        Self {
+            arch,
+            functions,
+            callgraph,
+            xrefs,
+            strings,
+        }
     }
 }
 
