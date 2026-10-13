@@ -2,6 +2,7 @@
 
 pub mod disasm;
 pub mod error;
+pub mod loader;
 
 use std::path::Path;
 
