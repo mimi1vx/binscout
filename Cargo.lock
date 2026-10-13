@@ -683,6 +683,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "yaxpeax-arch",
  "yaxpeax-arm",
 ]
 

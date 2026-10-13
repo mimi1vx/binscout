@@ -9,6 +9,9 @@ pub enum Error {
     /// Valid file but unsupported format/arch for this version.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Bytes that do not decode to a valid instruction.
+    #[error("invalid opcode: {0}")]
+    Invalid(String),
     /// Analysis limits hit (cap on insns, JSON bytes, pagination).
     #[error("limit exceeded: {0}")]
     Limit(String),
