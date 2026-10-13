@@ -7,10 +7,14 @@
 //!
 //! [`save`] rewrites every table in one transaction; [`load`] rebuilds the
 //! [`Analysis`] via [`Analysis::from_parts`](crate::analysis::Analysis::from_parts)
-//! and returns stored annotations untouched. Callers detect a changed binary
-//! by comparing [`content_hash`] against [`BinaryMeta::content_hash`]:
-//! re-analysis runs, annotations carry over by address, and only an explicit
-//! [`save`] writes — the analyzed binary itself is only ever read.
+//! and returns stored annotations untouched. [`load_cached`] filters by
+//! content hash in one read transaction: matching snapshots load fully,
+//! stale ones return metadata plus annotations without decoding the
+//! discarded derived rows (see its stale-cache policy). Callers detect a
+//! changed binary by comparing [`content_hash`] against
+//! [`BinaryMeta::content_hash`]: re-analysis runs, annotations carry over by
+//! address, and only an explicit [`save`] writes — the analyzed binary
+//! itself is only ever read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -317,10 +321,31 @@ pub struct Loaded {
 
 /// Open (creating if needed) the project DB at `path`.
 ///
+/// Scope this to writers ([`save`], [`save_annotation`], [`compact_db`]):
+/// read paths take [`open_db_read_only`] so a large sidecar costs no
+/// write-side open work and reads never create the file.
+///
 /// # Errors
 /// [`Error::Storage`] when the file cannot be created or opened.
 pub fn open_db(path: &Path) -> Result<Database> {
     Database::create(path).map_err(|e| Error::Storage(format!("open db: {e}")))
+}
+
+/// Open the project DB at `path` for reads only.
+///
+/// Unlike [`open_db`] this never creates the file, never takes the write
+/// lock, and skips write-side open work that scales with the file (debug
+/// builds of `redb` walk every page on writable open, which made opening a
+/// small binary against a large stale sidecar cost seconds and hundreds of
+/// megabytes). All [`Project`](crate::Project) read opens use this; writers
+/// open separately via [`open_db`].
+///
+/// # Errors
+/// [`Error::Storage`] when the file does not exist or cannot be opened.
+pub fn open_db_read_only(path: &Path) -> Result<redb::ReadOnlyDatabase> {
+    redb::Database::builder()
+        .open_read_only(path)
+        .map_err(|e| Error::Storage(format!("open db: {e}")))
 }
 
 fn block_key(func_entry: u64, start: u64) -> String {
@@ -578,17 +603,13 @@ pub fn save(
     Ok(())
 }
 
-/// Load a snapshot written by [`save`].
+/// Read the `meta` version marker plus the `binaries` row 0.
 ///
-/// Returns `Ok(None)` when the DB has no snapshot yet (fresh file or no
-/// `meta` table). Rebuilds CFGs and the callgraph from stored edges.
-///
-/// # Errors
-/// [`Error::Storage`] on corrupt rows or unknown arch/format values.
-pub fn load(db: &Database) -> Result<Option<Loaded>> {
-    let rtxn = db
-        .begin_read()
-        .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
+/// Returns `Ok(None)` when the DB holds no snapshot yet (fresh file,
+/// missing `meta` table, or no version row). A present `meta` table without
+/// a `binaries` row, or an undecodable `binaries` row, is corruption and
+/// errors: without metadata no hash comparison is possible.
+fn read_meta_row(rtxn: &redb::ReadTransaction) -> Result<Option<BinaryMeta>> {
     let meta_table = match rtxn.open_table(META) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -602,25 +623,31 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
     }
     drop(meta_table);
 
-    let meta: BinaryMeta = {
-        let t = rtxn
-            .open_table(BINARIES)
-            .map_err(|e| Error::Storage(format!("open binaries: {e}")))?;
-        let row = t
-            .get(0u64)
-            .map_err(|e| Error::Storage(format!("read binaries: {e}")))?
-            .ok_or_else(|| Error::Storage("project db has meta but no binary row".to_string()))?;
-        decode(&row.value())?
-    };
-    if meta.version != SCHEMA_VERSION {
-        return Err(Error::Storage(format!(
-            "project db version {} != {}",
-            meta.version, SCHEMA_VERSION
-        )));
-    }
-    let arch = parse_arch(&meta.arch)?;
-    parse_format(&meta.format)?;
+    let t = rtxn
+        .open_table(BINARIES)
+        .map_err(|e| Error::Storage(format!("open binaries: {e}")))?;
+    let row = t
+        .get(0u64)
+        .map_err(|e| Error::Storage(format!("read binaries: {e}")))?
+        .ok_or_else(|| Error::Storage("project db has meta but no binary row".to_string()))?;
+    Ok(Some(decode(&row.value())?))
+}
 
+/// Decoded derived rows (`functions`/CFG edges, xrefs, strings) shared by
+/// [`load`] and the hit path of [`load_cached`].
+struct AnalysisParts {
+    functions: BTreeMap<u64, crate::analysis::Function>,
+    call_edges: Vec<(u64, u64)>,
+    xrefs: Vec<Xref>,
+    strings: Vec<StringHit>,
+}
+
+/// Decode the derived `functions`/`blocks`/`xrefs`/`strings` tables.
+///
+/// A missing table or an undecodable row is corruption and errors; callers
+/// holding a known-stale snapshot must not call this at all (see the
+/// stale-cache policy on [`load_cached`]).
+fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
     let mut records: Vec<FunctionRecord> = Vec::new();
     {
         let t = rtxn
@@ -698,23 +725,185 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
             strings.push(decode(&v.value())?);
         }
     }
+    Ok(AnalysisParts {
+        functions,
+        call_edges,
+        xrefs,
+        strings,
+    })
+}
+
+/// Decode every stored annotation, skipping empty rows.
+///
+/// A missing table or an undecodable row is corruption and errors.
+fn read_annotations(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
+    let t = rtxn
+        .open_table(ANNOTATIONS)
+        .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
     let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
     {
-        let t = rtxn
-            .open_table(ANNOTATIONS)
-            .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
-        for row in t
-            .iter()
-            .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
-        {
-            let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
-            let ann: Annotation = decode(&v.value())?;
-            if !ann.is_empty() {
-                annotations.insert(k.value(), ann);
-            }
+        let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
+        let ann: Annotation = decode(&v.value())?;
+        if !ann.is_empty() {
+            annotations.insert(k.value(), ann);
         }
     }
-    let analysis = Analysis::from_parts(arch, functions, &call_edges, xrefs, strings);
+    Ok(annotations)
+}
+
+/// Decode stored annotations, reading a missing table as empty.
+///
+/// Stale snapshots carry annotations forward even when the sidecar has no
+/// annotations table (hand-built or partially written DBs); a corrupt
+/// annotation row still errors, since silently dropping user renames and
+/// comments would lose data the re-analysis keeps.
+fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
+    let t = match rtxn.open_table(ANNOTATIONS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+        Err(e) => return Err(Error::Storage(format!("open annotations: {e}"))),
+    };
+    let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
+    {
+        let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
+        let ann: Annotation = decode(&v.value())?;
+        if !ann.is_empty() {
+            annotations.insert(k.value(), ann);
+        }
+    }
+    Ok(annotations)
+}
+
+/// Hash-filtered snapshot read back by [`load_cached`].
+///
+/// The stale variant carries only what a content-hash mismatch preserves:
+/// metadata plus annotations. Derived rows are never decoded on that path
+/// (see the stale-cache policy on [`load_cached`]).
+#[derive(Debug)]
+pub enum Snapshot {
+    /// Stored hash matches: full cached analysis plus annotations.
+    Hit(Box<Loaded>),
+    /// Stored hash differs: metadata plus annotations only; the derived
+    /// `functions`/`blocks`/`xrefs`/`strings` tables were never opened.
+    Stale {
+        /// Snapshot metadata (row 0 of `binaries`).
+        meta: BinaryMeta,
+        /// Annotations keyed by address.
+        annotations: BTreeMap<u64, Annotation>,
+    },
+    /// No snapshot yet (fresh file, missing `meta` table, or no version row).
+    Miss,
+}
+
+/// Load the snapshot for one binary hash in a single read transaction.
+///
+/// Accepts any readable handle ([`Database`] or [`redb::ReadOnlyDatabase`]);
+/// read opens pass a read-only handle from [`open_db_read_only`].
+///
+/// Reads and validates the `meta`/`binaries` rows first. When the stored
+/// `content_hash` differs from `expected_hash`, returns [`Snapshot::Stale`]
+/// with the stored annotations after decoding only the `annotations` table;
+/// the derived tables are never opened, so opening a small binary against a
+/// sidecar written for a large one costs no decoding proportional to the
+/// discarded rows. On a hash match the full snapshot loads exactly as
+/// [`load`] does. Metadata and rows come from one read transaction, so a
+/// concurrent writer cannot interleave a metadata row from one snapshot with
+/// rows from another.
+///
+/// Stale-cache policy (a deliberate behavior change; strict all-input
+/// equivalence with [`load`] is not claimed): a stale snapshot's derived
+/// rows are discarded unchecked, so corrupt derived rows (bad JSON, unknown
+/// shapes) and missing derived tables no longer error — [`load`] would have
+/// errored on them before the caller ever compared hashes. Schema `version`,
+/// `arch`, and `format` are likewise unchecked on the stale path since they
+/// only gate analysis decoding. What is still validated on the stale path:
+/// the `meta` version marker, the `binaries` row (missing/undecodable rows
+/// error, as without metadata no hash comparison is possible), and every
+/// annotation row (a corrupt annotation errors because annotations carry
+/// over into the re-analysis; a missing annotations table reads as empty).
+/// A matching hash keeps the exact [`load`] validation: version mismatch,
+/// unknown arch/format, and any corrupt or missing table error.
+///
+/// # Errors
+/// [`Error::Storage`] on unreadable metadata, on corrupt annotations, and —
+/// for matching hashes only — on corrupt derived rows, missing tables, or
+/// unknown version/arch/format values.
+pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Snapshot> {
+    let rtxn = db
+        .begin_read()
+        .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
+    let meta = match read_meta_row(&rtxn)? {
+        None => return Ok(Snapshot::Miss),
+        Some(meta) => meta,
+    };
+    if meta.content_hash != expected_hash {
+        let annotations = read_annotations_or_empty(&rtxn)?;
+        return Ok(Snapshot::Stale { meta, annotations });
+    }
+    if meta.version != SCHEMA_VERSION {
+        return Err(Error::Storage(format!(
+            "project db version {} != {}",
+            meta.version, SCHEMA_VERSION
+        )));
+    }
+    let arch = parse_arch(&meta.arch)?;
+    parse_format(&meta.format)?;
+    let parts = read_analysis_parts(&rtxn)?;
+    let annotations = read_annotations(&rtxn)?;
+    let analysis = Analysis::from_parts(
+        arch,
+        parts.functions,
+        &parts.call_edges,
+        parts.xrefs,
+        parts.strings,
+    );
+    Ok(Snapshot::Hit(Box::new(Loaded {
+        meta,
+        analysis,
+        annotations,
+    })))
+}
+
+/// Load a snapshot written by [`save`].
+///
+/// Returns `Ok(None)` when the DB has no snapshot yet (fresh file or no
+/// `meta` table). Rebuilds CFGs and the callgraph from stored edges.
+/// Prefer [`load_cached`] on open paths: it skips decoding derived rows the
+/// caller would discard after a content-hash mismatch.
+///
+/// # Errors
+/// [`Error::Storage`] on corrupt rows or unknown arch/format values.
+pub fn load(db: &Database) -> Result<Option<Loaded>> {
+    let rtxn = db
+        .begin_read()
+        .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
+    let meta = match read_meta_row(&rtxn)? {
+        None => return Ok(None),
+        Some(meta) => meta,
+    };
+    if meta.version != SCHEMA_VERSION {
+        return Err(Error::Storage(format!(
+            "project db version {} != {}",
+            meta.version, SCHEMA_VERSION
+        )));
+    }
+    let arch = parse_arch(&meta.arch)?;
+    parse_format(&meta.format)?;
+    let parts = read_analysis_parts(&rtxn)?;
+    let annotations = read_annotations(&rtxn)?;
+    let analysis = Analysis::from_parts(
+        arch,
+        parts.functions,
+        &parts.call_edges,
+        parts.xrefs,
+        parts.strings,
+    );
     Ok(Some(Loaded {
         meta,
         analysis,

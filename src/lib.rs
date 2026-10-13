@@ -82,7 +82,10 @@ impl Project {
     /// explicit bases/arches go through [`Project::open_raw`]. Reads the
     /// sidecar when present: a matching content hash loads the cached
     /// snapshot, a mismatch re-analyzes while keeping stored annotations.
-    /// Never writes; call [`Project::save`].
+    /// A stale sidecar's derived rows are never decoded (only its metadata
+    /// and annotations are read), so a large obsolete snapshot costs no
+    /// decoding proportional to its discarded rows. Never writes; call
+    /// [`Project::save`].
     ///
     /// # Errors
     /// [`Error::NotFound`] if the path does not exist, [`Error::Unsupported`]
@@ -124,15 +127,24 @@ impl Project {
         let hash = db::content_hash(&bytes);
         let size = bytes.len() as u64;
 
-        let stored = if db_path.exists() {
-            let db = db::open_db(db_path)?;
-            db::load(&db)?
+        // Metadata-first snapshot read over a read-only handle: a stale
+        // sidecar yields its annotations without decoding the discarded
+        // derived rows (see the stale-cache policy on `db::load_cached`),
+        // and the read-only open itself costs nothing proportional to the
+        // file. Reads never save and never create the sidecar.
+        let cached = if db_path.exists() {
+            match db::open_db_read_only(db_path) {
+                Ok(db) => Some(db::load_cached(&db, hash)?),
+                // Raced with a concurrent sidecar deletion: read as absent.
+                Err(_) if !db_path.exists() => None,
+                Err(e) => return Err(e),
+            }
         } else {
             None
         };
 
-        match stored {
-            Some(hit) if hit.meta.content_hash == hash => Ok(Self {
+        match cached {
+            Some(db::Snapshot::Hit(hit)) => Ok(Self {
                 path: binary.to_path_buf(),
                 db_path: db_path.to_path_buf(),
                 content_hash: hash,
@@ -141,24 +153,42 @@ impl Project {
                 analysis: hit.analysis,
                 annotations: hit.annotations,
             }),
-            stored => {
-                let annotations = stored.map(|s| s.annotations).unwrap_or_default();
-                let loaded = match raw {
-                    Some(opts) => load_raw(&bytes, opts)?,
-                    None => load_or_raw(&bytes)?,
-                };
-                let analysis = analyze(&loaded)?;
-                Ok(Self {
-                    path: binary.to_path_buf(),
-                    db_path: db_path.to_path_buf(),
-                    content_hash: hash,
-                    size,
-                    binary: loaded,
-                    analysis,
-                    annotations,
-                })
+            Some(db::Snapshot::Stale { annotations, .. }) => {
+                Self::reanalyze(binary, db_path, bytes, raw, hash, size, annotations)
+            }
+            Some(db::Snapshot::Miss) | None => {
+                Self::reanalyze(binary, db_path, bytes, raw, hash, size, BTreeMap::new())
             }
         }
+    }
+
+    /// Re-analyze `bytes` from scratch, carrying `annotations` forward.
+    ///
+    /// Stale sidecars keep user renames and comments by address; the derived
+    /// analysis always comes from the current bytes, never from storage.
+    fn reanalyze(
+        binary: &Path,
+        db_path: &Path,
+        bytes: Vec<u8>,
+        raw: Option<RawOptions>,
+        hash: u64,
+        size: u64,
+        annotations: BTreeMap<u64, Annotation>,
+    ) -> Result<Self> {
+        let loaded = match raw {
+            Some(opts) => load_raw(&bytes, opts)?,
+            None => load_or_raw(&bytes)?,
+        };
+        let analysis = analyze(&loaded)?;
+        Ok(Self {
+            path: binary.to_path_buf(),
+            db_path: db_path.to_path_buf(),
+            content_hash: hash,
+            size,
+            binary: loaded,
+            analysis,
+            annotations,
+        })
     }
 
     /// Persist the analysis snapshot and annotations to the sidecar DB.
