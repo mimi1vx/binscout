@@ -414,9 +414,10 @@ impl Analysis {
     /// Function rows ordered by entry, paged.
     #[must_use]
     pub fn functions_page(&self, offset: usize, limit: usize) -> Vec<FunctionSummary> {
-        let rows: Vec<FunctionSummary> = self
-            .functions
+        self.functions
             .values()
+            .skip(offset)
+            .take(truncate_limit(limit))
             .map(|f| FunctionSummary {
                 id: f.id(),
                 entry: f.entry,
@@ -425,8 +426,7 @@ impl Analysis {
                 insns: f.insn_count(),
                 calls: self.calls_of(f.entry),
             })
-            .collect();
-        page_slice(&rows, offset, limit)
+            .collect()
     }
 
     /// Block rows for one function ordered by start, paged.
@@ -438,18 +438,20 @@ impl Analysis {
         limit: usize,
     ) -> Option<Vec<BlockSummary>> {
         let f = self.functions.get(&func_entry)?;
-        let rows: Vec<BlockSummary> = f
-            .blocks
-            .values()
-            .map(|b| BlockSummary {
-                id: b.id(func_entry),
-                start: b.start,
-                end: b.end(),
-                insns: b.insns.len(),
-                succs: f.successors(b.start),
-            })
-            .collect();
-        Some(page_slice(&rows, offset, limit))
+        Some(
+            f.blocks
+                .values()
+                .skip(offset)
+                .take(truncate_limit(limit))
+                .map(|b| BlockSummary {
+                    id: b.id(func_entry),
+                    start: b.start,
+                    end: b.end(),
+                    insns: b.insns.len(),
+                    succs: f.successors(b.start),
+                })
+                .collect(),
+        )
     }
 
     /// Instructions of one block in address order, paged.
@@ -468,11 +470,18 @@ impl Analysis {
     /// Xrefs of one kind (or all when `kind` is `None`), paged.
     #[must_use]
     pub fn xrefs_page(&self, kind: Option<XrefKind>, offset: usize, limit: usize) -> Vec<Xref> {
-        let rows: Vec<Xref> = match kind {
-            Some(k) => self.xrefs.iter().copied().filter(|x| x.kind == k).collect(),
-            None => self.xrefs.clone(),
-        };
-        page_slice(&rows, offset, limit)
+        let cap = truncate_limit(limit);
+        match kind {
+            Some(k) => self
+                .xrefs
+                .iter()
+                .copied()
+                .filter(|x| x.kind == k)
+                .skip(offset)
+                .take(cap)
+                .collect(),
+            None => self.xrefs.iter().copied().skip(offset).take(cap).collect(),
+        }
     }
 
     /// Xrefs pointing at `addr`.
@@ -525,7 +534,10 @@ impl Analysis {
         // a malformed/overlong pattern errors only when a row survives the
         // earlier filters, and costs zero compilations otherwise.
         let mut matcher: Option<strings::PatternMatcher<'_>> = None;
-        let mut rows: Vec<StringHit> = Vec::new();
+        let cap = truncate_limit(filter.limit);
+        let start = filter.start;
+        let mut out: Vec<StringHit> = Vec::new();
+        let mut matched: usize = 0;
         for h in &self.strings {
             if h.executable && !show_code {
                 continue;
@@ -552,9 +564,23 @@ impl Analysis {
                     continue;
                 }
             }
-            rows.push(h.clone());
+            // Storage-order match at dense index `matched`; clone only the
+            // selected page. Comparisons stay split (`matched >= start` plus
+            // `out.len() < cap`) so `start + cap` can never overflow.
+            if matched >= start && out.len() < cap {
+                out.push(h.clone());
+            }
+            matched += 1;
+            // No future row can fail once the matcher outcome is settled, so
+            // a filled page ends the scan. With an uncompiled pattern the
+            // outcome is unset (no eligible row seen yet), and the scan must
+            // continue: this keeps zero-limit/beyond-end error semantics
+            // identical to the old collect-all pass.
+            if out.len() >= cap && (filter.pattern.is_none() || matcher.is_some()) {
+                break;
+            }
         }
-        Ok(page_slice(&rows, filter.start, filter.limit))
+        Ok(out)
     }
 }
 
