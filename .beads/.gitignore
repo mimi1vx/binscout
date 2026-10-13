@@ -12,6 +12,10 @@
 *.vacuum-wal-cert*
 # fsqlite 0.3.6+ engine-upgrade bookkeeping written beside the database
 *.fsqlite-migration-state
+# WAL-index quarantine dirs (`br.wal_index.quarantine.v1`). These hold a byte
+# copy of the -shm under a non-`-shm` name, so the *.db-shm rule above misses
+# them and `git add .beads/` would stage the WAL index. Written by `br close`.
+.br-wal-index-*/
 
 # Lock files
 .write.lock
