@@ -9,6 +9,7 @@ homepage = "https://mimi1vx.github.io/binscout/"
 repository = "https://github.com/mimi1vx/binscout"
 readme = "README.md"
 keywords = ["binary-analysis", "disassembly", "mcp", "reverse-engineering"]
+exclude = [".beads/"]
 
 [dependencies]
 anyhow = "1"
