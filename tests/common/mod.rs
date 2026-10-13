@@ -1,4 +1,5 @@
-//! Shared M6 e2e helpers: temp dirs, synthetic ELF fixture, binary paths.
+//! Shared M6 e2e helpers: temp dirs, synthetic ELF fixture, binary paths,
+//! plus F0 synthetic PE32/LE/garbage fixtures and ground-truth helpers.
 //!
 //! Each integration test target compiles this module separately and uses a
 //! different subset, so unused helpers are expected.
@@ -6,6 +7,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// F0 synthetic fixture builders (PE32/LE/garbage).
+#[path = "../fixtures/builders.rs"]
+pub mod builders;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -85,4 +90,44 @@ pub fn write_bin(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 /// Temp DB path that cannot collide with a fixture sidecar.
 pub fn temp_db(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.redb"))
+}
+
+/// Build fixture `name` from scratch (deterministic, hermetic, no I/O).
+pub fn fixture_bytes(name: &str) -> Vec<u8> {
+    builders::build(name)
+}
+
+/// Write fixture `name` to `dir/name`; returns the binary path.
+pub fn write_fixture(dir: &Path, name: &str) -> PathBuf {
+    let bin = dir.join(name);
+    std::fs::write(&bin, fixture_bytes(name)).expect("write fixture binary");
+    bin
+}
+
+/// Write fixture `name` to a fresh file under `dir` and open it with a temp
+/// DB; panics when the fixture does not open (raw blobs fall back to raw
+/// x86-64 at base 0 via [`binscout::Project::open`]).
+pub fn open_test_project(dir: &Path, name: &str) -> binscout::Project {
+    let bin = write_fixture(dir, name);
+    let db = temp_db(dir, name);
+    binscout::Project::open_with_db(&bin, &db).expect("fixture must open")
+}
+
+/// Ground-truth scan for X2/A4: virtual addresses in `code` (loaded at
+/// `code_base`) holding a 4-byte little-endian occurrence of `target`.
+/// Counts absolute `imm32` data refs like the two `push`es of
+/// [`builders::BASIC_STRING_VA`] in the basic fixture's `.text`.
+#[must_use]
+pub fn le32_refs(code: &[u8], code_base: u64, target: u64) -> Vec<u64> {
+    let Ok(t) = u32::try_from(target) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, w) in code.windows(4).enumerate() {
+        let w: [u8; 4] = w.try_into().expect("window is 4 bytes");
+        if u32::from_le_bytes(w) == t {
+            out.push(code_base.wrapping_add(i as u64));
+        }
+    }
+    out
 }
