@@ -47,9 +47,26 @@
 //!   `svc`, `hvc`, `smc`. `RETURN`: `ret`, `eret`. `NOP`: `nop`, `hint`,
 //!   `dmb`, `dsb`, `isb`, `brk`.
 //!
+//! `lift_arm32` covers ARMv7/ARM32 and Thumb mnemonics as printed by the
+//! disassembler (one `.w`/`.n` width suffix, one condition suffix, and one
+//! flag `s` stripped first):
+//!
+//! - `COPY`: `mov`, `movw`, `movt`, `mvn`, `adr`. `LOAD`: `ldr`, `ldrb`,
+//!   `ldrh`, `ldrsb`, `ldrsh`, `ldrd`, `ldm`, `pop` (`pop`/`ldm` naming `pc`
+//!   lifts to `RETURN`, or `CBRANCH` when conditioned). `STORE`: `str`,
+//!   `strb`, `strh`, `strd`, `stm`, `push`.
+//! - `ADD`: `add`, `adc`. `SUB`: `sub`, `sbc`, `rsb`, `rsc`. `MUL`: `mul`,
+//!   `mla`. `DIV`: `sdiv`, `udiv`. `AND`: `and`, `bic`. `OR`: `orr`, `orn`.
+//!   `XOR`: `eor`. `SHL`: `lsl`. `SHR`: `lsr`, `asr`, `ror`, `rrx`.
+//! - `CMP`: `cmp`, `cmn`, `tst`, `teq`. `BRANCH`: plain `b`/`bx` (indirect
+//!   keeps operands), `tbb`/`tbh`. `CBRANCH`: conditioned `b`/`bx`,
+//!   `cbz`/`cbnz`. `CALL`: direct `bl`/`blx` (indirect keeps operands) plus
+//!   `svc`, `hvc`, `smc`. `RETURN`: `pop`/`ldm` with `pc`, plain `bx lr`.
+//!   `NOP`: `nop`, `dmb`, `dsb`, `isb`.
+//!
 //! # Warning semantics
 //!
-//! Lifting never fails: a mnemonic outside both tables (e.g. x86 `cpuid`,
+//! Lifting never fails: a mnemonic outside all tables (e.g. x86 `cpuid`,
 //! ARM `mrs`) lifts to [`IrOp::Nop`] with `warning` set to
 //! `"unlifted '<mnem>'; emitted NOP"`. `warning` is `None` for every mapped
 //! mnemonic, so `warning.is_some()` exactly marks approximate coverage.
