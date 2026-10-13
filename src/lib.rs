@@ -1,5 +1,6 @@
 //! binscout core: headless agent-first binary analysis (M0 scaffold).
 
+pub mod analysis;
 pub mod disasm;
 pub mod error;
 pub mod ir;

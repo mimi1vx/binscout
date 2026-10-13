@@ -6,13 +6,15 @@
 //! Overlapping hits from different encodings may occur at the same offset
 //! (e.g. an LE run contains a shifted BE run); all are reported.
 
+use serde::{Deserialize, Serialize};
+
 /// Default minimum run length in characters.
 pub const DEFAULT_MIN_LEN: usize = 4;
 /// Default cap on hits per scan.
 pub const DEFAULT_MAX_HITS: usize = 10_000;
 
 /// Encoding of an extracted string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Encoding {
     Ascii,
     Utf16Le,
@@ -20,7 +22,7 @@ pub enum Encoding {
 }
 
 /// One extracted string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StringHit {
     /// Byte offset within the scanned buffer.
     pub offset: usize,

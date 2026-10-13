@@ -6,6 +6,7 @@
 //! ([`Error::Limit`]).
 
 use iced_x86::{Decoder, DecoderOptions, Formatter as _, IntelFormatter, OpKind};
+use serde::{Deserialize, Serialize};
 use yaxpeax_arch::Decoder as ArmDecoder;
 use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode, Operand};
 
@@ -35,7 +36,7 @@ impl Arch {
 }
 
 /// One decoded instruction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Insn {
     /// Virtual address of the first byte.
     pub addr: u64,
@@ -49,6 +50,11 @@ pub struct Insn {
     pub ops: Vec<String>,
     /// Absolute target for direct branches/calls, if any.
     pub branch_target: Option<u64>,
+    /// Absolute address of PC-relative data access, if any (x86
+    /// RIP-relative memory operands; AArch64 `adr`/`adrp`/literal loads).
+    /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
+    /// reports its pointer slot here and `None` for `branch_target`.
+    pub mem_target: Option<u64>,
 }
 
 /// Byte-range disassembler over already-loaded bytes.
@@ -231,6 +237,9 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
             }
             _ => None,
         };
+        let mem_target = insn
+            .is_ip_rel_memory_operand()
+            .then(|| insn.ip_rel_memory_address());
         out.push(Insn {
             addr,
             size: size as u8,
@@ -238,6 +247,7 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
             mnem,
             ops,
             branch_target,
+            mem_target,
         });
     }
     Ok(out)
@@ -263,11 +273,38 @@ fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> 
             mnem,
             ops,
             branch_target: arm_branch_target(&inst, addr),
+            mem_target: arm_data_target(&inst, addr),
         });
         addr = addr.wrapping_add(4);
         off += 4;
     }
     Ok(out)
+}
+
+/// Absolute target of PC-relative data access (`adr`/`adrp`/literal loads),
+/// else `None`. Branch opcodes are excluded (see [`arm_branch_target`).
+/// `adrp` carries a page offset, so the PC is page-masked first.
+fn arm_data_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> Option<u64> {
+    if matches!(
+        inst.opcode,
+        Opcode::B
+            | Opcode::BL
+            | Opcode::Bcc(_)
+            | Opcode::BCcc(_)
+            | Opcode::CBZ
+            | Opcode::CBNZ
+            | Opcode::TBZ
+            | Opcode::TBNZ
+    ) {
+        return None;
+    }
+    inst.operands.iter().find_map(|op| match op {
+        Operand::PCOffset(off) if inst.opcode == Opcode::ADRP => {
+            Some((addr & !0xfff).wrapping_add_signed(*off))
+        }
+        Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
+        _ => None,
+    })
 }
 
 /// Absolute target for direct PC-relative branches, else `None`.
