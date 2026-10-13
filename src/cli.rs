@@ -73,13 +73,32 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Extracted strings, paged.
+    /// Extracted strings, filtered and paged. Hits in executable memory
+    /// (code bytes decoded as text) are hidden unless `--pattern`,
+    /// `--section`, or `--include-code` is given.
     Strings {
         binary: PathBuf,
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
+        /// Rows to skip after filtering.
+        #[arg(long)]
+        start: Option<usize>,
+        /// Deprecated alias of `--start` (warns on stderr).
+        #[arg(long, hide = true)]
+        offset: Option<usize>,
+        /// Max rows (capped at 1024).
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Case-sensitive substring, or `regex:`-prefixed expression.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Keep strings with at least this many characters.
+        #[arg(long)]
+        min_len: Option<usize>,
+        /// Keep strings in exactly this section (e.g. `.rdata`).
+        #[arg(long)]
+        section: Option<String>,
+        /// Show strings in executable memory (hidden by default).
+        #[arg(long)]
+        include_code: bool,
     },
     /// Imports and exports.
     Symbols { binary: PathBuf },
@@ -138,9 +157,30 @@ impl Cli {
             ),
             Cmd::Strings {
                 binary,
+                start,
                 offset,
                 limit,
-            } => strings(&binary, db, offset, limit),
+                pattern,
+                min_len,
+                section,
+                include_code,
+            } => {
+                if offset.is_some() {
+                    eprintln!("warning: --offset is deprecated, use --start");
+                }
+                strings(
+                    &binary,
+                    db,
+                    &binscout::analysis::StringsFilter {
+                        pattern,
+                        min_len,
+                        section,
+                        include_code,
+                        start: start.or(offset).unwrap_or(0),
+                        limit,
+                    },
+                )
+            }
             Cmd::Symbols { binary } => symbols(&binary, db),
             Cmd::Ir { binary, addr, len } => ir(&binary, db, &addr, len),
             Cmd::Annotate {
@@ -264,11 +304,10 @@ fn xrefs(
 fn strings(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
-    offset: usize,
-    limit: usize,
+    filter: &binscout::analysis::StringsFilter,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db)?;
-    let rows = p.analysis().strings_page(offset, limit.min(1024));
+    let rows = p.query_strings(filter)?;
     Ok(serde_json::to_value(rows).expect("strings serialize"))
 }
 

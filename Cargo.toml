@@ -19,6 +19,7 @@ memmap2 = "0.9"
 object = "0.40"
 petgraph = "0.8"
 redb = "4.3"
+regex = "1"
 rmcp = { version = "3.5", features = ["transport-io"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

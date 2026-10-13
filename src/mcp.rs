@@ -51,17 +51,27 @@ pub struct BinaryParams {
     pub db: Option<String>,
 }
 
-/// Parameters for paged list tools (`functions`, `strings`).
+/// Parameters for the `strings` tool: filtered, paged string search.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct PageParams {
+pub struct StringsParams {
     /// Path to the analyzed binary.
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
-    /// First row to return.
+    /// Rows to skip after filtering.
+    pub start: Option<usize>,
+    /// Deprecated alias of `start`.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+    /// Case-sensitive substring, or `regex:`-prefixed expression.
+    pub pattern: Option<String>,
+    /// Keep strings with at least this many characters.
+    pub min_len: Option<usize>,
+    /// Keep strings in exactly this section (e.g. `.rdata`).
+    pub section: Option<String>,
+    /// Show strings in executable memory (hidden by default).
+    pub include_code: Option<bool>,
 }
 
 /// Parameters for the `functions` tool: paged list with optional filters.
@@ -296,15 +306,28 @@ impl BinscoutMcp {
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, paged by offset/limit"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given"
     )]
-    fn strings(&self, p: Parameters<PageParams>) -> Result<String, ErrorData> {
+    fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
+        if p.offset.is_some() {
+            eprintln!("warning: strings offset is deprecated, use start");
+        }
         let proj = open(&p.binary, p.db.as_deref())?;
         let rows = proj
-            .analysis()
-            .strings_page(p.offset.unwrap_or(0), p.limit.unwrap_or(50).min(1024));
+            .query_strings(&crate::analysis::StringsFilter {
+                pattern: p.pattern,
+                min_len: p.min_len,
+                section: p.section,
+                include_code: p.include_code.unwrap_or(false),
+                start: p.start.or(p.offset).unwrap_or(0),
+                limit: p.limit.unwrap_or(50),
+            })
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
         ok(serde_json::to_value(rows).expect("strings serialize"))
     }
 

@@ -28,7 +28,7 @@ use crate::disasm::{Arch, Disassembler, Insn};
 use crate::error::{Error, Result};
 use crate::ir::IrOp;
 use crate::loader::strings::{self, Encoding, StringHit};
-use crate::loader::{LoadedBinary, RawOptions, Segment, load_raw};
+use crate::loader::{LoadedBinary, RawOptions, Section, Segment, load_raw};
 
 /// Cap on decoded instructions per [`analyze`] call.
 pub const MAX_TOTAL_INSNS: usize = 1_000_000;
@@ -290,6 +290,43 @@ fn truncate_limit(limit: usize) -> usize {
     limit.min(MAX_PAGE)
 }
 
+/// Filters for [`Analysis::strings_page_filtered`]: every present field must
+/// match. Paging (`start`/`limit`) applies after filtering.
+#[derive(Debug, Clone)]
+pub struct StringsFilter {
+    /// Case-sensitive substring, or `regex:`-prefixed expression; `None`
+    /// disables. An explicit pattern also shows executable-memory hits.
+    pub pattern: Option<String>,
+    /// Keep strings with at least this many characters; `None` disables.
+    /// Filters stored hits (extracted at length 4), so smaller values show
+    /// everything stored.
+    pub min_len: Option<usize>,
+    /// Keep strings in exactly this section; `None` hides executable-memory
+    /// hits instead of narrowing. Naming an executable section (e.g.
+    /// `.text`) shows its strings.
+    pub section: Option<String>,
+    /// Show strings in executable memory (hidden by default).
+    pub include_code: bool,
+    /// Rows to skip after filtering (`start` replaces the old `offset`
+    /// paging name, which collided with the per-row file offset).
+    pub start: usize,
+    /// Max rows (capped at [`MAX_PAGE`]).
+    pub limit: usize,
+}
+
+impl Default for StringsFilter {
+    fn default() -> Self {
+        Self {
+            pattern: None,
+            min_len: None,
+            section: None,
+            include_code: false,
+            start: 0,
+            limit: 50,
+        }
+    }
+}
+
 fn page_slice<T: Clone>(items: &[T], offset: usize, limit: usize) -> Vec<T> {
     items
         .iter()
@@ -397,9 +434,54 @@ impl Analysis {
     }
 
     /// Extracted strings ordered by address, paged.
+    ///
+    /// Shows every hit, including executable-memory noise;
+    /// [`Analysis::strings_page_filtered`] is the default-view query behind
+    /// the CLI/MCP `strings` command.
     #[must_use]
     pub fn strings_page(&self, offset: usize, limit: usize) -> Vec<StringHit> {
         page_slice(&self.strings, offset, limit)
+    }
+
+    /// Extracted strings ordered by address, filtered then paged.
+    ///
+    /// Strings in executable memory (code bytes decoded as text) are hidden
+    /// unless the query opts back in with [`StringsFilter::include_code`]
+    /// or narrows with `section`/`pattern` — an explicit search sees
+    /// everything. `section` is an exact name match, `min_len` counts
+    /// characters, and `pattern` is a case-sensitive substring unless
+    /// `regex:`-prefixed (see [`strings::matches_pattern`]).
+    /// Filtering happens before paging so `start`/`limit` apply to dense
+    /// matching rows.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `pattern` is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn strings_page_filtered(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
+        let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
+        let mut rows: Vec<StringHit> = Vec::new();
+        for h in &self.strings {
+            if h.executable && !show_code {
+                continue;
+            }
+            if let Some(sec) = &filter.section
+                && h.section.as_deref() != Some(sec.as_str())
+            {
+                continue;
+            }
+            if let Some(min) = filter.min_len
+                && h.value.chars().count() < min
+            {
+                continue;
+            }
+            if let Some(pat) = &filter.pattern
+                && !strings::matches_pattern(&h.value, pat)?
+            {
+                continue;
+            }
+            rows.push(h.clone());
+        }
+        Ok(page_slice(&rows, filter.start, filter.limit))
     }
 }
 
@@ -430,6 +512,24 @@ fn classify(arch: Arch, insn: &Insn) -> Flow {
         Some((IrOp::Return, _)) => Flow::Ret,
         _ => Flow::Seq,
     }
+}
+
+/// Resolve a string hit's section name and executability.
+///
+/// The first section containing `vaddr` wins; hits outside every section
+/// (raw blobs, which have no table) inherit their segment's flags, and
+/// unmapped hits fail open as non-executable data.
+fn locate_hit(sections: &[Section], seg: &Segment, vaddr: Option<u64>) -> (Option<String>, bool) {
+    let Some(va) = vaddr else {
+        return (None, false);
+    };
+    if let Some(sec) = sections
+        .iter()
+        .find(|s| va >= s.vaddr && va.wrapping_sub(s.vaddr) < s.size)
+    {
+        return (Some(sec.name.clone()), sec.executable);
+    }
+    (None, seg.executable)
 }
 
 /// Addressable view over loaded segments.
@@ -902,12 +1002,17 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     let mut strings: Vec<StringHit> = Vec::new();
     for seg in &space.all {
-        strings.extend(strings::extract(
+        for mut h in strings::extract(
             &seg.data,
             strings::DEFAULT_MIN_LEN,
             strings::DEFAULT_MAX_HITS,
             Some(seg.vaddr),
-        ));
+        ) {
+            let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
+            h.section = section;
+            h.executable = executable;
+            strings.push(h);
+        }
     }
     strings.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
     let spans: Vec<(u64, u64)> = strings

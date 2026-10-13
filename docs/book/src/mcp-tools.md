@@ -20,7 +20,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges |
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind, paged |
-| `strings` | binary, offset/limit | Extracted strings ordered by address, paged |
+| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given |
 | `symbols` | binary | Imports and exports of the binary |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |

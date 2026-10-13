@@ -301,3 +301,87 @@ fn le_project_info_is_a_tool_error() {
     assert!(msg.contains("LE"), "{resp}");
     cleanup(&dir);
 }
+
+#[test]
+fn strings_filters_pattern_section_and_paging() {
+    // pe32-basic.exe carries the SAVE marker in .rdata; text-garbage.bin is
+    // executable-memory noise, hidden unless the query opts back in.
+    let dir = tmpdir("mcp-strings");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let garbage = write_fixture(&dir, "text-garbage.bin")
+        .display()
+        .to_string();
+    let garbage_db = temp_db(&dir, "garbage").display().to_string();
+    let b = || Value::String(bin.clone());
+    let d = || Value::String(db.clone());
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            10,
+            "strings",
+            json!({"binary": b(), "db": d(), "pattern": "SAVE", "min_len": 6}),
+        ),
+        call(
+            11,
+            "strings",
+            json!({"binary": b(), "db": d(), "section": ".rdata", "limit": 1}),
+        ),
+        call(
+            12,
+            "strings",
+            json!({"binary": b(), "db": d(), "start": 1, "limit": 1}),
+        ),
+        call(
+            13,
+            "strings",
+            json!({"binary": b(), "db": d(), "offset": 1, "limit": 1}),
+        ),
+        call(
+            14,
+            "strings",
+            json!({"binary": Value::String(garbage.clone()), "db": Value::String(garbage_db.clone())}),
+        ),
+        call(
+            15,
+            "strings",
+            json!({"binary": b(), "db": d(), "pattern": "regex:(["}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 7, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+
+    let found: Value = serde_json::from_str(tool_text(by_id[&10])).expect("pattern json");
+    assert_eq!(found.as_array().expect("array").len(), 1);
+    assert_eq!(found[0]["value"], common::builders::BASIC_STRING);
+
+    let sec: Value = serde_json::from_str(tool_text(by_id[&11])).expect("section json");
+    assert_eq!(sec.as_array().expect("array").len(), 1);
+    assert_eq!(sec[0]["section"], ".rdata");
+
+    let via_start: Value = serde_json::from_str(tool_text(by_id[&12])).expect("start json");
+    let via_offset: Value = serde_json::from_str(tool_text(by_id[&13])).expect("offset json");
+    assert_eq!(
+        via_start, via_offset,
+        "deprecated offset must page like start"
+    );
+
+    let noise: Value = serde_json::from_str(tool_text(by_id[&14])).expect("garbage json");
+    assert_eq!(noise.as_array().expect("array").len(), 0);
+
+    // A bad regex is a protocol-level error, not a result.
+    assert!(by_id[&15].get("error").is_some(), "{:?}", by_id[&15]);
+    assert!(by_id[&15].get("result").is_none());
+    cleanup(&dir);
+}

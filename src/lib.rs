@@ -12,10 +12,11 @@ pub mod mcp;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{Analysis, Xref, XrefKind, analyze};
+use crate::analysis::{Analysis, StringsFilter, Xref, XrefKind, analyze};
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn};
 use crate::error::{Error, Result};
+use crate::loader::strings::StringHit;
 use crate::loader::{BinaryFormat, LoadedBinary, RawOptions, load, load_raw};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
@@ -501,6 +502,18 @@ impl Project {
     #[must_use]
     pub fn symbols_json(&self) -> serde_json::Value {
         serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })
+    }
+
+    /// Extracted strings, filtered then paged (the `strings` command query).
+    ///
+    /// See [`Analysis::strings_page_filtered`] for the filter semantics:
+    /// executable-memory hits are hidden unless the filter opts back in.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
+        self.analysis.strings_page_filtered(filter)
     }
 
     /// Current annotation at `addr`.

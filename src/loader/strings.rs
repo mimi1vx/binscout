@@ -8,10 +8,16 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{Error, Result};
+
 /// Default minimum run length in characters.
 pub const DEFAULT_MIN_LEN: usize = 4;
 /// Default cap on hits per scan.
 pub const DEFAULT_MAX_HITS: usize = 10_000;
+/// Cap on `--pattern` length; longer patterns are rejected, never truncated.
+pub const MAX_PATTERN_LEN: usize = 1024;
+/// Prefix opting a `--pattern` into regex matching (`regex:` + expression).
+pub const REGEX_PREFIX: &str = "regex:";
 
 /// Encoding of an extracted string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +42,45 @@ pub struct StringHit {
     pub encoding: Encoding,
     /// Decoded text.
     pub value: String,
+    /// Containing section name (`None` for whole-file scans and raw blobs,
+    /// which have no section table). Old sidecar rows predate this field
+    /// and decode as `None`.
+    #[serde(default)]
+    pub section: Option<String>,
+    /// Whether the hit lies in executable memory, resolved at extraction
+    /// from the section (or segment, when there is no section table).
+    /// Old sidecar rows predate this field and decode as `false` (shown).
+    #[serde(default)]
+    pub executable: bool,
+}
+
+/// Test `value` against a `strings` query pattern.
+///
+/// A `regex:`-prefixed pattern compiles the rest as a [`regex`] expression
+/// (unanchored, case-sensitive unless `(?i)` is given); anything else is a
+/// case-sensitive substring. An empty pattern matches everything. The
+/// `regex` crate runs in linear time, so opt-in regexes cannot backtrack
+/// into a ReDoS.
+///
+/// # Errors
+/// [`Error::Invalid`] when the pattern exceeds [`MAX_PATTERN_LEN`] or a
+/// `regex:` expression fails to compile. A bad regex is an error, never a
+/// silent fallback to substring matching.
+pub fn matches_pattern(value: &str, pattern: &str) -> Result<bool> {
+    if pattern.len() > MAX_PATTERN_LEN {
+        return Err(Error::Invalid(format!(
+            "pattern exceeds {MAX_PATTERN_LEN} bytes"
+        )));
+    }
+    if pattern.is_empty() {
+        return Ok(true);
+    }
+    match pattern.strip_prefix(REGEX_PREFIX) {
+        Some(expr) => regex::Regex::new(expr)
+            .map(|re| re.is_match(value))
+            .map_err(|e| Error::Invalid(format!("bad regex pattern {pattern:?}: {e}"))),
+        None => Ok(value.contains(pattern)),
+    }
 }
 
 /// Scan `bytes` for strings, sorted by offset, capped at `max_hits`.
@@ -101,6 +146,8 @@ fn scan_ascii(bytes: &[u8], min: usize, out: &mut Vec<StringHit>, base_va: Optio
                     vaddr: va(base_va, start),
                     encoding: Encoding::Ascii,
                     value: String::from_utf8_lossy(&bytes[start..i]).into_owned(),
+                    section: None,
+                    executable: false,
                 });
             }
         } else {
@@ -135,6 +182,8 @@ fn scan_utf16(
                         Encoding::Utf16Be
                     },
                     value,
+                    section: None,
+                    executable: false,
                 });
             }
         } else {
@@ -180,12 +229,16 @@ mod tests {
                     vaddr: Some(0x1000),
                     encoding: Encoding::Utf16Le,
                     value: "AB".to_string(),
+                    section: None,
+                    executable: false,
                 },
                 StringHit {
                     offset: 6,
                     vaddr: Some(0x1006),
                     encoding: Encoding::Utf16Be,
                     value: "CD".to_string(),
+                    section: None,
+                    executable: false,
                 },
             ]
         );
@@ -204,5 +257,39 @@ mod tests {
         );
         let capped = extract(&bytes, 4, 3, None);
         assert_eq!(capped.len(), 3);
+    }
+
+    #[test]
+    fn pattern_matches_substring_by_default() {
+        assert!(matches_pattern("SAVE%d.GAM is invalid", "SAVE").unwrap());
+        assert!(matches_pattern("SAVE%d.GAM is invalid", "GAM is").unwrap());
+        assert!(!matches_pattern("SAVE%d.GAM is invalid", "save").unwrap());
+        assert!(!matches_pattern("SAVE%d.GAM is invalid", "zzz").unwrap());
+        assert!(matches_pattern("anything", "").unwrap());
+        // `regex:` inside the value is literal; only a pattern prefix opts in.
+        assert!(matches_pattern("regex:SAVE", "SAVE").unwrap());
+    }
+
+    #[test]
+    fn pattern_regex_prefix_opts_in() {
+        assert!(matches_pattern("SAVE%d.GAM is invalid", "regex:SAVE.*invalid").unwrap());
+        assert!(matches_pattern("SAVE%d.GAM is invalid", "regex:(?i)save").unwrap());
+        assert!(!matches_pattern("SAVE%d.GAM is invalid", "regex:^invalid").unwrap());
+    }
+
+    #[test]
+    fn pattern_bad_regex_and_overlong_are_errors() {
+        assert!(matches_pattern("x", "regex:([").is_err());
+        assert!(matches_pattern("x", &"y".repeat(MAX_PATTERN_LEN + 1)).is_err());
+        assert!(matches_pattern("x", &"y".repeat(MAX_PATTERN_LEN)).is_ok());
+    }
+
+    #[test]
+    fn old_rows_decode_without_new_fields() {
+        let hit: StringHit =
+            serde_json::from_str(r#"{"offset":1,"vaddr":4096,"encoding":"Ascii","value":"hi"}"#)
+                .expect("old rows must still decode");
+        assert_eq!(hit.section, None);
+        assert!(!hit.executable);
     }
 }

@@ -12,5 +12,8 @@ $ binscout load tests/fixtures/raw-x64.bin
 {"annotations":0,"arch":"x86_64","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","entry":null,"format":"raw","functions":1,"insns":3,"size":3,"strings":0,"version":"0.1.0","xrefs":0}
 ```
 
-List commands (`functions`, `xrefs`, `strings`) paginate with `--offset`
-and `--limit`; limits are capped server-side (1024 rows).
+List commands (`functions`, `xrefs`, `strings`) paginate with
+`--offset`/`--start` and `--limit`; limits are capped server-side
+(1024 rows). `strings` pages with `--start` (`--offset` is a deprecated
+alias that warns); its per-row `offset` field is the byte offset of the
+hit, not the page position.
