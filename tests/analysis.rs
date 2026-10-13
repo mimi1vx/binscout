@@ -1,5 +1,9 @@
+mod common;
+
 use binscout::analysis::{XrefKind, analyze_raw};
 use binscout::disasm::{Arch, disasm_range};
+
+use common::builders;
 
 fn x64(bytes: &[u8], base: u64, entry: Option<u64>) -> binscout::analysis::Analysis {
     analyze_raw(bytes, base, Arch::X86_64, entry).expect("golden blob must analyze")
@@ -160,4 +164,60 @@ fn query_pages_and_summary() {
     assert!(a.block_insns(0x1000, 0x9999, 0, 8).is_none());
     let from_call = a.xrefs_from(0x1004);
     assert!(!from_call.is_empty());
+}
+
+// X2/A4: PE32 absolute `push imm32` refs recover as data + string xrefs.
+// Ground truth (`le32_refs`) holds exactly two LE32 occurrences of the
+// marker VA in `.text`; decoded `from` is the push start, one byte before
+// each window.
+#[test]
+fn pe32_basic_absolute_imm32_recovers_data_and_string_xrefs() {
+    let bytes = common::fixture_bytes(builders::BASIC_NAME);
+    let bin = binscout::loader::load(&bytes).expect("synthetic PE32 must load");
+    let text = &bin.sections[0].data;
+    assert_eq!(bin.sections[0].vaddr, builders::TEXT_VA);
+    let windows = common::le32_refs(text, builders::TEXT_VA, builders::BASIC_STRING_VA);
+    assert_eq!(windows.len(), 2, "ground truth: two push-imm32 refs");
+
+    let a = binscout::analysis::analyze(&bin).expect("PE32 analyzes");
+    let to_str = a.xrefs_to(builders::BASIC_STRING_VA);
+    let data: Vec<_> = to_str.iter().filter(|x| x.kind == XrefKind::Data).collect();
+    let strings: Vec<_> = to_str
+        .iter()
+        .filter(|x| x.kind == XrefKind::String)
+        .collect();
+    assert!(
+        data.len() >= 2,
+        "two push-imm32 data refs expected: {to_str:?}"
+    );
+    assert!(
+        strings.len() >= 2,
+        "two string refs into the marker expected: {to_str:?}"
+    );
+    let text_end = builders::TEXT_VA + text.len() as u64;
+    for x in data.iter().chain(strings.iter()) {
+        assert!(
+            (builders::TEXT_VA..text_end).contains(&x.from),
+            "ref must originate inside .text: {x:?}"
+        );
+    }
+    let mut froms: Vec<u64> = data.iter().map(|x| x.from).collect();
+    froms.sort_unstable();
+    let mut expect: Vec<u64> = windows.iter().map(|w| w - 1).collect();
+    expect.sort_unstable();
+    assert_eq!(froms, expect, "decoded refs match the LE32 ground truth");
+}
+
+// X2/A4: byte-noise strings in undecodable trailers must not become refs.
+#[test]
+fn garbage_fixture_yields_no_string_xrefs() {
+    let dir = common::tmpdir("x2-garbage");
+    let p = common::open_test_project(&dir, builders::GARBAGE_NAME);
+    assert!(
+        p.analysis()
+            .xrefs_page(Some(XrefKind::String), 0, 64)
+            .is_empty(),
+        "garbage must produce zero false string xrefs"
+    );
+    common::cleanup(&dir);
 }

@@ -34,6 +34,8 @@ use crate::loader::{LoadedBinary, RawOptions, Segment, load_raw};
 pub const MAX_TOTAL_INSNS: usize = 1_000_000;
 /// Cap on discovered function entries per [`analyze`] call.
 pub const MAX_FUNCTIONS: usize = 100_000;
+/// Cap on cross-references of each kind per [`analyze`] call.
+pub const MAX_XREFS_PER_KIND: usize = 1_000_000;
 /// Cap on discovery seeds (entry/exports/prologues) per call.
 pub const MAX_SEEDS: usize = 100_000;
 /// Query pages longer than this are truncated.
@@ -881,8 +883,8 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
 
     // Pass D: xrefs. Code from direct branch/call targets, data from
-    // PC-relative accesses into a segment, string refs where data lands in a
-    // recovered string.
+    // PC-relative accesses and x86-32 absolute immediates/displacements
+    // into a segment, string refs where data lands in a recovered string.
     let mut xrefs: BTreeSet<(u64, XrefKind, u64)> = BTreeSet::new();
     for (&va, d) in &decoded {
         let target = match d.flow {
@@ -937,6 +939,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         .into_iter()
         .map(|(from, kind, to)| Xref { from, to, kind })
         .collect();
+    for kind in [XrefKind::Code, XrefKind::Data, XrefKind::String] {
+        if xrefs.iter().filter(|x| x.kind == kind).count() > MAX_XREFS_PER_KIND {
+            return Err(Error::Limit(format!(
+                "more than {MAX_XREFS_PER_KIND} {kind:?} xrefs"
+            )));
+        }
+    }
 
     Ok(Analysis {
         arch,

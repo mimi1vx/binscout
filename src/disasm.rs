@@ -5,7 +5,9 @@
 //! ([`Error::Invalid`]) or when `max_insns` would be exceeded
 //! ([`Error::Limit`]).
 
-use iced_x86::{Decoder, DecoderOptions, Formatter as _, IntelFormatter, OpKind};
+use iced_x86::{
+    Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
+};
 use serde::{Deserialize, Serialize};
 use yaxpeax_arch::Decoder as ArmDecoder;
 use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode, Operand};
@@ -53,8 +55,10 @@ pub struct Insn {
     pub ops: Vec<String>,
     /// Absolute target for direct branches/calls, if any.
     pub branch_target: Option<u64>,
-    /// Absolute address of PC-relative data access, if any (x86
-    /// RIP-relative memory operands; AArch64 `adr`/`adrp`/literal loads).
+    /// Absolute address of a data access, if any: x86 RIP-relative memory
+    /// operands, x86-32 absolute immediates and displacements
+    /// (`push 0x402100`, `mov eax, [0x403000]`), and AArch64
+    /// `adr`/`adrp`/literal loads.
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
     /// reports its pointer slot here and `None` for `branch_target`.
     pub mem_target: Option<u64>,
@@ -252,6 +256,11 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
         let mem_target = insn
             .is_ip_rel_memory_operand()
             .then(|| insn.ip_rel_memory_address());
+        let mem_target = match mem_target {
+            Some(_) => mem_target,
+            None if bitness == 32 => absolute_target32(&insn),
+            None => None,
+        };
         out.push(Insn {
             addr,
             size: size as u8,
@@ -263,6 +272,31 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
         });
     }
     Ok(out)
+}
+
+/// Absolute data address referenced by a 32-bit x86 instruction, if any.
+///
+/// 32-bit code addresses data absolutely (`push 0x402100`,
+/// `mov eax, 0x403000`, `mov eax, [0x403000]`); 64-bit code uses
+/// RIP-relative operands instead (handled by the caller), so 64-bit
+/// immediates are never reported here. Absolute memory operands win over
+/// immediates: in `mov [0x403000], 0x1` the store slot is the reference,
+/// not the stored constant.
+fn absolute_target32(insn: &Instruction) -> Option<u64> {
+    for op in 0..insn.op_count() {
+        if insn.op_kind(op) == OpKind::Memory
+            && insn.memory_base() == Register::None
+            && insn.memory_index() == Register::None
+        {
+            return Some(u64::from(insn.memory_displacement32()));
+        }
+    }
+    for op in 0..insn.op_count() {
+        if insn.op_kind(op) == OpKind::Immediate32 {
+            return Some(u64::from(insn.immediate32()));
+        }
+    }
+    None
 }
 
 fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> {
@@ -338,4 +372,35 @@ fn arm_branch_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> 
         Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x86_32_push_imm32_reports_mem_target() {
+        // push 0x402100 at 0x401003.
+        let v = disasm_x86(&[0x68, 0x00, 0x21, 0x40, 0x00], 0x401003, 8, 32).expect("push decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mem_target, Some(0x402100));
+        assert_eq!(v[0].branch_target, None);
+    }
+
+    #[test]
+    fn x86_32_mov_abs_mem_reports_mem_target() {
+        // mov eax, [0x403000] at 0x401000.
+        let v = disasm_x86(&[0xA1, 0x00, 0x30, 0x40, 0x00], 0x401000, 8, 32)
+            .expect("moffs load decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mem_target, Some(0x403000));
+    }
+
+    #[test]
+    fn x86_64_push_imm32_is_not_a_data_ref() {
+        // Same bytes in 64-bit mode: a sign-extended constant, not an address.
+        let v = disasm_x86(&[0x68, 0x00, 0x21, 0x40, 0x00], 0x401003, 8, 64).expect("push decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mem_target, None);
+    }
 }
