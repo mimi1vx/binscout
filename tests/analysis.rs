@@ -208,6 +208,25 @@ fn pe32_basic_absolute_imm32_recovers_data_and_string_xrefs() {
     assert_eq!(froms, expect, "decoded refs match the LE32 ground truth");
 }
 
+// X1/A3: count_xrefs is the unpaged match count behind the `total`
+// envelope field, so paging never scans blind.
+#[test]
+fn count_xrefs_matches_query_before_paging() {
+    let dir = common::tmpdir("x1-count");
+    let p = common::open_test_project(&dir, builders::BASIC_NAME);
+    let to = Some(builders::BASIC_STRING_VA);
+    assert_eq!(p.count_xrefs(to, None, None), 4);
+    assert_eq!(
+        p.count_xrefs(to, None, Some(XrefKind::String)),
+        2,
+        "two string refs into the marker"
+    );
+    let page = p.query_xrefs(to, None, None, 1, 1);
+    assert_eq!(page.len(), 1, "paged rows shrink but the total does not");
+    assert_eq!(p.count_xrefs(to, None, None), 4);
+    common::cleanup(&dir);
+}
+
 // X2/A4: byte-noise strings in undecodable trailers must not become refs.
 #[test]
 fn garbage_fixture_yields_no_string_xrefs() {

@@ -297,8 +297,10 @@ fn xrefs(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
-    let rows = p.query_xrefs(opt_addr(to)?, opt_addr(from)?, kind, offset, limit);
-    Ok(serde_json::to_value(rows).expect("xrefs serialize"))
+    let (to, from) = (opt_addr(to)?, opt_addr(from)?);
+    let total = p.count_xrefs(to, from, kind);
+    let rows = p.query_xrefs(to, from, kind, offset, limit);
+    Ok(serde_json::json!({ "total": total, "xrefs": rows }))
 }
 
 fn strings(

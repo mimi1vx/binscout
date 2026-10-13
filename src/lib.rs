@@ -486,16 +486,34 @@ impl Project {
         offset: usize,
         limit: usize,
     ) -> Vec<Xref> {
+        self.xrefs_matching(to, from, kind)
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .collect()
+    }
+
+    /// Count of xrefs matching the [`Project::query_xrefs`] filters, before
+    /// paging. The CLI/MCP `xrefs` envelope reports this as `total` so
+    /// large result sets page without scanning blind.
+    #[must_use]
+    pub fn count_xrefs(&self, to: Option<u64>, from: Option<u64>, kind: Option<XrefKind>) -> usize {
+        self.xrefs_matching(to, from, kind).count()
+    }
+
+    /// Xrefs matching the endpoint/kind filters, in storage order.
+    fn xrefs_matching(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+    ) -> impl Iterator<Item = Xref> + '_ {
         self.analysis
             .xrefs
             .iter()
             .copied()
-            .filter(|x| to.is_none_or(|t| x.to == t))
-            .filter(|x| from.is_none_or(|f| x.from == f))
-            .filter(|x| kind.is_none_or(|k| x.kind == k))
-            .skip(offset)
-            .take(limit.min(MAX_ROWS))
-            .collect()
+            .filter(move |x| to.is_none_or(|t| x.to == t))
+            .filter(move |x| from.is_none_or(|f| x.from == f))
+            .filter(move |x| kind.is_none_or(|k| x.kind == k))
     }
 
     /// Imports plus exports for symbol views.
@@ -608,4 +626,33 @@ fn le_unsupported(detail: Option<&str>) -> Error {
         msg.push_str(d);
     }
     Error::Unsupported(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_addr, parse_xref_kind};
+    use crate::analysis::XrefKind;
+
+    #[test]
+    fn parse_addr_hex_equals_decimal() {
+        assert_eq!(parse_addr("0x402100").expect("hex"), 0x402100);
+        assert_eq!(parse_addr("0X402100").expect("upper hex"), 0x402100);
+        assert_eq!(
+            parse_addr("4202752").expect("decimal"),
+            parse_addr("0x402100").expect("hex")
+        );
+        assert!(parse_addr("zz").is_err());
+    }
+
+    #[test]
+    fn parse_xref_kind_is_case_insensitive() {
+        for (s, want) in [
+            ("code", XrefKind::Code),
+            ("Data", XrefKind::Data),
+            ("STRING", XrefKind::String),
+        ] {
+            assert_eq!(parse_xref_kind(s).expect("known kind"), want);
+        }
+        assert!(parse_xref_kind("nope").is_err());
+    }
 }

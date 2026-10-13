@@ -351,3 +351,56 @@ fn le_load_fails_with_unsupported_envelope() {
     assert!(msg.contains("LE"), "{v}");
     cleanup(&dir);
 }
+
+// X1/A3: hex and decimal addresses filter identically, kind is
+// case-insensitive, and the envelope carries the pre-paging total.
+#[test]
+fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
+    let dir = tmpdir("xrefs-norm");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "x").display().to_string();
+    let d = db.as_str();
+    let va = common::builders::BASIC_STRING_VA;
+    let hex = format!("{va:#x}");
+    let dec = va.to_string();
+
+    let (ok, h) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex]);
+    assert!(ok, "{h}");
+    let (ok, n) = run(&["--db", d, "xrefs", &bin_s, "--to", &dec]);
+    assert!(ok, "{n}");
+    assert_eq!(h, n, "hex and decimal must filter identically");
+    assert_eq!(h["total"], 4);
+    assert_eq!(h["xrefs"].as_array().expect("xrefs array").len(), 4);
+
+    for (a, b) in [("String", "string"), ("DATA", "data")] {
+        let (ok, upper) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--kind", a]);
+        assert!(ok, "{upper}");
+        let (ok, lower) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--kind", b]);
+        assert!(ok, "{lower}");
+        assert_eq!(upper, lower, "--kind {a} must equal --kind {b}");
+    }
+    let (ok, s) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--kind", "String"]);
+    assert!(ok, "{s}");
+    assert_eq!(s["total"], 2);
+    assert!(
+        s["xrefs"]
+            .as_array()
+            .expect("xrefs array")
+            .iter()
+            .all(|x| x["kind"] == "String"),
+        "{s}"
+    );
+
+    // Paging shrinks the rows but not the total.
+    let (ok, p) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--limit", "1"]);
+    assert!(ok, "{p}");
+    assert_eq!(p["total"], 4);
+    assert_eq!(p["xrefs"].as_array().expect("xrefs array").len(), 1);
+
+    // Bad kind stays a JSON error envelope.
+    let (ok, v) = run(&["--db", d, "xrefs", &bin_s, "--kind", "nope"]);
+    assert!(!ok);
+    assert!(v.get("error").is_some(), "{v}");
+    cleanup(&dir);
+}

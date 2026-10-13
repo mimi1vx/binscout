@@ -282,7 +282,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "xrefs",
-        description = "Cross-references filtered by to/from address and kind, paged"
+        description = "Cross-references filtered by to/from address and kind, paged with total match count"
     )]
     fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
@@ -294,14 +294,10 @@ impl BinscoutMcp {
             .map(parse_xref_kind)
             .transpose()
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        let rows = proj.query_xrefs(
-            opt_addr(p.to)?,
-            opt_addr(p.from)?,
-            kind,
-            p.offset.unwrap_or(0),
-            p.limit.unwrap_or(50),
-        );
-        ok(serde_json::to_value(rows).expect("xrefs serialize"))
+        let (to, from) = (opt_addr(p.to)?, opt_addr(p.from)?);
+        let total = proj.count_xrefs(to, from, kind);
+        let rows = proj.query_xrefs(to, from, kind, p.offset.unwrap_or(0), p.limit.unwrap_or(50));
+        ok(serde_json::json!({ "total": total, "xrefs": rows }))
     }
 
     #[tool(

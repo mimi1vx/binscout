@@ -385,3 +385,66 @@ fn strings_filters_pattern_section_and_paging() {
     assert!(by_id[&15].get("result").is_none());
     cleanup(&dir);
 }
+
+// X1/A3: MCP `to`/`from` accept hex or decimal interchangeably, `kind`
+// is case-insensitive, and results carry the pre-paging total.
+#[test]
+fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
+    let dir = tmpdir("mcp-xrefs-norm");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let b = || Value::String(bin.clone());
+    let d = || Value::String(db.clone());
+    let va = common::builders::BASIC_STRING_VA;
+    let hex = format!("{va:#x}");
+    let dec = va.to_string();
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(10, "xrefs", json!({"binary": b(), "db": d(), "to": hex})),
+        call(11, "xrefs", json!({"binary": b(), "db": d(), "to": dec})),
+        call(
+            12,
+            "xrefs",
+            json!({"binary": b(), "db": d(), "to": hex, "kind": "String"}),
+        ),
+        call(
+            13,
+            "xrefs",
+            json!({"binary": b(), "db": d(), "to": hex, "kind": "string"}),
+        ),
+        call(
+            14,
+            "xrefs",
+            json!({"binary": b(), "db": d(), "to": hex, "limit": 1}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 6, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+
+    let h: Value = serde_json::from_str(tool_text(by_id[&10])).expect("hex json");
+    let n: Value = serde_json::from_str(tool_text(by_id[&11])).expect("dec json");
+    assert_eq!(h, n, "hex and decimal must filter identically");
+    assert_eq!(h["total"], 4);
+    assert_eq!(h["xrefs"].as_array().expect("xrefs array").len(), 4);
+
+    let upper: Value = serde_json::from_str(tool_text(by_id[&12])).expect("kind json");
+    let lower: Value = serde_json::from_str(tool_text(by_id[&13])).expect("kind json");
+    assert_eq!(upper, lower, "kind case must not matter");
+    assert_eq!(upper["total"], 2);
+
+    let paged: Value = serde_json::from_str(tool_text(by_id[&14])).expect("paged json");
+    assert_eq!(paged["total"], 4);
+    assert_eq!(paged["xrefs"].as_array().expect("xrefs array").len(), 1);
+    cleanup(&dir);
+}

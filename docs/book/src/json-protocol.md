@@ -14,6 +14,9 @@ $ binscout load tests/fixtures/raw-x64.bin
 
 List commands (`functions`, `xrefs`, `strings`) paginate with
 `--offset`/`--start` and `--limit`; limits are capped server-side
-(1024 rows). `strings` pages with `--start` (`--offset` is a deprecated
+(1024 rows). `xrefs` returns a `{"total", "xrefs"}` envelope where
+`total` is the filter-matched count before paging, so large result
+sets page without scanning blind.
+`strings` pages with `--start` (`--offset` is a deprecated
 alias that warns); its per-row `offset` field is the byte offset of the
 hit, not the page position.
