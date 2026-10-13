@@ -30,6 +30,25 @@ use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
 pub const SCHEMA_VERSION: u32 = 1;
+/// Cap on aggregate encoded snapshot row bytes decoded or written.
+///
+/// 64 MiB dwarfs fixture snapshots (tens of KiB) while keeping a forged
+/// sidecar from decoding gigabytes before rejection.
+pub const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+/// Cap on cached function rows (mirrors analysis [`MAX_FUNCTIONS`](crate::analysis::MAX_FUNCTIONS)).
+pub const MAX_SNAPSHOT_FUNCTIONS: usize = 100_000;
+/// Cap on cached block rows (blocks never exceed decoded instructions).
+pub const MAX_SNAPSHOT_BLOCKS: usize = 1_000_000;
+/// Cap on cached xref rows (1M per kind times three kinds).
+pub const MAX_SNAPSHOT_XREFS: usize = 3_000_000;
+/// Cap on cached string rows (10k per segment times 256 segments, rounded up).
+pub const MAX_SNAPSHOT_STRINGS: usize = 3_000_000;
+/// Cap on stored annotation rows (user-created; 10k is 100x typical use).
+pub const MAX_SNAPSHOT_ANNOTATIONS: usize = 10_000;
+/// Cap on one annotation name/comment in bytes.
+///
+/// 8 KiB holds pasted stack traces while keeping a single row trivial.
+pub const MAX_ANNOTATION_BYTES: usize = 8192;
 
 const META: TableDefinition<&str, String> = TableDefinition::new("meta");
 const BINARIES: TableDefinition<u64, String> = TableDefinition::new("binaries");
@@ -372,6 +391,64 @@ fn decode<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| Error::Storage(format!("decode row: {e}")))
 }
 
+/// Reject one annotation whose name/comment exceeds the per-field budget.
+///
+/// 8 KiB bounds a single row before it ever reaches the sidecar.
+fn check_annotation_text(ann: &Annotation) -> Result<()> {
+    for (label, s) in [("name", &ann.name), ("comment", &ann.comment)] {
+        if let Some(t) = s
+            && t.len() > MAX_ANNOTATION_BYTES
+        {
+            return Err(Error::Limit(format!(
+                "annotation {label} of {} bytes exceeds {MAX_ANNOTATION_BYTES}",
+                t.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Add encoded row bytes to the snapshot aggregate budget.
+fn account_snapshot(total: &mut u64, len: usize) -> Result<()> {
+    *total = total
+        .checked_add(len as u64)
+        .filter(|m| *m <= MAX_SNAPSHOT_BYTES)
+        .ok_or_else(|| Error::Limit("snapshot exceeds 64 MiB".to_string()))?;
+    Ok(())
+}
+
+/// Pre-write row-count budget check so [`save`] never writes a snapshot
+/// that [`load`] would reject. Counts mirror the analysis caps plus the
+/// annotation cap; byte totals are enforced at read time row by row.
+fn check_analysis_budgets(
+    analysis: &Analysis,
+    annotations: &BTreeMap<u64, Annotation>,
+) -> Result<()> {
+    if analysis.functions.len() > MAX_SNAPSHOT_FUNCTIONS {
+        return Err(Error::Limit("snapshot functions exceed cap".to_string()));
+    }
+    let blocks: usize = analysis.functions.values().map(|f| f.blocks.len()).sum();
+    if blocks > MAX_SNAPSHOT_BLOCKS {
+        return Err(Error::Limit("snapshot blocks exceed cap".to_string()));
+    }
+    if analysis.xrefs.len() > MAX_SNAPSHOT_XREFS {
+        return Err(Error::Limit("snapshot xrefs exceed cap".to_string()));
+    }
+    if analysis.strings.len() > MAX_SNAPSHOT_STRINGS {
+        return Err(Error::Limit("snapshot strings exceed cap".to_string()));
+    }
+    let live = annotations.values().filter(|a| !a.is_empty()).count();
+    if live > MAX_SNAPSHOT_ANNOTATIONS {
+        return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
+    }
+    for ann in annotations.values() {
+        if !ann.is_empty() {
+            check_annotation_text(ann)?;
+        }
+    }
+    Ok(())
+}
+
 fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
     let deleted = match table {
         "meta" => wtxn.delete_table(META),
@@ -415,14 +492,20 @@ pub enum AnnotationSave {
 /// the analyzed binary.
 ///
 /// # Errors
-/// [`Error::Storage`] on any `redb` or encoding failure (including write
-/// contention with another process).
+/// [`Error::Limit`] when the annotation text exceeds
+/// [`MAX_ANNOTATION_BYTES`], [`Error::Storage`] on any `redb` or encoding
+/// failure (including write contention with another process).
 pub fn save_annotation(
     db: &Database,
     meta: &BinaryMeta,
     addr: u64,
     ann: Option<&Annotation>,
 ) -> Result<AnnotationSave> {
+    if let Some(a) = ann
+        && !a.is_empty()
+    {
+        check_annotation_text(a)?;
+    }
     let encoded: Option<String> = match ann {
         Some(a) if !a.is_empty() => Some(json(a)?),
         _ => None,
@@ -479,9 +562,12 @@ pub fn save_annotation(
 /// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
 ///
 /// Clears all seven tables first so a smaller re-analysis leaves no stale
-/// rows. Never touches the analyzed binary.
+/// rows. Row counts and aggregate encoded bytes are checked against the
+/// snapshot budgets before committing, so a snapshot that [`load`] could not
+/// read back is never written. Never touches the analyzed binary.
 ///
 /// # Errors
+/// [`Error::Limit`] when row or byte budgets are exceeded,
 /// [`Error::Storage`] on any `redb` or encoding failure.
 pub fn save(
     db: &Database,
@@ -489,6 +575,7 @@ pub fn save(
     analysis: &Analysis,
     annotations: &BTreeMap<u64, Annotation>,
 ) -> Result<()> {
+    check_analysis_budgets(analysis, annotations)?;
     let wtxn = db
         .begin_write()
         .map_err(|e| Error::Storage(format!("begin write: {e}")))?;
@@ -646,8 +733,11 @@ struct AnalysisParts {
 ///
 /// A missing table or an undecodable row is corruption and errors; callers
 /// holding a known-stale snapshot must not call this at all (see the
-/// stale-cache policy on [`load_cached`]).
+/// stale-cache policy on [`load_cached`]). Row counts and aggregate encoded
+/// bytes are capped so a forged sidecar fails fast with [`Error::Limit`]
+/// instead of decoding gigabytes.
 fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
+    let mut snapshot_bytes: u64 = 0;
     let mut records: Vec<FunctionRecord> = Vec::new();
     {
         let t = rtxn
@@ -658,11 +748,17 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
             .map_err(|e| Error::Storage(format!("read functions: {e}")))?
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read functions: {e}")))?;
-            records.push(decode(&v.value())?);
+            let raw = v.value();
+            account_snapshot(&mut snapshot_bytes, raw.len())?;
+            if records.len() >= MAX_SNAPSHOT_FUNCTIONS {
+                return Err(Error::Limit("snapshot functions exceed cap".to_string()));
+            }
+            records.push(decode(&raw)?);
         }
     }
     let mut blocks_by_func: BTreeMap<u64, BTreeMap<u64, BasicBlock>> = BTreeMap::new();
     let mut edges_by_func: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut block_count: usize = 0;
     {
         let t = rtxn
             .open_table(BLOCKS)
@@ -672,7 +768,13 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
             .map_err(|e| Error::Storage(format!("read blocks: {e}")))?
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read blocks: {e}")))?;
-            let rec: BlockRecord = decode(&v.value())?;
+            let raw = v.value();
+            account_snapshot(&mut snapshot_bytes, raw.len())?;
+            block_count += 1;
+            if block_count > MAX_SNAPSHOT_BLOCKS {
+                return Err(Error::Limit("snapshot blocks exceed cap".to_string()));
+            }
+            let rec: BlockRecord = decode(&raw)?;
             blocks_by_func.entry(rec.func_entry).or_default().insert(
                 rec.start,
                 BasicBlock {
@@ -708,7 +810,12 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
             .map_err(|e| Error::Storage(format!("read xrefs: {e}")))?
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read xrefs: {e}")))?;
-            xrefs.push(decode(&v.value())?);
+            let raw = v.value();
+            account_snapshot(&mut snapshot_bytes, raw.len())?;
+            if xrefs.len() >= MAX_SNAPSHOT_XREFS {
+                return Err(Error::Limit("snapshot xrefs exceed cap".to_string()));
+            }
+            xrefs.push(decode(&raw)?);
         }
     }
     xrefs.sort_by_key(|a| (a.from, a.kind, a.to));
@@ -722,7 +829,12 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
             .map_err(|e| Error::Storage(format!("read strings: {e}")))?
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read strings: {e}")))?;
-            strings.push(decode(&v.value())?);
+            let raw = v.value();
+            account_snapshot(&mut snapshot_bytes, raw.len())?;
+            if strings.len() >= MAX_SNAPSHOT_STRINGS {
+                return Err(Error::Limit("snapshot strings exceed cap".to_string()));
+            }
+            strings.push(decode(&raw)?);
         }
     }
     Ok(AnalysisParts {
@@ -735,18 +847,27 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
 
 /// Decode every stored annotation, skipping empty rows.
 ///
-/// A missing table or an undecodable row is corruption and errors.
+/// A missing table or an undecodable row is corruption and errors. Row
+/// counts, per-field text, and aggregate bytes are capped so a forged
+/// sidecar fails fast with [`Error::Limit`].
 fn read_annotations(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
     let t = rtxn
         .open_table(ANNOTATIONS)
         .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
     let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
+    let mut snapshot_bytes: u64 = 0;
     for row in t
         .iter()
         .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
     {
         let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
-        let ann: Annotation = decode(&v.value())?;
+        let raw = v.value();
+        account_snapshot(&mut snapshot_bytes, raw.len())?;
+        if annotations.len() >= MAX_SNAPSHOT_ANNOTATIONS {
+            return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
+        }
+        let ann: Annotation = decode(&raw)?;
+        check_annotation_text(&ann)?;
         if !ann.is_empty() {
             annotations.insert(k.value(), ann);
         }
@@ -759,7 +880,8 @@ fn read_annotations(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annota
 /// Stale snapshots carry annotations forward even when the sidecar has no
 /// annotations table (hand-built or partially written DBs); a corrupt
 /// annotation row still errors, since silently dropping user renames and
-/// comments would lose data the re-analysis keeps.
+/// comments would lose data the re-analysis keeps. Same row/text/byte
+/// budgets as [`read_annotations`](fn@read_annotations) apply.
 fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
     let t = match rtxn.open_table(ANNOTATIONS) {
         Ok(t) => t,
@@ -767,12 +889,19 @@ fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u6
         Err(e) => return Err(Error::Storage(format!("open annotations: {e}"))),
     };
     let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
+    let mut snapshot_bytes: u64 = 0;
     for row in t
         .iter()
         .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
     {
         let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
-        let ann: Annotation = decode(&v.value())?;
+        let raw = v.value();
+        account_snapshot(&mut snapshot_bytes, raw.len())?;
+        if annotations.len() >= MAX_SNAPSHOT_ANNOTATIONS {
+            return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
+        }
+        let ann: Annotation = decode(&raw)?;
+        check_annotation_text(&ann)?;
         if !ann.is_empty() {
             annotations.insert(k.value(), ann);
         }
@@ -833,7 +962,8 @@ pub enum Snapshot {
 /// # Errors
 /// [`Error::Storage`] on unreadable metadata, on corrupt annotations, and —
 /// for matching hashes only — on corrupt derived rows, missing tables, or
-/// unknown version/arch/format values.
+/// unknown version/arch/format values. [`Error::Limit`] when snapshot row
+/// or byte budgets are exceeded (forged or oversized sidecar).
 pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Snapshot> {
     let rtxn = db
         .begin_read()
@@ -878,7 +1008,8 @@ pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Sna
 /// caller would discard after a content-hash mismatch.
 ///
 /// # Errors
-/// [`Error::Storage`] on corrupt rows or unknown arch/format values.
+/// [`Error::Storage`] on corrupt rows or unknown arch/format values,
+/// [`Error::Limit`] when snapshot row or byte budgets are exceeded.
 pub fn load(db: &Database) -> Result<Option<Loaded>> {
     let rtxn = db
         .begin_read()

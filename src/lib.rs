@@ -87,10 +87,17 @@ impl Project {
     /// decoding proportional to its discarded rows. Never writes; call
     /// [`Project::save`].
     ///
+    /// Input policy: at most 512 MiB are read (single open, chunked with
+    /// checked growth); containers with large unmapped overlays still open
+    /// while mapped/name/demangled/snapshot budgets may reject with
+    /// [`Error::Limit`]. Budget rejections are intentional behavior changes,
+    /// never raw fallback: only [`Error::Invalid`] falls back.
+    ///
     /// # Errors
     /// [`Error::NotFound`] if the path does not exist, [`Error::Unsupported`]
     /// if it is not a file, the image is LE, or the arch has no
     /// disassembler, [`Error::Invalid`] on undecodable input,
+    /// [`Error::Limit`] on input/name/metadata/snapshot budget overrun,
     /// [`Error::Storage`] on DB or I/O failure.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_db(path, &db::default_db_path(path))
@@ -113,17 +120,9 @@ impl Project {
     }
 
     fn open_inner(binary: &Path, db_path: &Path, raw: Option<RawOptions>) -> Result<Self> {
-        if !binary.exists() {
-            return Err(Error::NotFound(binary.display().to_string()));
-        }
-        if !binary.is_file() {
-            return Err(Error::Unsupported(format!(
-                "not a file: {}",
-                binary.display()
-            )));
-        }
-        let bytes = std::fs::read(binary)
-            .map_err(|e| Error::Storage(format!("read {}: {e}", binary.display())))?;
+        // Single-open bounded read: one handle, chunked with checked
+        // accumulation, so a growing file cannot slip past a stat cap.
+        let bytes = read_input_bytes(binary)?;
         let hash = db::content_hash(&bytes);
         let size = bytes.len() as u64;
 
@@ -352,11 +351,19 @@ impl Project {
     /// snapshot rewrite.
     ///
     /// # Errors
-    /// [`Error::NotFound`] for unknown function entries, [`Error::Storage`]
-    /// when the annotation cannot be persisted.
+    /// [`Error::NotFound`] for unknown function entries, [`Error::Limit`]
+    /// when the name exceeds 8 KiB, [`Error::Storage`] when the annotation
+    /// cannot be persisted.
     pub fn rename_function(&mut self, entry: u64, name: &str) -> Result<()> {
         if !self.analysis.functions.contains_key(&entry) {
             return Err(Error::NotFound(format!("function {entry:#x}")));
+        }
+        if name.len() > crate::db::MAX_ANNOTATION_BYTES {
+            return Err(Error::Limit(format!(
+                "rename of {} bytes exceeds {}",
+                name.len(),
+                crate::db::MAX_ANNOTATION_BYTES
+            )));
         }
         let ann = self.annotations.entry(entry).or_default();
         ann.name = (!name.is_empty()).then(|| name.to_string());
@@ -374,8 +381,16 @@ impl Project {
     /// snapshot rewrite.
     ///
     /// # Errors
-    /// [`Error::Storage`] when the annotation cannot be persisted.
+    /// [`Error::Limit`] when the comment exceeds 8 KiB, [`Error::Storage`]
+    /// when the annotation cannot be persisted.
     pub fn set_comment(&mut self, addr: u64, comment: &str) -> Result<()> {
+        if comment.len() > crate::db::MAX_ANNOTATION_BYTES {
+            return Err(Error::Limit(format!(
+                "comment of {} bytes exceeds {}",
+                comment.len(),
+                crate::db::MAX_ANNOTATION_BYTES
+            )));
+        }
         let ann = self.annotations.entry(addr).or_default();
         ann.comment = (!comment.is_empty()).then(|| comment.to_string());
         if ann.is_empty() {
@@ -768,6 +783,66 @@ fn reload_binary(bytes: &[u8], raw: Option<RawOptions>) -> Result<LoadedBinary> 
     }
 }
 
+/// Read one input file with a hard pre-parse budget.
+///
+/// Opens the path once and accumulates 64 KiB chunks with checked
+/// arithmetic, so `stat`-then-read races and mid-read growth cannot dodge
+/// [`crate::loader::MAX_INPUT_BYTES`]. Containers larger than
+/// [`crate::loader::MAX_MAPPED_BYTES`] still open when their mapped bytes
+/// fit: unmapped overlays/debug data are accepted up to the input cap.
+/// Oversize returns [`Error::Limit`] (never `Invalid`), so
+/// [`load_or_raw`] does not fall back to raw.
+///
+/// # Errors
+/// [`Error::NotFound`] if the path does not exist, [`Error::Unsupported`]
+/// if it is not a file, [`Error::Limit`] past the input cap,
+/// [`Error::Storage`] on I/O failure.
+fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
+        _ => Error::Storage(format!("stat {}: {e}", path.display())),
+    })?;
+    if !meta.is_file() {
+        return Err(Error::Unsupported(format!(
+            "not a file: {}",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
+        _ => Error::Storage(format!("read {}: {e}", path.display())),
+    })?;
+    let cap = crate::loader::MAX_INPUT_BYTES;
+    let mut reader = file;
+    read_stream_capped(&mut reader, cap, &path.display().to_string())
+}
+
+/// Accumulate a stream with checked growth against `cap`.
+///
+/// Split from [`read_input_bytes`] so the exact/over boundary and
+/// mid-read growth are unit-testable without a 512 MiB file: every chunk
+/// extends the total with [`checked_add`](u64::checked_add) and rejects
+/// past `cap` with [`Error::Limit`].
+fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(reader, &mut chunk)
+            .map_err(|e| Error::Storage(format!("read {label}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        let next = (out.len() as u64)
+            .checked_add(n as u64)
+            .filter(|m| *m <= cap)
+            .ok_or_else(|| Error::Limit("input exceeds 512 MiB".to_string()))?;
+        out.reserve_exact(n);
+        out.extend_from_slice(&chunk[..n]);
+        debug_assert_eq!(out.len() as u64, next);
+    }
+    Ok(out)
+}
+
 /// Container parse with raw x86-64 fallback for unrecognized bytes.
 ///
 /// Only [`Error::Invalid`] on unrecognized input falls back; recognized
@@ -812,8 +887,9 @@ fn le_unsupported(detail: Option<&str>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_addr, parse_xref_kind};
+    use super::{parse_addr, parse_xref_kind, read_stream_capped};
     use crate::analysis::XrefKind;
+    use crate::error::Error;
 
     #[test]
     fn parse_addr_hex_equals_decimal() {
@@ -836,5 +912,42 @@ mod tests {
             assert_eq!(parse_xref_kind(s).expect("known kind"), want);
         }
         assert!(parse_xref_kind("nope").is_err());
+    }
+
+    #[test]
+    fn stream_cap_exact_passes_over_fails() {
+        let exact = vec![0x41u8; 16];
+        let mut cur = std::io::Cursor::new(exact.clone());
+        let got = read_stream_capped(&mut cur, 16, "t").expect("exact cap passes");
+        assert_eq!(got, exact);
+        let mut cur = std::io::Cursor::new(vec![0x41u8; 17]);
+        let err = read_stream_capped(&mut cur, 16, "t").unwrap_err();
+        assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+    }
+
+    /// A reader that grows past its initial length must still hit the cap:
+    /// the accumulator never trusts a stat size.
+    #[test]
+    fn stream_cap_catches_mid_read_growth() {
+        struct Growing {
+            left: usize,
+        }
+        impl std::io::Read for Growing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.left).min(7);
+                buf[..n].fill(0x42);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        let mut g = Growing { left: 25 };
+        let err = read_stream_capped(&mut g, 16, "g").unwrap_err();
+        assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+        let mut g = Growing { left: 16 };
+        let got = read_stream_capped(&mut g, 16, "g").expect("exact growth passes");
+        assert_eq!(got.len(), 16);
     }
 }

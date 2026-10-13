@@ -9,7 +9,7 @@
 pub mod le;
 pub mod strings;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,26 @@ pub const MAX_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_IMPORTS: usize = 100_000;
 /// Cap on exports per binary.
 pub const MAX_EXPORTS: usize = 100_000;
+/// Cap on total input bytes read before parsing (all formats).
+///
+/// Twice [`MAX_MAPPED_BYTES`] so containers with large unmapped
+/// overlays/debug data still open while pre-parse allocation stays bounded.
+pub const MAX_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap on one decoded symbol/section/library name in bytes.
+///
+/// 4 KiB covers mangled C++/Rust template expansions while keeping a
+/// single name allocation trivial.
+pub const MAX_NAME_BYTES: usize = 4096;
+/// Cap on one demangled C++ name in bytes.
+///
+/// Demanglers expand templates, so the output budget is twice the input
+/// name budget while still bounding each owned copy.
+pub const MAX_DEMANGLED_BYTES: usize = 8192;
+/// Cap on aggregate owned name/demangled bytes per binary.
+///
+/// 16 MiB holds 100k typical (~160 B) names with headroom yet rejects
+/// 100k repeated 4 KiB names (~400 MiB) well before OOM.
+pub const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// One loaded object: a contiguous virtual range with its file bytes.
 ///
@@ -218,14 +238,22 @@ pub struct RawOptions {
 
 /// Parse any supported binary: LE via [`le`], ELF/PE/Mach-O via `object`.
 ///
+/// Input longer than [`MAX_INPUT_BYTES`] is rejected before sniffing so a
+/// huge blob cannot allocate before table caps run; oversize returns
+/// [`Error::Limit`] (never [`Error::Invalid`]) so
+/// [`crate::load_or_raw`](crate::Project) does not fall back to raw.
+///
 /// # Errors
 /// [`Error::Invalid`] on empty or unrecognized input, [`Error::Unsupported`]
 /// on recognized formats this loader does not handle (Wasm, archives, …)
-/// or architectures without a disassembler, [`Error::Limit`] when table or
-/// byte caps are exceeded.
+/// or architectures without a disassembler, [`Error::Limit`] when input,
+/// table, byte, name, demangled, or aggregate metadata caps are exceeded.
 pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty input".to_string()));
+    }
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(Error::Limit("input exceeds 512 MiB".to_string()));
     }
     if le::is_le(bytes) {
         return Ok(convert_le(le::parse_le(bytes)?));
@@ -297,6 +325,10 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
     let file =
         object::File::parse(bytes).map_err(|e| Error::Invalid(format!("object parse: {e}")))?;
     let arch = arch_from_object(file.architecture())?;
+    // Owned-name budget shared by sections/imports/exports below; counted
+    // before each copy so repeated long names fail fast instead of OOMing.
+    let mut meta_bytes: u64 = 0;
+    let mut demangle_cache: HashMap<String, Option<String>> = HashMap::new();
 
     let mut mapped: u64 = 0;
     let mut segments = Vec::new();
@@ -328,10 +360,13 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         if sections.len() >= MAX_SECTIONS {
             return Err(Error::Limit("sections exceed cap".to_string()));
         }
-        let name = sec
-            .name_bytes()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|_| "<invalid>".to_string());
+        let name = match sec.name_bytes() {
+            Ok(b) => decode_owned_name(b, &mut meta_bytes)?,
+            Err(_) => {
+                account_meta(&mut meta_bytes, "<invalid>".len())?;
+                "<invalid>".to_string()
+            }
+        };
         let data = match sec.data() {
             Ok(d) => d,
             Err(_) if sec.size() == 0 || is_bss(sec.kind()) => &[],
@@ -370,9 +405,11 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
             return Err(Error::Limit("imports exceed cap".to_string()));
         }
         imports.push(import_from_object(
-            String::from_utf8_lossy(imp.library()).into_owned(),
+            imp.library(),
             imp.name(),
-        ));
+            &mut meta_bytes,
+            &mut demangle_cache,
+        )?);
     }
 
     let mut exports = Vec::new();
@@ -390,7 +427,9 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
                 object::ExportTarget::Address { address } => Some(address),
                 _ => None,
             },
-        ));
+            &mut meta_bytes,
+            &mut demangle_cache,
+        )?);
     }
 
     Ok(LoadedBinary {
@@ -404,6 +443,72 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
     })
 }
 
+/// Add `len` owned metadata bytes to the aggregate budget.
+///
+/// Checked so hostile counts cannot wrap the accumulator past the cap.
+fn account_meta(meta: &mut u64, len: usize) -> Result<()> {
+    *meta = meta
+        .checked_add(len as u64)
+        .filter(|m| *m <= MAX_METADATA_BYTES)
+        .ok_or_else(|| Error::Limit("owned metadata exceeds 16 MiB".to_string()))?;
+    Ok(())
+}
+
+/// Decode borrowed name bytes to an owned budgeted `String`.
+///
+/// The raw length is checked before copying and the decoded length after,
+/// since one invalid byte expands to a 3-byte replacement character.
+fn decode_owned_name(raw: &[u8], meta: &mut u64) -> Result<String> {
+    if raw.len() > MAX_NAME_BYTES {
+        return Err(Error::Limit(format!(
+            "name of {} bytes exceeds {MAX_NAME_BYTES}",
+            raw.len()
+        )));
+    }
+    let owned = String::from_utf8_lossy(raw).into_owned();
+    if owned.len() > MAX_NAME_BYTES {
+        return Err(Error::Limit(format!(
+            "decoded name of {} bytes exceeds {MAX_NAME_BYTES}",
+            owned.len()
+        )));
+    }
+    account_meta(meta, owned.len())?;
+    Ok(owned)
+}
+
+/// Demangle with per-output and aggregate budgets, memoizing repeats.
+///
+/// The cache only saves CPU on repeated names; every owned copy still
+/// counts toward the aggregate, so sharing a long name cannot dodge it.
+fn demangle_bounded(
+    raw: &str,
+    meta: &mut u64,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Result<Option<String>> {
+    if let Some(hit) = cache.get(raw) {
+        if let Some(d) = hit {
+            account_meta(meta, d.len())?;
+        }
+        return Ok(hit.clone());
+    }
+    let demangled = demangle_cpp(raw);
+    if let Some(d) = &demangled {
+        if d.len() > MAX_DEMANGLED_BYTES {
+            return Err(Error::Limit(format!(
+                "demangled name of {} bytes exceeds {MAX_DEMANGLED_BYTES}",
+                d.len()
+            )));
+        }
+        account_meta(meta, d.len())?;
+    }
+    // Bound the memo itself: distinct hostile names cannot grow it past a
+    // few thousand entries; beyond that demangle per row (still budgeted).
+    if cache.len() < 4096 {
+        cache.insert(raw.to_string(), demangled.clone());
+    }
+    Ok(demangled)
+}
+
 /// Map a parsed LE image to [`LoadedBinary`].
 ///
 /// Imports dedupe fixup targets (`Internal`/`Entry` fixups carry no import);
@@ -411,6 +516,10 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
 /// retains decoded names without offsets. Exports resolve entry bundles to
 /// flat addresses, skipping bundles whose object index is out of range.
 /// Sections mirror objects as `objN` sharing each segment's bytes.
+/// LE owned names are budgeted at [`le::parse_le`] time (shared 16 MiB
+/// aggregate); this mapping only clones that bounded set plus small
+/// generated names (`objN`, `#n`, `@0x…`, `mod#N`, each under a dozen bytes
+/// and count-capped), so its output stays bounded without a second check.
 #[must_use]
 pub fn convert_le(img: LeImage) -> LoadedBinary {
     let LeImage {
@@ -516,46 +625,65 @@ fn le_module(modules: &[String], module: u32) -> String {
         .unwrap_or_else(|| format!("mod#{module}"))
 }
 
-fn import_from_object(library: String, name: object::NameOrOrdinal<&[u8]>) -> ImportRef {
+fn import_from_object(
+    library: &[u8],
+    name: object::NameOrOrdinal<&[u8]>,
+    meta: &mut u64,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Result<ImportRef> {
+    let library = decode_owned_name(library, meta)?;
     match name {
-        object::NameOrOrdinal::Ordinal(o) => ImportRef {
-            library,
-            name: format!("#{o}"),
-            ordinal: Some(u32::from(o)),
-            unresolved: true,
-            demangled: None,
-        },
+        object::NameOrOrdinal::Ordinal(o) => {
+            let name = format!("#{o}");
+            account_meta(meta, name.len())?;
+            Ok(ImportRef {
+                library,
+                name,
+                ordinal: Some(u32::from(o)),
+                unresolved: true,
+                demangled: None,
+            })
+        }
         object::NameOrOrdinal::Name(b) => {
-            let raw = String::from_utf8_lossy(b).into_owned();
-            let demangled = demangle_cpp(&raw);
-            ImportRef {
+            let raw = decode_owned_name(b, meta)?;
+            let demangled = demangle_bounded(&raw, meta, cache)?;
+            Ok(ImportRef {
                 library,
                 name: raw,
                 ordinal: None,
                 unresolved: false,
                 demangled,
-            }
+            })
         }
     }
 }
 
-fn export_from_object(name: object::NameOrOrdinal<&[u8]>, address: Option<u64>) -> ExportRef {
+fn export_from_object(
+    name: object::NameOrOrdinal<&[u8]>,
+    address: Option<u64>,
+    meta: &mut u64,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Result<ExportRef> {
     match name {
-        object::NameOrOrdinal::Ordinal(o) => ExportRef {
-            name: format!("#{o}"),
-            address,
-            ordinal: Some(u32::from(o)),
-            demangled: None,
-        },
+        object::NameOrOrdinal::Ordinal(o) => {
+            let name = format!("#{o}");
+            account_meta(meta, name.len())?;
+            Ok(ExportRef {
+                name,
+                address,
+                ordinal: Some(u32::from(o)),
+                demangled: None,
+            })
+        }
         object::NameOrOrdinal::Name(b) => {
-            let raw = String::from_utf8_lossy(b).into_owned();
-            let demangled = demangle_cpp(&raw);
-            ExportRef {
+            let raw = decode_owned_name(b, meta)?;
+            let demangled = demangle_bounded(&raw, meta, cache)?;
+            Ok(ExportRef {
                 name: raw,
                 address,
                 ordinal: None,
                 demangled,
-            }
+            })
         }
     }
 }

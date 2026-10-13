@@ -205,8 +205,12 @@ pub fn is_le(bytes: &[u8]) -> bool {
 /// [`Error::Invalid`] on malformed input,
 /// [`Error::Unsupported`] on valid LE the
 /// reader does not handle (non-x86 CPU, iterated pages, forwarders),
-/// [`Error::Limit`] when table caps are exceeded.
+/// [`Error::Limit`] when table, byte, name, or aggregate metadata caps are
+/// exceeded.
 pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
+    if bytes.len() as u64 > super::MAX_INPUT_BYTES {
+        return Err(Error::Limit("input exceeds 512 MiB".to_string()));
+    }
     let le_off = mz_le_offset(bytes).ok_or_else(|| invalid("missing MZ stub"))?;
     let hdr = bytes
         .get(le_off..)
@@ -383,7 +387,9 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
         }
     }
 
-    // Import tables (length-prefixed, non-NUL-terminated).
+    // Import tables (length-prefixed, non-NUL-terminated). Module and
+    // procedure names share one aggregate budget so hostile tables cannot
+    // split 100k names across both halves to dodge it.
     let imp_count = u32_at(hdr, O_IMP_MOD_COUNT)? as usize;
     let (import_modules, import_procs) = if imp_count == 0 {
         (Vec::new(), Vec::new())
@@ -397,11 +403,12 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
         if !(mod_abs <= proc_abs && proc_abs <= section_end) {
             return Err(invalid("LE import tables out of order"));
         }
-        let mods = parse_names(bytes, mod_abs, proc_abs)?;
+        let mut meta: u64 = 0;
+        let mods = parse_names(bytes, mod_abs, proc_abs, &mut meta)?;
         if mods.len() != imp_count {
             return Err(invalid("LE import module count mismatch"));
         }
-        let procs = parse_names(bytes, proc_abs, section_end)?;
+        let procs = parse_names(bytes, proc_abs, section_end, &mut meta)?;
         let proc_len = section_end - proc_abs;
         for f in &fixups {
             if let LeTarget::ImportName { name_offset, .. } = f.target
@@ -647,7 +654,7 @@ fn parse_entries(bytes: &[u8], mut pos: usize, out: &mut Vec<LeEntry>) -> Result
     Ok(())
 }
 
-fn parse_names(bytes: &[u8], start: usize, end: usize) -> Result<Vec<String>> {
+fn parse_names(bytes: &[u8], start: usize, end: usize, meta: &mut u64) -> Result<Vec<String>> {
     if start > end || end > bytes.len() {
         return Err(invalid("LE name table out of range"));
     }
@@ -666,7 +673,20 @@ fn parse_names(bytes: &[u8], start: usize, end: usize) -> Result<Vec<String>> {
             .get(pos..name_end)
             .ok_or_else(|| invalid("LE name entry out of range"))?;
         pos = name_end;
-        out.push(String::from_utf8_lossy(s).into_owned());
+        // Length-prefixed names top out at 127 raw bytes, but the lossy
+        // decode can still triple them; enforce both before owning.
+        if s.len() > super::MAX_NAME_BYTES {
+            return Err(Error::Limit("LE name exceeds cap".to_string()));
+        }
+        let decoded = String::from_utf8_lossy(s).into_owned();
+        if decoded.len() > super::MAX_NAME_BYTES {
+            return Err(Error::Limit("LE decoded name exceeds cap".to_string()));
+        }
+        *meta = meta
+            .checked_add(decoded.len() as u64)
+            .filter(|m| *m <= super::MAX_METADATA_BYTES)
+            .ok_or_else(|| Error::Limit("LE names exceed 16 MiB".to_string()))?;
+        out.push(decoded);
         if out.len() > MAX_STRINGS {
             return Err(Error::Limit("LE name table too large".to_string()));
         }
