@@ -23,7 +23,7 @@ jobs:
         with:
           mdbook-version: "0.5.4"
       - run: mdbook build docs/book
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book/book
 
