@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use common::{cleanup, mcp_bin, temp_db, tmpdir, write_bin};
+use common::{cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
 /// One request line plus notification; returns response lines in order.
 fn session(lines: &[String]) -> Vec<Value> {
@@ -180,6 +180,90 @@ fn all_tools_return_json_over_stdio() {
         fixture,
         "binary untouched"
     );
+    cleanup(&dir);
+}
+
+#[test]
+fn functions_filters_and_mid_function_snap() {
+    // One session, but every call is order-independent: the server may run
+    // requests concurrently, so no call may depend on another's writes.
+    // pe32-basic.exe exports `basic_entry` at 0x401000.
+    let dir = tmpdir("mcp-funcfilter");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let b = || Value::String(bin.clone());
+    let d = || Value::String(db.clone());
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            10,
+            "functions",
+            json!({"binary": b(), "db": d(), "query": "BASIC"}),
+        ),
+        call(
+            11,
+            "functions",
+            json!({"binary": b(), "db": d(), "query": "zzz"}),
+        ),
+        call(
+            12,
+            "functions",
+            json!({"binary": b(), "db": d(), "range_lo": "0x401000", "range_hi": "0x401000"}),
+        ),
+        call(
+            13,
+            "functions",
+            json!({"binary": b(), "db": d(), "caller": "0x401000"}),
+        ),
+        call(
+            14,
+            "func",
+            json!({"binary": b(), "db": d(), "addr": "0x401001"}),
+        ),
+        call(
+            15,
+            "cfg",
+            json!({"binary": b(), "db": d(), "addr": "0x401001"}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 7, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+
+    let q: Value = serde_json::from_str(tool_text(by_id[&10])).expect("query json");
+    assert_eq!(q.as_array().expect("array").len(), 1);
+    assert_eq!(q[0]["entry"], 0x401000);
+
+    let q: Value = serde_json::from_str(tool_text(by_id[&11])).expect("query json");
+    assert_eq!(q.as_array().expect("array").len(), 0);
+
+    let q: Value = serde_json::from_str(tool_text(by_id[&12])).expect("range json");
+    assert_eq!(q.as_array().expect("array").len(), 1);
+
+    // The single-function fixture calls nothing, so nothing calls the entry:
+    // empty page, still success.
+    let q: Value = serde_json::from_str(tool_text(by_id[&13])).expect("caller json");
+    assert_eq!(q.as_array().expect("array").len(), 0);
+
+    // 0x401001 is mid-function (inside the entry block): snaps instead of
+    // reporting not-found.
+    let f: Value = serde_json::from_str(tool_text(by_id[&14])).expect("func json");
+    assert_eq!(f["entry"], 0x401000);
+    assert_eq!(f["containing_entry"], 0x401000);
+
+    let c: Value = serde_json::from_str(tool_text(by_id[&15])).expect("cfg json");
+    assert_eq!(c["entry"], 0x401000);
+    assert_eq!(c["containing_entry"], 0x401000);
     cleanup(&dir);
 }
 

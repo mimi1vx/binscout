@@ -23,6 +23,26 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Filters for [`Project::functions_filtered`]: every present field must match.
+///
+/// `query` is a case-insensitive substring over the rename-resolved display
+/// name (functions with no name never match a query). `caller` keeps the
+/// functions that call the function containing that address; `callee` keeps
+/// the functions called by the function containing that address. `range`
+/// keeps functions whose entry lies in the inclusive bounds (normalized so
+/// `lo <= hi`). An anchor address lying in no function matches nothing.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionFilter {
+    /// Case-insensitive name substring; `None` disables the filter.
+    pub query: Option<String>,
+    /// Keep callers of the function containing this address.
+    pub caller: Option<u64>,
+    /// Keep callees of the function containing this address.
+    pub callee: Option<u64>,
+    /// Keep functions with `entry` in `lo..=hi`.
+    pub range: Option<(u64, u64)>,
+}
+
 /// Opened analysis project: binary plus its cached analysis and annotations.
 ///
 /// The binary file is only ever read; all persistence (analysis snapshot,
@@ -317,14 +337,60 @@ impl Project {
     /// Function rows with annotation renames resolved, ordered by entry.
     #[must_use]
     pub fn functions_resolved(&self, offset: usize, limit: usize) -> Vec<serde_json::Value> {
+        self.functions_filtered(&FunctionFilter::default(), offset, limit)
+    }
+
+    /// Function rows with annotation renames resolved, filtered then paged.
+    ///
+    /// Every present [`FunctionFilter`] field must match; filtering happens
+    /// before paging so `offset`/`limit` apply to the matching rows.
+    #[must_use]
+    pub fn functions_filtered(
+        &self,
+        filter: &FunctionFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        // Resolve anchor addresses once: None = filter disabled,
+        // Some(None) = anchor lies in no function (matches nothing).
+        let caller: Option<Option<u64>> =
+            filter.caller.map(|a| self.analysis.containing_function(a));
+        let callee_calls: Option<Option<Vec<u64>>> = filter.callee.map(|a| {
+            self.analysis
+                .containing_function(a)
+                .map(|c| self.analysis.calls_of(c))
+        });
+        let range = filter
+            .range
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+        let query = filter.query.as_deref().map(|s| s.to_lowercase());
         self.analysis
-            .functions_page(offset, limit.min(MAX_ROWS))
-            .into_iter()
+            .functions
+            .values()
+            .filter(|f| range.is_none_or(|(lo, hi)| f.entry >= lo && f.entry <= hi))
+            .filter(|f| match caller {
+                None => true,
+                Some(None) => false,
+                Some(Some(c)) => self.analysis.calls_of(f.entry).contains(&c),
+            })
+            .filter(|f| match &callee_calls {
+                None => true,
+                Some(None) => false,
+                Some(Some(cs)) => cs.contains(&f.entry),
+            })
+            .filter(|f| match &query {
+                Some(q) => self
+                    .function_name(f.entry)
+                    .is_some_and(|n| n.to_lowercase().contains(q.as_str())),
+                None => true,
+            })
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
             .map(|f| {
                 serde_json::json!({
-                    "id": f.id, "entry": f.entry,
+                    "id": f.id(), "entry": f.entry,
                     "name": self.function_name(f.entry),
-                    "blocks": f.blocks, "insns": f.insns, "calls": f.calls,
+                    "blocks": f.blocks.len(), "insns": f.insn_count(), "calls": self.analysis.calls_of(f.entry),
                 })
             })
             .collect()
@@ -332,14 +398,22 @@ impl Project {
 
     /// Full function detail: blocks with instructions in address order.
     ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry. The result carries both `entry` (the canonical
+    /// function entry) and `containing_entry` (the entry containing `addr`).
+    ///
     /// # Errors
-    /// [`Error::NotFound`] for unknown function entries.
-    pub fn func_detail(&self, entry: u64) -> Result<serde_json::Value> {
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn func_detail(&self, addr: u64) -> Result<serde_json::Value> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
         let f = self
             .analysis
             .functions
             .get(&entry)
-            .ok_or_else(|| Error::NotFound(format!("function {entry:#x}")))?;
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
         let blocks: Vec<serde_json::Value> = f
             .blocks
             .values()
@@ -351,7 +425,7 @@ impl Project {
             })
             .collect();
         Ok(serde_json::json!({
-            "id": f.id(), "entry": f.entry,
+            "id": f.id(), "entry": f.entry, "containing_entry": entry,
             "name": self.function_name(entry),
             "blocks": blocks, "edges": f.edges(),
             "calls": self.analysis.calls_of(entry),
@@ -360,14 +434,22 @@ impl Project {
 
     /// CFG of one function: block nodes plus `(from, to)` block edges.
     ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry. The result carries both `entry` (the canonical
+    /// function entry) and `containing_entry` (the entry containing `addr`).
+    ///
     /// # Errors
-    /// [`Error::NotFound`] for unknown function entries.
-    pub fn cfg_of(&self, entry: u64) -> Result<serde_json::Value> {
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn cfg_of(&self, addr: u64) -> Result<serde_json::Value> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
         let f = self
             .analysis
             .functions
             .get(&entry)
-            .ok_or_else(|| Error::NotFound(format!("function {entry:#x}")))?;
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
         let nodes: Vec<serde_json::Value> = f
             .blocks
             .values()
@@ -378,7 +460,9 @@ impl Project {
                 })
             })
             .collect();
-        Ok(serde_json::json!({ "entry": entry, "nodes": nodes, "edges": f.edges() }))
+        Ok(
+            serde_json::json!({ "entry": entry, "containing_entry": entry, "nodes": nodes, "edges": f.edges() }),
+        )
     }
 
     /// Lift `len` bytes at `va` to IR.

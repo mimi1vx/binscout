@@ -11,7 +11,7 @@ use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::{Project, parse_addr, parse_xref_kind};
+use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
 
 /// Shared opener: explicit `db` path or the default sidecar.
 fn open(binary: &str, db: Option<&str>) -> Result<Project, ErrorData> {
@@ -58,6 +58,29 @@ pub struct PageParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `functions` tool: paged list with optional filters.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FunctionsParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Case-insensitive substring over the rename-resolved name.
+    pub query: Option<String>,
+    /// Keep functions that call the function containing this address.
+    pub caller: Option<String>,
+    /// Keep functions called by the function containing this address.
+    pub callee: Option<String>,
+    /// Keep functions with entry at or above this address (needs range_hi).
+    pub range_lo: Option<String>,
+    /// Keep functions with entry at or below this address (needs range_lo).
+    pub range_hi: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -174,19 +197,37 @@ impl BinscoutMcp {
 
     #[tool(
         name = "functions",
-        description = "List functions with rename-resolved names, paged by offset/limit"
+        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit"
     )]
-    fn functions(&self, p: Parameters<PageParams>) -> Result<String, ErrorData> {
+    fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
         let proj = open(&p.binary, p.db.as_deref())?;
-        let rows = proj.functions_resolved(p.offset.unwrap_or(0), p.limit.unwrap_or(50));
+        let filter = FunctionFilter {
+            query: p.query,
+            caller: opt_addr(p.caller)?,
+            callee: opt_addr(p.callee)?,
+            range: match (p.range_lo, p.range_hi) {
+                (None, None) => None,
+                (Some(lo), Some(hi)) => Some((
+                    parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                    parse_addr(&hi).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                )),
+                _ => {
+                    return Err(ErrorData::invalid_params(
+                        "range_lo and range_hi must be given together",
+                        None,
+                    ));
+                }
+            },
+        };
+        let rows = proj.functions_filtered(&filter, p.offset.unwrap_or(0), p.limit.unwrap_or(50));
         ok(serde_json::Value::Array(rows))
     }
 
     #[tool(
         name = "func",
-        description = "Full detail of one function: blocks with instructions, edges, calls"
+        description = "Full detail of one function: blocks with instructions, edges, calls. Any address inside the function snaps to its containing entry"
     )]
     fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
@@ -216,7 +257,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "cfg",
-        description = "Control-flow graph of one function: block nodes plus block edges"
+        description = "Control-flow graph of one function: block nodes plus block edges. Any address inside the function snaps to its containing entry"
     )]
     fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();

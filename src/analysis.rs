@@ -167,10 +167,36 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// Entry of the function containing `va`, if any.
+    ///
+    /// Takes the nearest entry at or below `va` (the same attribution
+    /// [`analyze`] uses for block ownership) and returns it only when `va`
+    /// lies inside one of that function's blocks. Gaps between functions
+    /// report `None` rather than snapping to a neighbor.
+    #[must_use]
+    pub fn containing_function(&self, va: u64) -> Option<u64> {
+        let (&entry, func) = self.functions.range(..=va).next_back()?;
+        func.blocks
+            .values()
+            .any(|b| va >= b.start && va < b.end())
+            .then_some(entry)
+    }
+
     /// Direct callees of `entry` (function entries only).
     #[must_use]
     pub fn calls_of(&self, entry: u64) -> Vec<u64> {
         let mut v: Vec<u64> = self.callgraph.neighbors(entry).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Direct callers of `entry` (function entries only).
+    #[must_use]
+    pub fn callers_of(&self, entry: u64) -> Vec<u64> {
+        let mut v: Vec<u64> = self
+            .callgraph
+            .neighbors_directed(entry, petgraph::Direction::Incoming)
+            .collect();
         v.sort_unstable();
         v
     }

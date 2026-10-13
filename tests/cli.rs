@@ -8,7 +8,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use common::{binscout_bin, cleanup, minimal_elf, temp_db, tmpdir, write_bin};
+use common::{binscout_bin, cleanup, minimal_elf, temp_db, tmpdir, write_bin, write_fixture};
 
 /// Run the CLI; assert stdout is one valid JSON value. Returns exit success
 /// plus the parsed document.
@@ -184,6 +184,129 @@ fn annotate_round_trip_and_binary_untouched() {
         before,
         "binary untouched"
     );
+    cleanup(&dir);
+}
+
+#[test]
+fn func_and_cfg_snap_to_containing_function() {
+    let (bin, db, _dir, dir) = raw_case("snap");
+    let d = db.as_str();
+    // raw-x64.bin is one function (nop; nop; ret) at 0x0; 0x1 is mid-function.
+    let (ok, v) = run(&["--db", d, "func", &bin, "0x1"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["entry"], 0);
+    assert_eq!(v["containing_entry"], 0);
+    let (ok, v) = run(&["--db", d, "cfg", &bin, "1"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["entry"], 0);
+    assert_eq!(v["containing_entry"], 0);
+    // Past the function's end is still not-found.
+    let (ok, v) = run(&["--db", d, "func", &bin, "0x3"]);
+    assert!(!ok);
+    assert!(v.get("error").is_some(), "{v}");
+    cleanup(&dir);
+}
+
+/// Two x86-64 functions: 0x0 calls 0x10 (raw fallback maps at base 0, so the
+/// relative call still lands on the second function).
+fn two_func_blob() -> Vec<u8> {
+    let mut b = vec![
+        0x55, 0x48, 0x89, 0xE5, 0xE8, 0x07, 0x00, 0x00, 0x00, 0x5D, 0xC3, 0x90, 0x90, 0x90, 0x90,
+        0x90,
+    ];
+    b.extend([
+        0x55, 0x48, 0x89, 0xE5, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x5D, 0xC3,
+    ]);
+    b
+}
+
+#[test]
+fn functions_caller_callee_and_range_filters() {
+    let dir = tmpdir("funcfilter");
+    let bin = write_bin(&dir, "two.bin", &two_func_blob());
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "two").display().to_string();
+    let d = db.as_str();
+
+    let (ok, v) = run(&["--db", d, "functions", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("functions array").len(), 2);
+
+    // --caller keeps functions that call the anchor: only 0x0 calls 0x10.
+    let (ok, v) = run(&["--db", d, "functions", &bin_s, "--caller", "0x10"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 1);
+    assert_eq!(v[0]["entry"], 0);
+
+    // --callee keeps functions called by the anchor: 0x0 calls 0x10.
+    let (ok, v) = run(&["--db", d, "functions", &bin_s, "--callee", "0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 1);
+    assert_eq!(v[0]["entry"], 0x10);
+
+    // --range bounds entries, inclusive on both ends.
+    let (ok, v) = run(&["--db", d, "functions", &bin_s, "--range", "0x10", "0x10"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 1);
+    assert_eq!(v[0]["entry"], 0x10);
+
+    // Reversed bounds normalize instead of matching nothing.
+    let (ok, v) = run(&["--db", d, "functions", &bin_s, "--range", "0x10", "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 2);
+
+    // Paging applies after filtering.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "functions",
+        &bin_s,
+        "--range",
+        "0",
+        "16",
+        "--limit",
+        "1",
+        "--offset",
+        "1",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 1);
+    assert_eq!(v[0]["entry"], 0x10);
+
+    // An anchor in no function matches nothing (still success, empty page).
+    let (ok, v) = run(&["--db", d, "functions", &bin_s, "--caller", "0xdead"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 0);
+    cleanup(&dir);
+}
+
+#[test]
+fn functions_query_matches_resolved_names() {
+    let (bin, db, _dir, dir) = raw_case("query-names");
+    let (ok, _) = run(&["--db", &db, "annotate", &bin, "0x0", "--rename", "main"]);
+    assert!(ok);
+
+    // Case-insensitive substring over the rename.
+    let (ok, v) = run(&["--db", &db, "functions", &bin, "--query", "MAI"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 1);
+    assert_eq!(v[0]["name"], "main");
+
+    let (ok, v) = run(&["--db", &db, "functions", &bin, "--query", "zzz"]);
+    assert!(ok, "{v}");
+    assert_eq!(v.as_array().expect("array").len(), 0);
+    cleanup(&dir);
+
+    // Export names match too: pe32-basic.exe exports `basic_entry`.
+    let dir = tmpdir("query-export");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let (ok, v) = run(&["--db", &db, "functions", &bin_s, "--query", "basic"]);
+    assert!(ok, "{v}");
+    let rows = v.as_array().expect("array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["entry"], 0x401000);
     cleanup(&dir);
 }
 

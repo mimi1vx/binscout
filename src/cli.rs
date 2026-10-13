@@ -27,15 +27,28 @@ pub struct Cli {
 pub enum Cmd {
     /// Open a binary, cache the analysis snapshot, print project info.
     Load { binary: PathBuf },
-    /// List functions (rename-resolved), paged.
+    /// List functions (rename-resolved), paged and optionally filtered.
     Functions {
         binary: PathBuf,
+        /// Case-insensitive substring over the rename-resolved name.
+        #[arg(long)]
+        query: Option<String>,
+        /// Keep functions that call the function containing this address.
+        #[arg(long)]
+        caller: Option<String>,
+        /// Keep functions called by the function containing this address.
+        #[arg(long)]
+        callee: Option<String>,
+        /// Keep functions with entry in LO..=HI (`0x`-hex or decimal).
+        #[arg(long, num_args = 2, value_names = ["LO", "HI"])]
+        range: Option<Vec<String>>,
         #[arg(long, default_value_t = 0)]
         offset: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Full detail of one function: blocks with instructions.
+    /// Full detail of one function: blocks with instructions. Any address
+    /// inside the function snaps to its containing entry.
     Func { binary: PathBuf, addr: String },
     /// Disassemble `len` bytes at `addr`.
     Disasm {
@@ -43,7 +56,8 @@ pub enum Cmd {
         addr: String,
         len: usize,
     },
-    /// Control-flow graph of one function.
+    /// Control-flow graph of one function. Any address inside the function
+    /// snaps to its containing entry.
     Cfg { binary: PathBuf, addr: String },
     /// Cross-references, optionally filtered by endpoint/kind.
     Xrefs {
@@ -95,9 +109,14 @@ impl Cli {
             Cmd::Load { binary } => load(&binary, db),
             Cmd::Functions {
                 binary,
+                query,
+                caller,
+                callee,
+                range,
                 offset,
                 limit,
-            } => functions(&binary, db, offset, limit),
+            } => functions_filter(query, caller, callee, range)
+                .and_then(|filter| functions(&binary, db, &filter, offset, limit)),
             Cmd::Func { binary, addr } => func(&binary, db, &addr),
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, &addr),
@@ -164,15 +183,37 @@ fn load(
     Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
 }
 
+fn functions_filter(
+    query: Option<String>,
+    caller: Option<String>,
+    callee: Option<String>,
+    range: Option<Vec<String>>,
+) -> binscout::error::Result<binscout::FunctionFilter> {
+    Ok(binscout::FunctionFilter {
+        query,
+        caller: caller.map(|s| binscout::parse_addr(&s)).transpose()?,
+        callee: callee.map(|s| binscout::parse_addr(&s)).transpose()?,
+        range: range
+            .map(|pair| match &pair[..] {
+                [lo, hi] => Ok((binscout::parse_addr(lo)?, binscout::parse_addr(hi)?)),
+                _ => Err(binscout::error::Error::Invalid(
+                    "--range takes LO HI".to_string(),
+                )),
+            })
+            .transpose()?,
+    })
+}
+
 fn functions(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    filter: &binscout::FunctionFilter,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db)?;
     Ok(serde_json::Value::Array(
-        p.functions_resolved(offset, limit),
+        p.functions_filtered(filter, offset, limit),
     ))
 }
 

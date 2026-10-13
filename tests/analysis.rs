@@ -121,6 +121,27 @@ fn arm64_adr_reports_data_target() {
 }
 
 #[test]
+fn containing_function_snaps_mid_function_but_not_gaps() {
+    let a = x64(&two_funcs(), 0x1000, Some(0x1000));
+    assert_eq!(a.containing_function(0x1000), Some(0x1000));
+    assert_eq!(a.containing_function(0x1005), Some(0x1000));
+    assert_eq!(a.containing_function(0x1010), Some(0x1010));
+    assert_eq!(a.containing_function(0x1014), Some(0x1010));
+    assert_eq!(a.containing_function(0x0FFF), None);
+    // Padding between func@0x1000's end (0x100B) and 0x1010 belongs to none.
+    assert_eq!(a.containing_function(0x100C), None);
+    assert_eq!(a.containing_function(0x2000), None);
+}
+
+#[test]
+fn callers_mirror_callees() {
+    let a = x64(&two_funcs(), 0x1000, Some(0x1000));
+    assert_eq!(a.callers_of(0x1010), [0x1000]);
+    assert!(a.callers_of(0x1000).is_empty());
+    assert!(a.callers_of(0x9999).is_empty());
+}
+
+#[test]
 fn query_pages_and_summary() {
     let a = x64(&two_funcs(), 0x1000, Some(0x1000));
     let s = a.summary();
