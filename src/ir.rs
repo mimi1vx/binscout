@@ -17,24 +17,43 @@ use crate::disasm::{Arch, Insn};
 /// Minimal P-code-inspired operation set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IrOp {
+    /// Register-to-register or memory-to-register copy.
     Copy,
+    /// Memory read.
     Load,
+    /// Memory write.
     Store,
+    /// Addition.
     Add,
+    /// Subtraction.
     Sub,
+    /// Multiplication.
     Mul,
+    /// Division.
     Div,
+    /// Bitwise AND.
     And,
+    /// Bitwise OR.
     Or,
+    /// Bitwise XOR.
     Xor,
+    /// Logical left shift.
     Shl,
+    /// Logical right shift.
     Shr,
+    /// Comparison (flag effects unmodeled).
     Cmp,
+    /// Unconditional direct branch.
     Branch,
+    /// Conditional direct branch.
     CBranch,
+    /// Direct call.
     Call,
+    /// Function return.
     Return,
+    /// Merge value, synthesized at CFG joins (never lifted).
     Phi,
+    /// Unmapped or effect-free operation.
     Nop,
 }
 

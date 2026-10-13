@@ -18,8 +18,11 @@ pub const DEFAULT_MAX_INSNS: usize = 100_000;
 /// Target architecture for disassembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
+    /// 64-bit x86.
     X86_64,
+    /// 32-bit x86 (LE/DOS code).
     X86_32,
+    /// 64-bit ARM.
     Aarch64,
 }
 
@@ -86,6 +89,7 @@ pub struct Aarch64Disasm {
 }
 
 impl X86_64Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -93,6 +97,7 @@ impl X86_64Disasm {
         }
     }
 
+    /// Custom instruction cap.
     #[must_use]
     pub fn with_limit(max_insns: usize) -> Self {
         Self { max_insns }
@@ -106,6 +111,7 @@ impl Default for X86_64Disasm {
 }
 
 impl X86_32Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -113,6 +119,7 @@ impl X86_32Disasm {
         }
     }
 
+    /// Custom instruction cap.
     #[must_use]
     pub fn with_limit(max_insns: usize) -> Self {
         Self { max_insns }
@@ -126,6 +133,7 @@ impl Default for X86_32Disasm {
 }
 
 impl Aarch64Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -133,6 +141,7 @@ impl Aarch64Disasm {
         }
     }
 
+    /// Custom instruction cap.
     #[must_use]
     pub fn with_limit(max_insns: usize) -> Self {
         Self { max_insns }
@@ -166,8 +175,11 @@ impl Disassembler for Aarch64Disasm {
 /// Arch-dispatched disassembler (object-safe use of [`Disassembler`]).
 #[derive(Debug, Clone, Copy)]
 pub enum AnyDisasm {
+    /// 64-bit x86 backend.
     X86_64(X86_64Disasm),
+    /// 32-bit x86 backend.
     X86_32(X86_32Disasm),
+    /// AArch64 backend.
     Aarch64(Aarch64Disasm),
 }
 

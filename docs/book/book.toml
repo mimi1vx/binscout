@@ -1,0 +1,8 @@
+[book]
+title = "binscout"
+authors = ["Ondřej Súkup <o.sukup@icloud.com>"]
+description = "Headless, agent-first binary analysis over a JSON CLI or MCP server"
+src = "src"
+
+[build]
+build-dir = "book"

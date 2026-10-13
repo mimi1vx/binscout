@@ -116,30 +116,45 @@ pub fn parse_format(s: &str) -> Result<BinaryFormat> {
 /// What binary a snapshot was taken over; row 0 of the `binaries` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryMeta {
+    /// Snapshot schema version.
     pub version: u32,
+    /// Analyzed binary path.
     pub binary_path: String,
+    /// Hash of the file contents.
     pub content_hash: u64,
+    /// File size in bytes.
     pub size: u64,
+    /// Architecture string.
     pub arch: String,
+    /// Format string.
     pub format: String,
+    /// Entry-point address, if known.
     pub entry: Option<u64>,
 }
 
 /// One function row: export name plus sorted direct callees.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionRecord {
+    /// Function entry address.
     pub entry: u64,
+    /// Export name or rename, if any.
     pub name: Option<String>,
+    /// Sorted direct callees.
     pub calls: Vec<u64>,
 }
 
 /// One basic-block row with its instructions and sorted successors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRecord {
+    /// Owning function entry.
     pub func_entry: u64,
+    /// Address of the first instruction.
     pub start: u64,
+    /// End address (one past the last byte).
     pub end: u64,
+    /// Decoded instructions in address order.
     pub insns: Vec<crate::disasm::Insn>,
+    /// Successor block starts.
     pub succs: Vec<u64>,
 }
 
@@ -148,7 +163,9 @@ pub struct BlockRecord {
 /// Stored only in the project DB; the analyzed binary is never modified.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Annotation {
+    /// Function rename.
     pub name: Option<String>,
+    /// Free-text comment.
     pub comment: Option<String>,
 }
 
@@ -164,27 +181,44 @@ impl Annotation {
 /// Agent-facing project summary; always JSON-serializable (M6 CLI/MCP).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectInfo {
+    /// Analyzed binary path.
     pub binary: String,
+    /// Sidecar DB path.
     pub db_path: String,
+    /// Crate version.
     pub version: String,
+    /// Architecture string.
     pub arch: String,
+    /// Format string.
     pub format: String,
+    /// Entry-point address, if known.
     pub entry: Option<u64>,
+    /// Hash of the file contents.
     pub content_hash: u64,
+    /// File size in bytes.
     pub size: u64,
+    /// Discovered functions.
     pub functions: usize,
+    /// Basic blocks across all functions.
     pub blocks: usize,
+    /// Decoded instructions.
     pub insns: usize,
+    /// Recorded cross-references.
     pub xrefs: usize,
+    /// Extracted strings.
     pub strings: usize,
+    /// Stored annotations.
     pub annotations: usize,
 }
 
 /// Snapshot read back by [`load`]: metadata, rebuilt analysis, annotations.
 #[derive(Debug)]
 pub struct Loaded {
+    /// Snapshot metadata (row 0).
     pub meta: BinaryMeta,
+    /// Rebuilt analysis snapshot.
     pub analysis: Analysis,
+    /// Annotations keyed by address.
     pub annotations: BTreeMap<u64, Annotation>,
 }
 

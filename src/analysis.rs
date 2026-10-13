@@ -2,13 +2,13 @@
 //!
 //! [`analyze`] runs recursive descent over [`LoadedBinary`]: starting from
 //! the entry point and export addresses, it decodes one instruction at a time
-//! ([`decode_one`]), follows direct branches and calls, and falls back to a
+//! (`decode_one()`), follows direct branches and calls, and falls back to a
 //! prologue scan for functions unreachable from those seeds. Decoded code is
 //! split into basic blocks, each function gets a CFG and the whole binary a
 //! callgraph (both `petgraph` maps), and cross-references are split into
 //! code, data, and string refs.
 //!
-//! Control flow reuses the M3 lift ([`lift`]): `Branch`/`CBranch`/`Call`
+//! Control flow reuses the M3 lift ([`lift`](crate::ir::lift)): `Branch`/`CBranch`/`Call`
 //! carry their direct target, `Return` ends a path, everything else
 //! (including unlifted `Nop`) falls through. Known gaps: indirect jumps and
 //! `loop`-style branches have no target, so those edges are missing rather
@@ -42,8 +42,11 @@ pub const MAX_PAGE: usize = 1024;
 /// What a cross-reference points through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum XrefKind {
+    /// Branch/call target reference.
     Code,
+    /// Data access reference (PC-relative slot or absolute pointer).
     Data,
+    /// Reference into an extracted string.
     String,
 }
 
@@ -211,31 +214,47 @@ impl Analysis {
 /// Outcome counts for agent planning and golden tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisSummary {
+    /// Discovered functions.
     pub functions: usize,
+    /// Basic blocks across all functions.
     pub blocks: usize,
+    /// Decoded instructions across all blocks.
     pub insns: usize,
+    /// Recorded cross-references.
     pub xrefs: usize,
+    /// Extracted strings.
     pub strings: usize,
 }
 
 /// One function row for list views.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionSummary {
+    /// Stable ID (`func@0x...`).
     pub id: String,
+    /// Function entry address.
     pub entry: u64,
+    /// Rename, if one is set.
     pub name: Option<String>,
+    /// Basic block count.
     pub blocks: usize,
+    /// Instruction count across all blocks.
     pub insns: usize,
+    /// Sorted direct call targets.
     pub calls: Vec<u64>,
 }
 
 /// One block row for list views (instructions come via [`Analysis::block_insns`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSummary {
+    /// Stable ID (`block@func+start`, both hex).
     pub id: String,
+    /// Address of the first instruction.
     pub start: u64,
+    /// End address (one past the last instruction's last byte).
     pub end: u64,
+    /// Instruction count.
     pub insns: usize,
+    /// Successor block starts.
     pub succs: Vec<u64>,
 }
 

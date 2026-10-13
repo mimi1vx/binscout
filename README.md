@@ -1,9 +1,39 @@
 # binscout
 
+[![CI](https://github.com/mimi1vx/binscout/actions/workflows/ci.yml/badge.svg)](https://github.com/mimi1vx/binscout/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/mimi1vx/binscout#license)
+
 Headless, agent-first binary analysis. Open a binary (ELF/PE/Mach-O/LE/raw),
 get functions, CFGs, xrefs, strings, symbols, and IR — over a JSON CLI or an
 MCP server over stdio. Annotations (renames, comments) live in a `redb`
 sidecar; the binary is never written.
+
+Full docs live in the [book](https://mimi1vx.github.io/binscout/).
+
+## Install
+
+```sh
+cargo install --git https://github.com/mimi1vx/binscout
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/mimi1vx/binscout
+cd binscout
+cargo install --path .
+```
+
+This installs both `binscout` (JSON CLI) and `binscout-mcp` (MCP server).
+
+## Quickstart
+
+```sh
+binscout load fw.elf                    # open the binary, cache the analysis snapshot
+binscout functions fw.elf --limit 10    # first 10 functions
+binscout disasm fw.elf 0x400000 32      # decode 32 bytes at the entry point
+binscout annotate fw.elf 0x400000 --rename main   # rename a known function
+```
 
 ## CLI
 
@@ -55,3 +85,12 @@ cargo test          # full suite (unit + CLI/MCP e2e over fixtures)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+## License
+
+Dual-licensed under either of:
+
+- [MIT](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.

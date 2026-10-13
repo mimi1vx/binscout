@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! binscout core: headless agent-first binary analysis.
 
 pub mod analysis;

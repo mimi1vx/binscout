@@ -16,8 +16,11 @@ pub const DEFAULT_MAX_HITS: usize = 10_000;
 /// Encoding of an extracted string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Encoding {
+    /// Single-byte printable runs.
     Ascii,
+    /// UTF-16LE runs over the ASCII subset.
     Utf16Le,
+    /// UTF-16BE runs over the ASCII subset.
     Utf16Be,
 }
 

@@ -42,14 +42,16 @@ fn all_params<T>(p: Parameters<T>) -> T {
     p.0
 }
 
+/// Parameters for single-binary tools (`project_info`, `symbols`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BinaryParams {
     /// Path to the analyzed binary.
     pub binary: String,
-    /// Explicit project DB path (default: `<binary>.binscout.redb` sidecar).
+    /// Explicit project DB path (default: `<binary>.rsdbg.redb` sidecar).
     pub db: Option<String>,
 }
 
+/// Parameters for paged list tools (`functions`, `strings`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PageParams {
     /// Path to the analyzed binary.
@@ -62,6 +64,7 @@ pub struct PageParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for single-address tools (`func`, `cfg`, `comment`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddrParams {
     /// Path to the analyzed binary.
@@ -72,6 +75,7 @@ pub struct AddrParams {
     pub addr: String,
 }
 
+/// Parameters for byte-range tools (`disasm`, `ir`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RangeParams {
     /// Path to the analyzed binary.
@@ -84,6 +88,7 @@ pub struct RangeParams {
     pub len: usize,
 }
 
+/// Parameters for the `xrefs` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct XrefsParams {
     /// Path to the analyzed binary.
@@ -102,6 +107,7 @@ pub struct XrefsParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for the `rename` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RenameParams {
     /// Path to the analyzed binary.
@@ -114,6 +120,7 @@ pub struct RenameParams {
     pub name: String,
 }
 
+/// Parameters for the `comment` tool.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CommentParams {
     /// Path to the analyzed binary.
@@ -126,6 +133,7 @@ pub struct CommentParams {
     pub comment: String,
 }
 
+/// MCP server handler; serializes tool calls behind one lock.
 #[derive(Debug, Clone, Default)]
 pub struct BinscoutMcp {
     /// Serializes tool calls: `redb` allows one open handle per file per
@@ -134,6 +142,7 @@ pub struct BinscoutMcp {
 }
 
 impl BinscoutMcp {
+    /// New handler with a fresh call-serializing lock.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

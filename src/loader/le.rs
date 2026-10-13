@@ -9,7 +9,7 @@
 //! base is file-absolute. Page file offsets are computed as
 //! `data_base + (page_offset << page_shift)`, which matches single-section
 //! DOS4GW files; iterated (`1`) and range (`4`) pages are rejected with
-//! [`Error::Unsupported`](crate::error::Error::Unsupported) rather than
+//! [`Error::Unsupported`] rather than
 //! misparsed.
 
 use crate::disasm::Arch;
@@ -82,56 +82,103 @@ const SRC_LIST: u8 = 0x20;
 /// One row of the object table (1-based `index`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeObject {
+    /// 1-based object-table index.
     pub index: u32,
+    /// In-memory size.
     pub virtual_size: u32,
+    /// Relocation base address.
     pub reloc_base: u32,
+    /// Raw object flags.
     pub flags: u32,
+    /// Object is readable.
     pub readable: bool,
+    /// Object is writable.
     pub writable: bool,
+    /// Object is executable.
     pub executable: bool,
 }
 
 /// Fixup target after resolving the per-record flag bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeTarget {
-    Internal { object: u32, offset: u32 },
-    ImportOrdinal { module: u32, ordinal: u32 },
-    ImportName { module: u32, name_offset: u32 },
-    Entry { ordinal: u32 },
+    /// Fixup inside the image.
+    Internal {
+        /// 1-based target object.
+        object: u32,
+        /// Offset within the target object.
+        offset: u32,
+    },
+    /// Fixup to an ordinal import.
+    ImportOrdinal {
+        /// 1-based import module index.
+        module: u32,
+        /// Export ordinal.
+        ordinal: u32,
+    },
+    /// Fixup to a named import.
+    ImportName {
+        /// 1-based import module index.
+        module: u32,
+        /// Offset into the import-names table.
+        name_offset: u32,
+    },
+    /// Fixup to an entry-table export.
+    Entry {
+        /// Export ordinal.
+        ordinal: u32,
+    },
 }
 
 /// One fixup record: every `sources` offset in `page` (1-based) is fixed up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeFixup {
+    /// 1-based page number.
     pub page: u32,
+    /// Offsets within the page to fix up.
     pub sources: Vec<u16>,
+    /// Resolved fixup target.
     pub target: LeTarget,
+    /// Optional addend (`None` when the record carries none).
     pub additive: Option<u32>,
 }
 
 /// One 16/32-bit entry-table export (ordinals start at 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeEntry {
+    /// Export ordinal (starts at 1).
     pub ordinal: u32,
+    /// 1-based target object.
     pub object: u32,
+    /// Offset within the target object.
     pub offset: u32,
+    /// Whether the entry is exported (vs. shared).
     pub exported: bool,
 }
 
 /// Parsed LE image mapped to loader [`Segment`]s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeImage {
+    /// Object page size in bytes.
     pub page_size: u32,
+    /// CPU type field (1-4 select x86).
     pub cpu: u16,
+    /// Target OS field.
     pub os: u16,
+    /// Raw module flags.
     pub module_flags: u32,
+    /// Object table in index order.
     pub objects: Vec<LeObject>,
+    /// Mapped loader segments.
     pub segments: Vec<Segment>,
     /// Flat VA of `CS:EIP` (`None` for libraries without an entry).
     pub entry: Option<u64>,
+    /// Applied fixup records.
     pub fixups: Vec<LeFixup>,
+    /// Entry-table exports.
     pub entries: Vec<LeEntry>,
+    /// Import module names in table order.
     pub import_modules: Vec<String>,
+    /// Import procedure names in table order.
     pub import_procs: Vec<String>,
 }
 
@@ -155,10 +202,10 @@ pub fn is_le(bytes: &[u8]) -> bool {
 /// Parse an LE file into [`LeImage`].
 ///
 /// # Errors
-/// [`Error::Invalid`](crate::error::Error::Invalid) on malformed input,
-/// [`Error::Unsupported`](crate::error::Error::Unsupported) on valid LE the
+/// [`Error::Invalid`] on malformed input,
+/// [`Error::Unsupported`] on valid LE the
 /// reader does not handle (non-x86 CPU, iterated pages, forwarders),
-/// [`Error::Limit`](crate::error::Error::Limit) when table caps are exceeded.
+/// [`Error::Limit`] when table caps are exceeded.
 pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     let le_off = mz_le_offset(bytes).ok_or_else(|| invalid("missing MZ stub"))?;
     let hdr = bytes

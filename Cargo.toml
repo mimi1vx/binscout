@@ -2,6 +2,13 @@
 name = "binscout"
 version = "0.1.0"
 edition = "2024"
+authors = ["Ondřej Súkup <o.sukup@icloud.com>"]
+license = "MIT OR Apache-2.0"
+description = "Headless, agent-first binary analysis: functions, CFGs, xrefs, strings, and IR over a JSON CLI or MCP server"
+homepage = "https://mimi1vx.github.io/binscout/"
+repository = "https://github.com/mimi1vx/binscout"
+readme = "README.md"
+keywords = ["binary-analysis", "disassembly", "mcp", "reverse-engineering"]
 
 [dependencies]
 anyhow = "1"

@@ -1,3 +1,5 @@
+//! Core errors: the [`Error`](enum@crate::error::Error) variants and the [`Result`] alias.
+
 use thiserror::Error;
 
 /// Core error type for the library (application binaries wrap with `anyhow` + context).

@@ -67,10 +67,15 @@ impl Segment {
 /// Detected container format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryFormat {
+    /// ELF (Unix).
     Elf,
+    /// PE (Windows).
     Pe,
+    /// Mach-O (macOS).
     MachO,
+    /// Linear Executable (DOS4GW).
     Le,
+    /// Flat bytes with caller-supplied architecture and base.
     Raw,
 }
 

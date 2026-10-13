@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
     about = "headless agent-first binary analysis"
 )]
 pub struct Cli {
-    /// Explicit project DB path (default: `<binary>.binscout.redb` sidecar).
+    /// Explicit project DB path (default: `<binary>.rsdbg.redb` sidecar).
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 
