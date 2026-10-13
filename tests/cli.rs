@@ -95,10 +95,14 @@ fn query_results_have_expected_shape() {
 
     let (ok, v) = run(&["--db", d, "disasm", &bin, "0", "3"]);
     assert!(ok, "{v}");
-    let insns = v.as_array().expect("disasm array");
+    let insns = v["insns"].as_array().expect("disasm envelope insns");
     assert_eq!(insns.len(), 3);
     assert_eq!(insns[0]["mnem"], "nop");
     assert_eq!(insns[2]["mnem"], "ret");
+    assert!(
+        v["error_at"].is_null(),
+        "clean range error_at:null, got {v}"
+    );
 
     let (ok, v) = run(&["--db", d, "cfg", &bin, "0x0"]);
     assert!(ok, "{v}");
@@ -109,11 +113,51 @@ fn query_results_have_expected_shape() {
     assert_eq!(v["insns"], 3);
     assert_eq!(v["ir"].as_array().expect("ir array").len(), 3);
     assert_eq!(v["ir"][2]["op"], "Return");
+    assert!(v["error_at"].is_null(), "clean ir error_at:null, got {v}");
 
     let (ok, v) = run(&["--db", d, "symbols", &bin]);
     assert!(ok, "{v}");
     assert_eq!(v["imports"].as_array().expect("imports").len(), 0);
     assert_eq!(v["exports"].as_array().expect("exports").len(), 0);
+    cleanup(&dir);
+}
+
+// D2/A6 golden: garbage range returns the valid prefix plus error_at;
+// a clean prefix of the same file reports error_at:null.
+#[test]
+fn disasm_partial_returns_prefix_and_error_at() {
+    let dir = tmpdir("disasm-partial");
+    let bin = write_fixture(&dir, common::builders::GARBAGE_NAME);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "garbage").display().to_string();
+    let d = db.as_str();
+    let bytes = std::fs::read(&bin).expect("garbage fixture");
+
+    // Full range: 2 valid insns (push rbp; mov rbp,rsp) then 0xD6 stop.
+    let (ok, v) = run(&["--db", d, "disasm", &bin_s, "0", &bytes.len().to_string()]);
+    assert!(ok, "{v}");
+    let insns = v["insns"].as_array().expect("envelope insns");
+    assert_eq!(insns.len(), 2);
+    assert_eq!(insns[0]["mnem"], "push");
+    let err = v["error_at"].as_object().expect("error_at set");
+    assert_eq!(err["addr"], 4);
+    assert!(err["message"].as_str().expect("message").contains("0x4"));
+
+    // Clean prefix before the stop byte: same insns, error_at null.
+    let stop = bytes.iter().position(|b| *b == 0xD6).expect("stop byte");
+    let (ok, v) = run(&["--db", d, "disasm", &bin_s, "0", &stop.to_string()]);
+    assert!(ok, "{v}");
+    assert_eq!(v["insns"].as_array().expect("insns").len(), 2);
+    assert!(
+        v["error_at"].is_null(),
+        "clean prefix error_at:null, got {v}"
+    );
+
+    // IR lifts the same prefix and carries the same error_at.
+    let (ok, v) = run(&["--db", d, "ir", &bin_s, "0", &bytes.len().to_string()]);
+    assert!(ok, "{v}");
+    assert_eq!(v["insns"], 2);
+    assert_eq!(v["error_at"]["addr"], 4);
     cleanup(&dir);
 }
 

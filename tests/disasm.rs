@@ -1,4 +1,4 @@
-use binscout::disasm::{Arch, Disassembler, disasm_range};
+use binscout::disasm::{Arch, Disassembler, disasm_range, disasm_range_partial};
 use binscout::error::Error;
 
 fn x86(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
@@ -176,4 +176,109 @@ fn trait_dispatch_per_arch() {
         .disasm_range(&[0x1f, 0x20, 0x03, 0xd5], 0x4000)
         .expect("arm trait dispatch must work");
     assert_eq!(a[0].mnem, "nop");
+}
+
+// --- D2/A6: partial prefix + error_at ---
+
+#[test]
+fn partial_returns_prefix_and_error_at_on_x86_garbage() {
+    // push rbp; mov rbp,rsp; then 0xD6 (invalid in 64-bit); then a nop.
+    let bytes = [0x55, 0x48, 0x89, 0xE5, 0xD6, 0x90];
+    let p =
+        disasm_range_partial(Arch::X86_64, &bytes, 0x1000, 100).expect("partial keeps the prefix");
+    assert_eq!(p.insns.len(), 2);
+    assert_eq!(p.insns[0].mnem, "push");
+    let err = p.error_at.expect("error_at set on garbage");
+    assert_eq!(err.addr, 0x1004);
+    assert!(err.message.contains("0x1004"), "got {:?}", err.message);
+    assert!(
+        !err.message.contains('/'),
+        "no host paths: {:?}",
+        err.message
+    );
+    // Strict still aborts on the same bytes.
+    let strict = disasm_range(Arch::X86_64, &bytes, 0x1000, 100).unwrap_err();
+    assert!(matches!(strict, Error::Invalid(_)), "got {strict:?}");
+    assert_eq!(
+        strict.to_string(),
+        format!("invalid opcode: {}", err.message)
+    );
+}
+
+#[test]
+fn partial_clean_range_reports_null_error() {
+    let p = disasm_range_partial(Arch::X86_64, &[0x90, 0x90, 0xc3], 0x1000, 100)
+        .expect("clean partial decodes");
+    assert_eq!(p.insns.len(), 3);
+    assert!(p.error_at.is_none());
+    let p = disasm_range_partial(Arch::X86_32, &[0x55, 0x89, 0xe5], 0x1000, 100)
+        .expect("clean x86-32 partial decodes");
+    assert_eq!(p.insns.len(), 2);
+    assert!(p.error_at.is_none());
+    let p = disasm_range_partial(
+        Arch::Aarch64,
+        &[0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6],
+        0x4000,
+        100,
+    )
+    .expect("clean aarch64 partial decodes");
+    assert_eq!(p.insns.len(), 2);
+    assert!(p.error_at.is_none());
+    assert!(
+        disasm_range_partial(Arch::X86_64, &[], 0x1000, 100)
+            .expect("empty partial decodes")
+            .error_at
+            .is_none()
+    );
+}
+
+#[test]
+fn partial_first_byte_invalid_reports_empty_prefix() {
+    let p = disasm_range_partial(Arch::X86_64, &[0x06], 0x1000, 100)
+        .expect("partial on bad first byte");
+    assert!(p.insns.is_empty());
+    let err = p.error_at.expect("error_at set");
+    assert_eq!(err.addr, 0x1000);
+}
+
+#[test]
+fn partial_aarch64_invalid_and_truncated_tail() {
+    let p = disasm_range_partial(Arch::Aarch64, &[0xff, 0xff, 0xff, 0xff], 0x4000, 100)
+        .expect("partial on bad word");
+    assert!(p.insns.is_empty());
+    assert_eq!(p.error_at.expect("error_at").addr, 0x4000);
+    // nop then a short tail: prefix of 1 plus error at the tail word.
+    let p = disasm_range_partial(
+        Arch::Aarch64,
+        &[0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20],
+        0x4000,
+        100,
+    )
+    .expect("partial on truncated tail");
+    assert_eq!(p.insns.len(), 1);
+    assert_eq!(p.error_at.expect("error_at").addr, 0x4004);
+}
+
+#[test]
+fn partial_cap_still_errors() {
+    let err = disasm_range_partial(Arch::X86_64, &[0x90, 0x90, 0xc3], 0x1000, 2).unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+    let err = disasm_range_partial(
+        Arch::Aarch64,
+        &[0x1f, 0x20, 0x03, 0xd5, 0x1f, 0x20, 0x03, 0xd5],
+        0x4000,
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Limit(_)), "got {err:?}");
+}
+
+#[test]
+fn partial_trait_dispatch_per_arch() {
+    let p = Arch::X86_64
+        .disassembler()
+        .disasm_range_partial(&[0x90, 0x06], 0x1000)
+        .expect("trait partial must work");
+    assert_eq!(p.insns.len(), 1);
+    assert_eq!(p.error_at.expect("error_at").addr, 0x1001);
 }

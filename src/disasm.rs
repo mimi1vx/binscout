@@ -3,7 +3,10 @@
 //! [`Disassembler::disasm_range`] decodes `bytes` assumed loaded at virtual
 //! address `va`. Decoding stops at the first invalid opcode
 //! ([`Error::Invalid`]) or when `max_insns` would be exceeded
-//! ([`Error::Limit`]).
+//! ([`Error::Limit`]). [`Disassembler::disasm_range_partial`] (and the free
+//! [`disasm_range_partial`]) instead return the valid prefix plus
+//! [`PartialDisasm::error_at`], so agents keep the decodable instructions
+//! rather than losing them to the first bad opcode.
 
 use iced_x86::{
     Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
@@ -64,6 +67,32 @@ pub struct Insn {
     pub mem_target: Option<u64>,
 }
 
+/// Address and reason of the first undecodable instruction in a partial
+/// decode. The message names only the virtual address and opcode context;
+/// it never carries host paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodeError {
+    /// Virtual address of the failing instruction.
+    pub addr: u64,
+    /// Human-readable reason (e.g. `x86 invalid opcode at 0x4 (64-bit)`).
+    pub message: String,
+}
+
+/// Prefix decode: the valid instructions plus the first failure, if any.
+///
+/// A clean range reports `error_at: None`; a range with trailing garbage
+/// keeps every instruction before the first bad opcode and reports it in
+/// `error_at`. Instruction-cap overruns are still [`Error::Limit`], never a
+/// partial result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialDisasm {
+    /// Valid instructions before the first failure (empty when the first
+    /// byte fails).
+    pub insns: Vec<Insn>,
+    /// First failure, or `None` for a clean decode.
+    pub error_at: Option<DecodeError>,
+}
+
 /// Byte-range disassembler over already-loaded bytes.
 pub trait Disassembler {
     /// Decode `bytes` loaded at `va`.
@@ -72,6 +101,16 @@ pub trait Disassembler {
     /// [`Error::Invalid`] on the first undecodable instruction,
     /// [`Error::Limit`] if the range holds more than the cap.
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>>;
+
+    /// Decode the valid prefix of `bytes` loaded at `va`.
+    ///
+    /// Returns every instruction before the first bad opcode plus
+    /// `error_at` for it (`None` when the whole range decodes).
+    ///
+    /// # Errors
+    /// [`Error::Limit`] if the range holds more than the cap; undecodable
+    /// bytes are reported in `error_at`, never as an error.
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm>;
 }
 
 /// x86_64 disassembler (iced-x86).
@@ -162,17 +201,29 @@ impl Disassembler for X86_64Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_x86(bytes, va, self.max_insns, 64)
     }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_x86_partial(bytes, va, self.max_insns, 64)
+    }
 }
 
 impl Disassembler for X86_32Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_x86(bytes, va, self.max_insns, 32)
     }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_x86_partial(bytes, va, self.max_insns, 32)
+    }
 }
 
 impl Disassembler for Aarch64Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_aarch64(bytes, va, self.max_insns)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_aarch64_partial(bytes, va, self.max_insns)
     }
 }
 
@@ -195,6 +246,14 @@ impl Disassembler for AnyDisasm {
             Self::Aarch64(d) => d.disasm_range(bytes, va),
         }
     }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        match self {
+            Self::X86_64(d) => d.disasm_range_partial(bytes, va),
+            Self::X86_32(d) => d.disasm_range_partial(bytes, va),
+            Self::Aarch64(d) => d.disasm_range_partial(bytes, va),
+        }
+    }
 }
 
 /// One-shot decode without holding a disassembler value.
@@ -203,6 +262,27 @@ pub fn disasm_range(arch: Arch, bytes: &[u8], va: u64, max_insns: usize) -> Resu
         Arch::X86_64 => disasm_x86(bytes, va, max_insns, 64),
         Arch::X86_32 => disasm_x86(bytes, va, max_insns, 32),
         Arch::Aarch64 => disasm_aarch64(bytes, va, max_insns),
+    }
+}
+
+/// One-shot prefix decode: valid instructions plus `error_at` for the first
+/// bad opcode (`None` when the whole range decodes).
+///
+/// Cap overruns are still [`Error::Limit`]; undecodable bytes are data, not
+/// an error.
+///
+/// # Errors
+/// [`Error::Limit`] if the range holds more than `max_insns`.
+pub fn disasm_range_partial(
+    arch: Arch,
+    bytes: &[u8],
+    va: u64,
+    max_insns: usize,
+) -> Result<PartialDisasm> {
+    match arch {
+        Arch::X86_64 => disasm_x86_partial(bytes, va, max_insns, 64),
+        Arch::X86_32 => disasm_x86_partial(bytes, va, max_insns, 32),
+        Arch::Aarch64 => disasm_aarch64_partial(bytes, va, max_insns),
     }
 }
 
@@ -226,6 +306,23 @@ fn split_asm(text: &str) -> (String, Vec<String>) {
 }
 
 fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<Vec<Insn>> {
+    let partial = disasm_x86_partial(bytes, va, max_insns, bitness)?;
+    match partial.error_at {
+        Some(e) => Err(Error::Invalid(e.message)),
+        None => Ok(partial.insns),
+    }
+}
+
+/// Prefix decode over x86 bytes: each position decodes independently via
+/// iced-x86, so trailing garbage cannot change the first decode (the same
+/// prefix property [`crate::analysis`] relies on for single-instruction
+/// `decode_one`). The first invalid opcode ends the prefix with `error_at`.
+fn disasm_x86_partial(
+    bytes: &[u8],
+    va: u64,
+    max_insns: usize,
+    bitness: u32,
+) -> Result<PartialDisasm> {
     let mut decoder = Decoder::new(bitness, bytes, DecoderOptions::NONE);
     decoder.set_ip(va);
     let mut formatter = IntelFormatter::new();
@@ -239,9 +336,13 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
         let start = decoder.position();
         let insn = decoder.decode();
         if insn.is_invalid() {
-            return Err(Error::Invalid(format!(
-                "x86 invalid opcode at {addr:#x} ({bitness}-bit)"
-            )));
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("x86 invalid opcode at {addr:#x} ({bitness}-bit)"),
+                }),
+            });
         }
         let size = insn.len();
         text.clear();
@@ -271,7 +372,10 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
             mem_target,
         });
     }
-    Ok(out)
+    Ok(PartialDisasm {
+        insns: out,
+        error_at: None,
+    })
 }
 
 /// Absolute data address referenced by a 32-bit x86 instruction, if any.
@@ -300,6 +404,17 @@ fn absolute_target32(insn: &Instruction) -> Option<u64> {
 }
 
 fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> {
+    let partial = disasm_aarch64_partial(bytes, va, max_insns)?;
+    match partial.error_at {
+        Some(e) => Err(Error::Invalid(e.message)),
+        None => Ok(partial.insns),
+    }
+}
+
+/// Prefix decode over AArch64 bytes: fixed 4-byte words decode
+/// independently, so the first bad word ends the prefix with `error_at`.
+/// A short tail (< 4 bytes) fails its word decode the same way.
+fn disasm_aarch64_partial(bytes: &[u8], va: u64, max_insns: usize) -> Result<PartialDisasm> {
     let mut reader = <&[u8] as yaxpeax_arch::ReaderBuilder<u64, u8>>::read_from(bytes);
     let decoder = InstDecoder::default();
     let mut out = Vec::new();
@@ -309,8 +424,18 @@ fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> 
         if out.len() >= max_insns {
             return Err(limit_err(max_insns));
         }
-        let inst = ArmDecoder::decode(&decoder, &mut reader)
-            .map_err(|e| Error::Invalid(format!("aarch64 decode error at {addr:#x}: {e:?}")))?;
+        let inst = match ArmDecoder::decode(&decoder, &mut reader) {
+            Ok(inst) => inst,
+            Err(e) => {
+                return Ok(PartialDisasm {
+                    insns: out,
+                    error_at: Some(DecodeError {
+                        addr,
+                        message: format!("aarch64 decode error at {addr:#x}: {e:?}"),
+                    }),
+                });
+            }
+        };
         let (mnem, ops) = split_asm(&inst.to_string());
         out.push(Insn {
             addr,
@@ -324,7 +449,10 @@ fn disasm_aarch64(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> 
         addr = addr.wrapping_add(4);
         off += 4;
     }
-    Ok(out)
+    Ok(PartialDisasm {
+        insns: out,
+        error_at: None,
+    })
 }
 
 /// Absolute target of PC-relative data access (`adr`/`adrp`/literal loads),

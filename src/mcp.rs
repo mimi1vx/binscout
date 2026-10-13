@@ -252,7 +252,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "disasm",
-        description = "Disassemble len bytes at addr with the binary architecture"
+        description = "Disassemble len bytes at addr with the binary architecture; returns the valid prefix plus error_at for the first bad opcode (null on a clean range)"
     )]
     fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
@@ -262,7 +262,7 @@ impl BinscoutMcp {
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.disasm_at(addr, p.len)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(|v| ok(serde_json::to_value(v).expect("insns serialize")))
+            .and_then(|v| ok(serde_json::to_value(v).expect("partial disasm serializes")))
     }
 
     #[tool(

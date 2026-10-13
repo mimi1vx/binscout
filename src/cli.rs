@@ -279,7 +279,7 @@ fn disasm(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db)?;
     let addr = binscout::parse_addr(addr)?;
-    Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("insns serialize"))
+    Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("partial disasm serializes"))
 }
 
 fn cfg(

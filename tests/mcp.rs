@@ -166,7 +166,8 @@ fn all_tools_return_json_over_stdio() {
     assert_eq!(funcs.as_array().expect("array").len(), 1);
 
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
-    assert_eq!(dis.as_array().expect("array").len(), 3);
+    assert_eq!(dis["insns"].as_array().expect("envelope insns").len(), 3);
+    assert!(dis["error_at"].is_null(), "clean disasm error_at:null");
 
     let renamed: Value = serde_json::from_str(tool_text(by_id[&20])).expect("rename json");
     assert_eq!(renamed["name"], "main");
@@ -273,6 +274,59 @@ fn functions_filters_and_mid_function_snap() {
     let c: Value = serde_json::from_str(tool_text(by_id[&15])).expect("cfg json");
     assert_eq!(c["entry"], 0x401000);
     assert_eq!(c["containing_entry"], 0x401000);
+    cleanup(&dir);
+}
+
+// D2/A6: MCP disasm returns the valid prefix plus error_at on garbage,
+// null on a clean prefix.
+#[test]
+fn disasm_partial_prefix_and_error_at() {
+    let dir = tmpdir("mcp-disasm-partial");
+    let bin = write_fixture(&dir, common::builders::GARBAGE_NAME)
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "garbage").display().to_string();
+    let b = || Value::String(bin.clone());
+    let d = || Value::String(db.clone());
+    let bytes = common::fixture_bytes(common::builders::GARBAGE_NAME);
+    let stop = bytes.iter().position(|b| *b == 0xD6).expect("stop byte");
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            10,
+            "disasm",
+            json!({"binary": b(), "db": d(), "addr": "0", "len": bytes.len()}),
+        ),
+        call(
+            11,
+            "disasm",
+            json!({"binary": b(), "db": d(), "addr": "0", "len": stop}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 3, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+
+    let full: Value = serde_json::from_str(tool_text(by_id[&10])).expect("partial json");
+    assert_eq!(full["insns"].as_array().expect("insns").len(), 2);
+    assert_eq!(full["error_at"]["addr"], 4);
+
+    let clean: Value = serde_json::from_str(tool_text(by_id[&11])).expect("clean json");
+    assert_eq!(clean["insns"].as_array().expect("insns").len(), 2);
+    assert!(
+        clean["error_at"].is_null(),
+        "clean error_at:null, got {clean}"
+    );
     cleanup(&dir);
 }
 

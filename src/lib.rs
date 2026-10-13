@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::analysis::{Analysis, StringsFilter, Xref, XrefKind, analyze};
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
-use crate::disasm::{Disassembler, Insn};
+use crate::disasm::{Disassembler, PartialDisasm};
 use crate::error::{Error, Result};
 use crate::loader::strings::StringHit;
 use crate::loader::{BinaryFormat, LoadedBinary, RawOptions, load, load_raw};
@@ -327,12 +327,18 @@ impl Project {
 
     /// Disassemble `len` bytes at `va` with the binary's architecture.
     ///
+    /// Returns the valid prefix plus `error_at` for the first bad opcode
+    /// (`None` when the whole range decodes); cap overruns are still
+    /// errors. Serializes as `{"insns": [...], "error_at": null|{...}}`.
+    ///
     /// # Errors
-    /// Same as [`Project::bytes_at`], plus [`Error::Invalid`] on undecodable
-    /// bytes.
-    pub fn disasm_at(&self, addr: u64, len: usize) -> Result<Vec<Insn>> {
+    /// Same as [`Project::bytes_at`], plus [`Error::Limit`] on cap overrun.
+    pub fn disasm_at(&self, addr: u64, len: usize) -> Result<PartialDisasm> {
         let bytes = self.bytes_at(addr, len)?;
-        self.binary.arch.disassembler().disasm_range(&bytes, addr)
+        self.binary
+            .arch
+            .disassembler()
+            .disasm_range_partial(&bytes, addr)
     }
 
     /// Function rows with annotation renames resolved, ordered by entry.
@@ -468,12 +474,17 @@ impl Project {
 
     /// Lift `len` bytes at `va` to IR.
     ///
+    /// Lifts the valid prefix (see [`Project::disasm_at`]) and reports the
+    /// first bad opcode in `error_at` (`None` on a clean range).
+    ///
     /// # Errors
     /// Same as [`Project::disasm_at`].
     pub fn ir_at(&self, addr: u64, len: usize) -> Result<serde_json::Value> {
-        let insns = self.disasm_at(addr, len)?;
-        let lifted = crate::ir::lift_range(self.binary.arch, &insns);
-        Ok(serde_json::json!({ "addr": addr, "insns": insns.len(), "ir": lifted }))
+        let partial = self.disasm_at(addr, len)?;
+        let lifted = crate::ir::lift_range(self.binary.arch, &partial.insns);
+        Ok(
+            serde_json::json!({ "addr": addr, "insns": partial.insns.len(), "ir": lifted, "error_at": partial.error_at }),
+        )
     }
 
     /// Xrefs filtered by endpoint/kind, paged.
