@@ -5,11 +5,12 @@
 //! `e_lfanew` → `LE` header → object table → object page map → fixup records
 //! → 32-bit entry (`object:offset` → flat VA). Read-only, x86-only.
 //!
-//! Offsets to loader tables are relative to the LE header; the data-pages
-//! base is file-absolute. Page file offsets are computed as
-//! `data_base + (page_offset << page_shift)`, which matches single-section
-//! DOS4GW files; iterated (`1`) and range (`4`) pages are rejected with
-//! [`Error::Unsupported`] rather than
+//! Offsets to loader tables and the data-pages base are relative to the LE
+//! header. The page-map width is auto-detected: LX 8-byte entries map as
+//! `data_base + (page_offset << page_shift)`, LE 4-byte entries as
+//! `data_base + (high + low - 1) * page_size` with the last physical page
+//! truncated to the `0x2C` byte count; iterated (`1`) pages are rejected
+//! with [`Error::Unsupported`] rather than
 //! misparsed.
 
 use crate::disasm::Arch;
@@ -36,8 +37,9 @@ const MZ_MIN: usize = 0x40;
 const HEADER_MIN: usize = 0x88;
 /// Object table entry size.
 const OBJECT_REC: usize = 24;
-/// Object page table entry size.
-const PAGE_REC: usize = 8;
+/// Object page table entry size: 4-byte LE entries, 8-byte LX entries.
+const PAGE_REC_32: usize = 4;
+const PAGE_REC_64: usize = 8;
 
 const MAX_OBJECTS: usize = 4096;
 const MAX_PAGES: usize = 1_048_576;
@@ -57,12 +59,20 @@ const O_NUM_PAGES: usize = 0x14;
 const O_EIP_OBJ: usize = 0x18;
 const O_EIP: usize = 0x1C;
 const O_PAGE_SIZE: usize = 0x28;
-const O_PAGE_SHIFT: usize = 0x2C;
+/// Raw word at `0x2C`: dual meaning picked by page-map width.
+///
+/// LE 4-byte entries read it as bytes on the last page (`0` = full page);
+/// LX 8-byte entries read it as the page shift.
+const O_PAGE_FIELD: usize = 0x2C;
 const O_FIXUP_SIZE: usize = 0x30;
 const O_OBJ_OFF: usize = 0x40;
 const O_NUM_OBJ: usize = 0x44;
 const O_PAGE_OFF: usize = 0x48;
+const O_ITER_MAP_OFF: usize = 0x4C;
+const O_RESOURCE_OFF: usize = 0x50;
+const O_RESIDENT_OFF: usize = 0x58;
 const O_ENTRY_OFF: usize = 0x5C;
+const O_DIRECTIVES_OFF: usize = 0x60;
 const O_FIXUP_PAGE_OFF: usize = 0x68;
 const O_FIXUP_REC_OFF: usize = 0x6C;
 const O_IMP_MOD_OFF: usize = 0x70;
@@ -242,10 +252,7 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
         return Err(invalid(format!("bogus LE page size {page_size}")));
     }
-    let page_shift = u32_at(hdr, O_PAGE_SHIFT)?;
-    if page_shift > 16 {
-        return Err(invalid(format!("bogus LE page shift {page_shift}")));
-    }
+    let page_field = u32_at(hdr, O_PAGE_FIELD)?;
     let num_pages = u32_at(hdr, O_NUM_PAGES)? as usize;
     if num_pages > MAX_PAGES {
         return Err(Error::Limit(format!("LE pages {num_pages} exceed cap")));
@@ -253,6 +260,17 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     let num_obj = u32_at(hdr, O_NUM_OBJ)? as usize;
     if num_obj == 0 || num_obj > MAX_OBJECTS {
         return Err(Error::Limit(format!("LE objects {num_obj} out of range")));
+    }
+    let fixup_size = u32_at(hdr, O_FIXUP_SIZE)? as usize;
+    let imp_count = u32_at(hdr, O_IMP_MOD_COUNT)? as usize;
+
+    // Data-pages base is header-relative (a file-absolute read overlaps
+    // the fixup tables on DOS4GW images).
+    let data_base = (le_off as u64)
+        .checked_add(u32_at(hdr, O_DATA_OFF)? as u64)
+        .ok_or_else(|| invalid("LE data pages offset overflow"))?;
+    if data_base > bytes.len() as u64 {
+        return Err(invalid("LE data pages offset out of range"));
     }
 
     // Absolute file offset of an LE-header-relative table field.
@@ -300,24 +318,29 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
         return Err(Error::Limit("LE segments exceed 256 MiB".to_string()));
     }
 
-    // Object page map.
+    // Object page map: width auto-detected (table-gap shortcut, else full
+    // validation of both widths).
+    let page_rel = u32_at(hdr, O_PAGE_OFF)? as usize;
     let page_abs = rel(O_PAGE_OFF)?;
-    let mut pages = Vec::with_capacity(num_pages);
-    for i in 0..num_pages {
-        let e = page_abs
-            .checked_add(i * PAGE_REC)
-            .and_then(|p| bytes.get(p..p + PAGE_REC))
-            .ok_or_else(|| invalid("page table out of range"))?;
-        pages.push((u32_at(e, 0)?, u16_at(e, 4)? as usize, u16_at(e, 6)?));
-    }
+    let map = PageMap {
+        bytes,
+        page_abs,
+        num_pages,
+        page_size,
+        page_field,
+        data_base,
+    };
+    let width = detect_page_width(hdr, page_rel, fixup_size as u32, imp_count as u32, &map)?;
+    let pages = if width == PAGE_REC_32 {
+        parse_page_32(&map)?
+    } else {
+        parse_page_64(&map)?
+    };
 
-    // Segments: concatenate each object's pages, zero-padding to page_size.
-    // Invalid (`2`) pages are zero-filled like zero pages (`3`): the loader
-    // leaves them unmapped, and zeros are the neutral read-only stand-in.
-    let data_base = u32_at(hdr, O_DATA_OFF)? as u64;
-    if data_base > bytes.len() as u64 {
-        return Err(invalid("LE data pages offset out of range"));
-    }
+    // Segments: concatenate each object's pages, zero-padding every page to
+    // page_size. Invalid (`2`) pages are zero-filled like zero pages (`3`):
+    // the loader leaves them unmapped, and zeros are the neutral read-only
+    // stand-in.
     let mut segments = Vec::with_capacity(num_obj);
     for (i, obj) in objects.iter().enumerate() {
         let o = bytes
@@ -327,28 +350,19 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
         let page_cnt = u32_at(o, 16)? as usize;
         let mut data = Vec::new();
         for p in 0..page_cnt {
-            let (raw, size, flags) = pages[page_idx - 1 + p];
-            match flags {
-                0 => {
-                    let shifted = (raw as u64)
-                        .checked_shl(page_shift)
-                        .ok_or_else(|| invalid("LE page offset overflow"))?;
-                    let off = data_base
-                        .checked_add(shifted)
-                        .ok_or_else(|| invalid("LE page offset overflow"))?;
-                    let end = off
-                        .checked_add(size as u64)
-                        .ok_or_else(|| invalid("LE page end overflow"))?;
-                    if size > page_size as usize || end > bytes.len() as u64 {
-                        return Err(invalid("LE page data out of range"));
-                    }
-                    let start = off as usize;
-                    data.extend_from_slice(&bytes[start..start + size]);
-                    data.resize(data.len() + page_size as usize - size, 0);
-                }
-                2 | 3 => data.resize(data.len() + page_size as usize, 0),
-                1 => return Err(unsupported("LE iterated data pages")),
-                _ => return Err(invalid(format!("unknown LE page flags {flags}"))),
+            let pg = &pages[page_idx - 1 + p];
+            if pg.zero {
+                data.resize(data.len() + page_size as usize, 0);
+            } else {
+                let start = pg.offset as usize;
+                let end = start
+                    .checked_add(pg.size)
+                    .ok_or_else(|| invalid("LE page end overflow"))?;
+                let chunk = bytes
+                    .get(start..end)
+                    .ok_or_else(|| invalid("LE page data out of range"))?;
+                data.extend_from_slice(chunk);
+                data.resize(data.len() + page_size as usize - pg.size, 0);
             }
         }
         data.truncate((obj.virtual_size as usize).min(data.len()));
@@ -363,7 +377,6 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     }
 
     // Fixup page table + records.
-    let fixup_size = u32_at(hdr, O_FIXUP_SIZE)? as usize;
     let mut fixups = Vec::new();
     if fixup_size > 0 {
         let fp_abs = rel(O_FIXUP_PAGE_OFF)?;
@@ -399,7 +412,6 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     // Import tables (length-prefixed, non-NUL-terminated). Module and
     // procedure names share one aggregate budget so hostile tables cannot
     // split 100k names across both halves to dodge it.
-    let imp_count = u32_at(hdr, O_IMP_MOD_COUNT)? as usize;
     let (import_modules, import_procs) = if imp_count == 0 {
         (Vec::new(), Vec::new())
     } else {
@@ -539,15 +551,16 @@ fn valid_le_candidate(bytes: &[u8], off: usize) -> bool {
         return false;
     }
     // Mandatory tables must fit; active optional tables must start in range.
-    // (`O_DATA_OFF` stays unchecked: it is file-absolute until step 3 makes
-    // it header-relative.)
+    // (`O_DATA_OFF` stays unchecked: the data-pages extent needs the page
+    // map to bound. The 8-byte entry size is an upper bound that also
+    // covers 4-byte LE maps.)
     let table = |field: usize, size: usize| -> bool {
         let rel = u32_from(&hdr[field..field + 4]) as usize;
         off.checked_add(rel)
             .and_then(|abs| abs.checked_add(size))
             .is_some_and(|end| end <= bytes.len())
     };
-    if !table(O_OBJ_OFF, num_obj * OBJECT_REC) || !table(O_PAGE_OFF, num_pages * PAGE_REC) {
+    if !table(O_OBJ_OFF, num_obj * OBJECT_REC) || !table(O_PAGE_OFF, num_pages * PAGE_REC_64) {
         return false;
     }
     if u32_from(&hdr[O_FIXUP_SIZE..O_FIXUP_SIZE + 4]) > 0
@@ -569,6 +582,220 @@ fn valid_le_candidate(bytes: &[u8], off: usize) -> bool {
 /// LE header offset: trustworthy `e_lfanew` first, validated scan second.
 fn resolve_le_offset(bytes: &[u8]) -> Option<usize> {
     fast_le_offset(bytes).or_else(|| scan_le_offset(bytes))
+}
+
+/// One mapped object page: `size` file bytes at absolute `offset`
+/// (`data_base`-relative math already applied), or a zero-filled page.
+struct LePage {
+    offset: u64,
+    size: usize,
+    zero: bool,
+}
+
+/// Shared inputs for page-map width detection and parsing.
+struct PageMap<'a> {
+    bytes: &'a [u8],
+    page_abs: usize,
+    num_pages: usize,
+    page_size: u32,
+    /// Raw `0x2C` word; each width validates its own reading.
+    page_field: u32,
+    data_base: u64,
+}
+
+/// Gap between the page map and the next defined loader table, if any.
+///
+/// Candidate tables (header-relative): iterate map, resource, resident
+/// names, entry, directives, fixup-page/record, import-module/proc. Only
+/// tables before the page map are ignored; a zero entry offset or an empty
+/// fixup/import section means undefined.
+fn next_table_gap(
+    hdr: &[u8],
+    page_rel: usize,
+    fixup_size: u32,
+    imp_count: u32,
+) -> Result<Option<usize>> {
+    let mut next: Option<usize> = None;
+    let mut consider = |field: usize, defined: bool| -> Result<()> {
+        if defined {
+            let v = u32_at(hdr, field)? as usize;
+            if v > page_rel {
+                next = Some(next.map_or(v, |n| n.min(v)));
+            }
+        }
+        Ok(())
+    };
+    consider(O_ITER_MAP_OFF, u32_at(hdr, O_ITER_MAP_OFF)? != 0)?;
+    consider(O_RESOURCE_OFF, u32_at(hdr, O_RESOURCE_OFF)? != 0)?;
+    consider(O_RESIDENT_OFF, u32_at(hdr, O_RESIDENT_OFF)? != 0)?;
+    consider(O_ENTRY_OFF, u32_at(hdr, O_ENTRY_OFF)? != 0)?;
+    consider(O_DIRECTIVES_OFF, u32_at(hdr, O_DIRECTIVES_OFF)? != 0)?;
+    consider(O_FIXUP_PAGE_OFF, fixup_size > 0)?;
+    consider(O_FIXUP_REC_OFF, fixup_size > 0)?;
+    consider(O_IMP_MOD_OFF, imp_count > 0)?;
+    consider(O_IMP_PROC_OFF, imp_count > 0)?;
+    Ok(next.map(|n| n - page_rel))
+}
+
+/// Page-map entry width: 4-byte LE or 8-byte LX.
+///
+/// The table gap decides when it fits exactly one width; otherwise both
+/// widths are fully validated and exactly one must pass. Ambiguous or
+/// bogus maps are errors, never silent raw fallbacks.
+fn detect_page_width(
+    hdr: &[u8],
+    page_rel: usize,
+    fixup_size: u32,
+    imp_count: u32,
+    map: &PageMap,
+) -> Result<usize> {
+    if map.num_pages == 0 {
+        return Ok(PAGE_REC_64);
+    }
+    if let Some(gap) = next_table_gap(hdr, page_rel, fixup_size, imp_count)? {
+        if gap == map.num_pages * PAGE_REC_32 {
+            return Ok(PAGE_REC_32);
+        }
+        if gap == map.num_pages * PAGE_REC_64 {
+            return Ok(PAGE_REC_64);
+        }
+    }
+    match (parse_page_32(map).is_ok(), parse_page_64(map).is_ok()) {
+        (true, false) => Ok(PAGE_REC_32),
+        (false, true) => Ok(PAGE_REC_64),
+        (true, true) => Err(invalid("ambiguous LE page-map width")),
+        (false, false) => Err(invalid("bogus LE page map")),
+    }
+}
+
+/// Parse 4-byte LE page entries (`high u16`, `low u8`, `type u8`).
+///
+/// Legal (`0`) pages sit at `data_base + (high + low - 1) * page_size`;
+/// the last physical page is truncated to the `0x2C` byte count.
+/// Invalid (`2`) and zero (`3`) pages are zero-filled.
+fn parse_page_32(map: &PageMap) -> Result<Vec<LePage>> {
+    let last_bytes = bytes_on_last_page(map.page_field, map.page_size)?;
+    let mut nums = Vec::with_capacity(map.num_pages);
+    for i in 0..map.num_pages {
+        let e = map
+            .page_abs
+            .checked_add(i * PAGE_REC_32)
+            .and_then(|p| map.bytes.get(p..p + PAGE_REC_32))
+            .ok_or_else(|| invalid("page table out of range"))?;
+        let num = u16_from(&e[0..2]) as u64 + e[2] as u64;
+        match e[3] {
+            0 => {
+                if num == 0 {
+                    return Err(invalid("LE page number out of range"));
+                }
+                nums.push(num);
+            }
+            1 => return Err(unsupported("LE iterated data pages")),
+            2 | 3 => nums.push(0),
+            t => return Err(invalid(format!("unknown LE page type {t}"))),
+        }
+    }
+    let last = nums.iter().copied().filter(|n| *n > 0).max();
+    let mut pages = Vec::with_capacity(map.num_pages);
+    for num in nums {
+        if num == 0 {
+            pages.push(LePage {
+                offset: 0,
+                size: map.page_size as usize,
+                zero: true,
+            });
+            continue;
+        }
+        let off = map
+            .data_base
+            .checked_add(
+                (num - 1)
+                    .checked_mul(map.page_size as u64)
+                    .ok_or_else(|| invalid("LE page offset overflow"))?,
+            )
+            .ok_or_else(|| invalid("LE page offset overflow"))?;
+        let size = if Some(num) == last {
+            last_bytes as usize
+        } else {
+            map.page_size as usize
+        };
+        let end = off
+            .checked_add(size as u64)
+            .ok_or_else(|| invalid("LE page end overflow"))?;
+        if end > map.bytes.len() as u64 {
+            return Err(invalid("LE page data out of range"));
+        }
+        pages.push(LePage {
+            offset: off,
+            size,
+            zero: false,
+        });
+    }
+    Ok(pages)
+}
+
+/// Parse 8-byte LX page entries (`offset u32`, `size u16`, `flags u16`).
+fn parse_page_64(map: &PageMap) -> Result<Vec<LePage>> {
+    let shift = page_shift(map.page_field)?;
+    let mut pages = Vec::with_capacity(map.num_pages);
+    for i in 0..map.num_pages {
+        let e = map
+            .page_abs
+            .checked_add(i * PAGE_REC_64)
+            .and_then(|p| map.bytes.get(p..p + PAGE_REC_64))
+            .ok_or_else(|| invalid("page table out of range"))?;
+        let (raw, size, flags) = (u32_at(e, 0)?, u16_at(e, 4)? as usize, u16_at(e, 6)?);
+        match flags {
+            0 => {
+                let shifted = (raw as u64)
+                    .checked_shl(shift)
+                    .ok_or_else(|| invalid("LE page offset overflow"))?;
+                let off = map
+                    .data_base
+                    .checked_add(shifted)
+                    .ok_or_else(|| invalid("LE page offset overflow"))?;
+                let end = off
+                    .checked_add(size as u64)
+                    .ok_or_else(|| invalid("LE page end overflow"))?;
+                if size > map.page_size as usize || end > map.bytes.len() as u64 {
+                    return Err(invalid("LE page data out of range"));
+                }
+                pages.push(LePage {
+                    offset: off,
+                    size,
+                    zero: false,
+                });
+            }
+            2 | 3 => pages.push(LePage {
+                offset: 0,
+                size: map.page_size as usize,
+                zero: true,
+            }),
+            1 => return Err(unsupported("LE iterated data pages")),
+            _ => return Err(invalid(format!("unknown LE page flags {flags}"))),
+        }
+    }
+    Ok(pages)
+}
+
+/// LX reading of the raw `0x2C` word: page shift (8-byte page-map entries).
+fn page_shift(raw: u32) -> Result<u32> {
+    if raw > 16 {
+        return Err(invalid(format!("bogus LE page shift {raw}")));
+    }
+    Ok(raw)
+}
+
+/// LE reading of the raw `0x2C` word: bytes on the last page (4-byte
+/// page-map entries). `0` means a full final page.
+fn bytes_on_last_page(raw: u32, page_size: u32) -> Result<u32> {
+    if raw == 0 {
+        return Ok(page_size);
+    }
+    if raw > page_size {
+        return Err(invalid(format!("bogus LE last-page bytes {raw}")));
+    }
+    Ok(raw)
 }
 
 fn walk_fixup_page(
@@ -892,7 +1119,7 @@ mod tests {
         t_put32(&mut f, h + 0x5C, entry_rel as u32);
         t_put32(&mut f, h + 0x68, fp_rel as u32);
         t_put32(&mut f, h + 0x6C, fr_rel as u32);
-        t_put32(&mut f, h + 0x80, (DOS_LE_OFF + code_rel) as u32);
+        t_put32(&mut f, h + 0x80, code_rel as u32);
         t_put32(&mut f, h + 0x84, 1);
 
         let p = DOS_LE_OFF + obj_rel;
@@ -913,6 +1140,146 @@ mod tests {
         f[DOS_LE_OFF + entry_rel..DOS_LE_OFF + entry_rel + entry.len()].copy_from_slice(&entry);
         f[DOS_LE_OFF + code_rel..].copy_from_slice(&DOS_CODE);
         f
+    }
+
+    #[test]
+    fn page_field_lx_shift_validation() {
+        assert_eq!(page_shift(0).unwrap(), 0);
+        assert_eq!(page_shift(16).unwrap(), 16);
+        assert!(page_shift(17).is_err());
+        // Orion2's `0x2C` = 113 is bogus as a shift ...
+        assert!(page_shift(0x71).is_err());
+    }
+
+    #[test]
+    fn page_field_le_last_page_bytes() {
+        // ... but valid as LE bytes-on-last-page (`page_size` `0x1000`).
+        assert_eq!(bytes_on_last_page(0x71, 0x1000).unwrap(), 0x71);
+        assert_eq!(bytes_on_last_page(0, 0x1000).unwrap(), 0x1000);
+        assert!(bytes_on_last_page(0x1001, 0x1000).is_err());
+    }
+
+    /// 4-byte-page-map image: DOS4GW-style outer stub, one object over two
+    /// pages (full + truncated tail), default entry bundle. `page_pad`
+    /// inserts dead bytes between the page map and the fixup table to
+    /// force the validation fallback instead of the table-gap shortcut.
+    fn dos4gw_outer_32(page_pad: usize) -> Vec<u8> {
+        const PS: usize = 512;
+        const TAIL: usize = 100;
+        let entry: Vec<u8> = vec![0x01, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let obj_rel = 0xAC;
+        let page_rel = obj_rel + 24;
+        let fp_rel = page_rel + 2 * PAGE_REC_32 + page_pad;
+        let fr_rel = fp_rel + 12;
+        let entry_rel = fr_rel;
+        let code_rel = entry_rel + entry.len();
+
+        let mut f = vec![0u8; DOS_LE_OFF];
+        f[0] = b'M';
+        f[1] = b'Z';
+        t_put16(&mut f, 0x18, 0x1E);
+        t_put32(&mut f, 0x3C, 0x09B4_0000);
+        f.resize(DOS_LE_OFF + code_rel + PS + TAIL, 0);
+
+        let h = DOS_LE_OFF;
+        f[h] = b'L';
+        f[h + 1] = b'E';
+        t_put32(&mut f, h + 0x04, 0);
+        t_put16(&mut f, h + 0x08, 2);
+        t_put16(&mut f, h + 0x0A, 1);
+        t_put32(&mut f, h + 0x14, 2);
+        t_put32(&mut f, h + 0x18, 1);
+        t_put32(&mut f, h + 0x20, 1);
+        t_put32(&mut f, h + 0x24, 0x1000);
+        t_put32(&mut f, h + 0x28, PS as u32);
+        t_put32(&mut f, h + 0x2C, TAIL as u32);
+        t_put32(&mut f, h + 0x30, 8);
+        t_put32(&mut f, h + 0x38, (code_rel - obj_rel + PS + TAIL) as u32);
+        t_put32(&mut f, h + 0x40, obj_rel as u32);
+        t_put32(&mut f, h + 0x44, 1);
+        t_put32(&mut f, h + 0x48, page_rel as u32);
+        t_put32(&mut f, h + 0x5C, entry_rel as u32);
+        t_put32(&mut f, h + 0x68, fp_rel as u32);
+        t_put32(&mut f, h + 0x6C, fr_rel as u32);
+        t_put32(&mut f, h + 0x80, code_rel as u32);
+        t_put32(&mut f, h + 0x84, 2);
+
+        let p = DOS_LE_OFF + obj_rel;
+        t_put32(&mut f, p, (PS + TAIL) as u32);
+        t_put32(&mut f, p + 4, 0x10000);
+        t_put32(&mut f, p + 8, 0x2005);
+        t_put32(&mut f, p + 12, 1);
+        t_put32(&mut f, p + 16, 2);
+
+        // Page 1: `{high:0, low:1, type:0}`; page 2 (last): `{0,2,0}`.
+        let p = DOS_LE_OFF + page_rel;
+        f[p] = 0;
+        f[p + 1] = 0;
+        f[p + 2] = 1;
+        f[p + 3] = 0;
+        f[p + 4] = 0;
+        f[p + 5] = 0;
+        f[p + 6] = 2;
+        f[p + 7] = 0;
+
+        let p = DOS_LE_OFF + fp_rel;
+        t_put32(&mut f, p, 0);
+        t_put32(&mut f, p + 4, 0);
+        t_put32(&mut f, p + 8, 0);
+
+        f[DOS_LE_OFF + entry_rel..DOS_LE_OFF + entry_rel + entry.len()].copy_from_slice(&entry);
+        let code = DOS_LE_OFF + code_rel;
+        f[code..code + PS].fill(0x90);
+        f[code + PS..code + PS + 4].copy_from_slice(&DOS_CODE);
+        f
+    }
+
+    #[test]
+    fn four_byte_page_map_maps_pages_with_truncated_tail() {
+        let bytes = dos4gw_outer_32(0);
+        let img = parse_le(&bytes).expect("4-byte LE image must parse");
+        assert_eq!(img.entry, Some(0x10000));
+        let s = &img.segments[0];
+        assert_eq!(s.data.len(), 512 + 100);
+        assert!(s.data[..512].iter().all(|b| *b == 0x90));
+        assert_eq!(&s.data[512..516], &DOS_CODE);
+        assert!(s.data[516..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn page_width_falls_back_to_validation() {
+        // Two pad bytes break the table-gap shortcut (gap 10 fits neither
+        // width for 2 pages); full validation must still pick 4-byte.
+        let bytes = dos4gw_outer_32(2);
+        let img = parse_le(&bytes).expect("validation fallback must pick 4-byte");
+        assert_eq!(img.segments[0].data.len(), 512 + 100);
+        assert_eq!(&img.segments[0].data[512..516], &DOS_CODE);
+    }
+
+    #[test]
+    fn four_byte_zero_and_invalid_pages_stay_virtual() {
+        let mut bytes = dos4gw_outer_32(0);
+        // Page 1 invalid (`2`), page 2 zero-filled (`3`).
+        bytes[DOS_LE_OFF + 0xAC + 24 + 3] = 2;
+        bytes[DOS_LE_OFF + 0xAC + 24 + 7] = 3;
+        let img = parse_le(&bytes).expect("zero/invalid pages must parse");
+        let s = &img.segments[0];
+        assert_eq!(s.data.len(), 512 + 100);
+        assert!(s.data.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn four_byte_iterated_page_is_unsupported() {
+        let mut bytes = dos4gw_outer_32(0);
+        bytes[DOS_LE_OFF + 0xAC + 24 + 3] = 1;
+        assert!(matches!(parse_le(&bytes), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn four_byte_unknown_page_type_is_invalid() {
+        let mut bytes = dos4gw_outer_32(0);
+        bytes[DOS_LE_OFF + 0xAC + 24 + 3] = 5;
+        assert!(matches!(parse_le(&bytes), Err(Error::Invalid(_))));
     }
 
     #[test]

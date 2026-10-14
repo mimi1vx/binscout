@@ -412,7 +412,7 @@ fn elf_fixture_reports_format_and_symbols() {
 }
 
 #[test]
-fn le_load_fails_with_unsupported_envelope() {
+fn le_load_reports_format_and_entry() {
     let dir = tmpdir("le");
     let bin = write_bin(
         &dir,
@@ -423,10 +423,10 @@ fn le_load_fails_with_unsupported_envelope() {
     let db = temp_db(&dir, "le").display().to_string();
 
     let (ok, v) = run(&["--db", &db, "load", &bin_s]);
-    assert!(!ok, "LE load must fail, got {v}");
-    let msg = v["error"].as_str().expect("error envelope");
-    assert!(msg.contains("unsupported"), "{v}");
-    assert!(msg.contains("LE"), "{v}");
+    assert!(ok, "{v}");
+    assert_eq!(v["format"], "le");
+    assert_eq!(v["arch"], "x86_32");
+    assert_eq!(v["entry"], 0x10000);
     cleanup(&dir);
 }
 

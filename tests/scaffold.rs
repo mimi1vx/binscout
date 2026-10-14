@@ -169,21 +169,19 @@ fn le_fixture_parses_as_le() {
 }
 
 #[test]
-fn le_fixture_open_is_explicitly_unsupported() {
+fn le_fixture_opens_and_analyzes_as_x86_32() {
     let dir = common::tmpdir("l1-le");
     let bin = common::write_fixture(&dir, builders::LE_NAME);
     let db = common::temp_db(&dir, "le");
-    let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
+    let p = binscout::Project::open_with_db(&bin, &db).expect("synthetic LE must open");
+    assert_eq!(p.binary().format, binscout::loader::BinaryFormat::Le);
+    assert_eq!(p.binary().arch, binscout::disasm::Arch::X86_32);
+    assert_eq!(p.binary().entry, Some(0x10000));
+    assert_eq!(p.binary().sections.len(), 1);
     assert!(
-        matches!(err, binscout::error::Error::Unsupported(_)),
-        "LE must be explicit-unsupported, never raw: got {err:?}"
+        !p.functions_resolved(0, 10).is_empty(),
+        "LE code must yield functions"
     );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported") && msg.contains("LE"),
-        "error must name LE as unsupported: {msg:?}"
-    );
-    assert!(!db.exists(), "unsupported open must not create a sidecar");
     common::cleanup(&dir);
 }
 
@@ -203,9 +201,10 @@ fn truncated_le_never_falls_back_to_raw() {
     let db = common::temp_db(&dir, "trunc");
     let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
     assert!(
-        matches!(err, binscout::error::Error::Unsupported(_)),
-        "recognized LE must stay unsupported, never raw fallback: got {err:?}"
+        matches!(err, binscout::error::Error::Invalid(_)),
+        "recognized-but-truncated LE must stay invalid, never raw fallback: got {err:?}"
     );
+    assert!(!db.exists(), "failed open must not create a sidecar");
     common::cleanup(&dir);
 }
 

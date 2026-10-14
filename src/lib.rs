@@ -17,7 +17,7 @@ use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, PartialDisasm};
 use crate::error::{Error, Result};
 use crate::loader::strings::StringHit;
-use crate::loader::{BinaryFormat, LoadedBinary, RawOptions, load, load_raw};
+use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
 pub fn version() -> &'static str {
@@ -72,11 +72,10 @@ impl Project {
         }
     }
 
-    /// Open a supported container binary (ELF/PE/Mach-O) with the default
+    /// Open a supported container binary (ELF/PE/Mach-O/LE) with the default
     /// sidecar DB.
     ///
-    /// Recognized LE images are rejected with [`Error::Unsupported`] (never
-    /// mis-parsed as raw); force raw mapping of any bytes, LE included,
+    /// LE images analyze as x86_32; force raw mapping of any bytes
     /// through [`Project::open_raw`]. Unrecognized bytes fall back to raw
     /// x86-64 at base 0 so fixture blobs and shellcode open without options;
     /// explicit bases/arches go through [`Project::open_raw`]. Reads the
@@ -95,8 +94,8 @@ impl Project {
     ///
     /// # Errors
     /// [`Error::NotFound`] if the path does not exist, [`Error::Unsupported`]
-    /// if it is not a file, the image is LE, or the arch has no
-    /// disassembler, [`Error::Invalid`] on undecodable input,
+    /// if it is not a file or the arch has no disassembler,
+    /// [`Error::Invalid`] on undecodable input,
     /// [`Error::Limit`] on input/name/metadata/snapshot budget overrun,
     /// [`Error::Storage`] on DB or I/O failure.
     pub fn open(path: &Path) -> Result<Self> {
@@ -846,19 +845,13 @@ fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) ->
 /// Container parse with raw x86-64 fallback for unrecognized bytes.
 ///
 /// Only [`Error::Invalid`] on unrecognized input falls back; recognized
-/// containers with unsupported arches still report [`Error::Unsupported`],
-/// and recognized LE images are always rejected: a valid LE parse is refused
-/// rather than analyzed, and a malformed-but-recognized LE stays
-/// [`Error::Unsupported`] (with the parse error as detail) instead of
-/// silently opening as raw x86-64.
+/// containers that fail to parse (LE included) report the parse error,
+/// and [`Error::Limit`]/[`Error::Unsupported`] propagate unchanged. LE
+/// images that parse flow to analysis as x86_32.
 fn load_or_raw(bytes: &[u8]) -> Result<LoadedBinary> {
     match load(bytes) {
-        Ok(bin) if bin.format == BinaryFormat::Le => Err(le_unsupported(None)),
         Ok(bin) => Ok(bin),
-        Err(Error::Invalid(detail)) if crate::loader::le::is_le(bytes) => {
-            Err(le_unsupported(Some(detail.as_str())))
-        }
-        Err(Error::Invalid(_)) => load_raw(
+        Err(Error::Invalid(_)) if !crate::loader::is_recognized(bytes) => load_raw(
             bytes,
             RawOptions {
                 base: 0,
@@ -868,21 +861,6 @@ fn load_or_raw(bytes: &[u8]) -> Result<LoadedBinary> {
         ),
         Err(e) => Err(e),
     }
-}
-
-/// Explicit-unsupported error for recognized LE images.
-///
-/// LE bytes are never analyzed and never fall back to raw x86-64, so agents
-/// cannot mistake a refusal for a successful analysis.
-fn le_unsupported(detail: Option<&str>) -> Error {
-    let mut msg = "LE format recognized (format:le, supported:false): \
-        Linear Executables are not supported for analysis"
-        .to_string();
-    if let Some(d) = detail {
-        msg.push_str(": ");
-        msg.push_str(d);
-    }
-    Error::Unsupported(msg)
 }
 
 #[cfg(test)]

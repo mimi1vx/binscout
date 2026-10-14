@@ -310,7 +310,7 @@ fn build_le(fixup_rec: &[u8]) -> Vec<u8> {
     put32(&mut f, h + 0x5C, entry_rel as u32);
     put32(&mut f, h + 0x68, fp_rel as u32);
     put32(&mut f, h + 0x6C, fr_rel as u32);
-    put32(&mut f, h + 0x80, (LE_OFF + code_rel) as u32);
+    put32(&mut f, h + 0x80, code_rel as u32);
     put32(&mut f, h + 0x84, 1);
 
     let p = LE_OFF + obj_rel;

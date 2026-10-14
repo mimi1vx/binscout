@@ -278,11 +278,12 @@ fn stats_reports_db_size_and_matching_counts() {
 fn fixture_snapshots_stay_under_size_cap() {
     // Mirrors the CI size gate: every loadable synthetic fixture must
     // snapshot far below 5 MiB (the 136 MB real-world snapshot is the
-    // cautionary datum, not the gate value). LE is unsupported by design.
+    // cautionary datum, not the gate value).
     const CAP: u64 = 5 * 1024 * 1024;
     for name in [
         common::builders::BASIC_NAME,
         common::builders::ORDINALS_NAME,
+        common::builders::LE_NAME,
         common::builders::GARBAGE_NAME,
     ] {
         let dir = common::tmpdir("size-cap");

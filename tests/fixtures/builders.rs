@@ -16,8 +16,8 @@
 pub const BASIC_NAME: &str = "pe32-basic.exe";
 /// Name of the ordinals PE32 fixture: ordinal + mangled imports.
 pub const ORDINALS_NAME: &str = "pe32-ordinals.exe";
-/// Name of the minimal LE fixture (explicitly unsupported at L1).
-pub const LE_NAME: &str = "le-unsupported.exe";
+/// Name of the minimal LE fixture (one R-X object, analyzed as x86_32).
+pub const LE_NAME: &str = "le-minimal.exe";
 /// Name of the raw garbage fixture (`.text`-noise + invalid opcode).
 pub const GARBAGE_NAME: &str = "text-garbage.bin";
 
@@ -290,7 +290,7 @@ pub fn pe32_ordinals() -> Vec<u8> {
 const LE_OFF: usize = 0x40;
 const LE_CODE: [u8; 4] = [0x55, 0x89, 0xE5, 0xC3]; // push ebp; mov ebp,esp; ret
 
-/// `le-unsupported.exe`: minimal MZ->LE image mirroring the `loader_le` test
+/// `le-minimal.exe`: minimal MZ->LE image mirroring the `loader_le` test
 /// harness (one R-X object, default entry bundle, no fixups).
 #[must_use]
 pub fn le_minimal() -> Vec<u8> {
@@ -326,7 +326,7 @@ pub fn le_minimal() -> Vec<u8> {
     put32(&mut f, h + 0x5C, entry_rel as u32);
     put32(&mut f, h + 0x68, fp_rel as u32);
     put32(&mut f, h + 0x6C, fr_rel as u32);
-    put32(&mut f, h + 0x80, (LE_OFF + code_rel) as u32); // data pages
+    put32(&mut f, h + 0x80, code_rel as u32); // data pages (header-relative)
     put32(&mut f, h + 0x84, 1);
 
     let p = LE_OFF + obj_rel;

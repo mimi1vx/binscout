@@ -76,7 +76,7 @@ fn build(o: &Opts) -> Vec<u8> {
     put32(&mut f, h + 0x5C, entry_rel as u32);
     put32(&mut f, h + 0x68, fp_rel as u32);
     put32(&mut f, h + 0x6C, fr_rel as u32);
-    put32(&mut f, h + 0x80, (LE_OFF + code_rel) as u32); // data pages
+    put32(&mut f, h + 0x80, code_rel as u32); // data pages (header-relative)
     put32(&mut f, h + 0x84, 1);
 
     let p = LE_OFF + obj_rel;
@@ -103,6 +103,169 @@ fn build(o: &Opts) -> Vec<u8> {
 
 fn minimal() -> Vec<u8> {
     build(&Opts::default())
+}
+
+/// DOS4GW-style image: outer MZ with no new header (`e_lfarlc` = `0x1E`,
+/// relocation garbage at `0x3C`) plus an embedded LE at [`DOS_OFF`] with a
+/// 4-byte page map: obj1 code over two pages (full + truncated tail),
+/// obj2 data as one zero-filled page, one fixup page, default entry.
+const DOS_OFF: usize = 0x200;
+const DOS_PS: usize = 512;
+const DOS_TAIL: usize = 100;
+
+fn build_dos4gw() -> Vec<u8> {
+    let entry: Vec<u8> = vec![0x01, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+    // One internal fixup on page 1: 32-bit offset @0x10 -> obj2+0.
+    let fixup_rec: Vec<u8> = vec![0x07, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00];
+    let obj_rel = 0xAC;
+    let page_rel = obj_rel + 2 * 24;
+    let fp_rel = page_rel + 3 * 4;
+    let fr_rel = fp_rel + 4 * 4;
+    let entry_rel = fr_rel + fixup_rec.len();
+    let data_rel = entry_rel + entry.len();
+
+    let mut f = vec![0u8; DOS_OFF];
+    f[0] = b'M';
+    f[1] = b'Z';
+    put16(&mut f, 0x18, 0x1E);
+    put32(&mut f, 0x3C, 0x09B4_0000);
+    f.resize(DOS_OFF + data_rel + DOS_PS + DOS_TAIL, 0);
+
+    let h = DOS_OFF;
+    f[h] = b'L';
+    f[h + 1] = b'E';
+    put32(&mut f, h + 0x04, 0); // level
+    put16(&mut f, h + 0x08, 2); // cpu 386
+    put16(&mut f, h + 0x0A, 1); // os DOS4GW
+    put32(&mut f, h + 0x14, 3); // pages
+    put32(&mut f, h + 0x18, 1); // eip obj
+    put32(&mut f, h + 0x1C, 0); // eip
+    put32(&mut f, h + 0x20, 1); // esp obj
+    put32(&mut f, h + 0x24, 0x1000); // esp
+    put32(&mut f, h + 0x28, DOS_PS as u32); // page size
+    put32(&mut f, h + 0x2C, DOS_TAIL as u32); // bytes on last page
+    put32(&mut f, h + 0x30, (16 + fixup_rec.len()) as u32); // fixup size
+    put32(
+        &mut f,
+        h + 0x38,
+        (data_rel - obj_rel + DOS_PS + DOS_TAIL) as u32,
+    );
+    put32(&mut f, h + 0x40, obj_rel as u32);
+    put32(&mut f, h + 0x44, 2);
+    put32(&mut f, h + 0x48, page_rel as u32);
+    put32(&mut f, h + 0x5C, entry_rel as u32);
+    put32(&mut f, h + 0x68, fp_rel as u32);
+    put32(&mut f, h + 0x6C, fr_rel as u32);
+    put32(&mut f, h + 0x80, data_rel as u32); // data pages (header-relative)
+    put32(&mut f, h + 0x84, 3);
+
+    // obj1: code, R-X, pages 1-2, base 0x10000.
+    let p = DOS_OFF + obj_rel;
+    put32(&mut f, p, (DOS_PS + DOS_TAIL) as u32);
+    put32(&mut f, p + 4, 0x10000);
+    put32(&mut f, p + 8, 0x2005);
+    put32(&mut f, p + 12, 1);
+    put32(&mut f, p + 16, 2);
+    // obj2: data, RW, page 3 (zero-filled), base 0x20000.
+    let p = DOS_OFF + obj_rel + 24;
+    put32(&mut f, p, DOS_PS as u32);
+    put32(&mut f, p + 4, 0x20000);
+    put32(&mut f, p + 8, 0x2003);
+    put32(&mut f, p + 12, 3);
+    put32(&mut f, p + 16, 1);
+
+    // Page map: `{high:0, low:n, type:0}` x2, then zero-fill page 3.
+    let p = DOS_OFF + page_rel;
+    f[p + 2] = 1;
+    f[p + 6] = 2;
+    f[p + 11] = 3;
+
+    let p = DOS_OFF + fp_rel;
+    put32(&mut f, p, 0);
+    put32(&mut f, p + 4, fixup_rec.len() as u32);
+    put32(&mut f, p + 8, fixup_rec.len() as u32);
+    put32(&mut f, p + 12, fixup_rec.len() as u32);
+
+    f[DOS_OFF + fr_rel..DOS_OFF + fr_rel + fixup_rec.len()].copy_from_slice(&fixup_rec);
+    f[DOS_OFF + entry_rel..DOS_OFF + entry_rel + entry.len()].copy_from_slice(&entry);
+    let d = DOS_OFF + data_rel;
+    f[d..d + 4].copy_from_slice(&CODE);
+    f[d + DOS_PS..d + DOS_PS + 4].copy_from_slice(&CODE);
+    f
+}
+
+#[test]
+fn dos4gw_embedded_le_is_found_by_scan() {
+    let bytes = build_dos4gw();
+    assert!(is_le(&bytes));
+    let img = parse_le(&bytes).expect("DOS4GW-style LE must parse");
+    assert_eq!(img.page_size, DOS_PS as u32);
+    assert_eq!(img.cpu, 2);
+    assert_eq!(img.os, 1);
+    assert_eq!(img.objects.len(), 2);
+    assert!(img.objects[0].readable && img.objects[0].executable);
+    assert!(img.objects[1].readable && img.objects[1].writable);
+    assert!(!img.objects[1].executable);
+}
+
+#[test]
+fn dos4gw_code_data_mapping_and_entry() {
+    let img = parse_le(&build_dos4gw()).expect("DOS4GW-style LE must parse");
+    assert_eq!(img.segments.len(), 2);
+    let code = &img.segments[0];
+    assert_eq!(code.vaddr, 0x10000);
+    assert_eq!(code.data.len(), DOS_PS + DOS_TAIL);
+    assert_eq!(&code.data[..4], &CODE);
+    assert_eq!(&code.data[DOS_PS..DOS_PS + 4], &CODE);
+    let data = &img.segments[1];
+    assert_eq!(data.vaddr, 0x20000);
+    assert_eq!(data.data.len(), DOS_PS);
+    assert!(data.data.iter().all(|b| *b == 0));
+    assert_eq!(img.entry, Some(0x10000));
+}
+
+#[test]
+fn dos4gw_fixup_page_walks() {
+    let img = parse_le(&build_dos4gw()).expect("DOS4GW-style LE must parse");
+    assert_eq!(
+        img.fixups,
+        [LeFixup {
+            page: 1,
+            sources: vec![0x10],
+            target: LeTarget::Internal {
+                object: 2,
+                offset: 0
+            },
+            additive: None,
+        }]
+    );
+}
+
+#[test]
+fn dos4gw_invalid_page_stays_virtual() {
+    let mut bytes = build_dos4gw();
+    // Page 3 (zero-filled) retyped as invalid (`2`): still zeros.
+    bytes[DOS_OFF + 0xAC + 48 + 8 + 3] = 2;
+    let img = parse_le(&bytes).expect("invalid page must parse");
+    assert!(img.segments[1].data.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn dos4gw_project_analysis_finds_entry_function() {
+    let dir = common::tmpdir("le-dos4gw-project");
+    let bytes = build_dos4gw();
+    let bin = common::write_bin(&dir, "dos4gw-le.bin", &bytes);
+    let db = common::temp_db(&dir, "dos4gw-le");
+    let p = binscout::Project::open_with_db(&bin, &db).expect("DOS4GW-style LE must open");
+    assert_eq!(p.binary().format, binscout::loader::BinaryFormat::Le);
+    assert_eq!(p.binary().arch, binscout::disasm::Arch::X86_32);
+    let funcs = p.functions_resolved(0, 100);
+    assert!(!funcs.is_empty(), "LE code must yield functions");
+    assert!(
+        funcs.iter().any(|f| f["entry"] == 0x10000),
+        "entry must sit inside a function"
+    );
+    common::cleanup(&dir);
 }
 
 #[test]
@@ -356,7 +519,7 @@ fn build_with_imports(
     put32(&mut f, h + 0x70, mod_rel as u32);
     put32(&mut f, h + 0x74, imp_count);
     put32(&mut f, h + 0x78, proc_rel as u32);
-    put32(&mut f, h + 0x80, (LE_OFF + code_rel) as u32);
+    put32(&mut f, h + 0x80, code_rel as u32);
     put32(&mut f, h + 0x84, 1);
 
     let p = LE_OFF + obj_rel;
@@ -457,7 +620,7 @@ fn truncated_file_with_imports_is_invalid_without_panic() {
 }
 
 #[test]
-fn malformed_import_tables_stay_explicitly_unsupported_at_project_level() {
+fn malformed_import_tables_stay_invalid_at_project_level() {
     let dir = common::tmpdir("le-import-boundary");
     let bytes = build_with_imports(&[], &[5, b'X'], &[3, b'a', b'b', b'c'], 1);
     assert!(is_le(&bytes));
@@ -465,9 +628,9 @@ fn malformed_import_tables_stay_explicitly_unsupported_at_project_level() {
     let db = common::temp_db(&dir, "cross-table-le");
     let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
     assert!(
-        matches!(err, Error::Unsupported(_)),
-        "recognized LE must stay unsupported, never raw fallback: got {err:?}"
+        matches!(err, Error::Invalid(_)),
+        "recognized-but-malformed LE must stay invalid, never raw fallback: got {err:?}"
     );
-    assert!(!db.exists(), "unsupported open must not create a sidecar");
+    assert!(!db.exists(), "failed open must not create a sidecar");
     common::cleanup(&dir);
 }

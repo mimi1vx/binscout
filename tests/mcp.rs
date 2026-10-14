@@ -389,7 +389,7 @@ fn disasm_partial_prefix_and_error_at() {
 }
 
 #[test]
-fn le_project_info_is_a_tool_error() {
+fn le_project_info_reports_le_format() {
     let dir = tmpdir("mcp-le");
     let bin = write_bin(
         &dir,
@@ -413,13 +413,9 @@ fn le_project_info_is_a_tool_error() {
     let resps = session(&lines);
     assert_eq!(resps.len(), 2, "{resps:?}");
     let resp = &resps[1];
-    assert!(
-        resp.get("result").is_none(),
-        "LE must not return info: {resp}"
-    );
-    let msg = resp["error"]["message"].as_str().expect("error message");
-    assert!(msg.contains("unsupported"), "{resp}");
-    assert!(msg.contains("LE"), "{resp}");
+    let text = tool_text(resp);
+    let info: Value = serde_json::from_str(text).expect("project_info json");
+    assert_eq!(info["format"], "le", "{resp}");
     cleanup(&dir);
 }
 

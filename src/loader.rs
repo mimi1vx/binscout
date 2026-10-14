@@ -95,7 +95,7 @@ pub enum BinaryFormat {
     Pe,
     /// Mach-O (macOS).
     MachO,
-    /// Linear Executable (DOS4GW).
+    /// Linear Executable (DOS4GW), analyzed as [`Arch::X86_32`].
     Le,
     /// Flat bytes with caller-supplied architecture and base.
     Raw,
@@ -234,6 +234,17 @@ pub struct RawOptions {
     pub arch: Arch,
     /// Entry-point address, if known.
     pub entry: Option<u64>,
+}
+
+/// True when `bytes` carry a recognized container magic (LE included),
+/// whether or not the full parse succeeds.
+///
+/// [`crate::Project`] falls back to raw only below this line:
+/// recognized-but-malformed containers report their parse error instead
+/// of silently opening as raw x86-64.
+#[must_use]
+pub fn is_recognized(bytes: &[u8]) -> bool {
+    le::is_le(bytes) || FileKind::parse(bytes).is_ok()
 }
 
 /// Parse any supported binary: LE via [`le`], ELF/PE/Mach-O via `object`.

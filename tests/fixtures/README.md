@@ -16,7 +16,7 @@ All PE32 fixtures: `I386`, `ImageBase 0x400000`, `.text` at `0x401000`,
   X2/A4 (`le32_refs` helper in `tests/common/mod.rs` expects exactly 2 refs).
 - `pe32-ordinals.exe`: imports `TESTDLL.dll!#1`, `#2` (ordinal-only) plus
   `?myfunc@@YAXH@Z` (C++ mangled). Ground truth for L3/A8.
-- `le-unsupported.exe`: minimal MZ->LE image (one R-X object, entry bundle).
+- `le-minimal.exe`: minimal MZ->LE image (one R-X object, entry bundle).
   Loader-level truth; L1/A1 makes `Project::open` reject it.
 - `text-garbage.bin`: x86-64 prologue, invalid opcode `0xD6`, noise strings
   `VWf3` and `D$ f`, trailing nops+ret. Decode-stop truth for D2/A6,
