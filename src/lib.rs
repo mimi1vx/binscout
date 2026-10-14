@@ -142,15 +142,35 @@ impl Project {
         };
 
         match cached {
-            Some(db::Snapshot::Hit(hit)) => Ok(Self {
-                path: binary.to_path_buf(),
-                db_path: db_path.to_path_buf(),
-                content_hash: hash,
-                size,
-                binary: reload_binary(&bytes, raw)?,
-                analysis: hit.analysis,
-                annotations: hit.annotations,
-            }),
+            Some(db::Snapshot::Hit(hit)) => {
+                let loaded = reload_binary(&bytes, raw)?;
+                let db::Loaded {
+                    arch,
+                    functions,
+                    call_edges,
+                    xrefs,
+                    strings,
+                    annotations,
+                    ..
+                } = *hit;
+                let analysis = crate::analysis::rebuild(
+                    arch,
+                    &loaded,
+                    &functions,
+                    &call_edges,
+                    xrefs,
+                    strings,
+                )?;
+                Ok(Self {
+                    path: binary.to_path_buf(),
+                    db_path: db_path.to_path_buf(),
+                    content_hash: hash,
+                    size,
+                    binary: loaded,
+                    analysis,
+                    annotations,
+                })
+            }
             Some(db::Snapshot::Stale { annotations, .. }) => {
                 Self::reanalyze(binary, db_path, bytes, raw, hash, size, annotations)
             }

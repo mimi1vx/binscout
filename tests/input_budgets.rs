@@ -40,7 +40,6 @@ fn budget_constants_are_independently_justified() {
     assert_eq!(MAX_NAME_BYTES, 4096, "covers mangled templates");
     assert_eq!(MAX_DEMANGLED_BYTES, 8192, "2x name for expansion");
     assert_eq!(MAX_METADATA_BYTES, 16 * 1024 * 1024, "16 MiB aggregate");
-    assert_eq!(db::MAX_SNAPSHOT_BYTES, 64 * 1024 * 1024);
     assert_eq!(db::MAX_SNAPSHOT_FUNCTIONS, 100_000);
     assert_eq!(db::MAX_SNAPSHOT_ANNOTATIONS, 10_000);
     assert_eq!(db::MAX_ANNOTATION_BYTES, 8192);

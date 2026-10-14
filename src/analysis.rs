@@ -259,6 +259,201 @@ impl Analysis {
     }
 }
 
+/// Persisted block shape: address range, per-instruction boundaries, and
+/// successors — no rendered instructions.
+///
+/// Snapshots store layouts and re-decode instructions from the binary on
+/// open (see [`rebuild`]): caching rendered [`Insn`] rows as JSON made a
+/// 1.5 MB binary produce a 70+ MB snapshot, so derived text is never
+/// persisted. Boundaries are per instruction (not just the range) because
+/// recursive descent can record overlapping decodes of one region from
+/// different paths; replaying each recorded address reproduces the block
+/// bit-identically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockLayout {
+    /// Address of the first instruction.
+    pub start: u64,
+    /// End address (one past the last byte).
+    pub end: u64,
+    /// `(address, size)` of every instruction in address order.
+    pub insns: Vec<InsnLayout>,
+    /// Successor block starts.
+    pub succs: Vec<u64>,
+}
+
+/// Persisted instruction boundary: address plus byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InsnLayout {
+    /// Virtual address of the first byte.
+    pub addr: u64,
+    /// Length in bytes.
+    pub size: u8,
+}
+
+/// Persisted function shape: entry, name, callees, and block layouts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionLayout {
+    /// Function entry address.
+    pub entry: u64,
+    /// Export name or rename, if any.
+    pub name: Option<String>,
+    /// Sorted direct callees.
+    pub calls: Vec<u64>,
+    /// Block layouts in address order.
+    pub blocks: Vec<BlockLayout>,
+}
+
+/// Flatten an analysis into persistable layouts.
+///
+/// Successor lists and call targets are sorted so snapshots are
+/// deterministic across processes.
+#[must_use]
+pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
+    analysis
+        .functions
+        .values()
+        .map(|f| {
+            let mut calls = analysis.calls_of(f.entry);
+            calls.sort_unstable();
+            let blocks = f
+                .blocks
+                .values()
+                .map(|b| {
+                    let mut succs = f.successors(b.start);
+                    succs.sort_unstable();
+                    let insns = b
+                        .insns
+                        .iter()
+                        .map(|i| InsnLayout {
+                            addr: i.addr,
+                            size: i.size,
+                        })
+                        .collect();
+                    BlockLayout {
+                        start: b.start,
+                        end: b.end(),
+                        insns,
+                        succs,
+                    }
+                })
+                .collect();
+            FunctionLayout {
+                entry: f.entry,
+                name: f.name.clone(),
+                calls,
+                blocks,
+            }
+        })
+        .collect()
+}
+
+/// Rebuild an analysis from persisted layouts by re-decoding each recorded
+/// instruction address from `bin`.
+///
+/// Each address decodes independently with [`crate::disasm::disasm_first`]
+/// exactly as the analysis walker does, so the reproduced instructions are
+/// bit-identical to a fresh analysis of the same bytes — including blocks
+/// where recursive descent recorded overlapping decodes from different
+/// paths. A boundary that does not decode, or decodes to a different size,
+/// is snapshot corruption and errors with [`Error::Storage`]. Total range
+/// bytes are bounded by the mapped segments, so a forged snapshot cannot
+/// decode past the binary.
+///
+/// # Errors
+/// [`Error::Storage`] on corrupt layouts (unknown function references are
+/// dropped as in [`analyze`], but undecodable ranges error),
+/// [`Error::Limit`] when layouts exceed analysis budgets.
+pub fn rebuild(
+    arch: Arch,
+    bin: &LoadedBinary,
+    functions: &[FunctionLayout],
+    call_edges: &[(u64, u64)],
+    xrefs: Vec<Xref>,
+    strings: Vec<StringHit>,
+) -> Result<Analysis> {
+    if functions.len() > MAX_FUNCTIONS {
+        return Err(Error::Limit(format!("more than {MAX_FUNCTIONS} functions")));
+    }
+    let space = AddrSpace::new(bin);
+    let mapped: u64 = bin.segments.iter().map(|s| s.data.len() as u64).sum();
+    let mut ranged: u64 = 0;
+    let mut rebuilt: BTreeMap<u64, Function> = BTreeMap::new();
+    for f in functions {
+        let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        for b in &f.blocks {
+            let len = b.end.wrapping_sub(b.start);
+            ranged = ranged
+                .checked_add(len)
+                .filter(|m| *m <= mapped)
+                .ok_or_else(|| {
+                    Error::Storage(format!(
+                        "snapshot block {:#x} exceeds mapped bytes",
+                        b.start
+                    ))
+                })?;
+            blocks.insert(b.start, decode_block(arch, &space, b)?);
+            edges.extend(b.succs.iter().map(|s| (b.start, *s)));
+        }
+        rebuilt.insert(
+            f.entry,
+            Function::from_parts(f.entry, f.name.clone(), blocks, &edges),
+        );
+    }
+    Ok(Analysis::from_parts(
+        arch, rebuilt, call_edges, xrefs, strings,
+    ))
+}
+
+/// Re-decode one persisted block instruction by instruction.
+///
+/// Replays every recorded `(address, size)` boundary independently, so
+/// overlapping decodes reproduce exactly. Anything but a clean replay that
+/// ends at the stored `end` is corruption.
+fn decode_block(arch: Arch, space: &AddrSpace, layout: &BlockLayout) -> Result<BasicBlock> {
+    let mut insns = Vec::with_capacity(layout.insns.len());
+    for boundary in &layout.insns {
+        let bytes = space.code_bytes(boundary.addr).ok_or_else(|| {
+            Error::Storage(format!(
+                "snapshot block {:#x} leaves executable bytes",
+                layout.start
+            ))
+        })?;
+        let Some(insn) = crate::disasm::disasm_first(arch, bytes, boundary.addr).map_err(|e| {
+            Error::Storage(format!(
+                "snapshot block {:#x} does not decode: {e}",
+                layout.start
+            ))
+        })?
+        else {
+            return Err(Error::Storage(format!(
+                "snapshot block {:#x} has no bytes at {:#x}",
+                layout.start, boundary.addr
+            )));
+        };
+        if insn.size != boundary.size {
+            return Err(Error::Storage(format!(
+                "snapshot block {:#x} decodes {:#x} as {} bytes, not {}",
+                layout.start, boundary.addr, insn.size, boundary.size
+            )));
+        }
+        insns.push(insn);
+    }
+    let block = BasicBlock {
+        start: layout.start,
+        insns,
+    };
+    if block.end() != layout.end {
+        return Err(Error::Storage(format!(
+            "snapshot block {:#x} ends at {:#x}, not {:#x}",
+            layout.start,
+            block.end(),
+            layout.end
+        )));
+    }
+    Ok(block)
+}
+
 /// Outcome counts for agent planning and golden tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisSummary {

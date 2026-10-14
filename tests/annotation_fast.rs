@@ -49,6 +49,26 @@ fn persisted_meta(bin: &Path, db: &Path) -> db::BinaryMeta {
     loaded.meta
 }
 
+/// Load a snapshot and re-decode it against the binary bytes: the full
+/// cached analysis plus stored annotations and metadata.
+fn load_rebuilt(
+    db_path: &Path,
+    bin: &Path,
+) -> (
+    binscout::analysis::Analysis,
+    BTreeMap<u64, Annotation>,
+    db::BinaryMeta,
+) {
+    let raw = std::fs::read(bin).expect("read bin");
+    let loaded_bin = binscout::loader::load(&raw).expect("reload bin");
+    let handle = db::open_db(db_path).expect("open db");
+    let loaded = db::load(&handle).expect("load").expect("snapshot");
+    let annotations = loaded.annotations.clone();
+    let meta = loaded.meta.clone();
+    let analysis = loaded.rebuild(&loaded_bin).expect("rebuild");
+    (analysis, annotations, meta)
+}
+
 #[test]
 fn fast_rename_matches_full_reference() {
     let dir = common::tmpdir("fast-rename");
@@ -84,23 +104,17 @@ fn fast_rename_matches_full_reference() {
             comment: None,
         },
     );
-    let loaded_fast = {
-        let h = db::open_db(&db).expect("open fast db");
-        db::load(&h).expect("load fast").expect("snapshot")
+    let loaded_fast = load_rebuilt(&db, &bin);
+    let loaded_ref = {
+        full_save_reference(&ref_db, q.analysis(), &expected_ann, &meta);
+        load_rebuilt(&ref_db, &bin)
     };
-    let loaded_ref = full_save_reference(&ref_db, q.analysis(), &expected_ann, &meta);
-    assert_eq!(
-        loaded_fast.analysis.summary(),
-        loaded_ref.analysis.summary()
-    );
-    assert_eq!(
-        loaded_fast.analysis.call_edges(),
-        loaded_ref.analysis.call_edges()
-    );
-    assert_eq!(loaded_fast.analysis.xrefs, loaded_ref.analysis.xrefs);
-    assert_eq!(loaded_fast.analysis.strings, loaded_ref.analysis.strings);
-    assert_eq!(loaded_fast.annotations, loaded_ref.annotations);
-    assert_eq!(loaded_fast.meta, loaded_ref.meta);
+    assert_eq!(loaded_fast.0.summary(), loaded_ref.0.summary());
+    assert_eq!(loaded_fast.0.call_edges(), loaded_ref.0.call_edges());
+    assert_eq!(loaded_fast.0.xrefs, loaded_ref.0.xrefs);
+    assert_eq!(loaded_fast.0.strings, loaded_ref.0.strings);
+    assert_eq!(loaded_fast.1, loaded_ref.1);
+    assert_eq!(loaded_fast.2, loaded_ref.2);
 
     assert_eq!(std::fs::read(&bin).expect("reread"), bytes_before);
     common::cleanup(&dir);
@@ -136,17 +150,14 @@ fn fast_comment_matches_full_reference() {
             comment: Some("string note".to_string()),
         },
     );
-    let loaded_fast = {
-        let h = db::open_db(&db).expect("open");
-        db::load(&h).expect("load").expect("snapshot")
+    let loaded_fast = load_rebuilt(&db, &bin);
+    let loaded_ref = {
+        full_save_reference(&ref_db, q.analysis(), &expected_ann, &meta);
+        load_rebuilt(&ref_db, &bin)
     };
-    let loaded_ref = full_save_reference(&ref_db, q.analysis(), &expected_ann, &meta);
-    assert_eq!(loaded_fast.annotations, loaded_ref.annotations);
-    assert_eq!(
-        loaded_fast.analysis.summary(),
-        loaded_ref.analysis.summary()
-    );
-    assert_eq!(loaded_fast.meta, loaded_ref.meta);
+    assert_eq!(loaded_fast.1, loaded_ref.1);
+    assert_eq!(loaded_fast.0.summary(), loaded_ref.0.summary());
+    assert_eq!(loaded_fast.2, loaded_ref.2);
     assert_eq!(std::fs::read(&bin).expect("reread"), bytes_before);
     common::cleanup(&dir);
 }
@@ -369,17 +380,15 @@ fn failed_rename_leaves_db_untouched() {
     let entry = common::builders::BASIC_ENTRY_VA;
     p.rename_function(entry, "real").expect("rename");
     let before = {
-        let h = db::open_db(&db).expect("open");
-        let l = db::load(&h).expect("load").expect("snapshot");
-        (l.analysis.summary(), l.annotations.clone(), l.meta.clone())
+        let (analysis, annotations, meta) = load_rebuilt(&db, &bin);
+        (analysis.summary(), annotations, meta)
     };
     let err = p.rename_function(0xdead_beef, "nope").unwrap_err();
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
     drop(p);
     let after = {
-        let h = db::open_db(&db).expect("open");
-        let l = db::load(&h).expect("load").expect("snapshot");
-        (l.analysis.summary(), l.annotations.clone(), l.meta.clone())
+        let (analysis, annotations, meta) = load_rebuilt(&db, &bin);
+        (analysis.summary(), annotations, meta)
     };
     assert_eq!(before, after);
     common::cleanup(&dir);

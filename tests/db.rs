@@ -275,6 +275,39 @@ fn stats_reports_db_size_and_matching_counts() {
 }
 
 #[test]
+fn snapshot_round_trip_preserves_every_instruction() {
+    // Snapshots persist block layouts; instructions re-decode from the
+    // binary on open. Every function's full detail must be identical
+    // across a save/reopen cycle.
+    for name in [
+        common::builders::BASIC_NAME,
+        common::builders::ORDINALS_NAME,
+        common::builders::LE_NAME,
+        common::builders::GARBAGE_NAME,
+    ] {
+        let dir = common::tmpdir("fidelity");
+        let bin = common::write_fixture(&dir, name);
+        let db = common::temp_db(&dir, "fidelity");
+        let p = Project::open_with_db(&bin, &db).expect("fixture must open");
+        let entries: Vec<u64> = p.analysis().functions.keys().copied().collect();
+        let before: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| p.func_detail(*e).expect("detail"))
+            .collect();
+        let summary = p.analysis().summary();
+        p.save().expect("save");
+        drop(p);
+        let q = Project::open_with_db(&bin, &db).expect("reopen loads snapshot");
+        assert_eq!(q.analysis().summary(), summary, "{name} summary differs");
+        for (entry, want) in entries.iter().zip(before.iter()) {
+            let got = q.func_detail(*entry).expect("detail after reopen");
+            assert_eq!(&got, want, "{name} func {entry:#x} differs");
+        }
+        common::cleanup(&dir);
+    }
+}
+
+#[test]
 fn fixture_snapshots_stay_under_size_cap() {
     // Mirrors the CI size gate: every loadable synthetic fixture must
     // snapshot far below 5 MiB (the 136 MB real-world snapshot is the

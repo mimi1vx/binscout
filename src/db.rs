@@ -5,11 +5,19 @@
 //! the [`Xref`] set, extracted [`StringHit`]s, and user [`Annotation`]s.
 //! Values are JSON so rows stay debuggable with any `redb` inspector.
 //!
+//! Block rows store address ranges plus successors only; instructions are
+//! re-decoded from the binary on open (see
+//! [`Analysis::rebuild`](crate::analysis::rebuild)). Caching rendered
+//! instructions made small binaries produce huge sidecars, so derived text
+//! is never persisted.
+//!
 //! [`save`] rewrites every table in one transaction; [`load`] rebuilds the
-//! [`Analysis`] via [`Analysis::from_parts`](crate::analysis::Analysis::from_parts)
-//! and returns stored annotations untouched. [`load_cached`] filters by
-//! content hash in one read transaction: matching snapshots load fully,
-//! stale ones return metadata plus annotations without decoding the
+//! skeleton [`Loaded`] snapshot and the caller re-decodes instructions via
+//! [`Analysis::rebuild`](crate::analysis::rebuild), returning stored
+//! annotations untouched. [`load_cached`] filters by
+//! content hash in one read transaction: matching snapshots load the
+//! skeleton fully, stale ones (different hash, or an older schema version)
+//! return metadata plus annotations without decoding the
 //! discarded derived rows (see its stale-cache policy). Callers detect a
 //! changed binary by comparing [`content_hash`] against
 //! [`BinaryMeta::content_hash`]: re-analysis runs, annotations carry over by
@@ -22,19 +30,14 @@ use std::path::{Path, PathBuf};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::{Analysis, BasicBlock, Xref};
+use crate::analysis::{Analysis, FunctionLayout, Xref};
 use crate::disasm::Arch;
 use crate::error::{Error, Result};
 use crate::loader::BinaryFormat;
 use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
-pub const SCHEMA_VERSION: u32 = 1;
-/// Cap on aggregate encoded snapshot row bytes decoded or written.
-///
-/// 64 MiB dwarfs fixture snapshots (tens of KiB) while keeping a forged
-/// sidecar from decoding gigabytes before rejection.
-pub const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+pub const SCHEMA_VERSION: u32 = 2;
 /// Cap on cached function rows (mirrors analysis [`MAX_FUNCTIONS`](crate::analysis::MAX_FUNCTIONS)).
 pub const MAX_SNAPSHOT_FUNCTIONS: usize = 100_000;
 /// Cap on cached block rows (blocks never exceed decoded instructions).
@@ -216,7 +219,12 @@ pub struct FunctionRecord {
     pub calls: Vec<u64>,
 }
 
-/// One basic-block row with its instructions and sorted successors.
+/// One basic-block row: address range, per-instruction boundaries, and
+/// sorted successors.
+///
+/// Instructions are not stored; the open path re-decodes each recorded
+/// `(address, size)` boundary from the binary (see
+/// [`crate::analysis::rebuild`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRecord {
     /// Owning function entry.
@@ -225,8 +233,8 @@ pub struct BlockRecord {
     pub start: u64,
     /// End address (one past the last byte).
     pub end: u64,
-    /// Decoded instructions in address order.
-    pub insns: Vec<crate::disasm::Insn>,
+    /// `(address, size)` of every instruction in address order.
+    pub insns: Vec<crate::analysis::InsnLayout>,
     /// Successor block starts.
     pub succs: Vec<u64>,
 }
@@ -326,15 +334,51 @@ impl Serialize for ProjectInfo {
     }
 }
 
-/// Snapshot read back by [`load`]: metadata, rebuilt analysis, annotations.
+/// Snapshot read back by [`load`]: metadata, cached layouts, annotations.
+///
+/// Instructions are not included; the caller rebuilds the [`Analysis`]
+/// from the layouts plus the binary via
+/// [`rebuild`](crate::analysis::rebuild).
 #[derive(Debug)]
 pub struct Loaded {
     /// Snapshot metadata (row 0).
     pub meta: BinaryMeta,
-    /// Rebuilt analysis snapshot.
-    pub analysis: Analysis,
+    /// Disassembler target the snapshot was taken as.
+    pub arch: Arch,
+    /// Cached function layouts (entry, name, callees, block ranges).
+    pub functions: Vec<FunctionLayout>,
+    /// Cached callgraph edges as `(caller, callee)` pairs.
+    pub call_edges: Vec<(u64, u64)>,
+    /// Cached cross-references.
+    pub xrefs: Vec<Xref>,
+    /// Cached extracted strings.
+    pub strings: Vec<StringHit>,
     /// Annotations keyed by address.
     pub annotations: BTreeMap<u64, Annotation>,
+}
+
+impl Loaded {
+    /// Re-decode snapshot instructions from `bin` into a full [`Analysis`].
+    ///
+    /// The snapshot holds block layouts only; this steps each range with the
+    /// same decoder the analysis walker uses, so the result equals a fresh
+    /// analysis of the same bytes. Stored annotations are not part of the
+    /// returned value; read [`Loaded::annotations`] directly.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on corrupt layouts (see
+    /// [`rebuild`](crate::analysis::rebuild)), [`Error::Limit`] past
+    /// analysis budgets.
+    pub fn rebuild(self, bin: &crate::loader::LoadedBinary) -> Result<Analysis> {
+        crate::analysis::rebuild(
+            self.arch,
+            bin,
+            &self.functions,
+            &self.call_edges,
+            self.xrefs,
+            self.strings,
+        )
+    }
 }
 
 /// Open (creating if needed) the project DB at `path`.
@@ -407,18 +451,9 @@ fn check_annotation_text(ann: &Annotation) -> Result<()> {
     Ok(())
 }
 
-/// Add encoded row bytes to the snapshot aggregate budget.
-fn account_snapshot(total: &mut u64, len: usize) -> Result<()> {
-    *total = total
-        .checked_add(len as u64)
-        .filter(|m| *m <= MAX_SNAPSHOT_BYTES)
-        .ok_or_else(|| Error::Limit("snapshot exceeds 64 MiB".to_string()))?;
-    Ok(())
-}
-
 /// Pre-write row-count budget check so [`save`] never writes a snapshot
 /// that [`load`] would reject. Counts mirror the analysis caps plus the
-/// annotation cap; byte totals are enforced at read time row by row.
+/// annotation cap.
 fn check_analysis_budgets(
     analysis: &Analysis,
     annotations: &BTreeMap<u64, Annotation>,
@@ -561,12 +596,13 @@ pub fn save_annotation(
 /// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
 ///
 /// Clears all seven tables first so a smaller re-analysis leaves no stale
-/// rows. Row counts and aggregate encoded bytes are checked against the
-/// snapshot budgets before committing, so a snapshot that [`load`] could not
-/// read back is never written. Never touches the analyzed binary.
+/// rows. Row counts are checked against the snapshot budgets before
+/// committing, so a snapshot that [`load`] could not read back is never
+/// written. Only block layouts persist; instructions re-decode on open.
+/// Never touches the analyzed binary.
 ///
 /// # Errors
-/// [`Error::Limit`] when row or byte budgets are exceeded,
+/// [`Error::Limit`] when row budgets are exceeded,
 /// [`Error::Storage`] on any `redb` or encoding failure.
 pub fn save(
     db: &Database,
@@ -618,17 +654,16 @@ pub fn save(
         t.insert(0u64, json(meta)?)
             .map_err(|e| Error::Storage(format!("write binaries: {e}")))?;
     }
+    let layouts = crate::analysis::layout(analysis);
     {
         let mut t = wtxn
             .open_table(FUNCTIONS)
             .map_err(|e| Error::Storage(format!("open functions: {e}")))?;
-        for f in analysis.functions.values() {
-            let mut calls = analysis.calls_of(f.entry);
-            calls.sort_unstable();
+        for f in &layouts {
             let rec = FunctionRecord {
                 entry: f.entry,
                 name: f.name.clone(),
-                calls,
+                calls: f.calls.clone(),
             };
             t.insert(f.entry, json(&rec)?)
                 .map_err(|e| Error::Storage(format!("write functions: {e}")))?;
@@ -638,16 +673,14 @@ pub fn save(
         let mut t = wtxn
             .open_table(BLOCKS)
             .map_err(|e| Error::Storage(format!("open blocks: {e}")))?;
-        for f in analysis.functions.values() {
-            for b in f.blocks.values() {
-                let mut succs = f.successors(b.start);
-                succs.sort_unstable();
+        for f in &layouts {
+            for b in &f.blocks {
                 let rec = BlockRecord {
                     func_entry: f.entry,
                     start: b.start,
-                    end: b.end(),
+                    end: b.end,
                     insns: b.insns.clone(),
-                    succs,
+                    succs: b.succs.clone(),
                 };
                 t.insert(block_key(f.entry, b.start), json(&rec)?)
                     .map_err(|e| Error::Storage(format!("write blocks: {e}")))?;
@@ -719,24 +752,27 @@ fn read_meta_row(rtxn: &redb::ReadTransaction) -> Result<Option<BinaryMeta>> {
     Ok(Some(decode(&row.value())?))
 }
 
-/// Decoded derived rows (`functions`/CFG edges, xrefs, strings) shared by
-/// [`load`] and the hit path of [`load_cached`].
-struct AnalysisParts {
-    functions: BTreeMap<u64, crate::analysis::Function>,
+/// Persisted derived rows (`functions`/block layouts, call edges, xrefs,
+/// strings) shared by [`load`] and the hit path of [`load_cached`].
+///
+/// Instructions are not part of the snapshot; the caller re-decodes them
+/// from the binary via
+/// [`rebuild`](crate::analysis::rebuild).
+struct SnapshotParts {
+    functions: Vec<FunctionLayout>,
     call_edges: Vec<(u64, u64)>,
     xrefs: Vec<Xref>,
     strings: Vec<StringHit>,
 }
 
-/// Decode the derived `functions`/`blocks`/`xrefs`/`strings` tables.
+/// Decode the derived `functions`/`blocks`/`xrefs`/`strings` tables into
+/// persistable layouts.
 ///
 /// A missing table or an undecodable row is corruption and errors; callers
 /// holding a known-stale snapshot must not call this at all (see the
-/// stale-cache policy on [`load_cached`]). Row counts and aggregate encoded
-/// bytes are capped so a forged sidecar fails fast with [`Error::Limit`]
-/// instead of decoding gigabytes.
-fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
-    let mut snapshot_bytes: u64 = 0;
+/// stale-cache policy on [`load_cached`]). Row counts are capped so a
+/// forged sidecar fails fast with [`Error::Limit`].
+fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
     let mut records: Vec<FunctionRecord> = Vec::new();
     {
         let t = rtxn
@@ -748,15 +784,13 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read functions: {e}")))?;
             let raw = v.value();
-            account_snapshot(&mut snapshot_bytes, raw.len())?;
             if records.len() >= MAX_SNAPSHOT_FUNCTIONS {
                 return Err(Error::Limit("snapshot functions exceed cap".to_string()));
             }
             records.push(decode(&raw)?);
         }
     }
-    let mut blocks_by_func: BTreeMap<u64, BTreeMap<u64, BasicBlock>> = BTreeMap::new();
-    let mut edges_by_func: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut blocks_by_func: BTreeMap<u64, Vec<crate::analysis::BlockLayout>> = BTreeMap::new();
     let mut block_count: usize = 0;
     {
         let t = rtxn
@@ -768,35 +802,34 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read blocks: {e}")))?;
             let raw = v.value();
-            account_snapshot(&mut snapshot_bytes, raw.len())?;
             block_count += 1;
             if block_count > MAX_SNAPSHOT_BLOCKS {
                 return Err(Error::Limit("snapshot blocks exceed cap".to_string()));
             }
             let rec: BlockRecord = decode(&raw)?;
-            blocks_by_func.entry(rec.func_entry).or_default().insert(
-                rec.start,
-                BasicBlock {
-                    start: rec.start,
-                    insns: rec.insns,
-                },
-            );
-            edges_by_func
+            blocks_by_func
                 .entry(rec.func_entry)
                 .or_default()
-                .extend(rec.succs.into_iter().map(|s| (rec.start, s)));
+                .push(crate::analysis::BlockLayout {
+                    start: rec.start,
+                    end: rec.end,
+                    insns: rec.insns,
+                    succs: rec.succs,
+                });
         }
     }
-    let mut functions: BTreeMap<u64, crate::analysis::Function> = BTreeMap::new();
+    let mut functions: Vec<FunctionLayout> = Vec::new();
     let mut call_edges: Vec<(u64, u64)> = Vec::new();
     for rec in records {
         let entry = rec.entry;
-        let blocks = blocks_by_func.remove(&entry).unwrap_or_default();
-        let edges = edges_by_func.remove(&entry).unwrap_or_default();
-        functions.insert(
+        let mut blocks = blocks_by_func.remove(&entry).unwrap_or_default();
+        blocks.sort_by_key(|b| b.start);
+        functions.push(FunctionLayout {
             entry,
-            crate::analysis::Function::from_parts(entry, rec.name, blocks, &edges),
-        );
+            name: rec.name.clone(),
+            calls: rec.calls.clone(),
+            blocks,
+        });
         call_edges.extend(rec.calls.into_iter().map(|c| (entry, c)));
     }
     let mut xrefs: Vec<Xref> = Vec::new();
@@ -810,7 +843,6 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read xrefs: {e}")))?;
             let raw = v.value();
-            account_snapshot(&mut snapshot_bytes, raw.len())?;
             if xrefs.len() >= MAX_SNAPSHOT_XREFS {
                 return Err(Error::Limit("snapshot xrefs exceed cap".to_string()));
             }
@@ -829,14 +861,13 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read strings: {e}")))?;
             let raw = v.value();
-            account_snapshot(&mut snapshot_bytes, raw.len())?;
             if strings.len() >= MAX_SNAPSHOT_STRINGS {
                 return Err(Error::Limit("snapshot strings exceed cap".to_string()));
             }
             strings.push(decode(&raw)?);
         }
     }
-    Ok(AnalysisParts {
+    Ok(SnapshotParts {
         functions,
         call_edges,
         xrefs,
@@ -847,21 +878,19 @@ fn read_analysis_parts(rtxn: &redb::ReadTransaction) -> Result<AnalysisParts> {
 /// Decode every stored annotation, skipping empty rows.
 ///
 /// A missing table or an undecodable row is corruption and errors. Row
-/// counts, per-field text, and aggregate bytes are capped so a forged
+/// counts and per-field text are capped so a forged
 /// sidecar fails fast with [`Error::Limit`].
 fn read_annotations(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
     let t = rtxn
         .open_table(ANNOTATIONS)
         .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
     let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
-    let mut snapshot_bytes: u64 = 0;
     for row in t
         .iter()
         .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
     {
         let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
         let raw = v.value();
-        account_snapshot(&mut snapshot_bytes, raw.len())?;
         if annotations.len() >= MAX_SNAPSHOT_ANNOTATIONS {
             return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
         }
@@ -879,7 +908,7 @@ fn read_annotations(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annota
 /// Stale snapshots carry annotations forward even when the sidecar has no
 /// annotations table (hand-built or partially written DBs); a corrupt
 /// annotation row still errors, since silently dropping user renames and
-/// comments would lose data the re-analysis keeps. Same row/text/byte
+/// comments would lose data the re-analysis keeps. Same row/text
 /// budgets as [`read_annotations`](fn@read_annotations) apply.
 fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, Annotation>> {
     let t = match rtxn.open_table(ANNOTATIONS) {
@@ -888,14 +917,12 @@ fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u6
         Err(e) => return Err(Error::Storage(format!("open annotations: {e}"))),
     };
     let mut annotations: BTreeMap<u64, Annotation> = BTreeMap::new();
-    let mut snapshot_bytes: u64 = 0;
     for row in t
         .iter()
         .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
     {
         let (k, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
         let raw = v.value();
-        account_snapshot(&mut snapshot_bytes, raw.len())?;
         if annotations.len() >= MAX_SNAPSHOT_ANNOTATIONS {
             return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
         }
@@ -910,15 +937,19 @@ fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u6
 
 /// Hash-filtered snapshot read back by [`load_cached`].
 ///
-/// The stale variant carries only what a content-hash mismatch preserves:
-/// metadata plus annotations. Derived rows are never decoded on that path
-/// (see the stale-cache policy on [`load_cached`]).
+/// The stale variant carries only what a content-hash mismatch or a schema
+/// version mismatch preserves: metadata plus annotations. Derived rows are
+/// never decoded on that path (see the stale-cache policy on
+/// [`load_cached`]).
 #[derive(Debug)]
 pub enum Snapshot {
-    /// Stored hash matches: full cached analysis plus annotations.
+    /// Stored hash matches on the current schema: cached layouts plus
+    /// annotations. The caller re-decodes instructions from the binary via
+    /// [`rebuild`](crate::analysis::rebuild).
     Hit(Box<Loaded>),
-    /// Stored hash differs: metadata plus annotations only; the derived
-    /// `functions`/`blocks`/`xrefs`/`strings` tables were never opened.
+    /// Stored hash differs, or the schema version differs: metadata plus
+    /// annotations only; the derived `functions`/`blocks`/`xrefs`/`strings`
+    /// tables were never opened.
     Stale {
         /// Snapshot metadata (row 0 of `binaries`).
         meta: BinaryMeta,
@@ -935,14 +966,16 @@ pub enum Snapshot {
 /// read opens pass a read-only handle from [`open_db_read_only`].
 ///
 /// Reads and validates the `meta`/`binaries` rows first. When the stored
-/// `content_hash` differs from `expected_hash`, returns [`Snapshot::Stale`]
+/// `content_hash` differs from `expected_hash`, or the stored schema
+/// version differs from [`SCHEMA_VERSION`], returns [`Snapshot::Stale`]
 /// with the stored annotations after decoding only the `annotations` table;
 /// the derived tables are never opened, so opening a small binary against a
 /// sidecar written for a large one costs no decoding proportional to the
-/// discarded rows. On a hash match the full snapshot loads exactly as
-/// [`load`] does. Metadata and rows come from one read transaction, so a
-/// concurrent writer cannot interleave a metadata row from one snapshot with
-/// rows from another.
+/// discarded rows. An older schema is not an error: annotations carry over
+/// and the binary simply re-analyzes. On a hash and version match the full
+/// skeleton loads exactly as [`load`] does. Metadata and rows come from one
+/// read transaction, so a concurrent writer cannot interleave a metadata row
+/// from one snapshot with rows from another.
 ///
 /// Stale-cache policy (a deliberate behavior change; strict all-input
 /// equivalence with [`load`] is not claimed): a stale snapshot's derived
@@ -955,14 +988,14 @@ pub enum Snapshot {
 /// error, as without metadata no hash comparison is possible), and every
 /// annotation row (a corrupt annotation errors because annotations carry
 /// over into the re-analysis; a missing annotations table reads as empty).
-/// A matching hash keeps the exact [`load`] validation: version mismatch,
+/// A matching hash and version keeps the exact [`load`] validation:
 /// unknown arch/format, and any corrupt or missing table error.
 ///
 /// # Errors
 /// [`Error::Storage`] on unreadable metadata, on corrupt annotations, and —
 /// for matching hashes only — on corrupt derived rows, missing tables, or
-/// unknown version/arch/format values. [`Error::Limit`] when snapshot row
-/// or byte budgets are exceeded (forged or oversized sidecar).
+/// unknown arch/format values. [`Error::Limit`] when snapshot row
+/// budgets are exceeded (forged sidecar).
 pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Snapshot> {
     let rtxn = db
         .begin_read()
@@ -971,30 +1004,21 @@ pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Sna
         None => return Ok(Snapshot::Miss),
         Some(meta) => meta,
     };
-    if meta.content_hash != expected_hash {
+    if meta.content_hash != expected_hash || meta.version != SCHEMA_VERSION {
         let annotations = read_annotations_or_empty(&rtxn)?;
         return Ok(Snapshot::Stale { meta, annotations });
     }
-    if meta.version != SCHEMA_VERSION {
-        return Err(Error::Storage(format!(
-            "project db version {} != {}",
-            meta.version, SCHEMA_VERSION
-        )));
-    }
     let arch = parse_arch(&meta.arch)?;
     parse_format(&meta.format)?;
-    let parts = read_analysis_parts(&rtxn)?;
+    let parts = read_snapshot_parts(&rtxn)?;
     let annotations = read_annotations(&rtxn)?;
-    let analysis = Analysis::from_parts(
-        arch,
-        parts.functions,
-        &parts.call_edges,
-        parts.xrefs,
-        parts.strings,
-    );
     Ok(Snapshot::Hit(Box::new(Loaded {
         meta,
-        analysis,
+        arch,
+        functions: parts.functions,
+        call_edges: parts.call_edges,
+        xrefs: parts.xrefs,
+        strings: parts.strings,
         annotations,
     })))
 }
@@ -1002,13 +1026,15 @@ pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Sna
 /// Load a snapshot written by [`save`].
 ///
 /// Returns `Ok(None)` when the DB has no snapshot yet (fresh file or no
-/// `meta` table). Rebuilds CFGs and the callgraph from stored edges.
-/// Prefer [`load_cached`] on open paths: it skips decoding derived rows the
-/// caller would discard after a content-hash mismatch.
+/// `meta` table). Rebuilds function layouts, CFGs, and the callgraph from
+/// stored edges; the caller re-decodes instructions via
+/// [`rebuild`](crate::analysis::rebuild). Prefer [`load_cached`] on open
+/// paths: it skips decoding derived rows the caller would discard after a
+/// content-hash mismatch.
 ///
 /// # Errors
 /// [`Error::Storage`] on corrupt rows or unknown arch/format values,
-/// [`Error::Limit`] when snapshot row or byte budgets are exceeded.
+/// [`Error::Limit`] when snapshot row budgets are exceeded.
 pub fn load(db: &Database) -> Result<Option<Loaded>> {
     let rtxn = db
         .begin_read()
@@ -1025,18 +1051,15 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
     }
     let arch = parse_arch(&meta.arch)?;
     parse_format(&meta.format)?;
-    let parts = read_analysis_parts(&rtxn)?;
+    let parts = read_snapshot_parts(&rtxn)?;
     let annotations = read_annotations(&rtxn)?;
-    let analysis = Analysis::from_parts(
-        arch,
-        parts.functions,
-        &parts.call_edges,
-        parts.xrefs,
-        parts.strings,
-    );
     Ok(Some(Loaded {
         meta,
-        analysis,
+        arch,
+        functions: parts.functions,
+        call_edges: parts.call_edges,
+        xrefs: parts.xrefs,
+        strings: parts.strings,
         annotations,
     }))
 }

@@ -126,8 +126,19 @@ fn hit_loads_cached_snapshot() {
         match db::load_cached(&handle, hash).expect("load_cached") {
             db::Snapshot::Hit(hit) => {
                 assert_eq!(hit.meta.content_hash, hash);
-                assert_same_analysis(&hit.analysis, &before);
-                assert_eq!(hit.analysis.call_edges(), before_edges);
+                let raw = std::fs::read(&bin).expect("read");
+                let loaded = binscout::loader::load(&raw).expect("reload");
+                let cached = binscout::analysis::rebuild(
+                    hit.arch,
+                    &loaded,
+                    &hit.functions,
+                    &hit.call_edges,
+                    hit.xrefs,
+                    hit.strings,
+                )
+                .expect("rebuild");
+                assert_same_analysis(&cached, &before);
+                assert_eq!(cached.call_edges(), before_edges);
                 assert_eq!(
                     hit.annotations
                         .get(&0x400000)
@@ -242,7 +253,7 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
 }
 
 #[test]
-fn version_mismatch_errors_on_hit_but_stale_carries_annotations() {
+fn version_mismatch_is_stale_but_carries_annotations() {
     let dir = common::tmpdir("stale-version");
     let bytes = small_elf();
     let bin = common::write_bin(&dir, "v.bin", &bytes);
@@ -252,13 +263,24 @@ fn version_mismatch_errors_on_hit_but_stale_carries_annotations() {
     let old_hash = db::content_hash(&bytes);
     set_stored_version(&db, 999);
 
-    // Matching hash with an unknown schema version: still an error, the
-    // cached rows cannot be trusted for decoding.
+    // Matching hash with an unknown schema version: stale, not an error —
+    // annotations carry over and the binary re-analyzes on open.
     {
         let handle = db::open_db(&db).expect("open db");
-        let err = db::load_cached(&handle, old_hash).unwrap_err();
-        assert!(err.to_string().contains("version"), "unexpected: {err:?}");
+        match db::load_cached(&handle, old_hash).expect("load_cached") {
+            db::Snapshot::Stale { meta, annotations } => {
+                assert_eq!(meta.version, 999);
+                assert_eq!(
+                    annotations.get(&0x400000).and_then(|a| a.name.as_deref()),
+                    Some("main")
+                );
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
     }
+    let q = Project::open_with_db(&bin, &db).expect("stale open succeeds");
+    assert_eq!(q.function_name(0x400000).as_deref(), Some("main"));
+    assert_same_analysis(q.analysis(), &fresh_analysis(&bytes));
 
     // Mismatched hash: the version only gates analysis decoding, which the
     // stale path skips; annotations still carry over.
@@ -296,18 +318,28 @@ fn healthy_stale_carries_annotations_matches_fresh_and_never_saves() {
     let (stored_meta, stored_summary, stored_edges, stored_xrefs, stored_strings, stored_ann) = {
         let handle = db::open_db(&db).expect("open db");
         let stored = db::load(&handle).expect("load").expect("snapshot exists");
+        let loaded = binscout::loader::load(&bytes).expect("reload");
+        let analysis = binscout::analysis::rebuild(
+            stored.arch,
+            &loaded,
+            &stored.functions,
+            &stored.call_edges,
+            stored.xrefs,
+            stored.strings,
+        )
+        .expect("rebuild");
         (
             stored.meta,
-            stored.analysis.summary(),
-            stored.analysis.call_edges(),
-            stored.analysis.xrefs,
-            stored.analysis.strings,
+            analysis.summary(),
+            analysis.call_edges(),
+            analysis.xrefs,
+            analysis.strings,
             stored.annotations,
         )
     };
     assert_eq!(stored_meta.content_hash, old_hash);
 
-    let new_bytes = patched(bytes);
+    let new_bytes = patched(bytes.clone());
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
 
     let q = Project::open_with_db(&bin, &db).expect("stale open");
@@ -338,11 +370,13 @@ fn healthy_stale_carries_annotations_matches_fresh_and_never_saves() {
             .expect("load")
             .expect("old snapshot intact");
         assert_eq!(stored.meta, stored_meta);
-        assert_eq!(stored.analysis.summary(), stored_summary);
-        assert_eq!(stored.analysis.call_edges(), stored_edges);
-        assert_eq!(stored.analysis.xrefs, stored_xrefs);
-        assert_eq!(stored.analysis.strings, stored_strings);
         assert_eq!(stored.annotations, stored_ann);
+        let old_bin = binscout::loader::load(&bytes).expect("reload");
+        let rebuilt = stored.rebuild(&old_bin).expect("rebuild");
+        assert_eq!(rebuilt.summary(), stored_summary);
+        assert_eq!(rebuilt.call_edges(), stored_edges);
+        assert_eq!(rebuilt.xrefs, stored_xrefs);
+        assert_eq!(rebuilt.strings, stored_strings);
     }
     common::cleanup(&dir);
 }
