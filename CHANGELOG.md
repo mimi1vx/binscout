@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/mimi1vx/binscout/compare/v0.2.0...v0.2.1) - 2026-10-14
+
+### Added
+
+- decode only first instruction via disasm_first
+
+### Fixed
+
+- enforce input and aggregate metadata memory budgets
+- keep LE length-prefixed names inside declared tables
+- bound memory, remove analysis bottlenecks, harden tail reads
+
+### Other
+
+- cache cargo builds and group dependabot updates
+- chore(deps) minor versions update
+- avoid cloning whole result sets for paged queries
+- skip stale snapshot decoding after metadata mismatch
+- reuse one lazy matcher per string-search query
+- index LE import identity instead of Vec membership scans
+
 ## [0.2.0](https://github.com/mimi1vx/binscout/compare/v0.1.1...v0.2.0) - 2026-10-13
 
 ### Added
