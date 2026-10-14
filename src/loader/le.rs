@@ -22,6 +22,13 @@ const MZ_MAGIC: u16 = 0x5A4D;
 const LE_MAGIC: [u8; 2] = [0x4C, 0x45];
 /// Offset of `e_lfanew` in the MZ stub.
 const E_LFANEW_OFF: usize = 0x3C;
+/// Offset of `e_lfarlc` (relocation-table offset) in the MZ stub.
+const MZ_RELOC_OFF: usize = 0x18;
+/// Minimum `e_lfarlc` for a new-header stub that really holds `e_lfanew`.
+///
+/// Plain DOS stubs (a DOS4GW outer MZ uses `0x1E`) leave relocation
+/// entries at `0x3C`, not an `e_lfanew` pointer.
+const MZ_RELOC_MIN: u16 = 0x40;
 /// Minimum MZ stub size that still holds `e_lfanew`.
 const MZ_MIN: usize = 0x40;
 /// Header bytes read (up to `#preload pages`); entry/import/fixup/data
@@ -190,13 +197,15 @@ impl LeImage {
     }
 }
 
-/// True when `bytes` looks like MZ + `e_lfanew` → `LE` (no errors).
+/// True when `bytes` looks like an LE image (no errors).
+///
+/// Fast path: MZ stub with a trustworthy `e_lfanew` pointing at `LE`.
+/// Scan fallback: DOS4GW outer stubs carry no new header, so garbage
+/// `e_lfanew` is ignored and the file is searched for a validated LE
+/// header instead.
 #[must_use]
 pub fn is_le(bytes: &[u8]) -> bool {
-    let Some(le_off) = mz_le_offset(bytes) else {
-        return false;
-    };
-    bytes.get(le_off..le_off + 2).is_some_and(|m| m == LE_MAGIC)
+    resolve_le_offset(bytes).is_some()
 }
 
 /// Parse an LE file into [`LeImage`].
@@ -211,7 +220,7 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     if bytes.len() as u64 > super::MAX_INPUT_BYTES {
         return Err(Error::Limit("input exceeds 512 MiB".to_string()));
     }
-    let le_off = mz_le_offset(bytes).ok_or_else(|| invalid("missing MZ stub"))?;
+    let le_off = resolve_le_offset(bytes).ok_or_else(|| invalid("missing MZ stub"))?;
     let hdr = bytes
         .get(le_off..)
         .filter(|h| h.len() >= HEADER_MIN && h[0..2] == LE_MAGIC)
@@ -456,12 +465,110 @@ pub fn parse_le(bytes: &[u8]) -> Result<LeImage> {
     })
 }
 
-fn mz_le_offset(bytes: &[u8]) -> Option<usize> {
+/// Fast LE offset: MZ stub with a trustworthy `e_lfanew` pointing at `LE`.
+///
+/// Absent (`None`) when the stub is short, non-MZ, old-DOS-style
+/// (`e_lfarlc < 0x40`, so `0x3C` is relocation garbage), or the pointer
+/// leaves the file or misses the magic. Magic-only on purpose: truncated
+/// headers still count as recognized here; [`parse_le`] reports them.
+fn fast_le_offset(bytes: &[u8]) -> Option<usize> {
     let stub = bytes.get(..MZ_MIN)?;
     if u16_from(&stub[0..2]) != MZ_MAGIC {
         return None;
     }
-    Some(u32_from(&stub[E_LFANEW_OFF..E_LFANEW_OFF + 4]) as usize)
+    if u16_from(&stub[MZ_RELOC_OFF..MZ_RELOC_OFF + 2]) < MZ_RELOC_MIN {
+        return None;
+    }
+    let le_off = u32_from(&stub[E_LFANEW_OFF..E_LFANEW_OFF + 4]) as usize;
+    if le_off < MZ_MIN {
+        return None;
+    }
+    bytes
+        .get(le_off..le_off + 2)
+        .filter(|m| *m == LE_MAGIC)
+        .map(|_| le_off)
+}
+
+/// First validated LE header offset anywhere in `bytes` (`None` if none).
+///
+/// Every `LE` magic occurrence is checked field-by-field (byte order,
+/// format level, CPU/OS, page size, object/page caps, table ranges), so
+/// stray `LE` bytes in code or data do not hit. Only MZ-led files are
+/// scanned: LE images always carry the outer DOS stub.
+fn scan_le_offset(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() >= 2 && u16_from(&bytes[0..2]) != MZ_MAGIC {
+        return None;
+    }
+    let mut off = 0;
+    while off + HEADER_MIN <= bytes.len() {
+        if bytes[off..off + 2] == LE_MAGIC && valid_le_candidate(bytes, off) {
+            return Some(off);
+        }
+        off += 1;
+    }
+    None
+}
+
+/// Header plausibility for one scan candidate at `off`.
+///
+/// Mirrors the [`parse_le`] prefix checks (plus OS range and table fit)
+/// without allocating or walking tables.
+fn valid_le_candidate(bytes: &[u8], off: usize) -> bool {
+    let Some(hdr) = bytes.get(off..off + HEADER_MIN) else {
+        return false;
+    };
+    if hdr[O_BORD] != 0 || u32_from(&hdr[O_LEVEL..O_LEVEL + 4]) != 0 {
+        return false;
+    }
+    if !(1..=4).contains(&u16_from(&hdr[O_CPU..O_CPU + 2])) {
+        return false;
+    }
+    if !(1..=4).contains(&u16_from(&hdr[O_OS..O_OS + 2])) {
+        return false;
+    }
+    let page_size = u32_from(&hdr[O_PAGE_SIZE..O_PAGE_SIZE + 4]);
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return false;
+    }
+    let num_pages = u32_from(&hdr[O_NUM_PAGES..O_NUM_PAGES + 4]) as usize;
+    if num_pages > MAX_PAGES {
+        return false;
+    }
+    let num_obj = u32_from(&hdr[O_NUM_OBJ..O_NUM_OBJ + 4]) as usize;
+    if num_obj == 0 || num_obj > MAX_OBJECTS {
+        return false;
+    }
+    // Mandatory tables must fit; active optional tables must start in range.
+    // (`O_DATA_OFF` stays unchecked: it is file-absolute until step 3 makes
+    // it header-relative.)
+    let table = |field: usize, size: usize| -> bool {
+        let rel = u32_from(&hdr[field..field + 4]) as usize;
+        off.checked_add(rel)
+            .and_then(|abs| abs.checked_add(size))
+            .is_some_and(|end| end <= bytes.len())
+    };
+    if !table(O_OBJ_OFF, num_obj * OBJECT_REC) || !table(O_PAGE_OFF, num_pages * PAGE_REC) {
+        return false;
+    }
+    if u32_from(&hdr[O_FIXUP_SIZE..O_FIXUP_SIZE + 4]) > 0
+        && (!table(O_FIXUP_PAGE_OFF, 0) || !table(O_FIXUP_REC_OFF, 0))
+    {
+        return false;
+    }
+    if u32_from(&hdr[O_IMP_MOD_COUNT..O_IMP_MOD_COUNT + 4]) > 0
+        && (!table(O_IMP_MOD_OFF, 0) || !table(O_IMP_PROC_OFF, 0))
+    {
+        return false;
+    }
+    if u32_from(&hdr[O_ENTRY_OFF..O_ENTRY_OFF + 4]) != 0 && !table(O_ENTRY_OFF, 0) {
+        return false;
+    }
+    true
+}
+
+/// LE header offset: trustworthy `e_lfanew` first, validated scan second.
+fn resolve_le_offset(bytes: &[u8]) -> Option<usize> {
+    fast_le_offset(bytes).or_else(|| scan_le_offset(bytes))
 }
 
 fn walk_fixup_page(
@@ -728,4 +835,97 @@ fn invalid(msg: impl Into<String>) -> Error {
 
 fn unsupported(msg: impl Into<String>) -> Error {
     Error::Unsupported(msg.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Embedded LE offset: outer DOS stub plus padding, DOS4GW-style.
+    const DOS_LE_OFF: usize = 0x200;
+    const DOS_CODE: [u8; 4] = [0x55, 0x89, 0xE5, 0xC3];
+
+    fn t_put16(v: &mut [u8], off: usize, x: u16) {
+        v[off..off + 2].copy_from_slice(&x.to_le_bytes());
+    }
+
+    fn t_put32(v: &mut [u8], off: usize, x: u32) {
+        v[off..off + 4].copy_from_slice(&x.to_le_bytes());
+    }
+
+    /// Outer MZ with no new header (`e_lfarlc` = `0x1E`, relocation garbage
+    /// at `0x3C`) plus one valid LE image at [`DOS_LE_OFF`].
+    fn dos4gw_outer() -> Vec<u8> {
+        // Same relative layout as the `loader_le` harness: object, page,
+        // fixup-page tables, empty fixup records, default entry, code.
+        let entry: Vec<u8> = vec![0x01, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let obj_rel = 0xAC;
+        let page_rel = obj_rel + 24;
+        let fp_rel = page_rel + 8;
+        let fr_rel = fp_rel + 8;
+        let entry_rel = fr_rel;
+        let code_rel = entry_rel + entry.len();
+
+        let mut f = vec![0u8; DOS_LE_OFF];
+        f[0] = b'M';
+        f[1] = b'Z';
+        t_put16(&mut f, 0x18, 0x1E);
+        t_put32(&mut f, 0x3C, 0x09B4_0000);
+        f.resize(DOS_LE_OFF + code_rel + DOS_CODE.len(), 0);
+
+        let h = DOS_LE_OFF;
+        f[h] = b'L';
+        f[h + 1] = b'E';
+        t_put32(&mut f, h + 0x04, 0);
+        t_put16(&mut f, h + 0x08, 2);
+        t_put16(&mut f, h + 0x0A, 1);
+        t_put32(&mut f, h + 0x14, 1);
+        t_put32(&mut f, h + 0x18, 1);
+        t_put32(&mut f, h + 0x20, 1);
+        t_put32(&mut f, h + 0x24, 0x1000);
+        t_put32(&mut f, h + 0x28, 0x1000);
+        t_put32(&mut f, h + 0x30, 8);
+        t_put32(&mut f, h + 0x38, (code_rel - obj_rel) as u32);
+        t_put32(&mut f, h + 0x40, obj_rel as u32);
+        t_put32(&mut f, h + 0x44, 1);
+        t_put32(&mut f, h + 0x48, page_rel as u32);
+        t_put32(&mut f, h + 0x5C, entry_rel as u32);
+        t_put32(&mut f, h + 0x68, fp_rel as u32);
+        t_put32(&mut f, h + 0x6C, fr_rel as u32);
+        t_put32(&mut f, h + 0x80, (DOS_LE_OFF + code_rel) as u32);
+        t_put32(&mut f, h + 0x84, 1);
+
+        let p = DOS_LE_OFF + obj_rel;
+        t_put32(&mut f, p, 0x1000);
+        t_put32(&mut f, p + 4, 0x10000);
+        t_put32(&mut f, p + 8, 0x2005);
+        t_put32(&mut f, p + 12, 1);
+        t_put32(&mut f, p + 16, 1);
+
+        let p = DOS_LE_OFF + page_rel;
+        t_put32(&mut f, p, 0);
+        t_put16(&mut f, p + 4, DOS_CODE.len() as u16);
+
+        let p = DOS_LE_OFF + fp_rel;
+        t_put32(&mut f, p, 0);
+        t_put32(&mut f, p + 4, 0);
+
+        f[DOS_LE_OFF + entry_rel..DOS_LE_OFF + entry_rel + entry.len()].copy_from_slice(&entry);
+        f[DOS_LE_OFF + code_rel..].copy_from_slice(&DOS_CODE);
+        f
+    }
+
+    #[test]
+    fn dos4gw_outer_mz_scans_to_embedded_le() {
+        let bytes = dos4gw_outer();
+        assert_eq!(fast_le_offset(&bytes), None, "garbage e_lfanew is ignored");
+        assert_eq!(scan_le_offset(&bytes), Some(DOS_LE_OFF));
+        assert!(is_le(&bytes));
+        let img = parse_le(&bytes).expect("scan-found LE must parse");
+        assert_eq!(img.cpu, 2);
+        assert_eq!(img.os, 1);
+        assert_eq!(img.objects.len(), 1);
+        assert_eq!(img.entry, Some(0x10000));
+        assert_eq!(&img.segments[0].data[..4], &DOS_CODE);
+    }
 }

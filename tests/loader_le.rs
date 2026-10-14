@@ -44,6 +44,7 @@ fn build(o: &Opts) -> Vec<u8> {
     let mut f = vec![0u8; LE_OFF];
     f[0] = b'M';
     f[1] = b'Z';
+    put16(&mut f, 0x18, 0x40); // e_lfarlc: new-header stub, e_lfanew trusted
     put32(&mut f, 0x3C, LE_OFF as u32);
 
     let obj_rel = 0xAC;
@@ -238,9 +239,10 @@ fn malformed_inputs_are_invalid() {
     let mut bad = minimal();
     bad[LE_OFF] = b'X';
     invalid(&bad);
-    // e_lfanew out of range.
+    // e_lfanew out of range with no scan candidate left intact.
     let mut bad = minimal();
     put32(&mut bad, 0x3C, 0xFFFF);
+    bad[LE_OFF] = b'X';
     invalid(&bad);
     // Object table out of range.
     let mut bad = minimal();
@@ -313,6 +315,7 @@ fn build_with_imports(
     let mut f = vec![0u8; LE_OFF];
     f[0] = b'M';
     f[1] = b'Z';
+    put16(&mut f, 0x18, 0x40); // e_lfarlc: new-header stub, e_lfanew trusted
     put32(&mut f, 0x3C, LE_OFF as u32);
 
     let obj_rel = 0xAC;

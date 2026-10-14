@@ -194,7 +194,9 @@ fn truncated_le_never_falls_back_to_raw() {
     let dir = common::tmpdir("l1-trunc");
     let mut bytes = common::fixture_bytes(builders::LE_NAME);
     // Keep MZ + e_lfanew + LE magic so the image is still recognized,
-    // but truncate the header so the parse fails.
+    // but truncate the header so the parse fails. The stub counts as
+    // new-header so the guarded fast path still recognizes the prefix.
+    bytes[0x18] = 0x40;
     bytes.truncate(0x44);
     assert!(is_le(&bytes), "truncated prefix must still read as LE");
     let bin = common::write_bin(&dir, "trunc-le.bin", &bytes);
