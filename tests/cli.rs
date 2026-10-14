@@ -482,3 +482,73 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     assert!(v.get("error").is_some(), "{v}");
     cleanup(&dir);
 }
+
+/// Minimal 32-bit ARM ELF with `code` as its single R+X load segment.
+fn minimal_arm_elf(code: &[u8]) -> Vec<u8> {
+    fn put16(v: &mut [u8], off: usize, x: u16) {
+        v[off..off + 2].copy_from_slice(&x.to_le_bytes());
+    }
+    fn put32(v: &mut [u8], off: usize, x: u32) {
+        v[off..off + 4].copy_from_slice(&x.to_le_bytes());
+    }
+    let mut f = vec![0u8; 84];
+    f[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    f[4] = 1;
+    f[5] = 1;
+    f[6] = 1;
+    put16(&mut f, 16, 2);
+    put16(&mut f, 18, 40);
+    put32(&mut f, 20, 1);
+    put32(&mut f, 24, 0x10000);
+    put32(&mut f, 28, 52);
+    put16(&mut f, 40, 52);
+    put16(&mut f, 42, 32);
+    put16(&mut f, 44, 1);
+    let p = 52;
+    put32(&mut f, p, 1);
+    put32(&mut f, p + 4, 84);
+    put32(&mut f, p + 8, 0x10000);
+    put32(&mut f, p + 12, 0x10000);
+    put32(&mut f, p + 16, code.len() as u32);
+    put32(&mut f, p + 20, code.len() as u32);
+    put32(&mut f, p + 24, 5);
+    put32(&mut f, p + 28, 0x1000);
+    f.extend_from_slice(code);
+    f
+}
+
+#[test]
+fn load_hostile_arm_elf_stays_json() {
+    // The entry word panics inside yaxpeax-arm; load and disasm must finish
+    // with valid JSON, never abort the process.
+    let dir = tmpdir("arm-hostile");
+    let bin = write_bin(
+        &dir,
+        "hostile-arm.elf",
+        &minimal_arm_elf(&[0xF9, 0xF0, 0x00, 0x00]),
+    );
+    let db = temp_db(&dir, "hostile");
+    let bin_s = bin.display().to_string();
+    let db_s = db.display().to_string();
+    let (ok, v) = run(&["--db", &db_s, "load", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v["arch"], "arm32");
+    assert_eq!(v["functions"], 0);
+    // The hostile word ends the prefix: valid JSON with error_at, not an abort.
+    let (ok, d) = run(&["--db", &db_s, "disasm", &bin_s, "0x10000", "1"]);
+    assert!(ok, "{d}");
+    assert!(d.get("error_at").is_some(), "{d}");
+    // Valid ARM control decodes through the same path.
+    let control = write_bin(
+        &dir,
+        "control-arm.elf",
+        &minimal_arm_elf(&[0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1]),
+    );
+    let control_s = control.display().to_string();
+    let db2 = temp_db(&dir, "control");
+    let db2_s = db2.display().to_string();
+    let (ok, v) = run(&["--db", &db2_s, "load", &control_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v["insns"], 2);
+    cleanup(&dir);
+}

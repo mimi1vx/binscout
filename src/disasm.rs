@@ -850,11 +850,21 @@ fn decode_single_armv7(bytes: &[u8], va: u64, thumb: bool) -> Result<Insn> {
     let mut reader = <&[u8] as yaxpeax_arch::ReaderBuilder<u32, u8>>::read_from(bytes);
     let decoder = ArmV7Decoder::default().with_thumb_mode(thumb);
     let label = if thumb { "thumb" } else { "arm32" };
-    let inst = match ArmDecoder::decode(&decoder, &mut reader) {
-        Ok(inst) => inst,
-        Err(e) => {
+    // yaxpeax-arm panics on some words (e.g. STRD with Rt == 15 builds
+    // Reg(16)); contain it so hostile bytes report Invalid, never abort.
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ArmDecoder::decode(&decoder, &mut reader)
+    }));
+    let inst = match decoded {
+        Ok(Ok(inst)) => inst,
+        Ok(Err(e)) => {
             return Err(Error::Invalid(format!(
                 "{label} decode error at {va:#x}: {e:?}"
+            )));
+        }
+        Err(_) => {
+            return Err(Error::Invalid(format!(
+                "{label} decode error at {va:#x}: invalid encoding (decoder panic)"
             )));
         }
     };
@@ -986,14 +996,30 @@ fn disasm_armv7_partial(
         if out.len() >= max_insns {
             return Err(limit_err(max_insns));
         }
-        let inst = match ArmDecoder::decode(&decoder, &mut reader) {
-            Ok(inst) => inst,
-            Err(e) => {
+        // See `decode_single_armv7`: contain yaxpeax-arm panics as the first
+        // failure so hostile bytes end the prefix, never abort the process.
+        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ArmDecoder::decode(&decoder, &mut reader)
+        }));
+        let inst = match decoded {
+            Ok(Ok(inst)) => inst,
+            Ok(Err(e)) => {
                 return Ok(PartialDisasm {
                     insns: out,
                     error_at: Some(DecodeError {
                         addr,
                         message: format!("{label} decode error at {addr:#x}: {e:?}"),
+                    }),
+                });
+            }
+            Err(_) => {
+                return Ok(PartialDisasm {
+                    insns: out,
+                    error_at: Some(DecodeError {
+                        addr,
+                        message: format!(
+                            "{label} decode error at {addr:#x}: invalid encoding (decoder panic)"
+                        ),
                     }),
                 });
             }

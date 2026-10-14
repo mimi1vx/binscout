@@ -413,3 +413,18 @@ fn many_function_ownership_matches_reference_and_golden() {
         assert_eq!(function_owner(&entries, va), linear_owner(&entries, va));
     }
 }
+
+#[test]
+fn arm32_hostile_word_ends_path_without_abort() {
+    // The entry word panics inside yaxpeax-arm; the contained Invalid ends
+    // the path via decode_one instead of aborting the process.
+    let hostile = vec![0xF9, 0xF0, 0x00, 0x00];
+    let a = analyze_raw(&hostile, 0x1000, Arch::Arm32, Some(0x1000)).expect("hostile analyzes");
+    assert_eq!(a.summary().insns, 0);
+    // A valid prefix before the hostile word is kept; the path ends there.
+    let mut prefixed = vec![0x01, 0x00, 0xA0, 0xE1];
+    prefixed.extend(&hostile);
+    let a = analyze_raw(&prefixed, 0x1000, Arch::Arm32, Some(0x1000)).expect("prefixed analyzes");
+    assert_eq!(a.summary().insns, 1);
+    assert_eq!(a.functions[&0x1000].insn_count(), 1);
+}

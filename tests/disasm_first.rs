@@ -1,6 +1,8 @@
 mod common;
 
-use binscout::disasm::{Arch, DEFAULT_MAX_INSNS, Insn, disasm_first, disasm_range};
+use binscout::disasm::{
+    Arch, DEFAULT_MAX_INSNS, Insn, disasm_first, disasm_range, disasm_range_partial,
+};
 use binscout::error::Error;
 
 fn arch_tag(arch: Arch) -> u64 {
@@ -94,16 +96,10 @@ fn assert_agree(arch: Arch, bytes: &[u8], va: u64) {
             "first-instruction mismatch for {arch:?} window {} at {va:#x}",
             Hex(bytes),
         ),
-        // yaxpeax-arm panics inside `decode` on some word patterns
-        // (`Reg::from_u8: register number out of range`); the range decoder
-        // the old algorithm used panics identically, so parity is equivalence.
-        (Err(_), Err(_)) => {}
-        (Ok(old), Err(_)) => panic!(
-            "new decoder panics where oracle returns {old:?} for {arch:?} window {}",
-            Hex(bytes),
-        ),
-        (Err(_), Ok(new)) => panic!(
-            "oracle panics where new decoder returns {new:?} for {arch:?} window {}",
+        // Hostile words report Invalid, never abort: any escaping panic is
+        // a containment failure (see arm32_decoder_panic_words_are_invalid).
+        _ => panic!(
+            "decoder panicked for {arch:?} window {} at {va:#x}",
             Hex(bytes),
         ),
     }
@@ -188,6 +184,78 @@ fn invalid_first_opcode_agrees_on_all_arches() {
     assert_eq!(new_first(Arch::Thumb, &[0x00, 0xf0], 0x20000), None);
     assert_agree(Arch::Thumb, &[0x00], 0x20000);
     assert_eq!(new_first(Arch::Thumb, &[0x00], 0x20000), None);
+}
+
+#[test]
+fn arm32_decoder_panic_words_are_invalid() {
+    // yaxpeax-arm 0.5.0 panics inside `decode` on STRD with Rt == 15
+    // (`Reg::from_u8(16)`); the panic is contained as Invalid at every
+    // entry point instead of aborting the process.
+    let hostile = [0xF9, 0xF0, 0x00, 0x00];
+    assert!(matches!(
+        disasm_first(Arch::Arm32, &hostile, 0x1000),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        disasm_range(Arch::Arm32, &hostile, 0x1000, DEFAULT_MAX_INSNS),
+        Err(Error::Invalid(_))
+    ));
+    let partial = disasm_range_partial(Arch::Arm32, &hostile, 0x1000, DEFAULT_MAX_INSNS)
+        .expect("partial keeps the prefix");
+    assert!(partial.insns.is_empty());
+    assert!(partial.error_at.is_some());
+    // Byte-swapped control errors identically in kind, without the panic path.
+    let swapped = [0x00, 0x00, 0xF0, 0xF9];
+    assert!(matches!(
+        disasm_first(Arch::Arm32, &swapped, 0x1000),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        disasm_range(Arch::Arm32, &swapped, 0x1000, DEFAULT_MAX_INSNS),
+        Err(Error::Invalid(_))
+    ));
+    // A valid prefix before the hostile word is kept; the hostile word ends
+    // the range exactly like any other undecodable word.
+    let mut prefixed = vec![0x01, 0x00, 0xA0, 0xE1];
+    prefixed.extend(hostile);
+    assert!(matches!(
+        disasm_range(Arch::Arm32, &prefixed, 0x10000, DEFAULT_MAX_INSNS),
+        Err(Error::Invalid(_))
+    ));
+    let partial = disasm_range_partial(Arch::Arm32, &prefixed, 0x10000, DEFAULT_MAX_INSNS)
+        .expect("partial keeps the prefix");
+    assert_eq!(partial.insns.len(), 1);
+    assert_eq!(partial.insns[0].mnem, "mov");
+    assert!(partial.error_at.is_some());
+    // Deterministic fuzz corpus over ARM32/Thumb words: no escaping panics.
+    // An escaping panic fails the test (no catch_unwind by design).
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..20_000 {
+        let word = (rng.next() & 0xffff_ffff) as u32;
+        let bytes = word.to_le_bytes();
+        for arch in [Arch::Arm32, Arch::Thumb] {
+            let _ = disasm_first(arch, &bytes, 0x1000);
+            let _ = disasm_range(arch, &bytes, 0x1000, DEFAULT_MAX_INSNS);
+            disasm_range_partial(arch, &bytes, 0x1000, DEFAULT_MAX_INSNS)
+                .expect("partial never errors on undecodable bytes");
+        }
+    }
+    // Structured Rt == 15 sample (the STRD/LDRD panic shape) across the
+    // condition/flag space, plus a Thumb halfword sample.
+    for top in 0..=0xFFu32 {
+        for flags in 0..=0x1Fu32 {
+            let bytes = ((top << 24) | (flags << 20) | (0xF << 12) | 0xF9).to_le_bytes();
+            for arch in [Arch::Arm32, Arch::Thumb] {
+                let _ = disasm_first(arch, &bytes, 0x1000);
+                let _ = disasm_range(arch, &bytes, 0x1000, DEFAULT_MAX_INSNS);
+            }
+        }
+    }
+    for hw in (0..=0xFFFFu32).step_by(64) {
+        let bytes = (hw as u16).to_le_bytes();
+        let _ = disasm_first(Arch::Thumb, &bytes, 0x20000);
+        let _ = disasm_range(Arch::Thumb, &bytes, 0x20000, DEFAULT_MAX_INSNS);
+    }
 }
 
 #[test]
