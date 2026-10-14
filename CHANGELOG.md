@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/mimi1vx/binscout/compare/v0.2.1...v0.3.0) - 2026-10-14
+
+### Added
+
+- analyze x86 LE (DOS4GW) binaries instead of refusing them
+- LE discovery with scan fallback for DOS4GW outer MZ
+
+### Fixed
+
+- persist block layouts instead of rendered instructions
+- contain yaxpeax-arm decode panics as Error::Invalid
+
+### Other
+
+- sync README and book with function filters, paging caps, and current output
+
 ## [0.2.1](https://github.com/mimi1vx/binscout/compare/v0.2.0...v0.2.1) - 2026-10-14
 
 ### Added
