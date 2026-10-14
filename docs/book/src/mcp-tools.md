@@ -15,15 +15,15 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | Tool | Parameters | Does |
 |---|---|---|
 | `project_info` | binary | Open a binary and report arch, format, entry, and analysis counts |
-| `functions` | binary, offset/limit | List functions with rename-resolved names, paged |
+| `functions` | binary, query/caller/callee/range_lo/range_hi, offset/limit | List functions with rename-resolved names, filtered (`query` case-insensitive substring; `caller`/`callee` addresses resolving to call-graph neighbors; `range_lo` + `range_hi` bounding entries) and paged |
 | `func` | binary, addr | Full detail of one function: blocks with instructions, edges, calls |
-| `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture |
+| `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges |
-| `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind, paged |
-| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given |
+| `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind, paged behind a `total` match count |
+| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`) |
 | `symbols` | binary | Imports and exports of the binary |
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
-| `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR |
+| `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears |

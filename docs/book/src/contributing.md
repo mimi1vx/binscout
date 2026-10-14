@@ -11,6 +11,9 @@ cargo fmt --check
 cargo doc --no-deps # warning-free (`#![warn(missing_docs)]` is on)
 ```
 
-Work is tracked as issues; file bugs and feature requests on GitHub and
-keep changes small and scoped. The project is dual-licensed MIT OR
+Work is tracked with `br`/`bd` issues; file bugs and feature requests as
+issues first and keep changes small and scoped. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/): `feat:`
+bumps minor, `fix:` bumps patch. New behavior needs a test; new public
+API needs rustdoc. The project is dual-licensed MIT OR
 Apache-2.0 — new files carry no headers, the license applies repo-wide.

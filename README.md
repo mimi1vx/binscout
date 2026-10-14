@@ -58,19 +58,22 @@ binscout [--db PATH] <command> <binary> [args]
 | Command | Example | Output |
 |---|---|---|
 | `load` | `binscout load fw.elf` | project info; caches the analysis snapshot |
-| `functions` | `binscout functions fw.elf --offset 0 --limit 50` | function rows, renames resolved |
+| `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; filter with `--query` (case-insensitive name substring), `--caller`/`--callee` (addresses resolving to call-graph neighbors), `--range LO HI`; page with `--offset`/`--limit` |
 | `func` | `binscout func fw.elf 0x400000` | blocks with instructions, edges, calls |
-| `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count) |
+| `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); trailing bad bytes report in `error_at`, ranges cap at 1 MiB |
 | `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges |
-| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | filtered/paged cross-references |
-| `strings` | `binscout strings fw.elf --limit 20` | extracted strings by address |
+| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
+| `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default); paged by `--start`/`--limit` |
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
-| `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range |
+| `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 
-Annotate without flags reads; `--rename ""` / omitting `--comment` clears.
+Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal strings.
+
+Annotate without flags reads; `--rename ""` / `--comment ""` clears,
+omitting the flag leaves that field alone.
 `rename` only accepts known function entries; `comment` accepts any address.
 
 ## MCP server
@@ -94,6 +97,7 @@ and returns one JSON document as text; failures are tool errors.
 cargo test          # full suite (unit + CLI/MCP e2e over fixtures)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+cargo doc --no-deps # warning-free; `#![warn(missing_docs)]` is on
 ```
 
 ## Project database

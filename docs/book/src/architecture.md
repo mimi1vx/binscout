@@ -5,9 +5,12 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
 (`binscout-mcp`) are thin adapters over it.
 
 - **Loader** (`loader`): sniffs ELF, PE, Mach-O, and LE, falling back to
-  flat raw bytes with a caller-supplied architecture and base. Produces
+  flat raw bytes when nothing matches: unrecognized input opens as
+  x86-64 at base 0, LE images analyze as 32-bit x86. Explicit
+  base/architecture mapping goes through `open_raw`. Produces
   segments, sections, imports/exports, and printable strings (ASCII plus
-  UTF-16LE/BE over the ASCII subset).
+  UTF-16LE/BE over the ASCII subset). Inputs over 512 MiB are rejected
+  before parsing.
 - **Disassembler** (`disasm`): x86_64 and 32-bit x86 via iced-x86, AArch64,
   32-bit ARM, and Thumb via yaxpeax-arm. Each instruction becomes an `Insn` with its bytes,
   mnemonic, operand strings, and resolved branch/data targets.
