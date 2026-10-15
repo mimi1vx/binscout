@@ -320,7 +320,7 @@ impl Project {
         }
     }
 
-    /// Open a supported container binary (ELF/PE/Mach-O/LE) with the default
+    /// Open a supported container binary (ELF/PE/Mach-O/COFF/LE) with the default
     /// sidecar DB.
     ///
     /// LE images analyze as x86_32; force raw mapping of any bytes

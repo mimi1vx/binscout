@@ -182,6 +182,91 @@ fn macho_loads_segment_and_section() {
 }
 
 #[test]
+fn coff_loads_section_at_zero_with_no_entry() {
+    let bytes = common::fixture_bytes(builders::COFF_NAME);
+    let bin = load(&bytes).expect("synthetic COFF must load");
+    assert_eq!(bin.format, BinaryFormat::Coff);
+    assert_eq!(bin.arch, Arch::X86_64);
+    // Relocatable objects link at address 0 and carry no entry point.
+    assert_eq!(bin.entry, None);
+    assert_eq!(bin.segments.len(), 1);
+    let seg = &bin.segments[0];
+    assert_eq!(seg.vaddr, 0);
+    assert_eq!(seg.mem_size, 3);
+    assert_eq!(seg.data, [0x90, 0x90, 0xC3]);
+    assert!(seg.readable && seg.executable && !seg.writable);
+    assert_eq!(bin.sections.len(), 1);
+    assert_eq!(bin.sections[0].name, ".text");
+    assert_eq!(bin.sections[0].vaddr, 0);
+    assert_eq!(&bin.sections[0].data, &[0x90, 0x90, 0xC3]);
+    assert!(bin.sections[0].executable);
+    // `object` exposes no COFF import/export tables.
+    assert!(bin.imports.is_empty());
+    assert!(bin.exports.is_empty());
+    let insns = disasm_range(bin.arch, &seg.data, seg.vaddr, 100).expect("code must decode");
+    assert_eq!(
+        insns.iter().map(|i| i.mnem.as_str()).collect::<Vec<_>>(),
+        ["nop", "nop", "ret"]
+    );
+}
+
+#[test]
+fn coff_i386_maps_to_x86_32() {
+    // Same headers with an I386 machine id: parses to the x86_32 target.
+    let mut bytes = common::fixture_bytes(builders::COFF_NAME);
+    put16(&mut bytes, 0, 0x14C);
+    let bin = load(&bytes).expect("i386 COFF must load");
+    assert_eq!(bin.format, BinaryFormat::Coff);
+    assert_eq!(bin.arch, Arch::X86_32);
+}
+
+#[test]
+fn coff_unsupported_arch_errors_without_raw_fallback() {
+    // PowerPC COFF: recognized container, but no disassembler.
+    let mut bytes = common::fixture_bytes(builders::COFF_NAME);
+    put16(&mut bytes, 0, 0x1F0);
+    assert!(binscout::loader::is_recognized(&bytes));
+    let err = load(&bytes).unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+}
+
+#[test]
+fn coff_truncated_stays_invalid_at_project_level() {
+    // COFF magic intact but headers cut: recognized, so `load_or_raw`
+    // must report the parse error instead of raw fallback, and the
+    // failed open must not create a sidecar.
+    let dir = common::tmpdir("coff-truncated");
+    let mut bytes = common::fixture_bytes(builders::COFF_NAME);
+    bytes.truncate(30);
+    assert!(binscout::loader::is_recognized(&bytes));
+    let err = load(&bytes).unwrap_err();
+    assert!(
+        matches!(err, Error::Invalid(_)),
+        "truncated COFF must be invalid, got {err:?}"
+    );
+    let bin = common::write_bin(&dir, "truncated.obj", &bytes);
+    let db = common::temp_db(&dir, "truncated");
+    let err = binscout::Project::open_with_db(&bin, &db).unwrap_err();
+    assert!(
+        matches!(err, Error::Invalid(_)),
+        "recognized-but-malformed COFF must stay invalid, never raw fallback: got {err:?}"
+    );
+    assert!(!db.exists(), "failed open must not create a sidecar");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn coff_opens_end_to_end_with_project() {
+    // Full open path: section maps, analysis runs, format surfaces.
+    let dir = common::tmpdir("coff-e2e");
+    let p = common::open_test_project(&dir, builders::COFF_NAME);
+    assert_eq!(p.binary().format, BinaryFormat::Coff);
+    assert_eq!(p.binary().arch, Arch::X86_64);
+    assert_eq!(p.project_info().format, "coff");
+    common::cleanup(&dir);
+}
+
+#[test]
 fn raw_mode_maps_single_segment_with_base_and_entry() {
     let raw = include_bytes!("fixtures/raw-x64.bin");
     let bin = load_raw(

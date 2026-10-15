@@ -1,7 +1,7 @@
 # Introduction
 
 binscout is headless, agent-first binary analysis. Open a binary —
-ELF, PE, Mach-O, LE, or flat raw bytes — and get functions, control-flow
+ELF, PE, Mach-O, COFF, LE, or flat raw bytes — and get functions, control-flow
 graphs, cross-references, strings, symbols, and IR out.
 
 There are two interfaces over the same engine:
