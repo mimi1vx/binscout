@@ -248,6 +248,23 @@ entry with the shortest distance in `depth` plus the rename-resolved
 `name` and the `entry`/`entry_hex` twins, paged under the envelope;
 querying never writes a sidecar.
 
+### `slice`
+
+```sh
+binscout slice B TO [--depth N] [--offset N] [--limit N]
+```
+
+MCP tool `slice` (`binary`, `db`?, `raw`?, `to`, `depth?`,
+`offset?`, `limit?`). `TO` is any address (data/string targets lie in
+no function, which is a valid root, not an error); `depth` bounds the
+reverse walk over xref edges of every kind plus intra-function CFG
+predecessors to that many hops (direct predecessors are depth 1, zero
+yields an empty page, past the 64-hop cap is an `Invalid` error).
+Items order by address with the shortest distance in `depth`, each
+carrying `addr`/`addr_hex`, the containing function (`func`/`func_hex`,
+null when in no function) plus its rename-resolved `name`, paged under
+the envelope; querying never writes a sidecar.
+
 ### `diagnostics`
 
 ```sh

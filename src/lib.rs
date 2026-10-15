@@ -243,6 +243,46 @@ impl Serialize for CallNode {
     }
 }
 
+/// One backward-slice row: an instruction that can reach the query target.
+/// `addr` is the reaching instruction address, `depth` the shortest
+/// reverse-walk distance from the query root (direct predecessors are
+/// depth 1), `func` the entry of the function containing `addr` (null
+/// when in no function), and `name` that function's rename-resolved
+/// display name, if any.
+///
+/// JSON pairs `addr` with `addr_hex` and `func` with `func_hex`, and
+/// carries the stable `addr@0x...` id; the twins and the id are
+/// recomputed on serialize and ignored on deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SliceNode {
+    /// Reaching instruction address.
+    pub addr: u64,
+    /// Shortest reverse-walk distance from the query root (1-based).
+    pub depth: usize,
+    /// Entry of the function containing `addr`, if any.
+    pub func: Option<u64>,
+    /// Rename-resolved display name of that function, if any.
+    pub name: Option<String>,
+}
+
+impl Serialize for SliceNode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("SliceNode", 6)?;
+        st.serialize_field("id", &format!("addr@{:#x}", self.addr))?;
+        st.serialize_field("addr", &self.addr)?;
+        st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
+        st.serialize_field("depth", &self.depth)?;
+        st.serialize_field("func", &self.func)?;
+        st.serialize_field("func_hex", &self.func.map(crate::addr_hex))?;
+        st.serialize_field("name", &self.name)?;
+        st.end()
+    }
+}
+
 /// One page of rows under the protocol-1 envelope
 /// (`docs/book/src/json-protocol.md`).
 ///
@@ -1231,6 +1271,54 @@ impl Project {
                 entry: target,
                 depth: d,
                 name: self.function_name(target),
+            })
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Backward slice of `to`: every instruction that can reach it, paged.
+    ///
+    /// Bounded reverse walk over xref edges of every kind plus
+    /// intra-function CFG predecessors (see
+    /// [`Analysis::slice_to`](crate::analysis::Analysis::slice_to)):
+    /// `depth` bounds the walk to that many reverse hops (direct
+    /// predecessors are depth 1, zero yields an empty page); values
+    /// past [`crate::analysis::MAX_SLICE_DEPTH`] are [`Error::Invalid`].
+    /// Any address is a valid root (data/string targets lie in no
+    /// function); rows order by address with the shortest distance in
+    /// `depth`, and only the selected page resolves containing
+    /// functions and names, so per-page work scales with the page.
+    /// Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `depth` exceeds the hop cap.
+    pub fn slice_page(
+        &self,
+        to: u64,
+        depth: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<SliceNode>> {
+        if depth > crate::analysis::MAX_SLICE_DEPTH {
+            return Err(Error::Invalid(format!(
+                "depth {depth} exceeds {}",
+                crate::analysis::MAX_SLICE_DEPTH
+            )));
+        }
+        let reached = self.analysis.slice_to(to, depth);
+        let total = reached.len();
+        let items: Vec<SliceNode> = reached
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|(addr, d)| {
+                let func = self.analysis.containing_function(addr);
+                SliceNode {
+                    addr,
+                    depth: d,
+                    name: func.and_then(|e| self.function_name(e)),
+                    func,
+                }
             })
             .collect();
         Ok(page_envelope(total, offset, limit, items))

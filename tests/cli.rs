@@ -68,6 +68,7 @@ fn all_query_commands_return_json() {
         ],
         vec!["disasm".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["cfg".into(), bin.clone(), "0x0".into()],
+        vec!["slice".into(), bin.clone(), "0x0".into()],
         vec!["xrefs".into(), bin.clone()],
         vec!["strings".into(), bin.clone()],
         vec!["symbols".into(), bin.clone()],
