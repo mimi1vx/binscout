@@ -1126,11 +1126,10 @@ impl Analysis {
                 if matcher.is_none() {
                     matcher = Some(strings::PatternMatcher::compile(pat)?);
                 }
-                if !matcher
-                    .as_ref()
-                    .expect("matcher compiled above")
-                    .is_match(&h.value)
-                {
+                let Some(m) = matcher.as_ref() else {
+                    continue;
+                };
+                if !m.is_match(&h.value) {
                     continue;
                 }
             }
@@ -2090,12 +2089,10 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
         match (hit, block_func.get(target)) {
             (Some((func, site_block)), Some(target_func)) if func == *target_func => {
-                functions
-                    .get_mut(&func)
-                    .expect("function retained")
-                    .inferred
-                    .insert((site_block, *target));
-                resolved_sites.insert(*site);
+                if let Some(f) = functions.get_mut(&func) {
+                    f.inferred.insert((site_block, *target));
+                    resolved_sites.insert(*site);
+                }
             }
             _ => {}
         }
@@ -2110,9 +2107,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     let mut cfg_edges: Vec<(u64, u64, u64)> = Vec::new();
     let mut cg_edges: Vec<(u64, u64)> = Vec::new();
     for entry in keys {
-        let f = &functions[&entry];
+        let Some(f) = functions.get(&entry) else {
+            continue;
+        };
         for (start, block) in &f.blocks {
-            let last = block.insns.last().expect("blocks hold at least one insn");
+            let Some(last) = block.insns.last() else {
+                continue;
+            };
             let flow = classify(arch, last);
             let end = block.end();
             match flow {
@@ -2154,11 +2155,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
     }
     for (func, a, b) in cfg_edges {
-        functions
-            .get_mut(&func)
-            .expect("function retained")
-            .cfg
-            .add_edge(a, b, ());
+        if let Some(f) = functions.get_mut(&func) {
+            f.cfg.add_edge(a, b, ());
+        }
     }
     for (a, b) in cg_edges {
         if functions.contains_key(&b) {
