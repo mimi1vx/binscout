@@ -8,6 +8,7 @@ pub mod error;
 pub mod ir;
 pub mod loader;
 pub mod mcp;
+pub mod search;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use crate::disasm::{Disassembler, Insn, PartialDisasm};
 use crate::error::{Error, Result};
 use crate::loader::strings::StringHit;
 use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
+use crate::search::{ByteMatch, BytePattern};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
 pub fn version() -> &'static str {
@@ -1065,6 +1067,40 @@ impl Project {
     /// expression fails to compile.
     pub fn query_strings(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
         self.analysis.strings_page_filtered(filter)
+    }
+
+    /// Search mapped file bytes for a literal/wildcard pattern, paged.
+    ///
+    /// `pattern` is whitespace-separated full-byte tokens, each two hex
+    /// digits or a `??` wildcard (see [`BytePattern::parse`]). `section`
+    /// keeps matches fully inside a file-backed section of that exact name;
+    /// `range` is half-open `[lo, hi)` over match VAs. Rows order by virtual
+    /// address with overlapping matches included, under the protocol-1
+    /// [`Page`] envelope; `total` is exact and may require a full bounded
+    /// scan. Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on malformed/overlong patterns and empty ranges,
+    /// [`Error::NotFound`] when `section` names no section,
+    /// [`Error::Limit`] past the per-request scan budget.
+    pub fn search_bytes(
+        &self,
+        pattern: &str,
+        section: Option<&str>,
+        range: Option<(u64, u64)>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<ByteMatch>> {
+        let parsed = BytePattern::parse(pattern)?;
+        let (total, items) = crate::search::run(
+            &self.binary,
+            &parsed,
+            section,
+            range,
+            offset,
+            limit.min(MAX_ROWS),
+        )?;
+        Ok(page_envelope(total, offset, limit, items))
     }
 
     /// Current annotation at `addr`.
