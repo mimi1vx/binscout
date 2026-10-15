@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/mimi1vx/binscout/compare/v0.3.0...v0.4.0) - 2026-10-15
+
+### Added
+
+- resolve single-slot absolute indirect jumps with bounded evidence
+- expose annotation transfer through CLI and MCP
+- add byte-pattern search CLI command and MCP tool
+- expose paged diagnostics and function discovery provenance
+- publish machine-readable IR coverage and per-range lift accounting
+- implement identity-checked atomic annotation export/import
+- implement bounded literal/wildcard byte search over mapped bytes
+- make CLI/MCP function inspection bounded by default
+- capture and persist analysis diagnostics and discovery evidence
+- expose explicit raw mapping and bounded function pages
+- make snapshot reuse raw-mapping aware
+
+### Fixed
+
+- reject uppercase annotation digests as malformed identity
+- keep indirect-jump sites single-visit in release builds
+- tolerate empty blocks and missing functions in analysis
+
+### Other
+
+- enforce doc warnings and cancel superseded runs
+- ignore local _testdata LE oracle corpus
+- include inferred-code in MCP xrefs kind filter
+- publish agent-first migration guidance and release notes
+- record measured MCP optimization no-go
+- benchmark repeated MCP investigation workflows
+- normalize import ordering per rustfmt
+- freeze protocol-1 JSON/CLI/MCP contract
+
 ## [0.3.0](https://github.com/mimi1vx/binscout/compare/v0.2.1...v0.3.0) - 2026-10-14
 
 ### Added
