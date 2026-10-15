@@ -40,10 +40,11 @@ use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
 ///
-/// Version 3 records the effective loader mapping plus the analysis
-/// revision in every snapshot, so same bytes opened under different
-/// raw options never share cached layouts.
-pub const SCHEMA_VERSION: u32 = 3;
+/// Version 4 records discovery provenance and bounded diagnostics alongside
+/// the mapping-aware v3 snapshot, so same bytes opened under different
+/// raw options never share cached layouts and old snapshots re-analyze
+/// rather than synthesizing clean diagnostics.
+pub const SCHEMA_VERSION: u32 = 4;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -59,6 +60,8 @@ pub const MAX_SNAPSHOT_XREFS: usize = 3_000_000;
 pub const MAX_SNAPSHOT_STRINGS: usize = 3_000_000;
 /// Cap on stored annotation rows (user-created; 10k is 100x typical use).
 pub const MAX_SNAPSHOT_ANNOTATIONS: usize = 10_000;
+/// Cap on cached diagnostic rows (mirrors analysis [`MAX_DIAGNOSTICS`](crate::analysis::MAX_DIAGNOSTICS)).
+pub const MAX_SNAPSHOT_DIAGNOSTICS: usize = 100_000;
 /// Cap on one annotation name/comment in bytes.
 ///
 /// 8 KiB holds pasted stack traces while keeping a single row trivial.
@@ -71,6 +74,7 @@ const BLOCKS: TableDefinition<String, String> = TableDefinition::new("blocks");
 const XREFS: TableDefinition<String, String> = TableDefinition::new("xrefs");
 const STRINGS: TableDefinition<u64, String> = TableDefinition::new("strings");
 const ANNOTATIONS: TableDefinition<u64, String> = TableDefinition::new("annotations");
+const DIAGNOSTICS: TableDefinition<String, String> = TableDefinition::new("diagnostics");
 
 /// Deterministic 64-bit FNV-1a hash of the binary bytes.
 ///
@@ -300,6 +304,19 @@ pub struct BinaryMeta {
     /// carrying same-mapping annotations forward.
     #[serde(default)]
     pub analysis_rev: Option<u32>,
+    /// Whether discovery produced more diagnostics than the record cap.
+    ///
+    /// Defaults to false so pre-v4 snapshots without the field still
+    /// decode; such snapshots never hit the cache (their schema version
+    /// mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
+    /// Diagnostics omitted by the record cap (zero unless truncated).
+    ///
+    /// Defaults to zero for pre-v4 snapshots; see
+    /// [`BinaryMeta::diagnostics_truncated`].
+    #[serde(default)]
+    pub diagnostics_omitted: usize,
 }
 
 fn default_supported() -> bool {
@@ -315,6 +332,13 @@ pub struct FunctionRecord {
     pub name: Option<String>,
     /// Sorted direct callees.
     pub calls: Vec<u64>,
+    /// Sorted, deduplicated discovery reasons.
+    ///
+    /// Defaults to empty so layouts written before provenance tracking
+    /// still decode; such snapshots never hit the cache (their analysis
+    /// revision mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub reasons: Vec<crate::analysis::DiscoveryReason>,
 }
 
 /// One basic-block row: address range, per-instruction boundaries, and
@@ -465,7 +489,7 @@ pub struct Loaded {
     pub meta: BinaryMeta,
     /// Disassembler target the snapshot was taken as.
     pub arch: Arch,
-    /// Cached function layouts (entry, name, callees, block ranges).
+    /// Cached function layouts (entry, name, callees, block ranges, reasons).
     pub functions: Vec<FunctionLayout>,
     /// Cached callgraph edges as `(caller, callee)` pairs.
     pub call_edges: Vec<(u64, u64)>,
@@ -473,6 +497,8 @@ pub struct Loaded {
     pub xrefs: Vec<Xref>,
     /// Cached extracted strings.
     pub strings: Vec<StringHit>,
+    /// Cached diagnostics sorted by `(addr, kind)`.
+    pub diagnostics: Vec<crate::analysis::Diagnostic>,
     /// Annotations keyed by address.
     pub annotations: BTreeMap<u64, Annotation>,
 }
@@ -482,7 +508,8 @@ impl Loaded {
     ///
     /// The snapshot holds block layouts only; this steps each range with the
     /// same decoder the analysis walker uses, so the result equals a fresh
-    /// analysis of the same bytes. Stored annotations are not part of the
+    /// analysis of the same bytes — including identical diagnostics and
+    /// discovery reasons. Stored annotations are not part of the
     /// returned value; read [`Loaded::annotations`] directly.
     ///
     /// # Errors
@@ -497,6 +524,11 @@ impl Loaded {
             &self.call_edges,
             self.xrefs,
             self.strings,
+            crate::analysis::Diagnostics {
+                records: self.diagnostics,
+                truncated: self.meta.diagnostics_truncated,
+                omitted: self.meta.diagnostics_omitted,
+            },
         )
     }
 }
@@ -546,6 +578,18 @@ fn xref_key(x: &Xref) -> String {
     format!("{:016x}:{}:{:016x}", x.from, xref_kind_name(x.kind), x.to)
 }
 
+fn diagnostic_kind_name(kind: crate::analysis::DiagnosticKind) -> &'static str {
+    match kind {
+        crate::analysis::DiagnosticKind::UnresolvedIndirectJump => "indirect_jump",
+        crate::analysis::DiagnosticKind::UnresolvedIndirectCall => "indirect_call",
+        crate::analysis::DiagnosticKind::DecodeFailure => "decode_failure",
+    }
+}
+
+fn diagnostic_key(d: &crate::analysis::Diagnostic) -> String {
+    format!("{:016x}:{}", d.addr, diagnostic_kind_name(d.kind))
+}
+
 fn json<T: Serialize>(v: &T) -> Result<String> {
     serde_json::to_string(v).map_err(|e| Error::Storage(format!("encode row: {e}")))
 }
@@ -591,6 +635,9 @@ fn check_analysis_budgets(
     if analysis.strings.len() > MAX_SNAPSHOT_STRINGS {
         return Err(Error::Limit("snapshot strings exceed cap".to_string()));
     }
+    if analysis.diagnostics.records.len() > MAX_SNAPSHOT_DIAGNOSTICS {
+        return Err(Error::Limit("snapshot diagnostics exceed cap".to_string()));
+    }
     let live = annotations.values().filter(|a| !a.is_empty()).count();
     if live > MAX_SNAPSHOT_ANNOTATIONS {
         return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
@@ -612,6 +659,7 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
         "xrefs" => wtxn.delete_table(XREFS),
         "strings" => wtxn.delete_table(STRINGS),
         "annotations" => wtxn.delete_table(ANNOTATIONS),
+        "diagnostics" => wtxn.delete_table(DIAGNOSTICS),
         _ => return Err(Error::Storage(format!("unknown table {table}"))),
     };
     match deleted {
@@ -802,7 +850,7 @@ fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) ->
 
 /// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
 ///
-/// Clears all seven tables first so a smaller re-analysis leaves no stale
+/// Clears all eight tables first so a smaller re-analysis leaves no stale
 /// rows. Row counts are checked against the snapshot budgets before
 /// committing, so a snapshot that [`load`] could not read back is never
 /// written. Only block layouts persist; instructions re-decode on open.
@@ -833,6 +881,7 @@ pub fn save(
         "xrefs",
         "strings",
         "annotations",
+        "diagnostics",
     ] {
         delete_if_exists(&wtxn, t)?;
     }
@@ -875,6 +924,7 @@ pub fn save(
                 entry: f.entry,
                 name: f.name.clone(),
                 calls: f.calls.clone(),
+                reasons: f.reasons.clone(),
             };
             t.insert(f.entry, json(&rec)?)
                 .map_err(|e| Error::Storage(format!("write functions: {e}")))?;
@@ -928,6 +978,15 @@ pub fn save(
                 .map_err(|e| Error::Storage(format!("write annotations: {e}")))?;
         }
     }
+    {
+        let mut t = wtxn
+            .open_table(DIAGNOSTICS)
+            .map_err(|e| Error::Storage(format!("open diagnostics: {e}")))?;
+        for d in &analysis.diagnostics.records {
+            t.insert(diagnostic_key(d), json(d)?)
+                .map_err(|e| Error::Storage(format!("write diagnostics: {e}")))?;
+        }
+    }
     wtxn.commit()
         .map_err(|e| Error::Storage(format!("commit: {e}")))?;
     Ok(())
@@ -964,7 +1023,7 @@ fn read_meta_row(rtxn: &redb::ReadTransaction) -> Result<Option<BinaryMeta>> {
 }
 
 /// Persisted derived rows (`functions`/block layouts, call edges, xrefs,
-/// strings) shared by [`load`] and the hit path of [`load_cached`].
+/// strings, diagnostics) shared by [`load`] and the hit path of [`load_cached`].
 ///
 /// Instructions are not part of the snapshot; the caller re-decodes them
 /// from the binary via
@@ -974,6 +1033,7 @@ struct SnapshotParts {
     call_edges: Vec<(u64, u64)>,
     xrefs: Vec<Xref>,
     strings: Vec<StringHit>,
+    diagnostics: Vec<crate::analysis::Diagnostic>,
 }
 
 /// Decode the derived `functions`/`blocks`/`xrefs`/`strings` tables into
@@ -1035,11 +1095,15 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
         let entry = rec.entry;
         let mut blocks = blocks_by_func.remove(&entry).unwrap_or_default();
         blocks.sort_by_key(|b| b.start);
+        let mut reasons = rec.reasons.clone();
+        reasons.sort_unstable();
+        reasons.dedup();
         functions.push(FunctionLayout {
             entry,
             name: rec.name.clone(),
             calls: rec.calls.clone(),
             blocks,
+            reasons,
         });
         call_edges.extend(rec.calls.into_iter().map(|c| (entry, c)));
     }
@@ -1078,12 +1142,39 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
             strings.push(decode(&raw)?);
         }
     }
+    let diagnostics = read_diagnostics(rtxn)?;
     Ok(SnapshotParts {
         functions,
         call_edges,
         xrefs,
         strings,
+        diagnostics,
     })
+}
+
+/// Decode stored diagnostics, sorted by `(addr, kind)`.
+///
+/// A missing table or an undecodable row is corruption and errors. Row
+/// counts are capped so a forged sidecar fails fast with [`Error::Limit`].
+fn read_diagnostics(rtxn: &redb::ReadTransaction) -> Result<Vec<crate::analysis::Diagnostic>> {
+    let t = rtxn
+        .open_table(DIAGNOSTICS)
+        .map_err(|e| Error::Storage(format!("open diagnostics: {e}")))?;
+    let mut diagnostics: Vec<crate::analysis::Diagnostic> = Vec::new();
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read diagnostics: {e}")))?
+    {
+        let (_, v) = row.map_err(|e| Error::Storage(format!("read diagnostics: {e}")))?;
+        let raw = v.value();
+        if diagnostics.len() >= MAX_SNAPSHOT_DIAGNOSTICS {
+            return Err(Error::Limit("snapshot diagnostics exceed cap".to_string()));
+        }
+        diagnostics.push(decode(&raw)?);
+    }
+    diagnostics.sort_unstable();
+    diagnostics.dedup();
+    Ok(diagnostics)
 }
 
 /// Decode every stored annotation, skipping empty rows.
@@ -1278,6 +1369,7 @@ pub fn load_cached(
         call_edges: parts.call_edges,
         xrefs: parts.xrefs,
         strings: parts.strings,
+        diagnostics: parts.diagnostics,
         annotations,
     })))
 }
@@ -1319,6 +1411,7 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
         call_edges: parts.call_edges,
         xrefs: parts.xrefs,
         strings: parts.strings,
+        diagnostics: parts.diagnostics,
         annotations,
     }))
 }

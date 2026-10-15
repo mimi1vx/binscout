@@ -255,6 +255,8 @@ fn mapping_conflict_with_annotations_errors_without_writes() {
         reason: None,
         mapping: Some(q.mapping().clone()),
         analysis_rev: Some(db::ANALYSIS_REVISION),
+        diagnostics_truncated: q.analysis().diagnostics.truncated,
+        diagnostics_omitted: q.analysis().diagnostics.omitted,
     };
     let err = db::save(&hog, &meta, q.analysis(), q.annotations()).unwrap_err();
     assert!(

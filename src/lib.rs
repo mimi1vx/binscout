@@ -349,8 +349,9 @@ impl Project {
                     call_edges,
                     xrefs,
                     strings,
+                    diagnostics,
                     annotations,
-                    ..
+                    meta,
                 } = *hit;
                 let analysis = crate::analysis::rebuild(
                     arch,
@@ -359,6 +360,11 @@ impl Project {
                     &call_edges,
                     xrefs,
                     strings,
+                    crate::analysis::Diagnostics {
+                        records: diagnostics,
+                        truncated: meta.diagnostics_truncated,
+                        omitted: meta.diagnostics_omitted,
+                    },
                 )?;
                 Ok(Self {
                     path: binary.to_path_buf(),
@@ -438,6 +444,8 @@ impl Project {
             reason: None,
             mapping: Some(self.mapping.clone()),
             analysis_rev: Some(db::ANALYSIS_REVISION),
+            diagnostics_truncated: self.analysis.diagnostics.truncated,
+            diagnostics_omitted: self.analysis.diagnostics.omitted,
         }
     }
 

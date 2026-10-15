@@ -44,7 +44,14 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 1;
+pub const ANALYSIS_REVISION: u32 = 2;
+/// Cap on retained diagnostic records per [`analyze`] call.
+///
+/// When discovery yields more sites than this, analysis continues and the
+/// excess is counted in [`Diagnostics::omitted`] with [`Diagnostics::truncated`]
+/// set; hard analysis budgets still
+/// return [`Error::Limit`].
+pub const MAX_DIAGNOSTICS: usize = 100_000;
 /// Query pages longer than this are truncated.
 pub const MAX_PAGE: usize = 1024;
 
@@ -89,6 +96,124 @@ impl Serialize for Xref {
     }
 }
 
+/// Why a function entry was discovered.
+///
+/// Evidence about how analysis reached an entry, not a confidence score
+/// or a verified-boundary claim. Reasons coexist: one entry can be the
+/// binary entry point, an export, a direct-call target, and a prologue
+/// hit at once. Stored sorted and deduplicated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DiscoveryReason {
+    /// Binary entry point (or the fallback first executable byte when no
+    /// entry or export seeds analysis).
+    Entry,
+    /// Export address resolving to executable code.
+    Export,
+    /// Direct call target followed during recursive descent.
+    DirectCall,
+    /// Prologue-scan hit outside round-one reached code.
+    Prologue,
+}
+
+/// What an analysis diagnostic records.
+///
+/// Evidence about where analysis is incomplete, not a confidence score.
+/// Unresolved sites stay unresolved: they never become proven CFG or
+/// callgraph edges. A clean decode with a `Return` terminator is valid
+/// termination, never a [`DiagnosticKind::DecodeFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DiagnosticKind {
+    /// Branch without a direct target (`Branch`/`CBranch` with no target
+    /// from the lift: indirect forms and unsupported `loop`-style
+    /// branches). The site stays edgeless.
+    UnresolvedIndirectJump,
+    /// Call without a direct target. The site stays edgeless.
+    UnresolvedIndirectCall,
+    /// Executable bytes at a discovery address that did not decode.
+    /// Only queued discovery addresses are recorded, never every
+    /// undecoded byte in the binary.
+    DecodeFailure,
+}
+
+/// One analysis diagnostic: an incomplete-analysis site.
+///
+/// JSON pairs `addr` with `addr_hex`; old rows without the twin still
+/// deserialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+pub struct Diagnostic {
+    /// Address of the unresolved instruction or failed decode.
+    pub addr: u64,
+    /// What is incomplete at `addr`.
+    pub kind: DiagnosticKind,
+}
+
+impl Serialize for Diagnostic {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("Diagnostic", 3)?;
+        st.serialize_field("addr", &self.addr)?;
+        st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
+        st.serialize_field("kind", &self.kind)?;
+        st.end()
+    }
+}
+
+/// Bounded diagnostic record set for one analysis.
+///
+/// `records` stay sorted by `(addr, kind)` with at most [`MAX_DIAGNOSTICS`]
+/// entries; on cap exhaustion analysis continues and the excess is counted
+/// in [`Diagnostics::omitted`] with [`Diagnostics::truncated`] set. Hard
+/// analysis budgets still return [`Error::Limit`]
+/// rather than a truncated partial result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    /// Retained records sorted by `(addr, kind)`.
+    pub records: Vec<Diagnostic>,
+    /// Whether discovery produced more records than [`MAX_DIAGNOSTICS`].
+    pub truncated: bool,
+    /// Records omitted by the [`MAX_DIAGNOSTICS`] cap (zero unless
+    /// [`Diagnostics::truncated`]).
+    pub omitted: usize,
+}
+
+impl Diagnostics {
+    /// Empty record set: no diagnostics, nothing omitted.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Sort, deduplicate, and cap `records`.
+    ///
+    /// Fresh analysis passes `false`/`0` and learns the flags here; the
+    /// rebuild path re-applies the cap defensively so a forged snapshot
+    /// cannot smuggle an unbounded record list past the reader.
+    #[must_use]
+    pub fn collect(records: Vec<Diagnostic>, truncated: bool, omitted: usize) -> Self {
+        let mut sorted = records;
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() > MAX_DIAGNOSTICS {
+            let excess = sorted.len() - MAX_DIAGNOSTICS;
+            sorted.truncate(MAX_DIAGNOSTICS);
+            Self {
+                records: sorted,
+                truncated: true,
+                omitted: omitted.saturating_add(excess),
+            }
+        } else {
+            Self {
+                records: sorted,
+                truncated,
+                omitted,
+            }
+        }
+    }
+}
+
 /// One basic block: a maximal run with a single entry at `start`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicBlock {
@@ -125,6 +250,11 @@ pub struct Function {
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
     cfg: DiGraphMap<u64, ()>,
+    /// How this entry was discovered, sorted and deduplicated.
+    ///
+    /// Evidence, not confidence: coexisting [`DiscoveryReason`]s record
+    /// every seed path that reached this entry.
+    pub reasons: BTreeSet<DiscoveryReason>,
 }
 
 impl Function {
@@ -152,15 +282,24 @@ impl Function {
         self.cfg.all_edges().map(|(a, b, _)| (a, b)).collect()
     }
 
+    /// Sorted, deduplicated discovery reasons.
+    #[must_use]
+    pub fn reason_list(&self) -> Vec<DiscoveryReason> {
+        self.reasons.iter().copied().collect()
+    }
+
     /// Rebuild a function from persisted rows (M5 redb round-trip).
     ///
-    /// `edges` are `(from_block, to_block)` pairs within this function.
+    /// `edges` are `(from_block, to_block)` pairs within this function;
+    /// `reasons` may arrive in any order with duplicates and are stored
+    /// sorted and deduplicated.
     #[must_use]
     pub fn from_parts(
         entry: u64,
         name: Option<String>,
         blocks: BTreeMap<u64, BasicBlock>,
         edges: &[(u64, u64)],
+        reasons: Vec<DiscoveryReason>,
     ) -> Self {
         let mut cfg = DiGraphMap::new();
         for &start in blocks.keys() {
@@ -176,6 +315,7 @@ impl Function {
             name,
             blocks,
             cfg,
+            reasons: reasons.into_iter().collect(),
         }
     }
 }
@@ -192,6 +332,8 @@ pub struct Analysis {
     pub xrefs: Vec<Xref>,
     /// Extracted strings sorted by address.
     pub strings: Vec<StringHit>,
+    /// Bounded discovery evidence: unresolved sites and decode failures.
+    pub diagnostics: Diagnostics,
 }
 
 impl Analysis {
@@ -247,6 +389,8 @@ impl Analysis {
     /// Rebuild analysis from persisted rows (M5 redb round-trip).
     ///
     /// Drops call edges pointing at unknown functions, mirroring [`analyze`].
+    /// `diagnostics` records are sorted, deduplicated, and capped at
+    /// [`MAX_DIAGNOSTICS`] via [`Diagnostics::collect`].
     #[must_use]
     pub fn from_parts(
         arch: Arch,
@@ -254,6 +398,7 @@ impl Analysis {
         call_edges: &[(u64, u64)],
         xrefs: Vec<Xref>,
         strings: Vec<StringHit>,
+        diagnostics: Diagnostics,
     ) -> Self {
         let mut callgraph = DiGraphMap::<u64, ()>::new();
         for e in functions.keys() {
@@ -264,12 +409,18 @@ impl Analysis {
                 callgraph.add_edge(a, b, ());
             }
         }
+        let diagnostics = Diagnostics::collect(
+            diagnostics.records,
+            diagnostics.truncated,
+            diagnostics.omitted,
+        );
         Self {
             arch,
             functions,
             callgraph,
             xrefs,
             strings,
+            diagnostics,
         }
     }
 }
@@ -316,6 +467,13 @@ pub struct FunctionLayout {
     pub calls: Vec<u64>,
     /// Block layouts in address order.
     pub blocks: Vec<BlockLayout>,
+    /// Sorted, deduplicated discovery reasons.
+    ///
+    /// Defaults to empty so layouts written before provenance tracking
+    /// still decode; such snapshots never hit the cache (their analysis
+    /// revision mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub reasons: Vec<DiscoveryReason>,
 }
 
 /// Flatten an analysis into persistable layouts.
@@ -357,6 +515,7 @@ pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
                 name: f.name.clone(),
                 calls,
                 blocks,
+                reasons: f.reason_list(),
             }
         })
         .collect()
@@ -374,6 +533,9 @@ pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
 /// bytes are bounded by the mapped segments, so a forged snapshot cannot
 /// decode past the binary.
 ///
+/// `diagnostics` records are sorted, deduplicated, and capped at
+/// [`MAX_DIAGNOSTICS`] via [`Diagnostics::collect`].
+///
 /// # Errors
 /// [`Error::Storage`] on corrupt layouts (unknown function references are
 /// dropped as in [`analyze`], but undecodable ranges error),
@@ -385,9 +547,17 @@ pub fn rebuild(
     call_edges: &[(u64, u64)],
     xrefs: Vec<Xref>,
     strings: Vec<StringHit>,
+    diagnostics: Diagnostics,
 ) -> Result<Analysis> {
     if functions.len() > MAX_FUNCTIONS {
         return Err(Error::Limit(format!("more than {MAX_FUNCTIONS} functions")));
+    }
+    if diagnostics.records.len() > MAX_DIAGNOSTICS + diagnostics.omitted {
+        // Defensive: a forged snapshot cannot smuggle an unbounded list;
+        // the db reader already caps rows, this guards direct callers.
+        return Err(Error::Limit(format!(
+            "more than {MAX_DIAGNOSTICS} diagnostics"
+        )));
     }
     let space = AddrSpace::new(bin);
     let mapped: u64 = bin.segments.iter().map(|s| s.data.len() as u64).sum();
@@ -412,11 +582,16 @@ pub fn rebuild(
         }
         rebuilt.insert(
             f.entry,
-            Function::from_parts(f.entry, f.name.clone(), blocks, &edges),
+            Function::from_parts(f.entry, f.name.clone(), blocks, &edges, f.reasons.clone()),
         );
     }
     Ok(Analysis::from_parts(
-        arch, rebuilt, call_edges, xrefs, strings,
+        arch,
+        rebuilt,
+        call_edges,
+        xrefs,
+        strings,
+        diagnostics,
     ))
 }
 
@@ -1171,6 +1346,7 @@ struct Walker<'a> {
     jump_targets: BTreeSet<u64>,
     fallthroughs: BTreeSet<u64>,
     call_targets: BTreeSet<u64>,
+    diagnostics: BTreeSet<Diagnostic>,
 }
 
 impl<'a> Walker<'a> {
@@ -1182,10 +1358,18 @@ impl<'a> Walker<'a> {
             jump_targets: BTreeSet::new(),
             fallthroughs: BTreeSet::new(),
             call_targets: BTreeSet::new(),
+            diagnostics: BTreeSet::new(),
         }
     }
 
     /// Decode from `seeds`, following direct branches, calls, and fallthrough.
+    ///
+    /// Records bounded evidence while walking: executable bytes at a queued
+    /// address that do not decode become [`DiagnosticKind::DecodeFailure`],
+    /// and decoded branches/calls without a direct target become unresolved
+    /// jump/call sites. Valid termination (`Return`) and fallthrough record
+    /// nothing. Unmapped queued addresses record nothing: they end that
+    /// path, they are not decode failures.
     fn run(&mut self, seeds: Vec<u64>) -> Result<()> {
         let mut stack = seeds;
         while let Some(va) = stack.pop() {
@@ -1197,10 +1381,37 @@ impl<'a> Walker<'a> {
                     "more than {MAX_TOTAL_INSNS} instructions"
                 )));
             }
-            let Some(insn) = decode_one(self.arch, self.space, va)? else {
+            let Some(bytes) = self.space.code_bytes(va).filter(|b| !b.is_empty()) else {
                 continue;
             };
+            let insn = match crate::disasm::disasm_first(self.arch, bytes, va) {
+                Ok(Some(insn)) => insn,
+                Ok(None) => continue,
+                Err(Error::Invalid(_)) => {
+                    self.diagnostics.insert(Diagnostic {
+                        addr: va,
+                        kind: DiagnosticKind::DecodeFailure,
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let flow = classify(self.arch, &insn);
+            match flow {
+                Flow::Branch { target: None } | Flow::CBranch { target: None } => {
+                    self.diagnostics.insert(Diagnostic {
+                        addr: va,
+                        kind: DiagnosticKind::UnresolvedIndirectJump,
+                    });
+                }
+                Flow::Call { target: None } => {
+                    self.diagnostics.insert(Diagnostic {
+                        addr: va,
+                        kind: DiagnosticKind::UnresolvedIndirectCall,
+                    });
+                }
+                _ => {}
+            }
             let next = va.wrapping_add(u64::from(insn.size));
             match flow {
                 Flow::Seq => stack.push(next),
@@ -1341,8 +1552,10 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         jump_targets,
         fallthroughs,
         call_targets,
+        diagnostics: diagnostic_set,
         ..
     } = walk;
+    let diagnostics = Diagnostics::collect(diagnostic_set.into_iter().collect(), false, 0);
 
     if decoded.is_empty() {
         return Ok(Analysis {
@@ -1351,6 +1564,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             callgraph: DiGraphMap::new(),
             xrefs: Vec::new(),
             strings: Vec::new(),
+            diagnostics,
         });
     }
 
@@ -1375,6 +1589,37 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     if entries.len() > MAX_FUNCTIONS {
         return Err(Error::Limit(format!("more than {MAX_FUNCTIONS} functions")));
+    }
+    // Discovery provenance: every seed path that reached an entry.
+    // `seeds1` holds the entry point, exports, or the fallback base;
+    // `seeds2` holds prologue hits; `call_targets` holds direct calls.
+    // A fallback base that is neither entry nor export still counts as
+    // `Entry`: it seeded analysis as the entry point.
+    let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
+    let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
+    let export_addrs: BTreeSet<u64> = bin.exports.iter().filter_map(|e| e.address).collect();
+    let mut reasons: BTreeMap<u64, BTreeSet<DiscoveryReason>> = BTreeMap::new();
+    for e in &entries {
+        let mut r = BTreeSet::new();
+        if Some(*e) == bin.entry {
+            r.insert(DiscoveryReason::Entry);
+        }
+        if export_addrs.contains(e) {
+            r.insert(DiscoveryReason::Export);
+        }
+        if call_targets.contains(e) {
+            r.insert(DiscoveryReason::DirectCall);
+        }
+        if seeds2_set.contains(e) {
+            r.insert(DiscoveryReason::Prologue);
+        }
+        if r.is_empty() && seeds1_set.contains(e) {
+            r.insert(DiscoveryReason::Entry);
+        }
+        if r.is_empty() {
+            r.insert(DiscoveryReason::Entry);
+        }
+        reasons.insert(*e, r);
     }
     let entry_list: Vec<u64> = entries.iter().copied().collect();
     let owner = |va: u64| -> u64 { function_owner(&entry_list, va) };
@@ -1433,6 +1678,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
                 name: names.get(e).cloned(),
                 blocks: BTreeMap::new(),
                 cfg: DiGraphMap::new(),
+                reasons: reasons.remove(e).unwrap_or_default(),
             },
         );
     }
@@ -1584,6 +1830,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         callgraph,
         xrefs,
         strings,
+        diagnostics,
     })
 }
 

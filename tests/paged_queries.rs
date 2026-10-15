@@ -91,7 +91,7 @@ fn build_functions(n: usize) -> BTreeMap<u64, binscout::analysis::Function> {
         };
         map.insert(
             entry,
-            binscout::analysis::Function::from_parts(entry, name, blocks, &[]),
+            binscout::analysis::Function::from_parts(entry, name, blocks, &[], Vec::new()),
         );
     }
     map
@@ -118,9 +118,17 @@ fn build_blocks_analysis(n_blocks: usize) -> Analysis {
             Some("many-blocks".to_string()),
             blocks,
             &[],
+            Vec::new(),
         ),
     );
-    Analysis::from_parts(Arch::X86_64, functions, &[], Vec::new(), Vec::new())
+    Analysis::from_parts(
+        Arch::X86_64,
+        functions,
+        &[],
+        Vec::new(),
+        Vec::new(),
+        binscout::analysis::Diagnostics::empty(),
+    )
 }
 
 fn build_xrefs(n: usize) -> Vec<Xref> {
@@ -161,6 +169,7 @@ fn build_analysis(funcs: usize, xrefs: usize, strings: usize) -> Analysis {
         &[],
         build_xrefs(xrefs),
         build_strings(strings),
+        binscout::analysis::Diagnostics::empty(),
     )
 }
 
@@ -267,7 +276,14 @@ fn xrefs_page_matches_oracle_for_all_kinds() {
 
 #[test]
 fn empty_sets_page_empty() {
-    let a = Analysis::from_parts(Arch::X86_64, BTreeMap::new(), &[], Vec::new(), Vec::new());
+    let a = Analysis::from_parts(
+        Arch::X86_64,
+        BTreeMap::new(),
+        &[],
+        Vec::new(),
+        Vec::new(),
+        binscout::analysis::Diagnostics::empty(),
+    );
     for &off in &[0, 1, usize::MAX] {
         for &lim in &[0, 1, MAX_PAGE + 1, usize::MAX] {
             assert!(a.functions_page(off, lim).is_empty());

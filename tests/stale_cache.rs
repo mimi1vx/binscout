@@ -108,6 +108,18 @@ fn assert_same_analysis(a: &binscout::analysis::Analysis, b: &binscout::analysis
     assert_eq!(a.call_edges(), b.call_edges());
     assert_eq!(a.xrefs, b.xrefs);
     assert_eq!(a.strings, b.strings);
+    assert_eq!(a.diagnostics, b.diagnostics);
+    let ra: Vec<(u64, Vec<binscout::analysis::DiscoveryReason>)> = a
+        .functions
+        .values()
+        .map(|f| (f.entry, f.reason_list()))
+        .collect();
+    let rb: Vec<(u64, Vec<binscout::analysis::DiscoveryReason>)> = b
+        .functions
+        .values()
+        .map(|f| (f.entry, f.reason_list()))
+        .collect();
+    assert_eq!(ra, rb);
 }
 
 #[test]
@@ -137,6 +149,11 @@ fn hit_loads_cached_snapshot() {
                     &hit.call_edges,
                     hit.xrefs,
                     hit.strings,
+                    binscout::analysis::Diagnostics {
+                        records: hit.diagnostics,
+                        truncated: hit.meta.diagnostics_truncated,
+                        omitted: hit.meta.diagnostics_omitted,
+                    },
                 )
                 .expect("rebuild");
                 assert_same_analysis(&cached, &before);
@@ -339,6 +356,11 @@ fn healthy_stale_carries_annotations_matches_fresh_and_never_saves() {
             &stored.call_edges,
             stored.xrefs,
             stored.strings,
+            binscout::analysis::Diagnostics {
+                records: stored.diagnostics,
+                truncated: stored.meta.diagnostics_truncated,
+                omitted: stored.meta.diagnostics_omitted,
+            },
         )
         .expect("rebuild");
         (
