@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_twenty_two_tools() {
+fn handshake_lists_twenty_three_tools() {
     let lines = vec![
         req(
             1,
@@ -119,6 +119,7 @@ fn handshake_lists_twenty_two_tools() {
             "comment",
             "diagnostics",
             "disasm",
+            "flirt_hints",
             "func",
             "functions",
             "ir",
@@ -132,7 +133,7 @@ fn handshake_lists_twenty_two_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 22 tools"
+        "exactly the 23 tools"
     );
     let search = tools
         .iter()
@@ -247,9 +248,10 @@ fn all_tools_return_json_over_stdio() {
             json!({"binary": b(), "db": d(), "addr": "0x0", "block": "0x1"}),
         ),
         call(27, "diagnostics", json!({"binary": b(), "db": d()})),
+        call(28, "flirt_hints", json!({"binary": b(), "db": d()})),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 19, "{resps:?}");
+    assert_eq!(resps.len(), 20, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -290,6 +292,10 @@ fn all_tools_return_json_over_stdio() {
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
     assert_eq!(dis["insns"].as_array().expect("envelope insns").len(), 3);
     assert!(dis["error_at"].is_null(), "clean disasm error_at:null");
+
+    let flirt: Value = serde_json::from_str(tool_text(by_id[&28])).expect("flirt_hints json");
+    assert_eq!(flirt["protocol"], 1);
+    assert_eq!(flirt["total"], 0, "nop;nop;ret matches no signature");
 
     let renamed: Value = serde_json::from_str(tool_text(by_id[&20])).expect("rename json");
     assert_eq!(renamed["name"], "main");

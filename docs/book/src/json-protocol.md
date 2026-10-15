@@ -269,6 +269,21 @@ record count), `diagnostics_truncated` (bool),
 `analysis_revision`. Zero retained diagnostics is not proof of
 complete recovery.
 
+### `flirt-hints`
+
+```sh
+binscout flirt-hints B [--addr ADDR] [--offset N] [--limit N]
+```
+
+MCP tool `flirt_hints` (`binary`, `db`?, `raw`?, `addr?`, `offset?`,
+`limit?`). Each row pairs a function entry (`entry`/`entry_hex`) with
+the matched corpus `signature` id, its `suggested_name`, and the
+`reason` that keeps the row a hint rather than an identity. `addr`
+snaps to its containing function and keeps only that function's hints
+(`NotFound` when in no function). Suggested names are never applied:
+renaming stays an explicit `rename`/`annotate` write. Querying never
+writes a sidecar.
+
 ### `ir-coverage`
 
 ```sh

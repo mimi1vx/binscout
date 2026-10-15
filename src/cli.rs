@@ -215,6 +215,19 @@ pub enum Cmd {
         addr: Option<String>,
         len: Option<usize>,
     },
+    /// FLIRT-like library hints (read-only): corpus signature matches over
+    /// each function's leading bytes, paged under the protocol-1 envelope.
+    /// Suggested names stay hints; querying never writes a sidecar.
+    FlirtHints {
+        binary: PathBuf,
+        /// Only hints for the function containing this address.
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Storage stats: binary size, sidecar DB size, and analysis counts.
     Stats { binary: PathBuf },
     /// Read or write the annotation at `addr`.
@@ -405,6 +418,12 @@ impl Cli {
                 len,
             ),
             Cmd::Stats { binary } => stats(&binary, db, raw_opts),
+            Cmd::FlirtHints {
+                binary,
+                addr,
+                offset,
+                limit,
+            } => flirt_hints(&binary, db, raw_opts, addr.as_deref(), offset, limit),
             Cmd::Annotate {
                 binary,
                 addr,
@@ -711,6 +730,19 @@ fn stats(
     raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<serde_json::Value> {
     open(binary, db, raw)?.stats_json()
+}
+
+fn flirt_hints(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let page = p.query_flirt_hints(opt_addr(addr)?, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("flirt hints page serializes"))
 }
 
 fn annotate(
