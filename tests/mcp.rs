@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_seventeen_tools() {
+fn handshake_lists_eighteen_tools() {
     let lines = vec![
         req(
             1,
@@ -121,14 +121,35 @@ fn handshake_lists_seventeen_tools() {
             "ir_coverage",
             "project_info",
             "rename",
+            "search_bytes",
             "sections",
             "stats",
             "strings",
             "symbols",
             "xrefs",
         ],
-        "exactly the 17 tools"
+        "exactly the 18 tools"
     );
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "search_bytes")
+        .expect("search_bytes listed");
+    let props = search["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in [
+        "binary",
+        "db",
+        "raw",
+        "pattern",
+        "section",
+        "range_start",
+        "range_end",
+        "offset",
+        "limit",
+    ] {
+        assert!(props.contains_key(key), "search_bytes exposes {key}");
+    }
 }
 
 #[test]
@@ -1155,5 +1176,121 @@ fn diagnostics_filters_and_cli_parity() {
         !std::path::Path::new(&db).exists(),
         "diagnostics queries never create the sidecar"
     );
+    cleanup(&dir);
+}
+// `search_bytes` MCP: PE + raw parity with the CLI, filters, documented
+// errors, and no-sidecar reads.
+#[test]
+fn search_bytes_parity_filters_and_errors() {
+    use common::builders::TEXT_VA;
+    let dir = tmpdir("mcp-search-bytes");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db_path = temp_db(&dir, "sb");
+    let db = db_path.display().to_string();
+
+    // PE parity: literal frame setup at the `.text` base.
+    let page = tool_once(
+        10,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "55 89 e5"}),
+    );
+    assert_eq!(page["protocol"], 1);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["addr"], TEXT_VA);
+    assert_eq!(page["items"][0]["addr_hex"], "0x401000");
+    assert_eq!(page["items"][0]["section"], ".text");
+    assert_eq!(page["items"][0]["len"], 3);
+
+    // Wildcard + section + range filters in one session shape.
+    let page = tool_once(
+        11,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "68 ?? ?? ?? ??"}),
+    );
+    assert_eq!(page["total"], 2);
+    let page = tool_once(
+        12,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "53 41 56 45", "section": ".rdata"}),
+    );
+    assert_eq!(page["total"], 1);
+    let page = tool_once(
+        13,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "55 89 e5", "range_start": "0x401000", "range_end": "0x401003"}),
+    );
+    assert_eq!(page["total"], 1);
+    let page = tool_once(
+        14,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "55 89 e5", "range_start": "0x401000", "range_end": "0x401002"}),
+    );
+    assert_eq!(page["total"], 0);
+
+    // Raw parity under an explicit mapping.
+    let raw = write_bin(&dir, "r.bin", &[0x90, 0x90, 0x90, 0xC3, 0x90, 0x90])
+        .display()
+        .to_string();
+    let page = tool_once(
+        15,
+        "search_bytes",
+        json!({"binary": raw, "db": db, "raw": {"arch": "x86_64", "base": "0x1000"}, "pattern": "90 90"}),
+    );
+    assert_eq!(page["total"], 3);
+    assert_eq!(page["items"][0]["addr"], 0x1000);
+    assert_eq!(page["items"][0]["file_off"], 0);
+    assert!(page["items"][0]["section"].is_null(), "{page}");
+
+    assert!(
+        !db_path.exists(),
+        "repeated queries never create the sidecar"
+    );
+
+    // Documented failures are protocol-level errors, never results.
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            30,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "zz"}),
+        ),
+        call(
+            31,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "??"}),
+        ),
+        call(
+            32,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "90", "section": "nope"}),
+        ),
+        call(
+            33,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "90", "range_start": "0x401000"}),
+        ),
+        call(
+            34,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "55 89 e5", "range_start": "0x401000", "range_end": "0x401000"}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 6, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    for id in [30, 31, 32, 33, 34] {
+        assert!(by_id[&id].get("error").is_some(), "{:?}", by_id[&id]);
+        assert!(by_id[&id].get("result").is_none());
+    }
+    assert!(!db_path.exists(), "failed queries never create the sidecar");
     cleanup(&dir);
 }

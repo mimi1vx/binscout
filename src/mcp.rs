@@ -1,4 +1,4 @@
-//! binscout MCP server: 17 stateless tools over [`Project`].
+//! binscout MCP server: 18 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -294,6 +294,29 @@ pub struct CommentParams {
     pub addr: String,
     /// Comment text (empty string clears).
     pub comment: String,
+}
+
+/// Parameters for the `search_bytes` tool: bounded byte-pattern search.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchBytesParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Whitespace-separated full-byte tokens: two hex digits or `??`.
+    pub pattern: String,
+    /// Keep matches fully inside this section (e.g. `.text`).
+    pub section: Option<String>,
+    /// Range start (`0x`-hex or decimal, needs range_end).
+    pub range_start: Option<String>,
+    /// Range end (`0x`-hex or decimal, needs range_start).
+    pub range_end: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
 }
 
 /// MCP server handler; serializes tool calls behind one lock.
@@ -614,5 +637,40 @@ impl BinscoutMcp {
         proj.set_comment(addr, &p.comment)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(proj.annotation_json(addr))
+    }
+
+    #[tool(
+        name = "search_bytes",
+        description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count"
+    )]
+    fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let range = match (p.range_start, p.range_end) {
+            (None, None) => None,
+            (Some(lo), Some(hi)) => Some((
+                parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                parse_addr(&hi).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+            )),
+            _ => {
+                return Err(ErrorData::invalid_params(
+                    "range_start and range_end must be given together",
+                    None,
+                ));
+            }
+        };
+        proj.search_bytes(
+            &p.pattern,
+            p.section.as_deref(),
+            range,
+            p.offset.unwrap_or(0),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
+        .and_then(|page| ok(serde_json::to_value(page).expect("search_bytes page serializes")))
     }
 }

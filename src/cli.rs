@@ -194,6 +194,22 @@ pub enum Cmd {
         #[arg(long)]
         comment: Option<String>,
     },
+    /// Search mapped file bytes for a byte pattern, paged.
+    SearchBytes {
+        binary: PathBuf,
+        /// Whitespace-separated full-byte tokens: two hex digits or `??`.
+        pattern: String,
+        /// Keep matches fully inside this section (e.g. `.text`).
+        #[arg(long)]
+        section: Option<String>,
+        /// Keep matches fully inside LO..HI (`0x`-hex or decimal, half-open).
+        #[arg(long, num_args = 2, value_names = ["LO", "HI"])]
+        range: Option<Vec<String>>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 impl Cli {
@@ -327,6 +343,23 @@ impl Cli {
                 &addr,
                 rename.as_deref(),
                 comment.as_deref(),
+            ),
+            Cmd::SearchBytes {
+                binary,
+                pattern,
+                section,
+                range,
+                offset,
+                limit,
+            } => search_bytes(
+                &binary,
+                db,
+                raw_opts,
+                &pattern,
+                section.as_deref(),
+                range,
+                offset,
+                limit,
             ),
         };
         match result {
@@ -585,4 +618,31 @@ fn annotate(
         p.set_comment(addr, text)?;
     }
     Ok(p.annotation_json(addr))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw"
+)]
+fn search_bytes(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    pattern: &str,
+    section: Option<&str>,
+    range: Option<Vec<String>>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let range = range
+        .map(|pair| match &pair[..] {
+            [lo, hi] => Ok((binscout::parse_addr(lo)?, binscout::parse_addr(hi)?)),
+            _ => Err(binscout::error::Error::Invalid(
+                "--range takes LO HI".to_string(),
+            )),
+        })
+        .transpose()?;
+    let page = p.search_bytes(pattern, section, range, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("search_bytes page serializes"))
 }

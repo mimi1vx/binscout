@@ -1098,3 +1098,187 @@ fn ir_coverage_range_counts_and_errors() {
     assert!(!ok && v.get("error").is_some(), "arch mismatch: {v}");
     cleanup(&dir);
 }
+// `search-bytes` CLI: PE + raw parity with `Project::search_bytes`,
+// filters, documented errors, and no-sidecar reads.
+#[test]
+fn search_bytes_parity_filters_and_errors() {
+    use common::builders::{BASIC_STRING_RDATA_OFF, TEXT_VA};
+    let dir = tmpdir("cli-search-bytes");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "sb").display().to_string();
+    let d = db.as_str();
+
+    // PE parity: literal frame setup at the `.text` base.
+    let (ok, v) = run(&["--db", d, "search-bytes", &bin, "55 89 e5"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"][0]["addr"], TEXT_VA);
+    assert_eq!(v["items"][0]["addr_hex"], "0x401000");
+    assert_eq!(v["items"][0]["section"], ".text");
+    assert_eq!(v["items"][0]["file_off"], 0x200);
+    assert_eq!(v["items"][0]["len"], 3);
+
+    // Wildcard parity: two `push imm32` sites.
+    let (ok, v) = run(&["--db", d, "search-bytes", &bin, "68 ?? ?? ?? ??"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["items"][0]["addr"], TEXT_VA + 3);
+
+    // Section filter narrows to `.rdata` for the SAVE marker.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "53 41 56 45",
+        "--section",
+        ".rdata",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    assert_eq!(
+        v["items"][0]["file_off"],
+        0x400 + BASIC_STRING_RDATA_OFF as u64
+    );
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "53 41 56 45",
+        "--section",
+        ".text",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 0);
+
+    // Half-open range: containing range hits, short range misses, swapped
+    // bounds normalize, empty ranges error.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "55 89 e5",
+        "--range",
+        "0x401000",
+        "0x401003",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "55 89 e5",
+        "--range",
+        "0x401000",
+        "0x401002",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 0);
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "55 89 e5",
+        "--range",
+        "0x401003",
+        "0x401000",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "55 89 e5",
+        "--range",
+        "0x401000",
+        "0x401000",
+    ]);
+    assert!(!ok && v.get("error").is_some(), "empty range: {v}");
+
+    // Paging follows the envelope: clipped limit, zero limit, past-end.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "68 ?? ?? ?? ??",
+        "--offset",
+        "0",
+        "--limit",
+        "1",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["next_offset"], 1);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1);
+
+    // Malformed patterns error as JSON with exit 1.
+    for bad in ["zz", "??", "5", "48,8B", ""] {
+        let (ok, v) = run(&["--db", d, "search-bytes", &bin, bad]);
+        assert!(!ok && v.get("error").is_some(), "{bad:?}: {v}");
+    }
+    // Unknown section errors as JSON with exit 1.
+    let (ok, v) = run(&["--db", d, "search-bytes", &bin, "90", "--section", "nope"]);
+    assert!(!ok && v.get("error").is_some(), "unknown section: {v}");
+    // A half-given `--range` never reaches validation: clap exits 2.
+    let out = Command::new(binscout_bin())
+        .args(["--db", d, "search-bytes", &bin, "90", "--range", "0x401000"])
+        .output()
+        .expect("spawn binscout");
+    assert_eq!(out.status.code(), Some(2), "partial --range exits 2");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "search-bytes",
+        &bin,
+        "90",
+        "--range",
+        "zz",
+        "0x401010",
+    ]);
+    assert!(!ok && v.get("error").is_some(), "bad range addr: {v}");
+
+    // Repeated queries never create a sidecar.
+    assert!(!Path::new(d).exists(), "searches never create the sidecar");
+
+    // Raw parity under an explicit mapping: overlapping matches included.
+    let raw = write_bin(&dir, "r.bin", &[0x90, 0x90, 0x90, 0xC3, 0x90, 0x90]);
+    let raw_s = raw.display().to_string();
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "--raw",
+        "--arch",
+        "x86_64",
+        "--base",
+        "0x1000",
+        "search-bytes",
+        &raw_s,
+        "90 90",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["items"][0]["addr"], 0x1000);
+    assert_eq!(v["items"][0]["file_off"], 0);
+    assert!(v["items"][0]["section"].is_null(), "{v}");
+    assert!(
+        !Path::new(d).exists(),
+        "raw searches never create the sidecar"
+    );
+
+    // Non-numeric paging never reaches validation: clap exits 2 on stderr.
+    let out = Command::new(binscout_bin())
+        .args(["--db", d, "search-bytes", &bin, "90", "--offset", "nope"])
+        .output()
+        .expect("spawn binscout");
+    assert_eq!(out.status.code(), Some(2), "clap misuse exits 2");
+    cleanup(&dir);
+}
