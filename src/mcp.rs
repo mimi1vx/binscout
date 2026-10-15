@@ -7,11 +7,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::ErrorData;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
-use crate::{parse_addr, parse_xref_kind, FunctionFilter, Project};
+use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
 
 /// Explicit raw mapping for MCP binary-taking tools.
 ///

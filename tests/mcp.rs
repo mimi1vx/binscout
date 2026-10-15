@@ -6,7 +6,7 @@ mod common;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use common::{cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
