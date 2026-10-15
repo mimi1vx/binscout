@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 13 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 14 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
@@ -24,6 +24,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `symbols` | binary | Imports and exports of the binary |
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
+| `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears |
@@ -35,9 +36,9 @@ allows a single open handle per file per process.
 ## Frozen upcoming tools (not yet implemented)
 
 The protocol-1 contract freezes these names and shapes; they land with
-their roadmap steps (13 tools today, 20 after). See
+their roadmap steps (14 tools today, 20 after). See
 [JSON protocol](json-protocol.md) for the full request/response
-definitions: `blocks`, `block_insns`, `diagnostics`, `ir_coverage`,
+definitions: `blocks`, `block_insns`, `diagnostics`,
 `search_bytes`, `annotations_export`, `annotations_import`, plus the
 optional `raw` (`arch`/`base`/`entry?`) mapping object on every
 binary-taking tool. Until these ship, `func` keeps its current

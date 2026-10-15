@@ -1075,6 +1075,75 @@ impl Project {
         )
     }
 
+    /// Machine-readable lift coverage for `arch` plus per-range accounting.
+    ///
+    /// The arch-level tables come from [`crate::ir::coverage`]; `range`
+    /// counts come from actual per-instruction lifts of the valid prefix
+    /// (see [`Project::disasm_at`]), so `decoded == lifted + unlifted`
+    /// exactly and `unlifted_mnemonics` names the distinct fallback
+    /// mnemonics (sorted, capped at [`MAX_COVERAGE_MNEMONICS`]) with their
+    /// real warning strings. `error_at` mirrors the disassembler's first
+    /// bad opcode (`None` on a clean range). Opens nothing new and never
+    /// writes; range caps follow [`Project::bytes_at`].
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `arch` differs from the binary's
+    /// architecture; same as [`Project::disasm_at`] otherwise.
+    pub fn ir_coverage_at(
+        &self,
+        arch: crate::disasm::Arch,
+        addr: u64,
+        len: usize,
+    ) -> Result<serde_json::Value> {
+        if arch != self.binary.arch {
+            return Err(Error::Invalid(format!(
+                "ir-coverage arch {} does not match binary arch {}",
+                crate::db::arch_name(arch),
+                crate::db::arch_name(self.binary.arch),
+            )));
+        }
+        let partial = self.disasm_at(addr, len)?;
+        let mut lifted = 0usize;
+        let mut unlifted = 0usize;
+        let mut counts: BTreeMap<&str, (usize, String)> = BTreeMap::new();
+        for insn in &partial.insns {
+            let rows = crate::ir::lift(arch, insn);
+            let warning = rows.iter().find_map(|r| r.warning.clone());
+            match warning {
+                Some(w) => {
+                    unlifted += 1;
+                    counts
+                        .entry(insn.mnem.as_str())
+                        .and_modify(|(n, _)| *n += 1)
+                        .or_insert((1, w));
+                }
+                None => lifted += 1,
+            }
+        }
+        let (truncated, unlifted_mnemonics): (bool, Vec<serde_json::Value>) = {
+            let mut rows: Vec<(&str, (usize, String))> = counts.into_iter().collect();
+            let truncated = rows.len() > MAX_COVERAGE_MNEMONICS;
+            rows.truncate(MAX_COVERAGE_MNEMONICS);
+            let values = rows
+                .into_iter()
+                .map(|(mnemonic, (count, warning))| {
+                    serde_json::json!({"mnemonic": mnemonic, "count": count, "warning": warning})
+                })
+                .collect();
+            (truncated, values)
+        };
+        let mut value =
+            serde_json::to_value(crate::ir::coverage(arch)).expect("coverage serializes");
+        let (range_addr, range_hex) = addr_pair(addr);
+        value["range"] = serde_json::json!({
+            "addr": range_addr, "addr_hex": range_hex,
+            "decoded": partial.insns.len(), "lifted": lifted, "unlifted": unlifted,
+            "unlifted_mnemonics": unlifted_mnemonics, "truncated": truncated,
+            "error_at": partial.error_at,
+        });
+        Ok(value)
+    }
+
     /// Xrefs filtered by endpoint/kind, paged.
     #[must_use]
     pub fn query_xrefs(
@@ -1217,6 +1286,21 @@ impl Project {
 pub const MAX_RANGE_BYTES: usize = 1 << 20;
 /// Cap on rows per paged query.
 const MAX_ROWS: usize = 1024;
+/// Cap on distinct unlifted mnemonics in an
+/// [`Project::ir_coverage_at`] range summary; beyond it `truncated` is set.
+pub const MAX_COVERAGE_MNEMONICS: usize = 32;
+
+/// Machine-readable lift coverage for `arch`, without opening a binary.
+///
+/// Families publish the same mnemonic slices the [`crate::ir`] dispatch
+/// predicates consult, with explicit implemented/partial/unmapped status
+/// plus the engine-wide limitations; unknown mnemonics stay fallback NOP
+/// with a warning. With a range, use [`Project::ir_coverage_at`], which
+/// adds per-range `decoded`/`lifted`/`unlifted` counts from actual lifts.
+#[must_use]
+pub fn ir_coverage(arch: crate::disasm::Arch) -> serde_json::Value {
+    serde_json::to_value(crate::ir::coverage(arch)).expect("coverage serializes")
+}
 
 /// Format a virtual address as canonical `0x`-hex (`0x401000`).
 ///

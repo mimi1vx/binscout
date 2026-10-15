@@ -18,6 +18,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
+| `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 
@@ -45,7 +46,6 @@ request/response definitions.
 | `blocks B ADDR` | bounded function views | page block summaries of the containing function |
 | `block-insns B ADDR BLOCK` | bounded function views | page one block's instructions in address order |
 | `diagnostics B` | diagnostic queries | page provenance records, filterable by `--kind`/`--func` |
-| `ir-coverage --arch ARCH` | IR coverage | lift coverage without opening a binary; optional range counts |
 | `search-bytes B PATTERN` | byte search | paged `??`-wildcard matches with section/range filters |
 | `annotations-export B` | annotation transfer | emit the portable JSON annotation document |
 | `annotations-import B` | annotation transfer | atomically merge a document (`--input`, `--overwrite`) |

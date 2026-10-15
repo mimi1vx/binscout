@@ -235,10 +235,10 @@ record count), `diagnostics_truncated` (bool),
 `analysis_revision`. Zero retained diagnostics is not proof of
 complete recovery.
 
-### `ir-coverage` (target: machine-readable lift coverage)
+### `ir-coverage` (implemented: machine-readable lift coverage)
 
 ```sh
-binscout ir-coverage --arch ARCH [B ADDR LEN]
+binscout ir-coverage ARCH [B ADDR LEN]
 ```
 
 MCP tool `ir_coverage` (`arch`, `binary`?, `db`?, `addr`?, `len`?):
@@ -249,7 +249,8 @@ limitations (operand strings, flags, stack/calling-convention
 effects, no SSA/PHI production); unknown mnemonics stay a `NOP` with
 a warning, distinguishable from a genuine `NOP`. With a range, it
 adds per-range `decoded`/`lifted`/`unlifted` counts from actual lift
-results plus a bounded mnemonic summary.
+results plus a bounded mnemonic summary. (`ARCH` is positional on the
+CLI because `--arch` is the global raw-mapping flag.)
 
 ### `search-bytes` (target: bounded byte-pattern search)
 

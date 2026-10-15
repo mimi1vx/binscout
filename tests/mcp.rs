@@ -1,12 +1,12 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 15 tools, and call every one against fixtures.
+//! list the 16 tools, and call every one against fixtures.
 
 mod common;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use common::{cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_fifteen_tools() {
+fn handshake_lists_sixteen_tools() {
     let lines = vec![
         req(
             1,
@@ -117,6 +117,7 @@ fn handshake_lists_fifteen_tools() {
             "func",
             "functions",
             "ir",
+            "ir_coverage",
             "project_info",
             "rename",
             "sections",
@@ -125,7 +126,7 @@ fn handshake_lists_fifteen_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 15 tools"
+        "exactly the 16 tools"
     );
 }
 
@@ -944,5 +945,63 @@ fn bounded_func_and_pages_stay_capped() {
     assert_eq!(page["limit"], 0);
     assert!(page["items"].as_array().expect("items").is_empty());
     assert!(page["next_offset"].is_null());
+    cleanup(&dir);
+}
+
+#[test]
+fn ir_coverage_arch_only_and_range() {
+    // Arch-only: no binary opened, no range section.
+    let v = tool_once(10, "ir_coverage", json!({"arch": "aarch64"}));
+    assert_eq!(v["arch"], "aarch64");
+    assert_eq!(v["families"].as_array().expect("families").len(), 19);
+    assert_eq!(v["fallback"]["op"], "Nop");
+    assert!(v.get("range").is_none(), "{v}");
+
+    // Range: per-range counts from actual lifts over a raw fallback blob
+    // (cpuid x2 unmapped, nop + ret lifted).
+    let dir = tmpdir("mcp-ir-coverage");
+    let bin = write_bin(&dir, "mixed.bin", &[0x0F, 0xA2, 0x0F, 0xA2, 0x90, 0xC3])
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "mixed").display().to_string();
+    let v = tool_once(
+        11,
+        "ir_coverage",
+        json!({"arch": "x86_64", "binary": bin.clone(), "db": db.clone(), "addr": "0", "len": 6}),
+    );
+    assert_eq!(v["arch"], "x86_64");
+    assert_eq!(v["range"]["decoded"], 4);
+    assert_eq!(v["range"]["lifted"], 2);
+    assert_eq!(v["range"]["unlifted"], 2);
+    assert_eq!(v["range"]["unlifted_mnemonics"][0]["mnemonic"], "cpuid");
+    cleanup(&dir);
+
+    // Partial ranges, arch mismatches, and unknown arches are tool errors.
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            10,
+            "ir_coverage",
+            json!({"arch": "x86_64", "binary": bin.clone()}),
+        ),
+        call(
+            11,
+            "ir_coverage",
+            json!({"arch": "aarch64", "binary": bin, "db": db, "addr": "0", "len": 6}),
+        ),
+        call(12, "ir_coverage", json!({"arch": "mips"})),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 4, "{resps:?}");
+    for resp in resps.iter().skip(1) {
+        assert!(resp.get("error").is_some(), "must error: {resp:?}");
+        assert!(resp.get("result").is_none());
+    }
     cleanup(&dir);
 }

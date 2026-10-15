@@ -913,3 +913,62 @@ fn bounded_func_and_pages_stay_capped() {
     assert_eq!(v["total"], 1201);
     cleanup(&dir);
 }
+
+/// cpuid (unmapped) x2, nop, ret as a raw blob at base 0.
+fn coverage_blob() -> Vec<u8> {
+    vec![0x0F, 0xA2, 0x0F, 0xA2, 0x90, 0xC3]
+}
+
+#[test]
+fn ir_coverage_arch_only_needs_no_binary() {
+    for arch in ["x86_64", "x86_32", "aarch64", "arm32", "thumb"] {
+        let (ok, v) = run(&["ir-coverage", arch]);
+        assert!(ok, "{arch}: {v}");
+        assert_eq!(v["arch"], arch, "{arch}");
+        assert_eq!(
+            v["families"].as_array().expect("families").len(),
+            19,
+            "{arch}"
+        );
+        assert!(
+            v["limitations"].as_array().expect("limitations").len() >= 3,
+            "{arch}"
+        );
+        assert_eq!(v["fallback"]["op"], "Nop", "{arch}");
+        assert!(v.get("range").is_none(), "{arch}: no range without binary");
+    }
+    // Unknown arch stays a JSON error envelope.
+    let (ok, v) = run(&["ir-coverage", "mips"]);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+}
+
+#[test]
+fn ir_coverage_range_counts_and_errors() {
+    let dir = tmpdir("ir-coverage");
+    let bin = write_bin(&dir, "mixed.bin", &coverage_blob());
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "mixed").display().to_string();
+    let d = db.as_str();
+
+    let (ok, v) = run(&["--db", d, "ir-coverage", "x86_64", &bin_s, "0", "6"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["arch"], "x86_64");
+    assert_eq!(v["range"]["decoded"], 4);
+    assert_eq!(v["range"]["lifted"], 2);
+    assert_eq!(v["range"]["unlifted"], 2);
+    assert_eq!(v["range"]["unlifted_mnemonics"][0]["mnemonic"], "cpuid");
+    assert!(v["range"]["error_at"].is_null());
+    assert!(
+        !Path::new(d).exists(),
+        "range reads never create the sidecar"
+    );
+
+    // Partial ranges and arch mismatches stay JSON errors.
+    let (ok, v) = run(&["--db", d, "ir-coverage", "x86_64", &bin_s]);
+    assert!(!ok && v.get("error").is_some(), "binary alone: {v}");
+    let (ok, v) = run(&["--db", d, "ir-coverage", "x86_64", &bin_s, "0"]);
+    assert!(!ok && v.get("error").is_some(), "binary+addr alone: {v}");
+    let (ok, v) = run(&["--db", d, "ir-coverage", "aarch64", &bin_s, "0", "6"]);
+    assert!(!ok && v.get("error").is_some(), "arch mismatch: {v}");
+    cleanup(&dir);
+}

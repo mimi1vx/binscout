@@ -154,6 +154,11 @@ fn every_addr_has_matching_hex() {
     );
     check_value(&p.ir_at(entry, 16).expect("ir"), "ir");
     check_value(
+        &p.ir_coverage_at(binscout::disasm::Arch::X86_32, entry, 16)
+            .expect("ir-coverage"),
+        "ir-coverage",
+    );
+    check_value(
         &serde_json::to_value(p.query_xrefs(None, None, None, 0, 100)).expect("json"),
         "xrefs",
     );
@@ -391,4 +396,47 @@ fn ir_warning_semantics_hold() {
         let v = lift_one(bytes);
         assert_eq!(v[0].warning, None);
     }
+}
+
+/// Arch-only coverage carries no `range` key; the ranged form pairs every
+/// address with its hex twin and keeps the invalid-arch error typed.
+#[test]
+fn ir_coverage_range_shape_and_mismatch() {
+    let dir = tmpdir("ir-coverage-shape");
+    let p = open_test_project(&dir, builders::BASIC_NAME);
+    let entry = builders::BASIC_ENTRY_VA;
+
+    let arch_only = binscout::ir_coverage(binscout::disasm::Arch::X86_32);
+    assert_eq!(arch_only["arch"], "x86_32");
+    assert!(arch_only.get("range").is_none(), "{arch_only}");
+    assert_eq!(
+        arch_only["fallback"]["warning"],
+        "unlifted '<mnem>'; emitted NOP"
+    );
+
+    let v = serde_json::to_value(
+        p.ir_coverage_at(binscout::disasm::Arch::X86_32, entry, 16)
+            .expect("range"),
+    )
+    .expect("json");
+    check_value(&v, "ir-coverage");
+    assert_eq!(v["arch"], "x86_32");
+    let range = &v["range"];
+    assert_eq!(
+        (range["addr"].as_u64(), range["addr_hex"].as_str()),
+        (Some(entry), Some(format!("{entry:#x}").as_str()))
+    );
+    assert_eq!(
+        range["decoded"].as_u64().unwrap(),
+        range["lifted"].as_u64().unwrap() + range["unlifted"].as_u64().unwrap()
+    );
+
+    let err = p
+        .ir_coverage_at(binscout::disasm::Arch::Aarch64, entry, 16)
+        .unwrap_err();
+    assert!(
+        matches!(err, binscout::error::Error::Invalid(_)),
+        "arch mismatch is Invalid, got {err:?}"
+    );
+    cleanup(&dir);
 }

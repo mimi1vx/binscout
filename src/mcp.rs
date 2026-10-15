@@ -1,4 +1,4 @@
-//! binscout MCP server: 15 stateless tools over [`Project`].
+//! binscout MCP server: 16 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -7,11 +7,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::ErrorData;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 
-use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
+use crate::{parse_addr, parse_xref_kind, FunctionFilter, Project};
 
 /// Explicit raw mapping for MCP binary-taking tools.
 ///
@@ -225,6 +225,24 @@ pub struct XrefsParams {
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+}
+
+/// Parameters for the `ir_coverage` tool: arch-only coverage, or coverage
+/// plus per-range accounting when `binary`/`addr`/`len` are all given.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct IrCoverageParams {
+    /// Coverage arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`.
+    pub arch: String,
+    /// Path to the analyzed binary (needs `addr` and `len` for a range).
+    pub binary: Option<String>,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Range address (`0x`-hex or decimal string; needs `binary` and `len`).
+    pub addr: Option<String>,
+    /// Range length in bytes (needs `binary` and `addr`).
+    pub len: Option<usize>,
 }
 
 /// Parameters for the `rename` tool.
@@ -493,6 +511,35 @@ impl BinscoutMcp {
         proj.ir_at(addr, p.len)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
+    }
+
+    #[tool(
+        name = "ir_coverage",
+        description = "Machine-readable IR lift coverage for one arch (implemented families, partial mappings, limitations); with binary/addr/len adds per-range decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary"
+    )]
+    fn ir_coverage(&self, p: Parameters<IrCoverageParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let arch = crate::parse_raw_arch(&p.arch)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        match (p.binary, p.addr, p.len) {
+            (None, None, None) => ok(crate::ir_coverage(arch)),
+            (Some(binary), Some(addr), Some(len)) => {
+                let proj = open(&binary, p.db.as_deref(), p.raw.as_ref())?;
+                let addr = parse_addr(&addr)
+                    .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+                proj.ir_coverage_at(arch, addr, len)
+                    .map_err(|e| match e {
+                        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                        other => ErrorData::internal_error(other.to_string(), None),
+                    })
+                    .and_then(ok)
+            }
+            _ => Err(ErrorData::invalid_params(
+                "ir_coverage range needs binary, addr, and len together",
+                None,
+            )),
+        }
     }
 
     #[tool(

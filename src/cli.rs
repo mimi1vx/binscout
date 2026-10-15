@@ -152,6 +152,18 @@ pub enum Cmd {
         addr: String,
         len: usize,
     },
+    /// Machine-readable IR lift coverage for one architecture. Without a
+    /// binary range, no binary is opened; with `binary addr len`, adds
+    /// per-range decoded/lifted/unlifted counts from actual lifts.
+    /// (`arch` is positional because `--arch` is the global raw-mapping flag.)
+    IrCoverage {
+        /// Coverage arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`.
+        #[arg(value_name = "ARCH")]
+        coverage_arch: String,
+        binary: Option<PathBuf>,
+        addr: Option<String>,
+        len: Option<usize>,
+    },
     /// Storage stats: binary size, sidecar DB size, and analysis counts.
     Stats { binary: PathBuf },
     /// Read or write the annotation at `addr`.
@@ -257,6 +269,19 @@ impl Cli {
             Cmd::Symbols { binary } => symbols(&binary, db, raw_opts),
             Cmd::Sections { binary } => sections(&binary, db, raw_opts),
             Cmd::Ir { binary, addr, len } => ir(&binary, db, raw_opts, &addr, len),
+            Cmd::IrCoverage {
+                coverage_arch,
+                binary,
+                addr,
+                len,
+            } => ir_coverage(
+                &coverage_arch,
+                binary.as_deref(),
+                db,
+                raw_opts,
+                addr.as_deref(),
+                len,
+            ),
             Cmd::Stats { binary } => stats(&binary, db, raw_opts),
             Cmd::Annotate {
                 binary,
@@ -465,6 +490,26 @@ fn ir(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
     p.ir_at(binscout::parse_addr(addr)?, len)
+}
+
+fn ir_coverage(
+    arch: &str,
+    binary: Option<&std::path::Path>,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: Option<&str>,
+    len: Option<usize>,
+) -> binscout::error::Result<serde_json::Value> {
+    let arch = binscout::parse_raw_arch(arch)?;
+    match (binary, addr, len) {
+        (None, None, None) => Ok(binscout::ir_coverage(arch)),
+        (Some(binary), Some(addr), Some(len)) => {
+            open(binary, db, raw)?.ir_coverage_at(arch, binscout::parse_addr(addr)?, len)
+        }
+        _ => Err(binscout::error::Error::Invalid(
+            "ir-coverage range needs BINARY ADDR LEN together".to_string(),
+        )),
+    }
 }
 
 fn stats(
