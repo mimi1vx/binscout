@@ -116,6 +116,34 @@ pub enum Cmd {
     /// Control-flow graph of one function. Any address inside the function
     /// snaps to its containing entry.
     Cfg { binary: PathBuf, addr: String },
+    /// Transitive callees of one function: every function reachable by
+    /// following call edges out to `--depth` hops. Any address inside the
+    /// function snaps to its containing entry.
+    Callees {
+        binary: PathBuf,
+        addr: String,
+        /// Max call edges from the root (direct callees are depth 1).
+        #[arg(long, default_value_t = binscout::analysis::MAX_CALL_DEPTH)]
+        depth: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Transitive callers of one function: every function that can reach
+    /// it by following call edges backward out to `--depth` hops. Any
+    /// address inside the function snaps to its containing entry.
+    Callers {
+        binary: PathBuf,
+        addr: String,
+        /// Max call edges to the root (direct callers are depth 1).
+        #[arg(long, default_value_t = binscout::analysis::MAX_CALL_DEPTH)]
+        depth: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Cross-references, optionally filtered by endpoint/kind.
     Xrefs {
         binary: PathBuf,
@@ -284,6 +312,20 @@ impl Cli {
             ),
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
+            Cmd::Callees {
+                binary,
+                addr,
+                depth,
+                offset,
+                limit,
+            } => callees(&binary, db, raw_opts, &addr, depth, offset, limit),
+            Cmd::Callers {
+                binary,
+                addr,
+                depth,
+                offset,
+                limit,
+            } => callers(&binary, db, raw_opts, &addr, depth, offset, limit),
             Cmd::Xrefs {
                 binary,
                 to,
@@ -531,6 +573,34 @@ fn cfg(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
     p.cfg_of(binscout::parse_addr(addr)?)
+}
+
+fn callees(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+    depth: usize,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let page = p.callees_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("callees page serializes"))
+}
+
+fn callers(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+    depth: usize,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let page = p.callers_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("callers page serializes"))
 }
 
 #[allow(

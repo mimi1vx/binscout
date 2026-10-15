@@ -1,4 +1,4 @@
-//! binscout MCP server: 20 stateless tools over [`Project`].
+//! binscout MCP server: 22 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -319,6 +319,28 @@ pub struct SearchBytesParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for the `callees`/`callers` tools: depth-bounded transitive
+/// callgraph reachability, paged under the protocol-1 envelope.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CallgraphParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Query address: any address inside the root function snaps to its
+    /// containing entry.
+    pub addr: String,
+    /// Max call edges from the root (direct neighbors are depth 1;
+    /// defaults to the 64-hop cap).
+    pub depth: Option<usize>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
 /// Parameters for the `annotations_import` tool: merge a portable document.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AnnotationsImportParams {
@@ -501,6 +523,52 @@ impl BinscoutMcp {
         proj.cfg_of(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
+    }
+
+    #[tool(
+        name = "callees",
+        description = "Transitive callees of one function out to depth hops (direct callees are depth 1), ordered by entry with shortest distance, paged under the protocol-1 envelope. Addr snaps to its containing function"
+    )]
+    fn callees(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.callees_page(
+            addr,
+            p.depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
+            p.offset.unwrap_or(0),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
+        .and_then(|page| ok(serde_json::to_value(page).expect("callees page serializes")))
+    }
+
+    #[tool(
+        name = "callers",
+        description = "Transitive callers of one function out to depth hops (direct callers are depth 1), ordered by entry with shortest distance, paged under the protocol-1 envelope. Addr snaps to its containing function"
+    )]
+    fn callers(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.callers_page(
+            addr,
+            p.depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
+            p.offset.unwrap_or(0),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
+        .and_then(|page| ok(serde_json::to_value(page).expect("callers page serializes")))
     }
 
     #[tool(

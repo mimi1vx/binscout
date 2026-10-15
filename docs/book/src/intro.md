@@ -8,9 +8,10 @@ There are two interfaces over the same engine:
 
 - `binscout`, a JSON CLI: every command prints exactly one JSON value to
   stdout.
-- `binscout-mcp`, an MCP server over stdio with 20 tools, one per
+- `binscout-mcp`, an MCP server over stdio with 22 tools, one per
   capability (plus `blocks`/`block_insns` for bounded inspection,
-  `diagnostics`, `search_bytes`, `ir_coverage`, and annotation
+  `diagnostics`, `callees`/`callers` for transitive reachability,
+  `search_bytes`, `ir_coverage`, and annotation
   transfer).
 
 Annotations (function renames, free-text comments) live in a `redb`

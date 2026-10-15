@@ -232,6 +232,22 @@ by start; `block_insns` pages that block's instructions in address
 order. Both use the page envelope; per-page work scales with the
 page, never with whole-function size.
 
+### `callees` / `callers`
+
+```sh
+binscout callees B ADDR [--depth N] [--offset N] [--limit N]
+binscout callers B ADDR [--depth N] [--limit N]
+```
+
+MCP tools `callees`/`callers` (`binary`, `db`?, `raw`?, `addr`,
+`depth?`, `offset?`, `limit?`). `ADDR` snaps to its containing
+function (`NotFound` when in no function); `depth` bounds the walk to
+that many call edges (direct neighbors are depth 1, zero yields an
+empty page, past the 64-hop cap is an `Invalid` error). Items order by
+entry with the shortest distance in `depth` plus the rename-resolved
+`name` and the `entry`/`entry_hex` twins, paged under the envelope;
+querying never writes a sidecar.
+
 ### `diagnostics`
 
 ```sh

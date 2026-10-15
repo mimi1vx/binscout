@@ -68,6 +68,13 @@ pub const MAX_INFERRED_PER_SITE: usize = 1;
 pub const MAX_INFERRED_EDGES: usize = 100_000;
 /// Query pages longer than this are truncated.
 pub const MAX_PAGE: usize = 1024;
+/// Cap on transitive callgraph hops per query.
+///
+/// Bounds BFS in [`Analysis::callees_transitive`] and
+/// [`Analysis::callers_transitive`]: deeper requests clip to this depth
+/// so a large depth cannot inflate work past one bounded walk over the
+/// function set.
+pub const MAX_CALL_DEPTH: usize = 64;
 
 /// What a cross-reference points through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -507,6 +514,64 @@ impl Analysis {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// Transitive callees of `entry` as `(target, depth)` pairs.
+    ///
+    /// Breadth-first walk over the callgraph out to `max_depth` edges from
+    /// `entry`; `depth` is the shortest distance (direct callees are depth
+    /// 1). The walk clips `max_depth` to [`MAX_CALL_DEPTH`], guards cycles
+    /// with a visited set, and never reports `entry` itself even when a
+    /// cycle reaches it. Pairs sort by target entry for deterministic
+    /// paging; a depth of zero yields an empty set, as does an unknown
+    /// entry.
+    #[must_use]
+    pub fn callees_transitive(&self, entry: u64, max_depth: usize) -> Vec<(u64, usize)> {
+        self.reachable(entry, max_depth, petgraph::Direction::Outgoing)
+    }
+
+    /// Transitive callers of `entry` as `(target, depth)` pairs.
+    ///
+    /// Mirror of [`Analysis::callees_transitive`] over incoming edges:
+    /// breadth-first, clipped to [`MAX_CALL_DEPTH`], cycle-guarded, never
+    /// reporting `entry` itself, sorted by target entry. Depth zero or an
+    /// unknown entry yields an empty set.
+    #[must_use]
+    pub fn callers_transitive(&self, entry: u64, max_depth: usize) -> Vec<(u64, usize)> {
+        self.reachable(entry, max_depth, petgraph::Direction::Incoming)
+    }
+
+    /// Breadth-first reachable set in one callgraph direction.
+    fn reachable(
+        &self,
+        entry: u64,
+        max_depth: usize,
+        dir: petgraph::Direction,
+    ) -> Vec<(u64, usize)> {
+        use std::collections::{HashSet, VecDeque};
+        let cap = max_depth.min(MAX_CALL_DEPTH);
+        if cap == 0 || !self.callgraph.contains_node(entry) {
+            return Vec::new();
+        }
+        let mut seen: HashSet<u64> = HashSet::from([entry]);
+        let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
+        queue.push_back((entry, 0));
+        let mut out: Vec<(u64, usize)> = Vec::new();
+        while let Some((cur, depth)) = queue.pop_front() {
+            if depth >= cap {
+                continue;
+            }
+            let mut next: Vec<u64> = self.callgraph.neighbors_directed(cur, dir).collect();
+            next.sort_unstable();
+            for n in next {
+                if seen.insert(n) {
+                    out.push((n, depth + 1));
+                    queue.push_back((n, depth + 1));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// All callgraph edges as `(caller, callee)` pairs.

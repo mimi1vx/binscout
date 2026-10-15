@@ -208,6 +208,41 @@ impl Serialize for FuncMeta {
     }
 }
 
+/// One transitive callgraph row: a reachable function plus its distance.
+///
+/// `entry` is the reachable function entry, `depth` the shortest
+/// callgraph distance from the query root (direct neighbors are depth
+/// 1), and `name` the rename-resolved display name, if any.
+///
+/// JSON pairs `entry` with `entry_hex` and carries the stable
+/// `func@0x...` id; both twins are recomputed on serialize and ignored
+/// on deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CallNode {
+    /// Reachable function entry address.
+    pub entry: u64,
+    /// Shortest callgraph distance from the query root (1-based).
+    pub depth: usize,
+    /// Rename-resolved display name, if any.
+    pub name: Option<String>,
+}
+
+impl Serialize for CallNode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("CallNode", 5)?;
+        st.serialize_field("id", &format!("func@{:#x}", self.entry))?;
+        st.serialize_field("entry", &self.entry)?;
+        st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
+        st.serialize_field("depth", &self.depth)?;
+        st.serialize_field("name", &self.name)?;
+        st.end()
+    }
+}
+
 /// One page of rows under the protocol-1 envelope
 /// (`docs/book/src/json-protocol.md`).
 ///
@@ -1110,6 +1145,95 @@ impl Project {
         Ok(
             serde_json::json!({ "addr": addr_json, "addr_hex": addr_hex, "insns": partial.insns.len(), "ir": lifted, "error_at": partial.error_at }),
         )
+    }
+
+    /// Transitive callees of the function containing `addr`, paged.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::func_detail`]. `depth`
+    /// bounds the walk to that many call edges (direct callees are depth
+    /// 1, zero yields an empty page); values past
+    /// [`crate::analysis::MAX_CALL_DEPTH`] are [`Error::Invalid`]. Rows
+    /// order by entry with the shortest distance in `depth`, and only
+    /// the selected page resolves names, so per-page work scales with
+    /// the page. Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function,
+    /// [`Error::Invalid`] when `depth` exceeds the hop cap.
+    pub fn callees_page(
+        &self,
+        addr: u64,
+        depth: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<CallNode>> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        if depth > crate::analysis::MAX_CALL_DEPTH {
+            return Err(Error::Invalid(format!(
+                "depth {depth} exceeds {}",
+                crate::analysis::MAX_CALL_DEPTH
+            )));
+        }
+        let reached = self.analysis.callees_transitive(entry, depth);
+        let total = reached.len();
+        let items: Vec<CallNode> = reached
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|(target, d)| CallNode {
+                entry: target,
+                depth: d,
+                name: self.function_name(target),
+            })
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Transitive callers of the function containing `addr`, paged.
+    ///
+    /// Mirror of [`Project::callees_page`] over incoming callgraph
+    /// edges: `addr` snaps to its containing entry, `depth` bounds the
+    /// reverse walk (direct callers are depth 1), rows order by entry
+    /// with the shortest distance, and only the selected page resolves
+    /// names. Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function,
+    /// [`Error::Invalid`] when `depth` exceeds the hop cap.
+    pub fn callers_page(
+        &self,
+        addr: u64,
+        depth: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<CallNode>> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        if depth > crate::analysis::MAX_CALL_DEPTH {
+            return Err(Error::Invalid(format!(
+                "depth {depth} exceeds {}",
+                crate::analysis::MAX_CALL_DEPTH
+            )));
+        }
+        let reached = self.analysis.callers_transitive(entry, depth);
+        let total = reached.len();
+        let items: Vec<CallNode> = reached
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|(target, d)| CallNode {
+                entry: target,
+                depth: d,
+                name: self.function_name(target),
+            })
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
     }
 
     /// Machine-readable lift coverage for `arch` plus per-range accounting.
