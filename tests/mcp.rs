@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 16 tools, and call every one against fixtures.
+//! list the 17 tools, and call every one against fixtures.
 
 mod common;
 
@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use common::{cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
+use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
 /// One request line plus notification; returns response lines in order.
 fn session(lines: &[String]) -> Vec<Value> {
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_sixteen_tools() {
+fn handshake_lists_seventeen_tools() {
     let lines = vec![
         req(
             1,
@@ -113,6 +113,7 @@ fn handshake_lists_sixteen_tools() {
             "blocks",
             "cfg",
             "comment",
+            "diagnostics",
             "disasm",
             "func",
             "functions",
@@ -126,7 +127,7 @@ fn handshake_lists_sixteen_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 16 tools"
+        "exactly the 17 tools"
     );
 }
 
@@ -200,9 +201,10 @@ fn all_tools_return_json_over_stdio() {
             "block_insns",
             json!({"binary": b(), "db": d(), "addr": "0x0", "block": "0x1"}),
         ),
+        call(27, "diagnostics", json!({"binary": b(), "db": d()})),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 18, "{resps:?}");
+    assert_eq!(resps.len(), 19, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -233,6 +235,12 @@ fn all_tools_return_json_over_stdio() {
     assert_eq!(insns["protocol"], 1);
     assert_eq!(insns["total"], 3);
     assert_eq!(insns["items"].as_array().expect("items").len(), 3);
+
+    let diags: Value = serde_json::from_str(tool_text(by_id[&27])).expect("diagnostics json");
+    assert_eq!(diags["protocol"], 1);
+    assert_eq!(diags["total"], 0, "clean blob has no diagnostics");
+    assert!(diags["items"].as_array().expect("items").is_empty());
+    assert!(diags["next_offset"].is_null());
 
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
     assert_eq!(dis["insns"].as_array().expect("envelope insns").len(), 3);
@@ -1003,5 +1011,149 @@ fn ir_coverage_arch_only_and_range() {
         assert!(resp.get("error").is_some(), "must error: {resp:?}");
         assert!(resp.get("result").is_none());
     }
+    cleanup(&dir);
+}
+
+/// Run the CLI; assert stdout is one valid JSON value.
+fn cli(args: &[&str]) -> (bool, Value) {
+    let out = Command::new(binscout_bin())
+        .args(args)
+        .output()
+        .expect("spawn binscout");
+    let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+    let value: Value = serde_json::from_str(text.trim_end())
+        .unwrap_or_else(|_| panic!("stdout must be one JSON value, got: {text:?}"));
+    (out.status.success(), value)
+}
+
+/// `call +0xB; call rax; invalid; nop*8; jmp rax`: two functions, one
+/// site of each diagnostic kind (raw fallback maps at base 0, so the
+/// relative call lands on the second function). Mirrors
+/// `tests/diagnostics.rs` and `tests/cli.rs`.
+fn three_site_blob() -> Vec<u8> {
+    let mut b = vec![0xE8, 0x0B, 0x00, 0x00, 0x00, 0xFF, 0xD0, 0x06];
+    b.extend([0x90; 8]);
+    b.extend([0xFF, 0xE0]);
+    b
+}
+
+// §7 adapter parity: CLI `diagnostics` and MCP `diagnostics` return
+// identical records over the same blob, filters, and pages; invalid
+// filters are errors on both surfaces; `func`/`project_info` carry the
+// new provenance fields; queries never write a sidecar.
+#[test]
+fn diagnostics_filters_and_cli_parity() {
+    let dir = tmpdir("mcp-diagnostics");
+    let bin = write_bin(&dir, "three.bin", &three_site_blob())
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "three").display().to_string();
+
+    // Same filters through both surfaces must agree byte-for-byte.
+    for (cli_args, mcp_args) in [
+        (
+            vec!["diagnostics".to_string(), bin.clone()],
+            json!({"binary": bin, "db": db}),
+        ),
+        (
+            vec![
+                "diagnostics".to_string(),
+                bin.clone(),
+                "--kind".to_string(),
+                "decode-failure".to_string(),
+            ],
+            json!({"binary": bin, "db": db, "kind": "decode-failure"}),
+        ),
+        (
+            vec![
+                "diagnostics".to_string(),
+                bin.clone(),
+                "--func".to_string(),
+                "0x0".to_string(),
+            ],
+            json!({"binary": bin, "db": db, "func": "0x0"}),
+        ),
+        (
+            vec![
+                "diagnostics".to_string(),
+                bin.clone(),
+                "--offset".to_string(),
+                "1".to_string(),
+                "--limit".to_string(),
+                "1".to_string(),
+            ],
+            json!({"binary": bin, "db": db, "offset": 1, "limit": 1}),
+        ),
+    ] {
+        let mut full: Vec<String> = vec!["--db".to_string(), db.clone()];
+        full.extend(cli_args);
+        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        let (ok, from_cli) = cli(&refs);
+        assert!(ok, "{from_cli}");
+        let id = 10;
+        let from_mcp = tool_once(id, "diagnostics", mcp_args);
+        assert_eq!(
+            from_cli, from_mcp,
+            "CLI and MCP must return identical records"
+        );
+    }
+
+    // Filtered envelope shape through MCP.
+    let v = tool_once(
+        11,
+        "diagnostics",
+        json!({"binary": bin, "db": db, "kind": "unresolved-indirect-call"}),
+    );
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"][0]["addr"], 0x5);
+    assert_eq!(v["items"][0]["func"], 0x0);
+    assert_eq!(v["items"][0]["kind"], "unresolved-indirect-call");
+
+    // `func` rows carry reasons and `project_info` the totals.
+    let f = tool_once(12, "func", json!({"binary": bin, "db": db, "addr": "0x10"}));
+    assert_eq!(f["reasons"], json!(["direct-call"]));
+    let info = tool_once(13, "project_info", json!({"binary": bin, "db": db}));
+    assert_eq!(info["diagnostics"], 3);
+    assert_eq!(info["diagnostics_truncated"], false);
+    assert_eq!(info["diagnostics_omitted"], 0);
+    assert_eq!(info["analysis_revision"], 2);
+
+    // Invalid kind, unparseable func, and gap func are tool errors.
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            20,
+            "diagnostics",
+            json!({"binary": bin, "db": db, "kind": "nope"}),
+        ),
+        call(
+            21,
+            "diagnostics",
+            json!({"binary": bin, "db": db, "func": "zz"}),
+        ),
+        call(
+            22,
+            "diagnostics",
+            json!({"binary": bin, "db": db, "func": "0x7"}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 4, "{resps:?}");
+    for resp in resps.iter().skip(1) {
+        assert!(resp.get("error").is_some(), "must error: {resp:?}");
+        assert!(resp.get("result").is_none());
+    }
+
+    assert!(
+        !std::path::Path::new(&db).exists(),
+        "diagnostics queries never create the sidecar"
+    );
     cleanup(&dir);
 }

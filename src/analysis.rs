@@ -102,16 +102,25 @@ impl Serialize for Xref {
 /// or a verified-boundary claim. Reasons coexist: one entry can be the
 /// binary entry point, an export, a direct-call target, and a prologue
 /// hit at once. Stored sorted and deduplicated.
+///
+/// Wire form is kebab-case (`entry`, `export`, `direct-call`,
+/// `prologue`); pre-provenance rows in the historical CamelCase spelling
+/// still decode via aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiscoveryReason {
     /// Binary entry point (or the fallback first executable byte when no
     /// entry or export seeds analysis).
+    #[serde(alias = "Entry")]
     Entry,
     /// Export address resolving to executable code.
+    #[serde(alias = "Export")]
     Export,
     /// Direct call target followed during recursive descent.
+    #[serde(alias = "DirectCall")]
     DirectCall,
     /// Prologue-scan hit outside round-one reached code.
+    #[serde(alias = "Prologue")]
     Prologue,
 }
 
@@ -121,17 +130,25 @@ pub enum DiscoveryReason {
 /// Unresolved sites stay unresolved: they never become proven CFG or
 /// callgraph edges. A clean decode with a `Return` terminator is valid
 /// termination, never a [`DiagnosticKind::DecodeFailure`].
+///
+/// Wire form is kebab-case (`unresolved-indirect-jump`,
+/// `unresolved-indirect-call`, `decode-failure`); rows persisted under
+/// the historical CamelCase spelling still decode via aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiagnosticKind {
     /// Branch without a direct target (`Branch`/`CBranch` with no target
     /// from the lift: indirect forms and unsupported `loop`-style
     /// branches). The site stays edgeless.
+    #[serde(alias = "UnresolvedIndirectJump")]
     UnresolvedIndirectJump,
     /// Call without a direct target. The site stays edgeless.
+    #[serde(alias = "UnresolvedIndirectCall")]
     UnresolvedIndirectCall,
     /// Executable bytes at a discovery address that did not decode.
     /// Only queued discovery addresses are recorded, never every
     /// undecoded byte in the binary.
+    #[serde(alias = "DecodeFailure")]
     DecodeFailure,
 }
 
@@ -158,6 +175,58 @@ impl Serialize for Diagnostic {
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("kind", &self.kind)?;
         st.end()
+    }
+}
+
+/// One diagnostics row: the site plus its containing function and detail.
+///
+/// JSON pairs `addr` with `addr_hex` and `func` with `func_hex` (`func`
+/// is null on both sides when the site lies in no function).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiagnosticRow {
+    /// What is incomplete at `addr`.
+    pub kind: DiagnosticKind,
+    /// Address of the unresolved instruction or failed decode.
+    pub addr: u64,
+    /// Entry of the function containing `addr`, if any.
+    pub func: Option<u64>,
+    /// Kind-specific detail: what is incomplete at the site.
+    pub detail: String,
+}
+
+impl Serialize for DiagnosticRow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("DiagnosticRow", 6)?;
+        st.serialize_field("kind", &self.kind)?;
+        st.serialize_field("addr", &self.addr)?;
+        st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
+        st.serialize_field("func", &self.func)?;
+        st.serialize_field("func_hex", &self.func.map(crate::addr_hex))?;
+        st.serialize_field("detail", &self.detail)?;
+        st.end()
+    }
+}
+
+/// Kind-specific detail for a diagnostics row: what is incomplete at the site.
+///
+/// Static evidence text derived from the kind itself, never a fabricated
+/// confidence claim or a proof of complete recovery.
+#[must_use]
+pub fn diagnostic_detail(kind: DiagnosticKind) -> &'static str {
+    match kind {
+        DiagnosticKind::UnresolvedIndirectJump => {
+            "indirect jump without a direct target; the site stays edgeless"
+        }
+        DiagnosticKind::UnresolvedIndirectCall => {
+            "indirect call without a direct target; the site stays edgeless"
+        }
+        DiagnosticKind::DecodeFailure => {
+            "executable bytes at a queued discovery address that did not decode"
+        }
     }
 }
 
@@ -887,6 +956,33 @@ impl Analysis {
             .copied()
             .filter(|x| x.from == addr)
             .collect()
+    }
+
+    /// Diagnostics filtered by kind and containing function, ordered by
+    /// (`kind`, `addr`).
+    ///
+    /// Filtering precedes paging: callers page this exact set, so the
+    /// reported total is the filtered count. `func` is an already-snapped
+    /// function entry; sites whose
+    /// [`Analysis::containing_function`] differs are dropped. Storage
+    /// keeps `(addr, kind)` order; this re-sorts by `(kind, addr)` per
+    /// the protocol-1 contract.
+    #[must_use]
+    pub fn diagnostics_matching(
+        &self,
+        kind: Option<DiagnosticKind>,
+        func: Option<u64>,
+    ) -> Vec<Diagnostic> {
+        let mut out: Vec<Diagnostic> = self
+            .diagnostics
+            .records
+            .iter()
+            .copied()
+            .filter(|d| kind.is_none_or(|k| d.kind == k))
+            .filter(|d| func.is_none_or(|e| self.containing_function(d.addr) == Some(e)))
+            .collect();
+        out.sort_by_key(|d| (d.kind, d.addr));
+        out
     }
 
     /// Extracted strings ordered by address, paged.

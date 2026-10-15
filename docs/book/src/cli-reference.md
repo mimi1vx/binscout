@@ -13,6 +13,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `func` | `binscout func fw.elf 0x400000` | blocks with instructions, edges, calls |
 | `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); the valid prefix plus `error_at` for the first bad opcode, ranges cap at 1 MiB |
 | `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges |
+| `diagnostics` | `binscout diagnostics fw.elf --kind decode-failure --func 0x400000` | provenance records (unresolved indirect sites, decode failures) ordered by (`kind`, `addr`) under the page envelope; `--kind` is one of `unresolved-indirect-jump`, `unresolved-indirect-call`, `decode-failure`, `--func` keeps only that function's sites; queries never write a sidecar |
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6` | filtered strings by address (`--pattern` substring or `regex:` expression, `--min-len`, `--section`, `--include-code`; executable-memory hits hidden by default; paged by `--start`/`--limit`, `--offset` deprecated) |
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
@@ -45,7 +46,6 @@ request/response definitions.
 |---|---|---|
 | `blocks B ADDR` | bounded function views | page block summaries of the containing function |
 | `block-insns B ADDR BLOCK` | bounded function views | page one block's instructions in address order |
-| `diagnostics B` | diagnostic queries | page provenance records, filterable by `--kind`/`--func` |
 | `search-bytes B PATTERN` | byte search | paged `??`-wildcard matches with section/range filters |
 | `annotations-export B` | annotation transfer | emit the portable JSON annotation document |
 | `annotations-import B` | annotation transfer | atomically merge a document (`--input`, `--overwrite`) |

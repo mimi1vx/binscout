@@ -436,6 +436,22 @@ pub struct ProjectInfo {
     pub strings: usize,
     /// Stored annotations.
     pub annotations: usize,
+    /// Retained diagnostic records (see [`crate::analysis::Diagnostics`]).
+    ///
+    /// Evidence about where analysis is incomplete, not a completeness
+    /// proof: zero retained diagnostics never means complete recovery.
+    #[serde(default)]
+    pub diagnostics: usize,
+    /// Whether discovery produced more diagnostics than the record cap.
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
+    /// Diagnostics omitted by the record cap (zero unless truncated).
+    #[serde(default)]
+    pub diagnostics_omitted: usize,
+    /// Analysis revision the in-memory result was taken over (see
+    /// [`crate::analysis::ANALYSIS_REVISION`]).
+    #[serde(default)]
+    pub analysis_revision: u32,
 }
 
 fn default_protocol() -> u32 {
@@ -452,7 +468,7 @@ impl Serialize for ProjectInfo {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("ProjectInfo", 21)?;
+        let mut st = serializer.serialize_struct("ProjectInfo", 25)?;
         st.serialize_field("binary", &self.binary)?;
         st.serialize_field("db_path", &self.db_path)?;
         st.serialize_field("version", &self.version)?;
@@ -474,6 +490,10 @@ impl Serialize for ProjectInfo {
         st.serialize_field("xrefs", &self.xrefs)?;
         st.serialize_field("strings", &self.strings)?;
         st.serialize_field("annotations", &self.annotations)?;
+        st.serialize_field("diagnostics", &self.diagnostics)?;
+        st.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
+        st.serialize_field("diagnostics_omitted", &self.diagnostics_omitted)?;
+        st.serialize_field("analysis_revision", &self.analysis_revision)?;
         st.end()
     }
 }

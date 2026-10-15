@@ -90,6 +90,23 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Provenance records: unresolved indirect sites and decode failures,
+    /// filtered by kind and containing function, paged under the
+    /// protocol-1 envelope. Querying never writes a sidecar.
+    Diagnostics {
+        binary: PathBuf,
+        /// Only `unresolved-indirect-jump`, `unresolved-indirect-call`,
+        /// or `decode-failure` sites.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only sites in the function containing this address.
+        #[arg(long)]
+        func: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Disassemble `len` bytes at `addr`.
     Disasm {
         binary: PathBuf,
@@ -220,6 +237,21 @@ impl Cli {
                 offset,
                 limit,
             } => block_insns(&binary, db, raw_opts, &addr, &block, offset, limit),
+            Cmd::Diagnostics {
+                binary,
+                kind,
+                func,
+                offset,
+                limit,
+            } => diagnostics(
+                &binary,
+                db,
+                raw_opts,
+                kind.as_deref(),
+                func.as_deref(),
+                offset,
+                limit,
+            ),
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
             Cmd::Xrefs {
@@ -408,6 +440,22 @@ fn block_insns(
         limit,
     )?;
     Ok(serde_json::to_value(page).expect("block_insns page serializes"))
+}
+
+fn diagnostics(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    kind: Option<&str>,
+    func: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let kind = kind.map(binscout::parse_diagnostic_kind).transpose()?;
+    let func = opt_addr(func)?;
+    let page = p.query_diagnostics(kind, func, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("diagnostics page serializes"))
 }
 
 fn disasm(

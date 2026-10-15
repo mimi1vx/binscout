@@ -72,6 +72,7 @@ fn all_query_commands_return_json() {
         vec!["strings".into(), bin.clone()],
         vec!["symbols".into(), bin.clone()],
         vec!["sections".into(), bin.clone()],
+        vec!["diagnostics".into(), bin.clone()],
         vec!["ir".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["stats".into(), bin.clone()],
         vec!["annotate".into(), bin.clone(), "0x0".into()],
@@ -765,6 +766,131 @@ fn auto_mode_without_flags_is_unchanged() {
     assert!(ok, "{v}");
     assert_eq!(v["mode"], "auto");
     assert!(v["base"].is_null() && v["base_hex"].is_null());
+    cleanup(&dir);
+}
+
+/// `call +0xB; call rax; invalid; nop*8; jmp rax`: two functions, one
+/// site of each diagnostic kind (raw fallback maps at base 0, so the
+/// relative call lands on the second function). Mirrors
+/// `tests/diagnostics.rs`.
+fn three_site_blob() -> Vec<u8> {
+    let mut b = vec![0xE8, 0x0B, 0x00, 0x00, 0x00, 0xFF, 0xD0, 0x06];
+    b.extend([0x90; 8]);
+    b.extend([0xFF, 0xE0]);
+    b
+}
+
+// Paged provenance over the CLI: envelope shape, kind/func filters with
+// filter-then-page totals, JSON error envelopes, and read-only queries.
+#[test]
+fn diagnostics_envelope_filters_and_errors() {
+    let dir = tmpdir("cli-diagnostics");
+    let bin = write_bin(&dir, "three.bin", &three_site_blob())
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "three").display().to_string();
+    let d = db.as_str();
+
+    // Unfiltered: all three sites ordered by (kind, addr).
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 3);
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["kind"], "unresolved-indirect-jump");
+    assert_eq!(items[0]["addr"], 0x10);
+    assert_eq!(items[0]["addr_hex"], "0x10");
+    assert_eq!(items[0]["func"], 0x10);
+    assert!(items[0]["detail"].as_str().is_some_and(|s| !s.is_empty()));
+    // The decode failure lies in no function: null on both sides.
+    assert_eq!(items[2]["kind"], "decode-failure");
+    assert!(items[2]["func"].is_null() && items[2]["func_hex"].is_null());
+
+    // Kind filter precedes pagination: exact filtered total, zero limit
+    // still counts.
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin, "--kind", "decode-failure"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1);
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "diagnostics",
+        &bin,
+        "--kind",
+        "unresolved-indirect-call",
+        "--limit",
+        "0",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    assert!(v["items"].as_array().expect("items").is_empty());
+
+    // Func filter keeps only that function's sites; interior snaps.
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin, "--func", "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"][0]["addr"], 0x5);
+    let (ok, snap) = run(&["--db", d, "diagnostics", &bin, "--func", "0x6"]);
+    assert!(ok, "{snap}");
+    assert_eq!(snap, v, "interior address must snap");
+
+    // Kind and func compose: filtering still precedes paging.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "diagnostics",
+        &bin,
+        "--kind",
+        "decode-failure",
+        "--func",
+        "0x0",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 0);
+    assert!(v["items"].as_array().expect("items").is_empty());
+
+    // Invalid kind, unparseable func, and gap func are JSON errors.
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin, "--kind", "nope"]);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin, "--func", "zz"]);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    let (ok, v) = run(&["--db", d, "diagnostics", &bin, "--func", "0x7"]);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+
+    // `func` rows carry the discovery vocabulary; `project_info` the totals.
+    let (ok, v) = run(&["--db", d, "func", &bin, "0x10"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["reasons"], serde_json::json!(["direct-call"]));
+    assert!(
+        !Path::new(d).exists(),
+        "diagnostics/func reads never create the sidecar"
+    );
+    let (ok, v) = run(&["--db", d, "load", &bin]);
+    assert!(ok, "{v}");
+    assert_eq!(v["diagnostics"], 3);
+    assert_eq!(v["diagnostics_truncated"], false);
+    assert_eq!(v["diagnostics_omitted"], 0);
+    assert_eq!(v["analysis_revision"], 2);
+
+    // Only `load` caches the snapshot.
+    assert!(Path::new(d).exists(), "load caches the snapshot");
+    cleanup(&dir);
+}
+
+#[test]
+fn diagnostics_reads_do_not_write_sidecars() {
+    let dir = tmpdir("cli-diag-no-save");
+    let bin = write_bin(&dir, "three.bin", &three_site_blob())
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "fresh");
+    let db_s = db.display().to_string();
+    let (ok, v) = run(&["--db", &db_s, "diagnostics", &bin]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 3);
+    assert!(!db.exists(), "diagnostics reads never create the sidecar");
     cleanup(&dir);
 }
 

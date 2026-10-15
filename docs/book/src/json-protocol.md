@@ -214,7 +214,7 @@ by start; `block_insns` pages that block's instructions in address
 order. Both use the page envelope; per-page work scales with the
 page, never with whole-function size.
 
-### `diagnostics` (target: paged provenance)
+### `diagnostics` (implemented: paged provenance)
 
 ```sh
 binscout diagnostics B [--kind KIND] [--func ADDR] [--offset N] [--limit N]

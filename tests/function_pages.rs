@@ -352,14 +352,19 @@ fn compact_meta_has_no_unbounded_arrays() {
             "name",
             "blocks",
             "insns",
-            "calls"
+            "calls",
+            "reasons"
         ]),
-        "compact metadata carries counts only"
+        "compact metadata carries counts plus the reason set only"
     );
     assert!(obj["blocks"].is_number());
     assert!(obj["insns"].is_number());
     assert!(obj["calls"].is_number());
     assert_eq!(obj["entry_hex"], "0x1000");
+    assert!(
+        obj["reasons"].is_array(),
+        "reasons is a bounded vocabulary set: {obj:?}"
+    );
 
     // The envelope shape matches the protocol-1 contract.
     let envelope: serde_json::Value =

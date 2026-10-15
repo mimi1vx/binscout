@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::{Analysis, BlockSummary, StringsFilter, Xref, XrefKind, analyze};
+use crate::analysis::{
+    Analysis, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref, XrefKind, analyze,
+    diagnostic_detail,
+};
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn, PartialDisasm};
 use crate::error::{Error, Result};
@@ -152,7 +155,8 @@ pub const WIRE_PROTOCOL: u32 = 1;
 /// `blocks`/`insns` are row counts and `calls` is the direct-callee count:
 /// unlike [`Project::func_detail`], this carries no instruction arrays, no
 /// block rows, and no unbounded call-target array, so it stays small for
-/// arbitrarily large functions.
+/// arbitrarily large functions. `reasons` is the sorted, deduplicated
+/// discovery vocabulary (see [`crate::analysis::DiscoveryReason`]).
 ///
 /// JSON pairs `entry` with `entry_hex`; `entry_hex` is recomputed on
 /// serialize and ignored on deserialize.
@@ -170,6 +174,12 @@ pub struct FuncMeta {
     pub insns: usize,
     /// Direct-callee count (not the target array).
     pub calls: usize,
+    /// Sorted, deduplicated discovery reasons.
+    ///
+    /// Defaults to empty so metadata written before provenance tracking
+    /// still decodes.
+    #[serde(default)]
+    pub reasons: Vec<crate::analysis::DiscoveryReason>,
 }
 
 impl Serialize for FuncMeta {
@@ -178,7 +188,7 @@ impl Serialize for FuncMeta {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("FuncMeta", 7)?;
+        let mut st = serializer.serialize_struct("FuncMeta", 8)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("entry", &self.entry)?;
         st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
@@ -186,6 +196,7 @@ impl Serialize for FuncMeta {
         st.serialize_field("blocks", &self.blocks)?;
         st.serialize_field("insns", &self.insns)?;
         st.serialize_field("calls", &self.calls)?;
+        st.serialize_field("reasons", &self.reasons)?;
         st.end()
     }
 }
@@ -512,6 +523,10 @@ impl Project {
             xrefs: s.xrefs,
             strings: s.strings,
             annotations: self.annotations.values().filter(|a| !a.is_empty()).count(),
+            diagnostics: self.analysis.diagnostics.records.len(),
+            diagnostics_truncated: self.analysis.diagnostics.truncated,
+            diagnostics_omitted: self.analysis.diagnostics.omitted,
+            analysis_revision: crate::analysis::ANALYSIS_REVISION,
         }
     }
 
@@ -555,6 +570,10 @@ impl Project {
             "xrefs": s.xrefs,
             "strings": s.strings,
             "annotations": self.annotations.values().filter(|a| !a.is_empty()).count(),
+            "diagnostics": self.analysis.diagnostics.records.len(),
+            "diagnostics_truncated": self.analysis.diagnostics.truncated,
+            "diagnostics_omitted": self.analysis.diagnostics.omitted,
+            "analysis_revision": crate::analysis::ANALYSIS_REVISION,
         }))
     }
 
@@ -943,6 +962,7 @@ impl Project {
             blocks: f.blocks.len(),
             insns: f.insn_count(),
             calls: self.analysis.calls_count(entry),
+            reasons: f.reason_list(),
         })
     }
 
@@ -1267,6 +1287,49 @@ impl Project {
         Ok(page_envelope(total, offset, limit, items))
     }
 
+    /// Diagnostics filtered by kind and containing function, under the
+    /// protocol-1 [`Page`] envelope.
+    ///
+    /// Filtering precedes paging (see
+    /// [`Analysis::diagnostics_matching`](crate::analysis::Analysis::diagnostics_matching)):
+    /// `total` is the filtered count and only the selected page is
+    /// materialized into rows. `func` may be any address inside a
+    /// function; it snaps to the containing entry exactly like
+    /// [`Project::func_detail`]. Read-only: never writes the binary or
+    /// the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `func` lies in no function.
+    pub fn query_diagnostics(
+        &self,
+        kind: Option<DiagnosticKind>,
+        func: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<DiagnosticRow>> {
+        let entry = func
+            .map(|a| {
+                self.analysis
+                    .containing_function(a)
+                    .ok_or_else(|| Error::NotFound(format!("function {a:#x}")))
+            })
+            .transpose()?;
+        let matched = self.analysis.diagnostics_matching(kind, entry);
+        let total = matched.len();
+        let items = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|d| DiagnosticRow {
+                kind: d.kind,
+                addr: d.addr,
+                func: self.analysis.containing_function(d.addr),
+                detail: diagnostic_detail(d.kind).to_string(),
+            })
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
     /// Current annotation at `addr`.
     #[must_use]
     pub fn annotation_json(&self, addr: u64) -> serde_json::Value {
@@ -1354,6 +1417,20 @@ pub fn parse_xref_kind(s: &str) -> Result<XrefKind> {
         "data" => Ok(XrefKind::Data),
         "string" => Ok(XrefKind::String),
         _ => Err(Error::Invalid(format!("bad xref kind: {s:?}"))),
+    }
+}
+
+/// Parse a diagnostics kind filter: `unresolved-indirect-jump`,
+/// `unresolved-indirect-call`, or `decode-failure` (case-insensitive).
+///
+/// # Errors
+/// [`Error::Invalid`] for anything else.
+pub fn parse_diagnostic_kind(s: &str) -> Result<DiagnosticKind> {
+    match s.to_lowercase().as_str() {
+        "unresolved-indirect-jump" => Ok(DiagnosticKind::UnresolvedIndirectJump),
+        "unresolved-indirect-call" => Ok(DiagnosticKind::UnresolvedIndirectCall),
+        "decode-failure" => Ok(DiagnosticKind::DecodeFailure),
+        _ => Err(Error::Invalid(format!("bad diagnostic kind: {s:?}"))),
     }
 }
 
@@ -1450,7 +1527,7 @@ fn load_or_raw(bytes: &[u8]) -> Result<LoadedBinary> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_addr, parse_xref_kind, read_stream_capped};
+    use super::{parse_addr, parse_diagnostic_kind, parse_xref_kind, read_stream_capped};
     use crate::analysis::XrefKind;
     use crate::error::Error;
 
@@ -1475,6 +1552,27 @@ mod tests {
             assert_eq!(parse_xref_kind(s).expect("known kind"), want);
         }
         assert!(parse_xref_kind("nope").is_err());
+    }
+
+    #[test]
+    fn parse_diagnostic_kind_takes_kebab_case_only() {
+        use crate::analysis::DiagnosticKind;
+        for (s, want) in [
+            (
+                "unresolved-indirect-jump",
+                DiagnosticKind::UnresolvedIndirectJump,
+            ),
+            (
+                "Unresolved-Indirect-Call",
+                DiagnosticKind::UnresolvedIndirectCall,
+            ),
+            ("DECODE-FAILURE", DiagnosticKind::DecodeFailure),
+        ] {
+            assert_eq!(parse_diagnostic_kind(s).expect("known kind"), want);
+        }
+        for s in ["code", "", "UnresolvedIndirectCall", "decode_failure"] {
+            assert!(parse_diagnostic_kind(s).is_err(), "{s:?} must error");
+        }
     }
 
     #[test]

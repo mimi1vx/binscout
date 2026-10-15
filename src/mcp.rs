@@ -1,4 +1,4 @@
-//! binscout MCP server: 16 stateless tools over [`Project`].
+//! binscout MCP server: 17 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -185,6 +185,27 @@ pub struct BlockInsnsParams {
     pub addr: String,
     /// Block start address; must belong to the containing function.
     pub block: String,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `diagnostics` tool: paged provenance records.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DiagnosticsParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Only `unresolved-indirect-jump`, `unresolved-indirect-call`, or
+    /// `decode-failure` sites.
+    pub kind: Option<String>,
+    /// Only sites in the function containing this address (`0x`-hex or
+    /// decimal string).
+    pub func: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -389,6 +410,29 @@ impl BinscoutMcp {
         proj.func_block_insns_page(addr, block, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("block_insns page serializes")))
+    }
+
+    #[tool(
+        name = "diagnostics",
+        description = "Analysis provenance: unresolved indirect sites and decode failures, filtered by kind and containing function, paged under the protocol-1 envelope"
+    )]
+    fn diagnostics(&self, p: Parameters<DiagnosticsParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let kind = p
+            .kind
+            .as_deref()
+            .map(crate::parse_diagnostic_kind)
+            .transpose()
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
+        let func = opt_addr(p.func)?;
+        proj.query_diagnostics(kind, func, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|page| ok(serde_json::to_value(page).expect("diagnostics page serializes")))
     }
 
     #[tool(

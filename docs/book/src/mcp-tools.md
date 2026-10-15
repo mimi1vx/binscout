@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 14 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 17 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
@@ -19,6 +19,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `func` | binary, addr | Full detail of one function: blocks with instructions, edges, calls |
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges |
+| `diagnostics` | binary, kind?, func?, offset/limit | Provenance records (unresolved indirect sites, decode failures) ordered by (`kind`, `addr`) under the page envelope, filtered by `kind` and containing-function `func`; queries never write a sidecar |
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind, paged behind a `total` match count |
 | `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`) |
 | `symbols` | binary | Imports and exports of the binary |
@@ -38,7 +39,7 @@ allows a single open handle per file per process.
 The protocol-1 contract freezes these names and shapes; they land with
 their roadmap steps (14 tools today, 20 after). See
 [JSON protocol](json-protocol.md) for the full request/response
-definitions: `blocks`, `block_insns`, `diagnostics`,
+definitions: `blocks`, `block_insns`,
 `search_bytes`, `annotations_export`, `annotations_import`, plus the
 optional `raw` (`arch`/`base`/`entry?`) mapping object on every
 binary-taking tool. Until these ship, `func` keeps its current
