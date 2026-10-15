@@ -1,4 +1,4 @@
-//! binscout MCP server: 13 stateless tools over [`Project`].
+//! binscout MCP server: 15 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -140,7 +140,7 @@ pub struct FunctionsParams {
     pub limit: Option<usize>,
 }
 
-/// Parameters for single-address tools (`func`, `cfg`, `comment`).
+/// Parameters for single-address tools (`func`, `cfg`, `blocks`, `comment`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddrParams {
     /// Path to the analyzed binary.
@@ -151,6 +151,44 @@ pub struct AddrParams {
     pub raw: Option<RawParams>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
+}
+
+/// Parameters for the `blocks` tool: one function's block summaries, paged.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BlocksParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Function address: any address inside the function snaps to its
+    /// containing entry.
+    pub addr: String,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `block_insns` tool: one block's instructions, paged.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BlockInsnsParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Function address: any address inside the function snaps to its
+    /// containing entry.
+    pub addr: String,
+    /// Block start address; must belong to the containing function.
+    pub block: String,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
 }
 
 /// Parameters for byte-range tools (`disasm`, `ir`).
@@ -290,7 +328,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "func",
-        description = "Full detail of one function: blocks with instructions, edges, calls. Any address inside the function snaps to its containing entry"
+        description = "Compact metadata of one function: entry, name, and block/insn/call counts. Any address inside the function snaps to its containing entry"
     )]
     fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
@@ -298,9 +336,41 @@ impl BinscoutMcp {
         let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.func_detail(addr)
+        proj.func_meta(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+            .and_then(|m| ok(serde_json::to_value(m).expect("func_meta serializes")))
+    }
+
+    #[tool(
+        name = "blocks",
+        description = "Block summaries of one function ordered by block start, paged with total block count. Any address inside the function snaps to its containing entry"
+    )]
+    fn blocks(&self, p: Parameters<BlocksParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.func_blocks_page(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|page| ok(serde_json::to_value(page).expect("blocks page serializes")))
+    }
+
+    #[tool(
+        name = "block_insns",
+        description = "Instructions of one function-owned block in address order, paged. Addr snaps to its containing function; block must be a block start belonging to that function"
+    )]
+    fn block_insns(&self, p: Parameters<BlockInsnsParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let block =
+            parse_addr(&p.block).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.func_block_insns_page(addr, block, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|page| ok(serde_json::to_value(page).expect("block_insns page serializes")))
     }
 
     #[tool(

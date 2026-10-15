@@ -59,6 +59,13 @@ fn all_query_commands_return_json() {
     let cases: Vec<Vec<String>> = vec![
         vec!["functions".into(), bin.clone()],
         vec!["func".into(), bin.clone(), "0x0".into()],
+        vec!["blocks".into(), bin.clone(), "0x0".into()],
+        vec![
+            "block-insns".into(),
+            bin.clone(),
+            "0x0".into(),
+            "0x0".into(),
+        ],
         vec!["disasm".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["cfg".into(), bin.clone(), "0x0".into()],
         vec!["xrefs".into(), bin.clone()],
@@ -90,9 +97,36 @@ fn query_results_have_expected_shape() {
 
     let (ok, v) = run(&["--db", d, "func", &bin, "0x0"]);
     assert!(ok, "{v}");
+    // Compact metadata: counts only, no embedded block/insn arrays.
     assert_eq!(v["entry"], 0);
-    assert_eq!(v["blocks"].as_array().expect("blocks array").len(), 1);
-    assert_eq!(v["blocks"][0]["insns"].as_array().expect("insns").len(), 3);
+    assert_eq!(v["entry_hex"], "0x0");
+    assert_eq!(v["blocks"], 1);
+    assert_eq!(v["insns"], 3);
+    assert_eq!(v["calls"], 0);
+    assert!(v.get("containing_entry").is_none(), "no snap twin: {v}");
+    assert!(v.get("edges").is_none(), "no edges array: {v}");
+    assert!(
+        v.get("blocks").is_some_and(|b| b.is_number()),
+        "blocks is a count: {v}"
+    );
+
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"].as_array().expect("items array").len(), 1);
+    assert_eq!(v["items"][0]["start"], 0);
+    assert_eq!(v["items"][0]["insns"], 3);
+    assert!(v["items"][0].get("succs").is_some(), "{v}");
+
+    let (ok, v) = run(&["--db", d, "block-insns", &bin, "0x0", "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 3);
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["mnem"], "nop");
+    assert_eq!(items[2]["mnem"], "ret");
 
     let (ok, v) = run(&["--db", d, "disasm", &bin, "0", "3"]);
     assert!(ok, "{v}");
@@ -206,6 +240,17 @@ fn failures_are_json_envelopes() {
     let (ok, v) = run(&["--db", d, "func", &bin, "0xdead"]);
     assert!(!ok);
     assert!(v.get("error").is_some(), "{v}");
+    // Unknown function through the paged views.
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "0xdead"]);
+    assert!(!ok);
+    assert!(v.get("error").is_some(), "{v}");
+    let (ok, v) = run(&["--db", d, "block-insns", &bin, "0xdead", "0x0"]);
+    assert!(!ok);
+    assert!(v.get("error").is_some(), "{v}");
+    // Block interior (not a block start) of a known function.
+    let (ok, v) = run(&["--db", d, "block-insns", &bin, "0x0", "0x1"]);
+    assert!(!ok);
+    assert!(v.get("error").is_some(), "{v}");
     // Malformed address.
     let (ok, v) = run(&["--db", d, "func", &bin, "zz"]);
     assert!(!ok);
@@ -273,7 +318,15 @@ fn func_and_cfg_snap_to_containing_function() {
     let (ok, v) = run(&["--db", d, "func", &bin, "0x1"]);
     assert!(ok, "{v}");
     assert_eq!(v["entry"], 0);
-    assert_eq!(v["containing_entry"], 0);
+    assert_eq!(v["entry_hex"], "0x0");
+    assert!(v.get("containing_entry").is_none(), "no snap twin: {v}");
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "1"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"][0]["start"], 0);
+    let (ok, v) = run(&["--db", d, "block-insns", &bin, "1", "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 3);
     let (ok, v) = run(&["--db", d, "cfg", &bin, "1"]);
     assert!(ok, "{v}");
     assert_eq!(v["entry"], 0);
@@ -408,6 +461,8 @@ fn elf_fixture_reports_format_and_symbols() {
     let (ok, v) = run(&["--db", &db, "func", &bin_s, "0x400000"]);
     assert!(ok, "{v}");
     assert_eq!(v["entry"], 0x400000);
+    assert_eq!(v["entry_hex"], "0x400000");
+    assert!(v["blocks"].is_number() && v["insns"].is_number(), "{v}");
     cleanup(&dir);
 }
 
@@ -710,5 +765,151 @@ fn auto_mode_without_flags_is_unchanged() {
     assert!(ok, "{v}");
     assert_eq!(v["mode"], "auto");
     assert!(v["base"].is_null() && v["base_hex"].is_null());
+    cleanup(&dir);
+}
+
+/// `nop` x 1500, then `jmp +0` x 1200 (each targeting the next), then
+/// `ret`: one function with 1201 blocks / 2701 instructions, past the
+/// 1024-row page cap. Mirrors `tests/function_pages.rs`.
+fn big_blob() -> Vec<u8> {
+    let mut b = vec![0x90u8; 1500];
+    for _ in 0..1200 {
+        b.extend([0xEB, 0x00]);
+    }
+    b.push(0xC3);
+    b
+}
+
+/// Raw stdout bytes of one CLI invocation (validates the byte-size side
+/// of bounded inspection, not just the row counts).
+fn run_raw(args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new(binscout_bin())
+        .args(args)
+        .output()
+        .expect("spawn binscout");
+    let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+    // Must still be exactly one JSON value.
+    let _: Value = serde_json::from_str(text.trim_end())
+        .unwrap_or_else(|_| panic!("stdout must be one JSON value, got: {text:?}"));
+    (out.status.success(), text)
+}
+
+// Bounded function inspection: compact `func` plus paged `blocks` and
+// `block-insns` over a 1201-block synthetic function. `func` carries
+// counts only (no instruction arrays); pages follow the protocol-1
+// envelope and clip to the 1024-row cap; `cfg` stays the explicit
+// full-graph export.
+#[test]
+fn bounded_func_and_pages_stay_capped() {
+    let dir = tmpdir("func-bounded");
+    let bin = write_bin(&dir, "big.bin", &big_blob())
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "big").display().to_string();
+    let d = db.as_str();
+
+    // Compact func: counts, no arrays, tiny response for a huge function.
+    let (ok, text) = run_raw(&["--db", d, "func", &bin, "0x0"]);
+    assert!(ok, "{text}");
+    let v: Value = serde_json::from_str(text.trim_end()).expect("json");
+    assert_eq!(v["blocks"], 1201);
+    assert_eq!(v["insns"], 2701);
+    assert_eq!(v["calls"], 0);
+    assert!(
+        text.len() < 1024,
+        "compact func must stay small, got {} bytes",
+        text.len()
+    );
+
+    // Successive block pages rebuild the full 1201-block order.
+    let mut starts: Vec<u64> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (ok, v) = run(&[
+            "--db",
+            d,
+            "blocks",
+            &bin,
+            "0x0",
+            "--offset",
+            &offset.to_string(),
+            "--limit",
+            "100",
+        ]);
+        assert!(ok, "{v}");
+        assert_eq!(v["protocol"], 1);
+        assert_eq!(v["total"], 1201);
+        assert_eq!(v["offset"], offset);
+        starts.extend(
+            v["items"]
+                .as_array()
+                .expect("items array")
+                .iter()
+                .map(|b| b["start"].as_u64().expect("start")),
+        );
+        match v["next_offset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => break,
+        }
+    }
+    assert_eq!(starts.len(), 1201);
+    assert!(starts.windows(2).all(|w| w[0] < w[1]), "ordered, no gaps");
+
+    // Over-cap limits clip to 1024 rows and report the clipped limit.
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "0x0", "--limit", "5000"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["limit"], 1024);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1024);
+    assert_eq!(v["next_offset"], 1024);
+
+    // The 1501-instruction opening block pages under the same cap.
+    let first = starts[0].to_string();
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "block-insns",
+        &bin,
+        "0x0",
+        &first,
+        "--limit",
+        "5000",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["limit"], 1024);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1024);
+    assert_eq!(v["next_offset"], 1024);
+    assert_eq!(v["total"], 1501);
+
+    // Zero limit and past-end offsets are normal empty pages, not errors.
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "0x0", "--limit", "0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1201);
+    assert_eq!(v["limit"], 0);
+    assert!(v["items"].as_array().expect("items").is_empty());
+    assert!(v["next_offset"].is_null());
+    let (ok, v) = run(&["--db", d, "blocks", &bin, "0x0", "--offset", "99999"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1201);
+    assert!(v["items"].as_array().expect("items").is_empty());
+
+    // `cfg` remains the explicit full-graph export for the same function.
+    let (ok, v) = run(&["--db", d, "cfg", &bin, "0x0"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["nodes"].as_array().expect("nodes").len(), 1201);
+
+    // Raw/DB options apply to the new commands: same blob under an
+    // explicit mapping agrees on counts.
+    let (ok, v) = run(&[
+        "--db", d, "--raw", "--arch", "x86_64", "--base", "0x1000", "--entry", "0x1000", "func",
+        &bin, "0x1000",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["blocks"], 1201);
+    let (ok, v) = run(&[
+        "--db", d, "--raw", "--arch", "x86_64", "--base", "0x1000", "--entry", "0x1000", "blocks",
+        &bin, "0x1000", "--limit", "1",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 1201);
     cleanup(&dir);
 }

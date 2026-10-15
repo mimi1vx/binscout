@@ -63,9 +63,33 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Full detail of one function: blocks with instructions. Any address
-    /// inside the function snaps to its containing entry.
+    /// Compact metadata of one function: entry, name, and block/insn/call
+    /// counts. Any address inside the function snaps to its containing
+    /// entry. Paged block/insn rows come from `blocks`/`block-insns`;
+    /// `cfg` remains the explicit full-graph export.
     Func { binary: PathBuf, addr: String },
+    /// Block summaries of one function ordered by block start, paged.
+    /// Any address inside the function snaps to its containing entry.
+    Blocks {
+        binary: PathBuf,
+        addr: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Instructions of one function-owned block in address order, paged.
+    /// `addr` snaps to its containing function; `block` must be a block
+    /// start belonging to that function.
+    BlockInsns {
+        binary: PathBuf,
+        addr: String,
+        block: String,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Disassemble `len` bytes at `addr`.
     Disasm {
         binary: PathBuf,
@@ -171,6 +195,19 @@ impl Cli {
             } => functions_filter(query, caller, callee, range)
                 .and_then(|filter| functions(&binary, db, raw_opts, &filter, offset, limit)),
             Cmd::Func { binary, addr } => func(&binary, db, raw_opts, &addr),
+            Cmd::Blocks {
+                binary,
+                addr,
+                offset,
+                limit,
+            } => blocks(&binary, db, raw_opts, &addr, offset, limit),
+            Cmd::BlockInsns {
+                binary,
+                addr,
+                block,
+                offset,
+                limit,
+            } => block_insns(&binary, db, raw_opts, &addr, &block, offset, limit),
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
             Cmd::Xrefs {
@@ -312,7 +349,40 @@ fn func(
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
-    p.func_detail(binscout::parse_addr(addr)?)
+    let meta = p.func_meta(binscout::parse_addr(addr)?)?;
+    Ok(serde_json::to_value(meta).expect("func_meta serializes"))
+}
+
+fn blocks(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let page = p.func_blocks_page(binscout::parse_addr(addr)?, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("blocks page serializes"))
+}
+
+fn block_insns(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+    block: &str,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    let page = p.func_block_insns_page(
+        binscout::parse_addr(addr)?,
+        binscout::parse_addr(block)?,
+        offset,
+        limit,
+    )?;
+    Ok(serde_json::to_value(page).expect("block_insns page serializes"))
 }
 
 fn disasm(

@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 13 tools, and call every one against fixtures.
+//! list the 15 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_thirteen_tools() {
+fn handshake_lists_fifteen_tools() {
     let lines = vec![
         req(
             1,
@@ -109,6 +109,8 @@ fn handshake_lists_thirteen_tools() {
     assert_eq!(
         names,
         vec![
+            "block_insns",
+            "blocks",
             "cfg",
             "comment",
             "disasm",
@@ -123,7 +125,7 @@ fn handshake_lists_thirteen_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 13 tools"
+        "exactly the 15 tools"
     );
 }
 
@@ -147,6 +149,16 @@ fn all_tools_return_json_over_stdio() {
         call(10, "project_info", json!({"binary": b(), "db": d()})),
         call(11, "functions", json!({"binary": b(), "db": d()})),
         call(12, "func", json!({"binary": b(), "db": d(), "addr": "0x0"})),
+        call(
+            23,
+            "blocks",
+            json!({"binary": b(), "db": d(), "addr": "0x0"}),
+        ),
+        call(
+            24,
+            "block_insns",
+            json!({"binary": b(), "db": d(), "addr": "0x0", "block": "0x0"}),
+        ),
         call(
             13,
             "disasm",
@@ -177,9 +189,19 @@ fn all_tools_return_json_over_stdio() {
             "func",
             json!({"binary": b(), "db": d(), "addr": "0xdead"}),
         ),
+        call(
+            25,
+            "blocks",
+            json!({"binary": b(), "db": d(), "addr": "0xdead"}),
+        ),
+        call(
+            26,
+            "block_insns",
+            json!({"binary": b(), "db": d(), "addr": "0x0", "block": "0x1"}),
+        ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 14, "{resps:?}");
+    assert_eq!(resps.len(), 18, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -190,6 +212,26 @@ fn all_tools_return_json_over_stdio() {
 
     let funcs: Value = serde_json::from_str(tool_text(by_id[&11])).expect("functions json");
     assert_eq!(funcs.as_array().expect("array").len(), 1);
+
+    // Compact func: counts only, no embedded block/insn arrays.
+    let func: Value = serde_json::from_str(tool_text(by_id[&12])).expect("func json");
+    assert_eq!(func["entry"], 0);
+    assert_eq!(func["blocks"], 1);
+    assert_eq!(func["insns"], 3);
+    assert_eq!(func["calls"], 0);
+    assert!(func.get("containing_entry").is_none(), "{func}");
+    assert!(func.get("edges").is_none(), "{func}");
+
+    let blocks: Value = serde_json::from_str(tool_text(by_id[&23])).expect("blocks json");
+    assert_eq!(blocks["protocol"], 1);
+    assert_eq!(blocks["total"], 1);
+    assert_eq!(blocks["items"][0]["start"], 0);
+    assert_eq!(blocks["items"][0]["insns"], 3);
+
+    let insns: Value = serde_json::from_str(tool_text(by_id[&24])).expect("block_insns json");
+    assert_eq!(insns["protocol"], 1);
+    assert_eq!(insns["total"], 3);
+    assert_eq!(insns["items"].as_array().expect("items").len(), 3);
 
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
     assert_eq!(dis["insns"].as_array().expect("envelope insns").len(), 3);
@@ -210,6 +252,11 @@ fn all_tools_return_json_over_stdio() {
     // Unknown function is a protocol-level error, not a result.
     assert!(by_id[&22].get("error").is_some(), "{:?}", by_id[&22]);
     assert!(by_id[&22].get("result").is_none());
+    // Unknown function/block through the paged views error the same way.
+    assert!(by_id[&25].get("error").is_some(), "{:?}", by_id[&25]);
+    assert!(by_id[&25].get("result").is_none());
+    assert!(by_id[&26].get("error").is_some(), "{:?}", by_id[&26]);
+    assert!(by_id[&26].get("result").is_none());
 
     assert_eq!(
         std::fs::read(dir.join("m.bin")).expect("reread"),
@@ -324,10 +371,12 @@ fn functions_filters_and_mid_function_snap() {
     assert_eq!(q.as_array().expect("array").len(), 0);
 
     // 0x401001 is mid-function (inside the entry block): snaps instead of
-    // reporting not-found.
+    // reporting not-found. Compact func carries counts, no snap twin.
     let f: Value = serde_json::from_str(tool_text(by_id[&14])).expect("func json");
     assert_eq!(f["entry"], 0x401000);
-    assert_eq!(f["containing_entry"], 0x401000);
+    assert_eq!(f["entry_hex"], "0x401000");
+    assert!(f.get("containing_entry").is_none(), "{f}");
+    assert!(f["blocks"].is_number() && f["insns"].is_number(), "{f}");
 
     let c: Value = serde_json::from_str(tool_text(by_id[&15])).expect("cfg json");
     assert_eq!(c["entry"], 0x401000);
@@ -777,5 +826,123 @@ fn raw_reads_do_not_write_sidecars() {
     );
     assert_eq!(funcs.as_array().expect("array").len(), 1);
     assert!(!db_path.exists(), "raw reads never create the sidecar");
+    cleanup(&dir);
+}
+
+/// `nop` x 1500, then `jmp +0` x 1200 (each targeting the next), then
+/// `ret`: one function with 1201 blocks / 2701 instructions, past the
+/// 1024-row page cap. Mirrors `tests/function_pages.rs` and the CLI
+/// bounded-inspection test.
+fn big_blob() -> Vec<u8> {
+    let mut b = vec![0x90u8; 1500];
+    for _ in 0..1200 {
+        b.extend([0xEB, 0x00]);
+    }
+    b.push(0xC3);
+    b
+}
+
+// Bounded function inspection over MCP: compact `func` plus paged
+// `blocks`/`block_insns` on the 1201-block synthetic function. Mirrors
+// the CLI coverage: no instruction arrays in `func`, envelope shape and
+// row caps on pages, byte-size sanity, and matching counts with the CLI.
+#[test]
+fn bounded_func_and_pages_stay_capped() {
+    let dir = tmpdir("mcp-func-bounded");
+    let bin = write_bin(&dir, "big.bin", &big_blob())
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "big").display().to_string();
+
+    // Compact func: counts only; the text payload stays small for a
+    // 2701-instruction function.
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(10, "func", json!({"binary": bin, "db": db, "addr": "0x0"})),
+        call(
+            11,
+            "blocks",
+            json!({"binary": bin, "db": db, "addr": "0x0", "limit": 5000}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 3, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    let raw_text = tool_text(by_id[&10]).to_owned();
+    assert!(
+        raw_text.len() < 1024,
+        "compact func must stay small, got {} bytes",
+        raw_text.len()
+    );
+    let func: Value = serde_json::from_str(&raw_text).expect("func json");
+    assert_eq!(func["blocks"], 1201);
+    assert_eq!(func["insns"], 2701);
+    assert_eq!(func["calls"], 0);
+    assert!(func.get("containing_entry").is_none(), "{func}");
+
+    let blocks: Value = serde_json::from_str(tool_text(by_id[&11])).expect("blocks json");
+    assert_eq!(blocks["protocol"], 1);
+    assert_eq!(blocks["total"], 1201);
+    assert_eq!(blocks["limit"], 1024);
+    assert_eq!(blocks["items"].as_array().expect("items").len(), 1024);
+    assert_eq!(blocks["next_offset"], 1024);
+
+    // Successive pages rebuild the full block order; the opening block's
+    // 1501 instructions page under the same cap.
+    let first = blocks["items"][0]["start"].as_u64().expect("start");
+    let mut starts: Vec<u64> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let page = tool_once(
+            12,
+            "blocks",
+            json!({"binary": bin, "db": db, "addr": "0x0", "offset": offset, "limit": 100}),
+        );
+        assert_eq!(page["total"], 1201);
+        assert_eq!(page["offset"], offset);
+        starts.extend(
+            page["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .map(|b| b["start"].as_u64().expect("start")),
+        );
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next as usize,
+            None => break,
+        }
+    }
+    assert_eq!(starts.len(), 1201);
+    assert_eq!(starts[0], first);
+    assert!(starts.windows(2).all(|w| w[0] < w[1]), "ordered, no gaps");
+
+    let page = tool_once(
+        13,
+        "block_insns",
+        json!({"binary": bin, "db": db, "addr": "0x0", "block": first.to_string(), "limit": 5000}),
+    );
+    assert_eq!(page["total"], 1501);
+    assert_eq!(page["limit"], 1024);
+    assert_eq!(page["items"].as_array().expect("items").len(), 1024);
+
+    // Zero limit and past-end offsets are normal empty pages, not errors.
+    let page = tool_once(
+        14,
+        "blocks",
+        json!({"binary": bin, "db": db, "addr": "0x0", "limit": 0}),
+    );
+    assert_eq!(page["total"], 1201);
+    assert_eq!(page["limit"], 0);
+    assert!(page["items"].as_array().expect("items").is_empty());
+    assert!(page["next_offset"].is_null());
     cleanup(&dir);
 }
