@@ -103,3 +103,27 @@ unresolved by this data.
 - **No generalization.** Two synthetic fixtures do not predict real
   binaries. Do not cite these numbers as guarantees, do not encode them
   as CI timing assertions, and do not claim any speedup from them.
+
+## Decision (rsdbg-0vt.14, 2026-10-15): no-go
+
+No optimization is justified by this data, and no implementation
+follow-up is approved:
+
+- Absolute costs are single-digit milliseconds on both fixtures; no
+  user-visible problem is demonstrated.
+- Cold vs saved-sidecar differs by ~0.1 ms on the large fixture, inside
+  the ±10–15% run-to-run noise — layout replay is not observably
+  cheaper than reanalysis here, so a resident-project cache has no
+  measured prize to chase, while carrying the full correctness price
+  (memory bounds, content+mapping identity, external annotation
+  invalidation, rename/comment coherence, DB lock lifecycle).
+- The dominant large-fixture cost (~2.9 ms serializing ~368 KB of
+  bounded rows) is inherent to returning the data, not open-path
+  overhead; caching open projects would not touch it.
+- Nothing was measured at real-binary scale (megabytes), so no claim
+  about real binaries is made in either direction.
+
+Revisit only with before/after measurements on real-scale inputs
+showing a material, reproducible bottleneck with unchanged observable
+results. A raw-size or mtime-only cache key remains insufficient for
+any future proposal.
