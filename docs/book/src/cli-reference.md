@@ -22,6 +22,8 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
+| `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, sha256, size, mapping, sorted rows); read-only, never creates a sidecar |
+| `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns row/change counts, default fails on conflicts |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal
 strings. `func`/`cfg` snap any address inside the function to its
@@ -47,8 +49,6 @@ request/response definitions.
 | `blocks B ADDR` | bounded function views | page block summaries of the containing function |
 | `block-insns B ADDR BLOCK` | bounded function views | page one block's instructions in address order |
 | `search-bytes B PATTERN` | byte search | paged `??`-wildcard matches with section/range filters |
-| `annotations-export B` | annotation transfer | emit the portable JSON annotation document |
-| `annotations-import B` | annotation transfer | atomically merge a document (`--input`, `--overwrite`) |
 
 Raw mapping also arrives as global flags
 `[--raw --arch ARCH --base ADDR [--entry ADDR]]` on every binary-taking

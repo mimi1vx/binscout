@@ -210,6 +210,20 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Emit the portable annotation interchange document to stdout.
+    /// Read-only: never creates or modifies the sidecar.
+    AnnotationsExport { binary: PathBuf },
+    /// Merge a portable annotation document into the project DB.
+    /// Reads capped JSON from `--input`; the binary stays immutable.
+    AnnotationsImport {
+        binary: PathBuf,
+        /// Path to the JSON document (as emitted by `annotations-export`).
+        #[arg(long)]
+        input: PathBuf,
+        /// Replace supplied fields on conflict instead of failing.
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 impl Cli {
@@ -361,6 +375,12 @@ impl Cli {
                 offset,
                 limit,
             ),
+            Cmd::AnnotationsExport { binary } => annotations_export(&binary, db, raw_opts),
+            Cmd::AnnotationsImport {
+                binary,
+                input,
+                overwrite,
+            } => annotations_import(&binary, db, raw_opts, &input, overwrite),
         };
         match result {
             Ok(value) => {
@@ -645,4 +665,63 @@ fn search_bytes(
         .transpose()?;
     let page = p.search_bytes(pattern, section, range, offset, limit)?;
     Ok(serde_json::to_value(page).expect("search_bytes page serializes"))
+}
+
+fn annotations_export(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+) -> binscout::error::Result<serde_json::Value> {
+    let doc = open(binary, db, raw)?.export_annotations()?;
+    serde_json::from_str(&doc)
+        .map_err(|e| binscout::error::Error::Storage(format!("encode annotation document: {e}")))
+}
+
+fn annotations_import(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    input: &std::path::Path,
+    overwrite: bool,
+) -> binscout::error::Result<serde_json::Value> {
+    let text = read_transfer_document(input)?;
+    let mut p = open(binary, db, raw)?;
+    let summary = p.import_annotations(&text, overwrite)?;
+    Ok(serde_json::json!({"rows": summary.rows, "changed": summary.changed}))
+}
+
+/// Read an interchange document with a hard pre-parse budget.
+///
+/// Metadata rejects missing/non-file/oversize inputs before any read; the
+/// post-read length re-check closes stat-then-read growth races. The core
+/// import enforces the same cap again, so this is an allocation guard only.
+fn read_transfer_document(path: &std::path::Path) -> binscout::error::Result<String> {
+    use binscout::annotations::MAX_TRANSFER_BYTES;
+    use binscout::error::Error;
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
+        _ => Error::Storage(format!("stat {}: {e}", path.display())),
+    })?;
+    if !meta.is_file() {
+        return Err(Error::Unsupported(format!(
+            "not a file: {}",
+            path.display()
+        )));
+    }
+    if meta.len() > MAX_TRANSFER_BYTES as u64 {
+        return Err(Error::Limit(format!(
+            "annotation document of {} bytes exceeds the {MAX_TRANSFER_BYTES}-byte cap",
+            meta.len()
+        )));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::Storage(format!("read {}: {e}", path.display())))?;
+    if bytes.len() > MAX_TRANSFER_BYTES {
+        return Err(Error::Limit(format!(
+            "annotation document of {} bytes exceeds the {MAX_TRANSFER_BYTES}-byte cap",
+            bytes.len()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|e| Error::Invalid(format!("malformed annotation document: {e}")))
 }

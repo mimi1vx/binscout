@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 17 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 20 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
@@ -29,18 +29,19 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears |
+| `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
+| `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
 
 Addresses are `0x`-hex or decimal strings. `kind` is one of `code`,
 `data`, or `string`. Calls are serialized behind one lock because `redb`
 allows a single open handle per file per process.
 
-## Frozen upcoming tools (not yet implemented)
+## Protocol-1 tools (all implemented)
 
-The protocol-1 contract freezes these names and shapes; they land with
-their roadmap steps (14 tools today, 20 after). See
-[JSON protocol](json-protocol.md) for the full request/response
-definitions: `blocks`, `block_insns`,
-`search_bytes`, `annotations_export`, `annotations_import`, plus the
-optional `raw` (`arch`/`base`/`entry?`) mapping object on every
-binary-taking tool. Until these ship, `func` keeps its current
-full-detail shape.
+All protocol-1 tools are implemented (20 tools today): `blocks`,
+`block_insns`, `search_bytes`, `diagnostics`, `ir_coverage`,
+`annotations_export`, and `annotations_import` have all landed with
+their roadmap steps, alongside the optional `raw`
+(`arch`/`base`/`entry?`) mapping object on every binary-taking tool.
+See [JSON protocol](json-protocol.md) for the full request/response
+definitions. `func` returns the compact metadata shape.

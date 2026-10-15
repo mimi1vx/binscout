@@ -274,7 +274,7 @@ never bridged, virtual BSS is never materialized, and scans past
 of truncating silently. Results page under the envelope (capped at
 1024 rows); the exact `total` may require a full bounded scan.
 
-### `annotations-export` / `annotations-import` (target: portable annotations)
+### `annotations-export` / `annotations-import` (implemented: portable annotations)
 
 ```sh
 binscout annotations-export B
@@ -287,15 +287,15 @@ the document, and `annotations_import` (`binary`, `db`?, `raw`?,
 capped at 16 MiB serialized:
 
 ```json
-{"format_revision": 1, "sha256": "…64 hex…", "binary_len": 3,
- "mapping": {"mode": "auto", "arch": "x86_64", "base": null, "base_hex": null, "entry": null, "entry_hex": null},
- "annotations": [{"addr": 4198400, "addr_hex": "0x401000", "rename": "main", "comment": null}]}
+{"revision": 1, "sha256": "…64 hex…", "size": 3,
+ "mapping": {"mode": "auto"},
+ "annotations": [{"addr": 4198400, "rename": "main", "comment": null}]}
 ```
 
 Rows sort by address and only nonempty annotations appear; host
 paths and analysis snapshots are excluded. Import validates the
 whole document before a single atomic write: identity
-(`sha256` + `binary_len` + `mapping`) must match exactly, duplicate
+(`sha256` + `size` + `mapping`) must match exactly, duplicate
 addresses and oversized documents are rejected, `rename` targets must
 be known function entries while comments keep the any-address
 contract. Default merge fails on differing existing field values
@@ -303,7 +303,7 @@ contract. Default merge fails on differing existing field values
 only, absent fields leave existing values alone, and empty strings
 clear. Untouched annotations remain; a failure in the last row leaves
 the DB unchanged. Import returns merge counts
-(`imported`, `overwritten`, current `annotations` total).
+(`rows`, `changed`).
 
 ## Errors and validation
 

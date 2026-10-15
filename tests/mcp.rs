@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 17 tools, and call every one against fixtures.
+//! list the 20 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_eighteen_tools() {
+fn handshake_lists_twenty_tools() {
     let lines = vec![
         req(
             1,
@@ -109,6 +109,8 @@ fn handshake_lists_eighteen_tools() {
     assert_eq!(
         names,
         vec![
+            "annotations_export",
+            "annotations_import",
             "block_insns",
             "blocks",
             "cfg",
@@ -128,7 +130,7 @@ fn handshake_lists_eighteen_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 18 tools"
+        "exactly the 20 tools"
     );
     let search = tools
         .iter()
@@ -149,6 +151,26 @@ fn handshake_lists_eighteen_tools() {
         "limit",
     ] {
         assert!(props.contains_key(key), "search_bytes exposes {key}");
+    }
+    let import = tools
+        .iter()
+        .find(|t| t["name"] == "annotations_import")
+        .expect("annotations_import listed");
+    let props = import["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in ["binary", "db", "raw", "document", "overwrite"] {
+        assert!(props.contains_key(key), "annotations_import exposes {key}");
+    }
+    let export = tools
+        .iter()
+        .find(|t| t["name"] == "annotations_export")
+        .expect("annotations_export listed");
+    let props = export["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in ["binary", "db", "raw"] {
+        assert!(props.contains_key(key), "annotations_export exposes {key}");
     }
 }
 
@@ -1292,5 +1314,232 @@ fn search_bytes_parity_filters_and_errors() {
         assert!(by_id[&id].get("result").is_none());
     }
     assert!(!db_path.exists(), "failed queries never create the sidecar");
+    cleanup(&dir);
+}
+
+#[test]
+fn annotations_export_import_parity_and_atomicity() {
+    use common::builders::{BASIC_ENTRY_VA, BASIC_STRING_VA};
+    let dir = tmpdir("mcp-annotations");
+    let fixture = common::fixture_bytes("pe32-basic.exe");
+    let bin = write_bin(&dir, "a.exe", &fixture).display().to_string();
+    let db_a = temp_db(&dir, "a").display().to_string();
+    let db_b = temp_db(&dir, "b").display().to_string();
+    let entry_hex = format!("{BASIC_ENTRY_VA:#x}");
+    let string_hex = format!("{BASIC_STRING_VA:#x}");
+
+    // Seed through the interface; each call reopens the same DB file.
+    tool_once(
+        10,
+        "rename",
+        json!({"binary": bin, "db": db_a, "addr": entry_hex, "name": "ported_entry"}),
+    );
+    tool_once(
+        11,
+        "comment",
+        json!({"binary": bin, "db": db_a, "addr": string_hex, "comment": "ported note"}),
+    );
+
+    // Export returns the portable document; CLI parity on the same DB.
+    let doc = tool_once(12, "annotations_export", json!({"binary": bin, "db": db_a}));
+    assert_eq!(doc["revision"], 1);
+    assert_eq!(doc["sha256"].as_str().expect("sha256").len(), 64);
+    let rows = doc["annotations"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]["addr"].as_u64() < rows[1]["addr"].as_u64(),
+        "rows sorted: {doc}"
+    );
+    let (ok, cli_doc) = cli(&["--db", &db_a, "annotations-export", &bin]);
+    assert!(ok, "{cli_doc}");
+    assert_eq!(doc, cli_doc, "MCP export matches CLI export");
+
+    // Export alone never creates a sidecar.
+    let fresh = temp_db(&dir, "fresh").display().to_string();
+    let empty = tool_once(
+        13,
+        "annotations_export",
+        json!({"binary": bin, "db": fresh}),
+    );
+    assert_eq!(empty["annotations"].as_array().expect("rows").len(), 0);
+    assert!(
+        !std::path::Path::new(&fresh).exists(),
+        "export never creates the sidecar"
+    );
+
+    // Import into a fresh DB; re-export proves equivalence.
+    let summary = tool_once(
+        14,
+        "annotations_import",
+        json!({"binary": bin, "db": db_b, "document": doc.to_string()}),
+    );
+    assert_eq!(summary["rows"], 2);
+    assert_eq!(summary["changed"], 2);
+    let doc2 = tool_once(15, "annotations_export", json!({"binary": bin, "db": db_b}));
+    assert_eq!(doc, doc2, "fresh-DB import reproduces the document");
+    let summary = tool_once(
+        16,
+        "annotations_import",
+        json!({"binary": bin, "db": db_b, "document": doc.to_string()}),
+    );
+    assert_eq!(summary["changed"], 0, "re-import is idempotent");
+
+    // Documented failures are protocol-level errors, never results.
+    // `Invalid` (malformed, conflict, duplicate) is `invalid_params`
+    // (-32602); `Storage`/`NotFound`/`Limit` (identity, mapping, unknown
+    // rename, oversize) is a tool error (-32603). Every failure must
+    // leave the target DB untouched.
+    let mut conflict = doc.clone();
+    for row in conflict["annotations"].as_array_mut().expect("rows") {
+        if row["addr"].as_u64() == Some(BASIC_ENTRY_VA) {
+            row["rename"] = "other_name".into();
+        }
+    }
+    let mut duplicate = doc.clone();
+    let first = duplicate["annotations"].as_array().expect("rows")[0].clone();
+    duplicate["annotations"]
+        .as_array_mut()
+        .expect("rows")
+        .push(first);
+    let mut ghost = doc.clone();
+    ghost["annotations"]
+        .as_array_mut()
+        .expect("rows")
+        .push(serde_json::json!({"addr": 0xdead_beefu64, "rename": "ghost"}));
+    let mut bad_sha = doc.clone();
+    bad_sha["sha256"] = "00".repeat(32).into();
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            30,
+            "annotations_import",
+            json!({"binary": bin, "db": db_b, "document": "{not json"}),
+        ),
+        call(
+            31,
+            "annotations_import",
+            json!({"binary": bin, "db": db_b, "document": conflict.to_string()}),
+        ),
+        call(
+            32,
+            "annotations_import",
+            json!({"binary": bin, "db": db_b, "document": duplicate.to_string()}),
+        ),
+        call(
+            33,
+            "annotations_import",
+            json!({"binary": bin, "db": db_b, "document": ghost.to_string()}),
+        ),
+        call(
+            34,
+            "annotations_import",
+            json!({"binary": bin, "db": db_b, "document": bad_sha.to_string()}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 6, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    for id in [30u64, 31, 32] {
+        assert_eq!(by_id[&id]["error"]["code"], -32602, "{:?}", by_id[&id]);
+        assert!(by_id[&id].get("result").is_none());
+    }
+    for id in [33u64, 34] {
+        assert_eq!(by_id[&id]["error"]["code"], -32603, "{:?}", by_id[&id]);
+        assert!(by_id[&id].get("result").is_none());
+    }
+    let doc_after = tool_once(17, "annotations_export", json!({"binary": bin, "db": db_b}));
+    assert_eq!(doc, doc_after, "failed imports write nothing");
+
+    // Same conflict with overwrite: supplied rename wins, comment kept.
+    let summary = tool_once(
+        18,
+        "annotations_import",
+        json!({"binary": bin, "db": db_b, "document": conflict.to_string(), "overwrite": true}),
+    );
+    assert_eq!(summary["changed"], 1);
+    let renamed = tool_once(
+        19,
+        "func",
+        json!({"binary": bin, "db": db_b, "addr": entry_hex}),
+    );
+    assert_eq!(renamed["name"], "other_name");
+
+    // Mapping mismatch under an explicit raw mapping: tool error, no sidecar.
+    let db_c = temp_db(&dir, "c").display().to_string();
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            40,
+            "annotations_import",
+            json!({"binary": bin, "db": db_c, "raw": {"arch": "x86_64", "base": "0x0"}, "document": doc.to_string()}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    assert_eq!(resps[1]["error"]["code"], -32603, "{:?}", resps[1]);
+    assert!(
+        resps[1]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("mapping mismatch")),
+        "mapping mismatch message: {:?}",
+        resps[1]
+    );
+    assert!(
+        !std::path::Path::new(&db_c).exists(),
+        "failed import writes nothing"
+    );
+
+    // Oversized document: the transport materializes the full `document`
+    // string before validation (residual allocation risk documented on the
+    // tool), but the core 16 MiB cap still rejects it with no write.
+    let db_d = temp_db(&dir, "d").display().to_string();
+    let huge = "x".repeat(binscout::annotations::MAX_TRANSFER_BYTES + 1);
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            50,
+            "annotations_import",
+            json!({"binary": bin, "db": db_d, "document": huge}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    assert_eq!(
+        resps[1]["error"]["code"],
+        -32603,
+        "{:?}",
+        resps[1].get("error").map(|e| &e["code"])
+    );
+    assert!(
+        !std::path::Path::new(&db_d).exists(),
+        "rejected input writes nothing"
+    );
+
+    assert_eq!(
+        std::fs::read(dir.join("a.exe")).expect("reread"),
+        fixture,
+        "binary untouched"
+    );
     cleanup(&dir);
 }

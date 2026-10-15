@@ -76,6 +76,7 @@ fn all_query_commands_return_json() {
         vec!["ir".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["stats".into(), bin.clone()],
         vec!["annotate".into(), bin.clone(), "0x0".into()],
+        vec!["annotations-export".into(), bin.clone()],
     ];
     for mut c in cases {
         let mut args: Vec<String> = db_args.to_vec();
@@ -1280,5 +1281,283 @@ fn search_bytes_parity_filters_and_errors() {
         .output()
         .expect("spawn binscout");
     assert_eq!(out.status.code(), Some(2), "clap misuse exits 2");
+    cleanup(&dir);
+}
+
+#[test]
+fn annotations_export_import_round_trip_across_dbs() {
+    use common::builders::{BASIC_ENTRY_VA, BASIC_STRING_VA};
+    let dir = tmpdir("cli-annotations-roundtrip");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db_a = temp_db(&dir, "a").display().to_string();
+    let db_b = temp_db(&dir, "b").display().to_string();
+    let entry_hex = format!("{BASIC_ENTRY_VA:#x}");
+    let string_hex = format!("{BASIC_STRING_VA:#x}");
+
+    // Seed two annotations through the interface.
+    let (ok, v) = run(&[
+        "--db",
+        &db_a,
+        "annotate",
+        &bin_s,
+        &entry_hex,
+        "--rename",
+        "ported_entry",
+    ]);
+    assert!(ok, "{v}");
+    let (ok, v) = run(&[
+        "--db",
+        &db_a,
+        "annotate",
+        &bin_s,
+        &string_hex,
+        "--comment",
+        "ported note",
+    ]);
+    assert!(ok, "{v}");
+
+    // Export prints one JSON document: revision, identity, sorted rows.
+    let (ok, doc) = run(&["--db", &db_a, "annotations-export", &bin_s]);
+    assert!(ok, "{doc}");
+    assert_eq!(doc["revision"], 1);
+    assert_eq!(doc["sha256"].as_str().expect("sha256").len(), 64);
+    let rows = doc["annotations"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows[0]["addr"].as_u64() < rows[1]["addr"].as_u64(),
+        "rows sorted: {doc}"
+    );
+    assert!(
+        !doc.to_string().contains(&dir.display().to_string()),
+        "no host paths in document"
+    );
+
+    // Export alone never creates a sidecar.
+    let fresh = temp_db(&dir, "fresh").display().to_string();
+    let (ok, empty) = run(&["--db", &fresh, "annotations-export", &bin_s]);
+    assert!(ok, "{empty}");
+    assert_eq!(empty["annotations"].as_array().expect("rows").len(), 0);
+    assert!(
+        !Path::new(&fresh).exists(),
+        "export never creates a sidecar"
+    );
+
+    // Round-trip across DBs: the test saves stdout itself (the shell
+    // redirection equivalent); the server takes no output path.
+    let input = dir.join("doc.json");
+    std::fs::write(&input, doc.to_string()).expect("write input doc");
+    let input_s = input.display().to_string();
+    let (ok, summary) = run(&[
+        "--db",
+        &db_b,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &input_s,
+    ]);
+    assert!(ok, "{summary}");
+    assert_eq!(summary["rows"], 2);
+    assert_eq!(summary["changed"], 2);
+
+    // The annotations resolve through the interface on the new DB.
+    let (ok, v) = run(&["--db", &db_b, "functions", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(v[0]["name"], "ported_entry");
+    let (ok, v) = run(&["--db", &db_b, "annotate", &bin_s, &string_hex]);
+    assert!(ok, "{v}");
+    assert_eq!(v["comment"], "ported note");
+
+    // Idempotent re-import changes nothing.
+    let (ok, summary) = run(&[
+        "--db",
+        &db_b,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &input_s,
+    ]);
+    assert!(ok, "{summary}");
+    assert_eq!(summary["changed"], 0);
+
+    assert_eq!(
+        std::fs::read(&bin).expect("reread"),
+        common::fixture_bytes("pe32-basic.exe"),
+        "binary untouched"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn annotations_import_conflicts_mismatches_and_atomicity() {
+    use common::builders::BASIC_ENTRY_VA;
+    let dir = tmpdir("cli-annotations-errors");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "a").display().to_string();
+    let d = db.as_str();
+    let entry_hex = format!("{BASIC_ENTRY_VA:#x}");
+
+    let (ok, _) = run(&[
+        "--db", d, "annotate", &bin_s, &entry_hex, "--rename", "seeded",
+    ]);
+    assert!(ok);
+    let (ok, doc) = run(&["--db", d, "annotations-export", &bin_s]);
+    assert!(ok, "{doc}");
+    let seeded_rows = doc["annotations"].clone();
+
+    // Write a tampered Value to an input path for one import attempt.
+    let attempt = |tag: &str, v: &serde_json::Value| -> (bool, serde_json::Value) {
+        let path = dir.join(format!("{tag}.json"));
+        std::fs::write(&path, v.to_string()).expect("write input doc");
+        run(&[
+            "--db",
+            d,
+            "annotations-import",
+            &bin_s,
+            "--input",
+            &path.display().to_string(),
+        ])
+    };
+    // Current annotations through the interface (atomicity oracle).
+    let current_rows = || {
+        let (ok, v) = run(&["--db", d, "annotations-export", &bin_s]);
+        assert!(ok, "{v}");
+        v["annotations"].clone()
+    };
+
+    // Differing rename under default: conflict, nothing changes.
+    let mut conflict = doc.clone();
+    for row in conflict["annotations"].as_array_mut().expect("rows") {
+        if row["addr"].as_u64() == Some(BASIC_ENTRY_VA) {
+            row["rename"] = "other_name".into();
+        }
+    }
+    let (ok, v) = attempt("conflict", &conflict);
+    assert!(!ok && v.get("error").is_some(), "conflict: {v}");
+    assert_eq!(current_rows(), seeded_rows, "conflict writes nothing");
+
+    // Same document with --overwrite: supplied rename wins.
+    let path = dir.join("conflict.json");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &path.display().to_string(),
+        "--overwrite",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(v["changed"], 1);
+    let (ok, v) = run(&["--db", d, "annotate", &bin_s, &entry_hex]);
+    assert!(ok, "{v}");
+    assert_eq!(v["name"], "other_name");
+
+    // Invalid final row (unknown rename target): no partial write.
+    let (ok, doc) = run(&["--db", d, "annotations-export", &bin_s]);
+    assert!(ok, "{doc}");
+    let mut ghost = doc.clone();
+    ghost["annotations"]
+        .as_array_mut()
+        .expect("rows")
+        .push(serde_json::json!({"addr": 0xdead_beefu64, "rename": "ghost"}));
+    let (ok, v) = attempt("ghost", &ghost);
+    assert!(!ok && v.get("error").is_some(), "unknown rename: {v}");
+    let (ok, v) = run(&["--db", d, "annotations-export", &bin_s]);
+    assert!(ok, "{v}");
+    assert_eq!(
+        v["annotations"], doc["annotations"],
+        "final-row failure writes nothing"
+    );
+
+    // Identity mismatch: tampered sha256.
+    let mut bad_sha = doc.clone();
+    bad_sha["sha256"] = "00".repeat(32).into();
+    let (ok, v) = attempt("bad-sha", &bad_sha);
+    assert!(!ok && v.get("error").is_some(), "identity mismatch: {v}");
+
+    // Mapping mismatch: the auto-exported document under an explicit raw mapping.
+    let raw_input = dir.join("doc.json");
+    std::fs::write(&raw_input, doc.to_string()).expect("write input doc");
+    let raw_s = raw_input.display().to_string();
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "--raw",
+        "--arch",
+        "x86_64",
+        "--base",
+        "0x0",
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &raw_s,
+    ]);
+    assert!(!ok && v.get("error").is_some(), "mapping mismatch: {v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("mapping mismatch")),
+        "mapping mismatch message: {v}"
+    );
+
+    // Garbled, missing, directory, and oversized inputs fail as JSON envelopes.
+    std::fs::write(dir.join("garbage.json"), "{not json").expect("write");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &dir.join("garbage.json").display().to_string(),
+    ]);
+    assert!(!ok && v.get("error").is_some(), "garbled: {v}");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &dir.join("no-such.json").display().to_string(),
+    ]);
+    assert!(!ok && v.get("error").is_some(), "missing input: {v}");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &dir.display().to_string(),
+    ]);
+    assert!(!ok && v.get("error").is_some(), "directory input: {v}");
+    let big = vec![b'x'; binscout::annotations::MAX_TRANSFER_BYTES + 1];
+    std::fs::write(dir.join("big.json"), &big).expect("write oversized");
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "annotations-import",
+        &bin_s,
+        "--input",
+        &dir.join("big.json").display().to_string(),
+    ]);
+    assert!(!ok && v.get("error").is_some(), "oversized: {v}");
+    assert!(
+        v["error"].as_str().is_some_and(|m| m.contains("cap")),
+        "oversized message names the cap: {v}"
+    );
+
+    // A missing --input never reaches validation: clap exits 2 on stderr.
+    let out = Command::new(binscout_bin())
+        .args(["--db", d, "annotations-import", &bin_s])
+        .output()
+        .expect("spawn binscout");
+    assert_eq!(out.status.code(), Some(2), "missing --input exits 2");
+
+    assert_eq!(
+        std::fs::read(&bin).expect("reread"),
+        common::fixture_bytes("pe32-basic.exe"),
+        "binary untouched"
+    );
     cleanup(&dir);
 }

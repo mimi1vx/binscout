@@ -1,4 +1,4 @@
-//! binscout MCP server: 18 stateless tools over [`Project`].
+//! binscout MCP server: 20 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -317,6 +317,21 @@ pub struct SearchBytesParams {
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+}
+
+/// Parameters for the `annotations_import` tool: merge a portable document.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AnnotationsImportParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Interchange document, as returned by `annotations_export`.
+    pub document: String,
+    /// Replace supplied fields on conflict instead of failing.
+    pub overwrite: Option<bool>,
 }
 
 /// MCP server handler; serializes tool calls behind one lock.
@@ -672,5 +687,47 @@ impl BinscoutMcp {
             other => ErrorData::internal_error(other.to_string(), None),
         })
         .and_then(|page| ok(serde_json::to_value(page).expect("search_bytes page serializes")))
+    }
+
+    #[tool(
+        name = "annotations_export",
+        description = "Emit the portable annotation interchange document (revision, sha256, size, mapping, sorted rows); read-only, never creates or modifies the sidecar"
+    )]
+    fn annotations_export(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let doc = proj
+            .export_annotations()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        serde_json::from_str::<serde_json::Value>(&doc)
+            .map_err(|e| {
+                ErrorData::internal_error(format!("encode annotation document: {e}"), None)
+            })
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "annotations_import",
+        description = "Atomically merge a portable annotation document into the project DB; returns row/change counts. Default fails on conflicting fields, overwrite replaces supplied fields only"
+    )]
+    fn annotations_import(
+        &self,
+        p: Parameters<AnnotationsImportParams>,
+    ) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        // Transport note: rmcp delivers `document` as a fully-materialized
+        // `String` before this runs, so no pre-parse cap exists at this
+        // layer; the core re-checks the 16 MiB serialized cap plus row/text
+        // budgets during validation, before any write, and every failure
+        // leaves the DB and memory unchanged.
+        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        proj.import_annotations(&p.document, p.overwrite.unwrap_or(false))
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })
+            .and_then(|s| ok(serde_json::json!({"rows": s.rows, "changed": s.changed})))
     }
 }
