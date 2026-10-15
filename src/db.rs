@@ -800,6 +800,102 @@ pub fn save_annotation(
     Ok(AnnotationSave::Fast)
 }
 
+/// Persist validated annotation rows in one transaction, for imports.
+///
+/// Same guards as [`save_annotation`], applied once for the whole batch:
+/// reads the persisted `meta`/`binaries` rows inside the write transaction
+/// that applies every change, so rows never land on a snapshot written for
+/// different bytes by another process. On match, upserts (`Some` non-empty)
+/// or deletes (`None`) every entry of `changes` and commits once; the
+/// `functions`/`blocks`/`xrefs`/`strings` tables are never opened for
+/// writing. An empty `changes` map commits nothing and returns
+/// [`AnnotationSave::Fast`]. On a fresh DB or any content/revision mismatch
+/// under the same mapping, aborts without writing and returns
+/// [`AnnotationSave::NeedsFull`]. A populated sidecar under an incompatible
+/// mapping (or an ambiguous legacy mapping) errors instead of returning
+/// `NeedsFull`, so a batch write never migrates annotations across address
+/// spaces. Validate the document fully before calling: this commits
+/// everything or nothing at the storage layer, but semantic validation is
+/// the caller's job. Never touches the analyzed binary.
+///
+/// # Errors
+/// [`Error::Limit`] when an annotation text exceeds
+/// [`MAX_ANNOTATION_BYTES`], [`Error::Storage`] on any `redb` or encoding
+/// failure (including write contention with another process) and on
+/// mapping conflicts holding live annotations.
+pub fn save_annotation_batch(
+    db: &Database,
+    meta: &BinaryMeta,
+    changes: &BTreeMap<u64, Option<Annotation>>,
+) -> Result<AnnotationSave> {
+    for ann in changes.values().flatten() {
+        check_annotation_text(ann)?;
+    }
+    if changes.is_empty() {
+        return Ok(AnnotationSave::Fast);
+    }
+    let wtxn = db
+        .begin_write()
+        .map_err(|e| Error::Storage(format!("begin write: {e}")))?;
+    {
+        let meta_table = wtxn
+            .open_table(META)
+            .map_err(|e| Error::Storage(format!("open meta: {e}")))?;
+        let version = meta_table
+            .get("version")
+            .map_err(|e| Error::Storage(format!("read meta: {e}")))?;
+        if version.is_none() {
+            return Ok(AnnotationSave::NeedsFull);
+        }
+    }
+    {
+        let binaries = wtxn
+            .open_table(BINARIES)
+            .map_err(|e| Error::Storage(format!("open binaries: {e}")))?;
+        let row = binaries
+            .get(0u64)
+            .map_err(|e| Error::Storage(format!("read binaries: {e}")))?;
+        let Some(row) = row else {
+            return Ok(AnnotationSave::NeedsFull);
+        };
+        let persisted: BinaryMeta = decode(&row.value())?;
+        if persisted.mapping != meta.mapping {
+            let live = live_annotations_in_wtxn(&wtxn)?;
+            if live > 0 {
+                let expected = meta.mapping.clone().unwrap_or(StoredMapping::Auto);
+                match persisted.mapping {
+                    Some(stored) => return Err(mapping_conflict(&stored, live, &expected)),
+                    None => return Err(legacy_ambiguous(live, persisted.version)),
+                }
+            }
+            return Ok(AnnotationSave::NeedsFull);
+        }
+        if persisted != *meta {
+            return Ok(AnnotationSave::NeedsFull);
+        }
+    }
+    {
+        let mut t = wtxn
+            .open_table(ANNOTATIONS)
+            .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
+        for (&addr, next) in changes {
+            match next {
+                Some(ann) => {
+                    t.insert(addr, json(ann)?)
+                        .map_err(|e| Error::Storage(format!("write annotations: {e}")))?;
+                }
+                None => {
+                    t.remove(addr)
+                        .map_err(|e| Error::Storage(format!("remove annotations: {e}")))?;
+                }
+            }
+        }
+    }
+    wtxn.commit()
+        .map_err(|e| Error::Storage(format!("commit: {e}")))?;
+    Ok(AnnotationSave::Fast)
+}
+
 /// Refuse to overwrite a populated snapshot under an incompatible mapping.
 ///
 /// Reads the existing `binaries` row plus live annotations inside the same

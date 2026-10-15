@@ -2,6 +2,7 @@
 //! binscout core: headless agent-first binary analysis.
 
 pub mod analysis;
+pub mod annotations;
 pub mod db;
 pub mod disasm;
 pub mod error;
@@ -246,6 +247,7 @@ pub struct Project {
     path: PathBuf,
     db_path: PathBuf,
     content_hash: u64,
+    content_sha256: String,
     size: u64,
     binary: LoadedBinary,
     analysis: Analysis,
@@ -372,6 +374,7 @@ impl Project {
                     path: binary.to_path_buf(),
                     db_path: db_path.to_path_buf(),
                     content_hash: hash,
+                    content_sha256: crate::annotations::sha256_hex(&bytes),
                     size,
                     binary: loaded,
                     analysis,
@@ -413,6 +416,7 @@ impl Project {
             path: binary.to_path_buf(),
             db_path: db_path.to_path_buf(),
             content_hash: hash,
+            content_sha256: crate::annotations::sha256_hex(&bytes),
             size,
             binary: loaded,
             analysis,
@@ -572,6 +576,22 @@ impl Project {
         self.content_hash
     }
 
+    /// Hex SHA-256 of the binary bytes the analysis was taken over.
+    ///
+    /// Cryptographic identity for portable annotation interchange (see
+    /// [`Project::export_annotations`]); the 64-bit
+    /// [`Project::content_hash`] only detects "binary changed, re-analyze".
+    #[must_use]
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    /// Binary size in bytes the analysis was taken over.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Parsed binary headers, segments, and symbols.
     #[must_use]
     pub fn binary(&self) -> &LoadedBinary {
@@ -663,6 +683,81 @@ impl Project {
             self.annotations.remove(&addr);
         }
         self.persist_annotation(addr)
+    }
+
+    /// Export renames and comments as a portable JSON interchange document.
+    ///
+    /// The document carries the format revision, the binary's SHA-256 plus
+    /// size, the effective loader mapping, and the sorted non-empty rows;
+    /// host paths and analysis snapshots are excluded. Strictly read-only:
+    /// no sidecar is created or modified. Fails explicitly past the
+    /// interchange size cap instead of emitting an unimportable document.
+    ///
+    /// # Errors
+    /// [`Error::Limit`] past annotation or document budgets,
+    /// [`Error::Storage`] on encoding failure.
+    pub fn export_annotations(&self) -> Result<String> {
+        crate::annotations::build_document(
+            &self.content_sha256,
+            self.size,
+            &self.mapping,
+            &self.annotations,
+        )
+    }
+
+    /// Import a document from [`Project::export_annotations`] atomically.
+    ///
+    /// The whole document is validated before a single transaction:
+    /// identity, mapping, duplicates, budgets, rename targets, and merge
+    /// conflicts. On success the changes persist in one transaction (an
+    /// annotation-only batch write, or a full snapshot rewrite when no
+    /// matching snapshot exists) and memory updates only after the commit;
+    /// on any failure the DB and the in-memory annotations are unchanged.
+    /// Default (`overwrite == false`) fails on differing existing field
+    /// values while equal values and fills of absent fields succeed;
+    /// `overwrite == true` replaces supplied fields only (absent fields
+    /// untouched, empty strings clear). Rows outside the document remain.
+    /// Rename targets must be known function entries; comments keep the
+    /// any-address contract.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on malformed documents, duplicates, and
+    /// default-mode conflicts; [`Error::Storage`] on identity/mapping
+    /// mismatches; [`Error::NotFound`] on unknown rename targets;
+    /// [`Error::Limit`] past input/field/row budgets.
+    pub fn import_annotations(
+        &mut self,
+        document: &str,
+        overwrite: bool,
+    ) -> Result<crate::annotations::ImportSummary> {
+        let doc = crate::annotations::parse_document(document)?;
+        let is_function = |addr: u64| self.analysis.functions.contains_key(&addr);
+        let changes = crate::annotations::validate_document(
+            &doc,
+            &self.content_sha256,
+            self.size,
+            &self.mapping,
+            &is_function,
+            &self.annotations,
+            overwrite,
+        )?;
+        let summary = crate::annotations::ImportSummary {
+            rows: doc.annotations.len(),
+            changed: changes.len(),
+        };
+        if !changes.is_empty() {
+            let db = db::open_db(&self.db_path)?;
+            match db::save_annotation_batch(&db, &self.meta(), &changes)? {
+                db::AnnotationSave::Fast => {}
+                db::AnnotationSave::NeedsFull => {
+                    let mut merged = self.annotations.clone();
+                    crate::annotations::apply_changes(&mut merged, &changes);
+                    db::save(&db, &self.meta(), &self.analysis, &merged)?;
+                }
+            }
+            crate::annotations::apply_changes(&mut self.annotations, &changes);
+        }
+        Ok(summary)
     }
 
     /// File-backed bytes mapped at `va` (zero-padded past file data).
