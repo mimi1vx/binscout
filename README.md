@@ -50,25 +50,35 @@ Every command prints exactly one JSON value to stdout. Runtime failures print
 errors for unknown flags/subcommands still go to stderr with exit 2.)
 
 ```sh
-binscout [--db PATH] <command> <binary> [args]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] <command> <binary> [args]
 ```
 
-`--db` overrides the sidecar DB (default `<binary>.rsdbg.redb`).
+`--db` overrides the sidecar DB (default `<binary>.rsdbg.redb`). `--raw`
+selects explicit raw mapping for firmware/blob workflows (`arch` is one
+of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); without it,
+container auto-detection applies.
 
 | Command | Example | Output |
 |---|---|---|
-| `load` | `binscout load fw.elf` | project info; caches the analysis snapshot |
-| `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; filter with `--query` (case-insensitive name substring), `--caller`/`--callee` (addresses resolving to call-graph neighbors), `--range LO HI`; page with `--offset`/`--limit` |
-| `func` | `binscout func fw.elf 0x400000` | blocks with instructions, edges, calls |
+| `load` | `binscout load fw.elf` | project info (`protocol`, `mode`, `arch`, `base`, diagnostic totals, `analysis_revision`); caches the analysis snapshot |
+| `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; filter with `--query` (case-insensitive name substring), `--caller`/`--callee` (addresses resolving to call-graph neighbors), `--range LO HI` (inclusive); page with `--offset`/`--limit` |
+| `func` | `binscout func fw.elf 0x400000` | compact metadata: entry, name, block/insn/call counts, discovery `reasons` |
+| `blocks` | `binscout blocks fw.elf 0x400000 --limit 50` | block summaries of the containing function, paged under the page envelope |
+| `block-insns` | `binscout block-insns fw.elf 0x400000 0x400000` | one block's instructions in address order, paged |
+| `diagnostics` | `binscout diagnostics fw.elf --kind decode-failure` | provenance records (unresolved indirect sites, decode failures) filtered by `--kind`/`--func`, paged; never writes a sidecar |
 | `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); trailing bad bytes report in `error_at`, ranges cap at 1 MiB |
-| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges |
-| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
+| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only) |
+| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default); paged by `--start`/`--limit` |
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
+| `ir-coverage` | `binscout ir-coverage x86_64` | machine-readable lift coverage for one arch; with `BINARY ADDR LEN` adds decoded/lifted/unlifted counts from actual lifts |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
+| `search-bytes` | `binscout search-bytes fw.elf "48 8B ??" --range 0x400000 0x401000` | paged `??`-wildcard byte-pattern matches with `--section`/`--range` filters |
+| `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, SHA-256, size, mapping, sorted rows); read-only |
+| `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns `rows`/`changed`, default fails on conflicts |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal strings.
 
@@ -78,10 +88,13 @@ omitting the flag leaves that field alone.
 
 ## MCP server
 
-`binscout-mcp` serves 13 tools over stdio (newline-delimited JSON-RPC):
-`project_info`, `functions`, `func`, `disasm`, `cfg`, `xrefs`, `strings`,
-`symbols`, `sections`, `ir`, `stats`, `rename`, `comment`. Each takes `binary` plus optional `db`
-and returns one JSON document as text; failures are tool errors.
+`binscout-mcp` serves 20 tools over stdio (newline-delimited JSON-RPC):
+`project_info`, `functions`, `func`, `blocks`, `block_insns`,
+`diagnostics`, `disasm`, `cfg`, `xrefs`, `strings`, `symbols`, `stats`,
+`sections`, `ir`, `ir_coverage`, `rename`, `comment`, `search_bytes`,
+`annotations_export`, `annotations_import`. Each takes `binary` plus
+optional `db` (and an optional `raw` mapping object on binary-taking
+tools) and returns one JSON document as text; failures are tool errors.
 
 ```json
 {
@@ -111,8 +124,14 @@ PATH` (CLI) or the `db` parameter (MCP). `load` writes the snapshot;
 storage cost of a snapshot stays visible.
 
 The sidecar is a cache: delete it to drop analysis and annotations, and
-it is rebuilt on the next `load`. Never commit sidecars — keep them out
-of version control:
+it is rebuilt on the next `load`. Snapshots are keyed by binary
+content, loader mapping (auto versus explicit raw arch/base/entry),
+and analysis revision: the same bytes opened under a different
+mapping re-analyze rather than reuse layouts, and opening a sidecar
+holding annotations under an incompatible mapping fails with a
+separate-DB error instead of remapping them. Sidecars from older
+schema versions rebuild the same way. Never commit sidecars — keep
+them out of version control:
 
 ```gitignore
 *.rsdbg.redb

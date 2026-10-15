@@ -9,12 +9,20 @@ Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
 $ binscout load tests/fixtures/raw-x64.bin
-{"annotations":0,"arch":"x86_64","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","entry":null,"entry_hex":null,"format":"raw","functions":1,"insns":3,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.3.0","xrefs":0}
+{"analysis_revision":3,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.3.0","xrefs":0}
 ```
+
+`mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto
+mode. `protocol` is the wire revision below; `analysis_revision` is
+the engine revision that produced the snapshot. `diagnostics` counts
+retained provenance records (`diagnostics_truncated` plus
+`diagnostics_omitted` when the 100,000-record cap drops rows);
+`inferred_truncated`/`inferred_omitted` do the same for the
+single-slot resolver's edge budget.
 
 ## Stability guarantees
 
-These hold before and after the protocol-1 changes below:
+These stability guarantees hold across wire revisions:
 
 - One JSON value on CLI stdout per command. Runtime failure:
   `{"error": "..."}` on stdout, exit 1. Clap usage errors
@@ -148,15 +156,17 @@ Before — `func` today embeds every instruction of every block:
 ```
 
 After — `func` is a bounded summary. `blocks`/`insns` are counts,
-`calls` is a count (not the unbounded target array), and `reasons`
-is the sorted, deduplicated discovery vocabulary (`entry`, `export`,
-`direct-call`, `prologue`). The redundant `containing_entry` twin is
-dropped; any interior address still snaps to the canonical `entry`:
+`calls` is a count (not the unbounded target array),
+`inferred_edges` counts provenance-marked single-slot resolutions in
+that function, and `reasons` is the sorted, deduplicated discovery
+vocabulary (`entry`, `export`, `direct-call`, `prologue`). The
+redundant `containing_entry` twin is dropped; any interior address
+still snaps to the canonical `entry`:
 
 ```json
 {"id": "func@0x401000", "entry": 4198400, "entry_hex": "0x401000",
  "name": "main", "blocks": 1, "insns": 3, "calls": 0,
- "reasons": ["entry"]}
+ "inferred_edges": 0, "reasons": ["entry"]}
 ```
 
 Explicitly unchanged in this contract (no style churn): the bare-array
@@ -170,14 +180,12 @@ empty string clears, 8 KiB text cap); all exit codes and error
 channels. A future alignment of the grandfathered list shapes would
 bump `protocol`.
 
-## New query contracts (design targets)
+## Query contracts
 
-Names, parameters, and shapes below are frozen by this contract but
-**not yet implemented**; each is built and tested by its roadmap step.
 `B` is the binary path; every binary-taking operation also accepts the
 common `--db PATH` / `db` sidecar override and the raw-mapping options.
 
-### Raw mapping (target: explicit raw opens)
+### Raw mapping
 
 Opt-in firmware/raw workflow. CLI global flags (like `--db`):
 
@@ -197,7 +205,17 @@ Explicit raw mode never falls back to another mode on failure.
 `"raw"`) plus `base`/`base_hex` (null in auto mode); `arch`,
 `format`, and `entry`/`entry_hex` keep their current fields.
 
-### `blocks` / `block_insns` (target: bounded function views)
+```sh
+$ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/raw.redb
+{"analysis_revision":3,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.3.0","xrefs":0}
+```
+
+Same bytes under a different mapping never reuse cached layouts: the
+open re-analyzes. A sidecar holding annotations opened under an
+incompatible mapping fails with a separate-DB error instead of
+remapping them (see [CLI reference](cli-reference.md)).
+
+### `blocks` / `block_insns`
 
 ```sh
 binscout blocks B ADDR [--offset N] [--limit N]
@@ -214,7 +232,7 @@ by start; `block_insns` pages that block's instructions in address
 order. Both use the page envelope; per-page work scales with the
 page, never with whole-function size.
 
-### `diagnostics` (implemented: paged provenance)
+### `diagnostics`
 
 ```sh
 binscout diagnostics B [--kind KIND] [--func ADDR] [--offset N] [--limit N]
@@ -235,7 +253,7 @@ record count), `diagnostics_truncated` (bool),
 `analysis_revision`. Zero retained diagnostics is not proof of
 complete recovery.
 
-### `ir-coverage` (implemented: machine-readable lift coverage)
+### `ir-coverage`
 
 ```sh
 binscout ir-coverage ARCH [B ADDR LEN]
@@ -252,7 +270,7 @@ adds per-range `decoded`/`lifted`/`unlifted` counts from actual lift
 results plus a bounded mnemonic summary. (`ARCH` is positional on the
 CLI because `--arch` is the global raw-mapping flag.)
 
-### `search-bytes` (target: bounded byte-pattern search)
+### `search-bytes`
 
 ```sh
 binscout search-bytes B PATTERN [--section S] [--range LO HI] [--offset N] [--limit N]
@@ -260,21 +278,27 @@ binscout search-bytes B PATTERN [--section S] [--range LO HI] [--offset N] [--li
 
 MCP tool `search_bytes` (`binary`, `db`?, `raw`?, `pattern`,
 `section`?, `range_start`?, `range_end`?, `offset?`, `limit?`).
-`PATTERN` is whitespace-separated full-byte tokens, each two hex
-digits (case-insensitive) or a `??` wildcard (e.g. `48 8B ?? ??`).
-Empty, all-wildcard, odd-length, non-hex, or over-4096-byte patterns
-are `Invalid` errors. `--range` is half-open `[LO, HI)` over virtual
-addresses (unlike the inclusive `--range` on `functions`);
-`--section` is an exact section-name match. Matches report `addr` /
-`addr_hex`, `file_off` (null when unavailable), `section` (null when
-unmapped to a named section), and match `len`, ordered by virtual
-address with overlapping matches included. Gaps between mappings are
-never bridged, virtual BSS is never materialized, and scans past
-256 MiB of unique file-backed mapped bytes fail with `Limit` instead
-of truncating silently. Results page under the envelope (capped at
-1024 rows); the exact `total` may require a full bounded scan.
+`PATTERN` is a positional whitespace-separated full-byte token
+string, each two hex digits (case-insensitive) or a `??` wildcard
+(e.g. `48 8B ?? ??`). Empty, all-wildcard, odd-length, non-hex, or
+over-4096-byte patterns are `Invalid` errors. `--range` is half-open
+`[LO, HI)` over virtual addresses (unlike the inclusive `--range` on
+`functions`); `--section` is an exact section-name match. Matches
+report `addr` / `addr_hex`, `file_off` (null when unavailable),
+`section` (null when unmapped to a named section), and match `len`,
+ordered by virtual address with overlapping matches included. Gaps
+between mappings are never bridged, virtual BSS is never
+materialized, and scans past 256 MiB of unique file-backed mapped
+bytes fail with `Limit` instead of truncating silently. Results page
+under the envelope (capped at 1024 rows); the exact `total` may
+require a full bounded scan.
 
-### `annotations-export` / `annotations-import` (implemented: portable annotations)
+```sh
+$ binscout search-bytes fw.bin 90 --range 0x0 0x2
+{"items":[{"addr":0,"addr_hex":"0x0","file_off":0,"len":1,"section":null},{"addr":1,"addr_hex":"0x1","file_off":1,"len":1,"section":null}],"limit":50,"next_offset":null,"offset":0,"protocol":1,"total":2}
+```
+
+### `annotations-export` / `annotations-import`
 
 ```sh
 binscout annotations-export B
@@ -289,21 +313,59 @@ capped at 16 MiB serialized:
 ```json
 {"revision": 1, "sha256": "…64 hex…", "size": 3,
  "mapping": {"mode": "auto"},
- "annotations": [{"addr": 4198400, "rename": "main", "comment": null}]}
+ "annotations": [{"addr": 4198400, "rename": "main"}]}
 ```
 
-Rows sort by address and only nonempty annotations appear; host
-paths and analysis snapshots are excluded. Import validates the
-whole document before a single atomic write: identity
-(`sha256` + `size` + `mapping`) must match exactly, duplicate
-addresses and oversized documents are rejected, `rename` targets must
-be known function entries while comments keep the any-address
-contract. Default merge fails on differing existing field values
-(equal values are idempotent); `--overwrite` replaces supplied fields
-only, absent fields leave existing values alone, and empty strings
-clear. Untouched annotations remain; a failure in the last row leaves
-the DB unchanged. Import returns merge counts
-(`rows`, `changed`).
+Rows sort by address and only nonempty annotations appear; unset
+fields are omitted (no nulls). Host paths and analysis snapshots are
+excluded. Under explicit raw mapping the document records
+`"mapping": {"mode": "explicit", "arch": "x86_64", "base": 4194304,
+"entry": null}`. Import validates the whole document before a single
+atomic write: identity (`sha256` + `size` + `mapping`) must match
+exactly, duplicate addresses and oversized documents are rejected,
+`rename` targets must be known function entries while comments keep
+the any-address contract. Default merge fails on differing existing
+field values (equal values are idempotent); `--overwrite` replaces
+supplied fields only, absent fields leave existing values alone, and
+empty strings clear. Untouched annotations remain; a failure in the
+last row leaves the DB unchanged. Import returns merge counts:
+
+```json
+{"rows": 1, "changed": 0}
+```
+
+### Inferred edges (single-slot resolver)
+
+One conservative indirect-jump pattern resolves to a real edge:
+a single-slot absolute indirect jump (x86-32 `jmp m32` through an
+absolute slot, x86-64 `jmp m64` through a RIP-relative slot) in an
+explicit raw mapping, with the slot value landing on executable
+mapped bytes in the same function. Everything else — indexed
+multi-entry tables, cross-function targets, truncated or unmapped
+slots, non-executable targets, container (non-raw) binaries — keeps
+its `unresolved-indirect-jump` diagnostic and stays edgeless, e.g.:
+
+```json
+{"addr": 4194304, "addr_hex": "0x400000", "detail": "indirect jump without a direct target; the site stays edgeless", "func": 4194304, "func_hex": "0x400000", "kind": "unresolved-indirect-jump"}
+```
+
+Resolved edges carry their provenance separately from direct flow:
+`cfg` lists them in `inferred_edges` (never in `edges`), compact
+`func` counts them in `inferred_edges`, and `xrefs` tags them
+`inferred-code` alongside the `Data` xref into the slot:
+
+```json
+{"containing_entry": 4194304, "containing_entry_hex": "0x400000", "edges": [], "entry": 4194304, "entry_hex": "0x400000", "inferred_edges": [[4194304, 4194322]], "nodes": [{"end": 4194310, "end_hex": "0x400006", "insns": 1, "start": 4194304, "start_hex": "0x400000", "succs": []}, {"end": 4194325, "end_hex": "0x400015", "insns": 3, "start": 4194322, "start_hex": "0x400012", "succs": []}]}
+{"total": 2, "xrefs": [
+  {"from": 4194304, "from_hex": "0x400000", "kind": "Data", "to": 4194314, "to_hex": "0x40000a"},
+  {"from": 4194304, "from_hex": "0x400000", "kind": "inferred-code", "to": 4194322, "to_hex": "0x400012"}]}
+```
+
+Caps: one edge per site, 100,000 recovered edges per project. When
+the project budget exhausts, the site stays unresolved with its
+diagnostic retained and the excess counted in `inferred_omitted`
+with `inferred_truncated` set — never silently clipped from the
+inferred graph.
 
 ## Errors and validation
 

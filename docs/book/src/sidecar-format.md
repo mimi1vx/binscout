@@ -5,20 +5,25 @@ binary: `<binary>.rsdbg.redb` by default, overridden per-invocation with
 `--db PATH` (CLI) or the `db` parameter (MCP tools). The analyzed binary
 itself is only ever read.
 
-On open, the stored content hash is compared against the file; a mismatch
-means the binary changed and it is re-analyzed (annotations carry over by
-address). A sidecar written by an older schema version behaves the same
-way: annotations carry over and the binary re-analyzes. Row values are
-JSON.
+On open, the stored content hash, loader mapping (auto versus
+explicit raw arch/base/entry), and analysis revision are compared
+against the request; a mismatch means the snapshot is discarded and
+the binary re-analyzes. Annotations carry over by address when the
+mapping is unchanged. A sidecar holding annotations opened under an
+incompatible mapping fails with a separate-DB error instead of
+remapping them. A sidecar written by an older schema version (current
+version 5, analysis revision 3) behaves the same way: annotations
+carry over and the binary re-analyzes. Row values are JSON.
 
 | Table | Key | Value |
 |---|---|---|
-| `meta` | string | schema version, path, hash, size, arch, format, entry |
+| `meta` | string | schema version, path, hash, size, arch, format, entry, mapping, analysis revision |
 | `binaries` | `0` | snapshot metadata |
-| `functions` | entry address | function row (name, callees) |
-| `blocks` | block key | block row (address range, successors) |
-| `xrefs` | xref key | cross-reference row |
+| `functions` | entry address | function row (name, callees, discovery reasons, inferred successors) |
+| `blocks` | block key | block row (address range, successors, inferred successors) |
+| `xrefs` | xref key | cross-reference row (direct and `inferred-code` kinds) |
 | `strings` | row index | extracted-string row |
+| `diagnostics` | record key | provenance row (unresolved indirect sites, decode failures) |
 | `annotations` | address | rename and/or comment |
 
 Block rows store address ranges plus per-instruction boundaries, not
