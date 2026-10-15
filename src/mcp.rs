@@ -1,4 +1,4 @@
-//! binscout MCP server: 22 stateless tools over [`Project`].
+//! binscout MCP server: 23 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -359,6 +359,24 @@ pub struct AnnotationsImportParams {
     pub document: String,
     /// Replace supplied fields on conflict instead of failing.
     pub overwrite: Option<bool>,
+}
+
+/// Parameters for the `flirt_hints` tool: read-only library-idiom hints.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FlirtHintsParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Only hints for the function containing this address (`0x`-hex or
+    /// decimal string).
+    pub addr: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
 }
 
 /// MCP server handler; serializes tool calls behind one lock.
@@ -814,5 +832,19 @@ impl BinscoutMcp {
                 other => ErrorData::internal_error(other.to_string(), None),
             })
             .and_then(|s| ok(serde_json::json!({"rows": s.rows, "changed": s.changed})))
+    }
+
+    #[tool(
+        name = "flirt_hints",
+        description = "FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope. Suggested names stay hints; read-only, never renames or writes the sidecar"
+    )]
+    fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr = opt_addr(p.addr)?;
+        proj.query_flirt_hints(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|page| ok(serde_json::to_value(page).expect("flirt hints page serializes")))
     }
 }

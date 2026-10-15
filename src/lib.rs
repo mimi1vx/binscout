@@ -6,6 +6,7 @@ pub mod annotations;
 pub mod db;
 pub mod disasm;
 pub mod error;
+pub mod flirt;
 pub mod ir;
 pub mod loader;
 pub mod mcp;
@@ -23,6 +24,7 @@ use crate::analysis::{
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn, PartialDisasm};
 use crate::error::{Error, Result};
+use crate::flirt::FlirtHint;
 use crate::loader::strings::StringHit;
 use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
 use crate::search::{ByteMatch, BytePattern};
@@ -1503,6 +1505,43 @@ impl Project {
                 serde_json::json!({ "addr": addr_json, "addr_hex": addr_hex, "name": null, "comment": null })
             }
         }
+    }
+
+    /// FLIRT-like library hints: corpus signature matches over each
+    /// function's leading bytes, under the protocol-1 [`Page`] envelope.
+    ///
+    /// Filtering precedes paging: `addr` snaps to its containing entry
+    /// exactly like [`Project::func_detail`] and keeps only that function's
+    /// hints (`total` is the filtered count); `None` lists every hint
+    /// ordered by entry. Suggested names stay hints: this never renames,
+    /// comments, or otherwise writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn query_flirt_hints(
+        &self,
+        addr: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<FlirtHint>> {
+        let entry = addr
+            .map(|a| {
+                self.analysis
+                    .containing_function(a)
+                    .ok_or_else(|| Error::NotFound(format!("function {a:#x}")))
+            })
+            .transpose()?;
+        let matched: Vec<FlirtHint> = crate::flirt::hints_for_analysis(&self.analysis)
+            .into_iter()
+            .filter(|h| entry.is_none_or(|e| h.entry == e))
+            .collect();
+        let total = matched.len();
+        let items = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
     }
 }
 
