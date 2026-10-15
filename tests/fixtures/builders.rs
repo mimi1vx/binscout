@@ -18,11 +18,13 @@ pub const BASIC_NAME: &str = "pe32-basic.exe";
 pub const ORDINALS_NAME: &str = "pe32-ordinals.exe";
 /// Name of the minimal LE fixture (one R-X object, analyzed as x86_32).
 pub const LE_NAME: &str = "le-minimal.exe";
+/// Name of the minimal COFF fixture (AMD64 relocatable object, one `.text`).
+pub const COFF_NAME: &str = "coff-minimal.obj";
 /// Name of the raw garbage fixture (`.text`-noise + invalid opcode).
 pub const GARBAGE_NAME: &str = "text-garbage.bin";
 
 /// All fixture names in build order.
-pub const FIXTURE_NAMES: [&str; 4] = [BASIC_NAME, ORDINALS_NAME, LE_NAME, GARBAGE_NAME];
+pub const FIXTURE_NAMES: [&str; 5] = [BASIC_NAME, ORDINALS_NAME, LE_NAME, COFF_NAME, GARBAGE_NAME];
 
 /// PE image base both PE32 fixtures link at.
 pub const IMAGE_BASE: u64 = 0x400_000;
@@ -78,6 +80,7 @@ pub fn build(name: &str) -> Vec<u8> {
         BASIC_NAME => pe32_basic(),
         ORDINALS_NAME => pe32_ordinals(),
         LE_NAME => le_minimal(),
+        COFF_NAME => coff_minimal(),
         GARBAGE_NAME => text_garbage(),
         _ => panic!("unknown fixture {name:?}; known: {FIXTURE_NAMES:?}"),
     }
@@ -340,6 +343,29 @@ pub fn le_minimal() -> Vec<u8> {
     put16(&mut f, p + 4, LE_CODE.len() as u16);
     f[LE_OFF + entry_rel..LE_OFF + entry_rel + entry.len()].copy_from_slice(&entry);
     f[LE_OFF + code_rel..].copy_from_slice(&LE_CODE);
+    f
+}
+
+/// `coff-minimal.obj`: AMD64 relocatable object with one `.text`
+/// (`nop; nop; ret`) and no symbol table. Relocatable sections link at
+/// address 0, so the segment and the section both map at VA 0 and the
+/// entry point is `None`; imports/exports are empty (`object` exposes no
+/// COFF import/export tables).
+#[must_use]
+pub fn coff_minimal() -> Vec<u8> {
+    let mut f = vec![0u8; 60];
+    put16(&mut f, 0, 0x8664); // AMD64
+    put16(&mut f, 2, 1); // one section
+    put32(&mut f, 4, TIMESTAMP);
+    // PointerToSymbolTable + NumberOfSymbols stay 0 (no symbols);
+    // SizeOfOptionalHeader stays 0 (object file, no optional header).
+    f[20..28].copy_from_slice(b".text\0\0\0");
+    put32(&mut f, 28, 3); // VirtualSize
+    put32(&mut f, 32, 0); // VirtualAddress (relocatable: links at 0)
+    put32(&mut f, 36, 3); // SizeOfRawData
+    put32(&mut f, 40, 60); // PointerToRawData
+    put32(&mut f, 56, 0x6000_0020); // CNT_CODE|EXECUTE|READ
+    f.extend_from_slice(&[0x90, 0x90, 0xC3]);
     f
 }
 

@@ -4,7 +4,7 @@ One engine, two interfaces. Data flows one way — loader, disassembler,
 IR, analysis, database — and both the CLI (`binscout`) and the MCP server
 (`binscout-mcp`) are thin adapters over it.
 
-- **Loader** (`loader`): sniffs ELF, PE, Mach-O, and LE, falling back to
+- **Loader** (`loader`): sniffs ELF, PE, Mach-O, COFF, and LE, falling back to
   flat raw bytes when nothing matches: unrecognized input opens as
   x86-64 at base 0, LE images analyze as 32-bit x86. Explicit
   base/architecture mapping goes through `open_raw`, exposed as CLI

@@ -1,6 +1,6 @@
 //! M1 loader: binary format readers mapped to shared [`Segment`]s.
 //!
-//! ELF/PE/Mach-O go through the `object` crate (parent epic
+//! ELF/PE/Mach-O/COFF go through the `object` crate (parent epic
 //! `rsdbg-m1-loader-0tp`); the LE branch is a custom pure-Rust reader in
 //! [`le`] because `object` has no Linear Executable support. Raw blobs
 //! (firmware, shellcode, `--base` dumps) map via [`load_raw`]. Printable
@@ -95,6 +95,11 @@ pub enum BinaryFormat {
     Pe,
     /// Mach-O (macOS).
     MachO,
+    /// COFF relocatable object (e.g. Windows `.obj`): sections map at
+    /// their link-time addresses (usually zero), entry is `None`, and
+    /// imports/exports are empty (`object` exposes no COFF import/export
+    /// tables yet).
+    Coff,
     /// Linear Executable (DOS4GW), analyzed as [`Arch::X86_32`].
     Le,
     /// Flat bytes with caller-supplied architecture and base.
@@ -247,7 +252,7 @@ pub fn is_recognized(bytes: &[u8]) -> bool {
     le::is_le(bytes) || FileKind::parse(bytes).is_ok()
 }
 
-/// Parse any supported binary: LE via [`le`], ELF/PE/Mach-O via `object`.
+/// Parse any supported binary: LE via [`le`], ELF/PE/Mach-O/COFF via `object`.
 ///
 /// Input longer than [`MAX_INPUT_BYTES`] is rejected before sniffing so a
 /// huge blob cannot allocate before table caps run; oversize returns
@@ -277,6 +282,7 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
         FileKind::MachO32 | FileKind::MachO64 | FileKind::MachOFat32 | FileKind::MachOFat64 => {
             load_object(bytes, BinaryFormat::MachO)
         }
+        FileKind::Coff => load_object(bytes, BinaryFormat::Coff),
         other => Err(Error::Unsupported(format!("file kind {other:?}"))),
     }
 }

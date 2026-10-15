@@ -170,6 +170,7 @@ pub fn format_name(format: BinaryFormat) -> &'static str {
         BinaryFormat::Elf => "elf",
         BinaryFormat::Pe => "pe",
         BinaryFormat::MachO => "macho",
+        BinaryFormat::Coff => "coff",
         BinaryFormat::Le => "le",
         BinaryFormat::Raw => "raw",
     }
@@ -184,6 +185,7 @@ pub fn parse_format(s: &str) -> Result<BinaryFormat> {
         "elf" => Ok(BinaryFormat::Elf),
         "pe" => Ok(BinaryFormat::Pe),
         "macho" => Ok(BinaryFormat::MachO),
+        "coff" => Ok(BinaryFormat::Coff),
         "le" => Ok(BinaryFormat::Le),
         "raw" => Ok(BinaryFormat::Raw),
         other => Err(Error::Storage(format!(
@@ -1613,6 +1615,7 @@ mod tests {
             BinaryFormat::Elf,
             BinaryFormat::Pe,
             BinaryFormat::MachO,
+            BinaryFormat::Coff,
             BinaryFormat::Le,
             BinaryFormat::Raw,
         ] {
