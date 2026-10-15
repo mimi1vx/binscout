@@ -4,7 +4,10 @@
 //! multi-op expansion (e.g. `push` as adjust-plus-store); M3 always emits a
 //! single element. Operands reuse the disassembler's strings verbatim and
 //! `target` carries direct branch/call destinations from
-//! [`Insn::branch_target`]. Stack-pointer and flag effects are not modeled.
+//! [`Insn::branch_target`]. Flag and stack-pointer effects are scoped:
+//! integer add/sub/cmp record [`IrEffects::sets_flags`] and x86
+//! push/pop/call/operand-free-ret record [`IrEffects::sp_delta`];
+//! everything else reports none (see [`IrEffects`] for the bounds).
 //!
 //! [`IrOp::Phi`] is never emitted by these lifters; M4 synthesizes it at CFG
 //! merges. Unknown mnemonics become [`IrOp::Nop`] with `warning` set instead
@@ -232,7 +235,7 @@ pub enum IrOp {
     Shl,
     /// Logical right shift.
     Shr,
-    /// Comparison (flag effects unmodeled).
+    /// Comparison (integer forms record flag writes; see [`IrEffects`]).
     Cmp,
     /// Unconditional direct branch.
     Branch,
@@ -285,11 +288,58 @@ impl IrOp {
     }
 }
 
+/// Scoped per-instruction flag/stack effects over [`IrInsn`].
+///
+/// The [`IrOp`] set stays unchanged: effects ride along as data so existing
+/// consumers keep working. Only the first scope is modeled:
+/// [`IrEffects::sets_flags`] for integer add/sub/cmp and
+/// [`IrEffects::sp_delta`] for x86 push/pop/call/operand-free-ret.
+///
+/// Still unmodeled: FP/SIMD/vector ALU flag writes (`fadd`, `addps`,
+/// `paddb`, ... report no flags although they lift as `Add`), `lea`
+/// (address math, never flags), x87 FPU-condition writers (`fcom`,
+/// `ftst`, `fxam`, `ficom`, packed mask writers like `pcmpeqb`, and the
+/// imm-folded `cmp<cc>`/`vcmp<cc>` pseudo-ops, which target the FPU status
+/// word or a mask register instead of EFLAGS/NZCV), flag reads
+/// (`adc`/`sbb`/`rsc` carry-in, `cmovcc`/`setcc` conditions), preserved
+/// bits (`inc`/`dec` keep CF yet report `sets_flags`), ARM saturating `Q`
+/// effects (`qadd`/`qsub`), `ret` with an immediate (extra argument pop),
+/// far/privileged returns (`retf`, `iret*`) and traps
+/// (`syscall`/`sysenter`/`int`, `svc`/`hvc`/`smc`), ARM multi-register
+/// push/pop (the delta needs register-list decoding, so they report
+/// `None`), AArch64 `bl`/`blr`/`ret` (link-register moves, no SP effect),
+/// and calling-convention frame effects (`enter`/`leave`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IrEffects {
+    /// Whether the instruction writes condition flags in the common
+    /// integer case: x86 EFLAGS or ARM NZCV.
+    ///
+    /// True only for the curated integer writers (x86 `add`/`adc`/`sub`/
+    /// `sbb`/`inc`/`dec`/`neg`/`cmp`/`test`/`bt`, string compares, and the
+    /// EFLAGS-writing FP compares `comiss*`/`vtest*`/`vptest`/`fcomi*`;
+    /// AArch64 `adds`/`adcs`/`subs`/`sbcs`/`negs`/`ngcs` and
+    /// `cmp`/`cmn`/`tst`/`ccmp`/`ccmn`/`cmtst`/`fcmp*`; ARM32/Thumb
+    /// compares and `s`-suffixed add/sub). Every other mnemonic reports
+    /// false, including FP/SIMD ALU forms that lift as `Add`/`Sub`/`Cmp`.
+    pub sets_flags: bool,
+    /// Signed stack-pointer delta in bytes (`None` means no effect or an
+    /// unmodeled one).
+    ///
+    /// Only x86 reports values: `push`/`pop`/`pushf*`/`popf*` move one
+    /// slot (-/+8 on x86-64, -/+4 on x86-32), `pusha`/`popa` move 16 and
+    /// `pushad`/`popad` 32, `call` pushes one return slot, and
+    /// operand-free `ret`/`retn` pop one. Assigned by [`lift`], which owns
+    /// the arch context: [`lift_x86`] is mode-agnostic by design (one
+    /// table for both x86 modes), so its direct rows carry flags only.
+    pub sp_delta: Option<i64>,
+}
+
 /// One lifted IR operation.
 ///
 /// JSON pairs `addr` with `addr_hex` and `target` with `target_hex`
 /// (see [`crate::addr_hex`]); old rows without the twins still
-/// deserialize.
+/// deserialize. Rows written before effects existed (no `effects` key)
+/// also still deserialize, defaulting to no modeled effects.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct IrInsn {
     /// Address of the source machine instruction.
@@ -304,6 +354,11 @@ pub struct IrInsn {
     pub target: Option<u64>,
     /// Set when the mnemonic had no mapping and `op` fell back to [`IrOp::Nop`].
     pub warning: Option<String>,
+    /// Scoped flag/stack effects (see [`IrEffects`]).
+    ///
+    /// Defaults to no modeled effects so pre-effect rows still decode.
+    #[serde(default)]
+    pub effects: IrEffects,
 }
 
 impl Serialize for IrInsn {
@@ -312,7 +367,7 @@ impl Serialize for IrInsn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("IrInsn", 7)?;
+        let mut st = serializer.serialize_struct("IrInsn", 8)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("op", &self.op)?;
@@ -321,18 +376,29 @@ impl Serialize for IrInsn {
         st.serialize_field("target", &self.target)?;
         st.serialize_field("target_hex", &self.target.map(crate::addr_hex))?;
         st.serialize_field("warning", &self.warning)?;
+        st.serialize_field("effects", &self.effects)?;
         st.end()
     }
 }
 
 /// Lift one instruction for its architecture.
+///
+/// Flag effects come from the per-arch lifters; stack-slot magnitudes need
+/// the mode, so `sp_delta` is assigned here where the arch is known
+/// (see [`IrEffects::sp_delta`]).
 #[must_use]
 pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
-    match arch {
+    let mut rows = match arch {
         Arch::X86_64 | Arch::X86_32 => lift_x86(insn),
         Arch::Aarch64 => lift_aarch64(insn),
         Arch::Arm32 | Arch::Thumb => lift_arm32(insn),
+    };
+    if let [row] = rows.as_mut_slice()
+        && row.warning.is_none()
+    {
+        row.effects.sp_delta = sp_delta_for(arch, insn);
     }
+    rows
 }
 
 /// Lift a decoded range, preserving order.
@@ -459,8 +525,8 @@ pub struct Coverage {
 /// Engine-wide lift limitations shared by every architecture.
 pub const COVERAGE_LIMITATIONS: &[&str] = &[
     "operands reuse the disassembler's strings verbatim; no operand decoding beyond that",
-    "flag effects are unmodeled: CMP records the comparison only",
-    "stack-pointer and calling-convention effects are unmodeled: push/pop lift as STORE/LOAD, CALL carries no frame effects",
+    "flag effects are scoped: integer add/sub/cmp record sets_flags (x86 EFLAGS writers, ARM NZCV writers); FP/SIMD/vector forms, lea, x87 FPU-condition writers, flag reads (adc/sbb carry-in), and preserved bits (inc/dec keep CF) are unmodeled",
+    "stack effects are scoped: x86 push/pop/call and operand-free ret record sp_delta in bytes (pusha/popad as multi-slot constants); ret-with-immediate, far/privileged returns, traps, ARM multi-register push/pop, and calling-convention frame effects are unmodeled",
     "no SSA/PHI production: Phi is never emitted by lifters; it is synthesized at CFG merges",
     "implemented families are not semantically complete: listed mnemonics lift without warning, but the bounds above still apply",
 ];
@@ -512,7 +578,7 @@ fn x86_families() -> Vec<FamilyCoverage> {
             X86_LOAD,
             &[],
             Some(
-                "pop lifts as LOAD; stack-pointer effects unmodeled; x87 control/state loads approximated as LOAD",
+                "pop lifts as LOAD; single-slot pop/popf record sp_delta, popa/popad as multi-slot constants; x87 control/state loads approximated as LOAD",
             ),
         ),
         fam(
@@ -521,7 +587,7 @@ fn x86_families() -> Vec<FamilyCoverage> {
             X86_STORE,
             &[],
             Some(
-                "push lifts as STORE; stack-pointer effects unmodeled; x87 control/state stores approximated as STORE",
+                "push lifts as STORE; single-slot push/pushf record sp_delta, pusha/pushad as multi-slot constants; x87 control/state stores approximated as STORE",
             ),
         ),
         fam(
@@ -529,9 +595,19 @@ fn x86_families() -> Vec<FamilyCoverage> {
             Implemented,
             X86_ADD,
             &[],
-            Some("lea lifts as address math, not a load"),
+            Some(
+                "lea lifts as address math, not a load; only integer add/adc/inc record sets_flags, FP/SIMD forms report none",
+            ),
         ),
-        fam(IrOp::Sub, Implemented, X86_SUB, &[], None),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            X86_SUB,
+            &[],
+            Some(
+                "only integer sub/sbb/dec/neg record sets_flags; FP/SIMD forms report none; carry-in reads unmodeled",
+            ),
+        ),
         fam(IrOp::Mul, Implemented, X86_MUL, &[], None),
         fam(IrOp::Div, Implemented, X86_DIV, &[], None),
         fam(IrOp::And, Implemented, X86_AND, &[], None),
@@ -560,7 +636,9 @@ fn x86_families() -> Vec<FamilyCoverage> {
             Partial,
             X86_CMP,
             X86_CMP_PATTERNS,
-            Some("flag effects unmodeled; imm-folded cmp<cc>/vcmp<cc> pseudo-ops match by pattern"),
+            Some(
+                "integer/EFLAGS compares (cmp/test/bt/cmps/scas, comiss/vtest/fcomi families) record sets_flags; x87-condition and mask writers report none; imm-folded cmp<cc>/vcmp<cc> pseudo-ops match by pattern",
+            ),
         ),
         fam(
             IrOp::Branch,
@@ -575,9 +653,19 @@ fn x86_families() -> Vec<FamilyCoverage> {
             Implemented,
             X86_CALL,
             &[],
-            Some("indirect calls keep operands without target"),
+            Some(
+                "indirect calls keep operands without target; call records sp_delta, traps (syscall/int/...) report none",
+            ),
         ),
-        fam(IrOp::Return, Implemented, X86_RETURN, &[], None),
+        fam(
+            IrOp::Return,
+            Implemented,
+            X86_RETURN,
+            &[],
+            Some(
+                "operand-free ret/retn record sp_delta; ret-with-immediate and far/privileged returns report none",
+            ),
+        ),
         phi_family(),
         fam(IrOp::Nop, Implemented, X86_NOP, &[], Some(NOP_NOTE)),
     ]
@@ -611,8 +699,20 @@ fn aarch64_families() -> Vec<FamilyCoverage> {
                 "release/exclusive/pair/SIMD stores carry no ordering effects; store-only atomics fold the ALU part away",
             ),
         ),
-        fam(IrOp::Add, Implemented, ARM_ADD, &[], None),
-        fam(IrOp::Sub, Implemented, ARM_SUB, &[], None),
+        fam(
+            IrOp::Add,
+            Implemented,
+            ARM_ADD,
+            &[],
+            Some("only adds/adcs record sets_flags; FP/SIMD/atomic forms report none"),
+        ),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            ARM_SUB,
+            &[],
+            Some("only subs/sbcs/negs/ngcs record sets_flags; FP/SIMD forms report none"),
+        ),
         fam(IrOp::Mul, Implemented, ARM_MUL, &[], None),
         fam(IrOp::Div, Implemented, ARM_DIV, &[], None),
         fam(IrOp::And, Implemented, ARM_AND, &[], None),
@@ -639,7 +739,9 @@ fn aarch64_families() -> Vec<FamilyCoverage> {
             Partial,
             ARM_CMP,
             &[],
-            Some("flag effects unmodeled; compare-and-swap drops the conditional store"),
+            Some(
+                "integer/FP compares record sets_flags; vector compares and compare-and-swap report none; compare-and-swap drops the conditional store",
+            ),
         ),
         fam(
             IrOp::Branch,
@@ -678,12 +780,30 @@ fn arm32_families() -> Vec<FamilyCoverage> {
             ARM32_LOAD,
             &[],
             Some(
-                "pop/ldm/ldmia/ldmdb/ldmda naming pc lift as RETURN (CBRANCH when predicated), not LOAD; exclusives carry no ordering effects",
+                "pop/ldm/ldmia/ldmdb/ldmda naming pc lift as RETURN (CBRANCH when predicated), not LOAD; exclusives carry no ordering effects; push/pop-equivalent stack deltas need register-list decoding, reported as none",
             ),
         ),
-        fam(IrOp::Store, Implemented, ARM32_STORE, &[], None),
-        fam(IrOp::Add, Implemented, ARM32_ADD, &[], None),
-        fam(IrOp::Sub, Implemented, ARM32_SUB, &[], None),
+        fam(
+            IrOp::Store,
+            Implemented,
+            ARM32_STORE,
+            &[],
+            Some("push lifts as STORE; stack deltas need register-list decoding, reported as none"),
+        ),
+        fam(
+            IrOp::Add,
+            Implemented,
+            ARM32_ADD,
+            &[],
+            Some("s-suffixed forms record sets_flags; saturating Q-flag effects unmodeled"),
+        ),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            ARM32_SUB,
+            &[],
+            Some("s-suffixed forms record sets_flags; carry-in reads (sbc/rsc) unmodeled"),
+        ),
         fam(IrOp::Mul, Implemented, ARM32_MUL, &[], None),
         fam(IrOp::Div, Implemented, ARM32_DIV, &[], None),
         fam(IrOp::And, Implemented, ARM32_AND, &[], None),
@@ -702,7 +822,7 @@ fn arm32_families() -> Vec<FamilyCoverage> {
             Partial,
             ARM32_CMP,
             &[],
-            Some("flag effects unmodeled"),
+            Some("cmp/cmn/tst/teq and s-suffixed add/sub record sets_flags"),
         ),
         fam(
             IrOp::Branch,
@@ -777,6 +897,10 @@ pub fn coverage(arch: Arch) -> Coverage {
 }
 
 /// Lift one x86 (32- or 64-bit) instruction.
+///
+/// Mode-agnostic by design (one table for both modes): flag effects are
+/// complete here, but slot-sized `sp_delta` values are assigned by
+/// [`lift`], which owns the arch context.
 #[must_use]
 pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
     let mnem = insn.mnem.as_str();
@@ -850,6 +974,7 @@ pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
         s if is_x86_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
         _ => return unlifted(insn),
     };
+    let sets_flags = matches!(op, IrOp::Add | IrOp::Sub | IrOp::Cmp) && x86_sets_flags(mnem);
     vec![IrInsn {
         addr: insn.addr,
         op,
@@ -857,6 +982,10 @@ pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
         outputs,
         target,
         warning: None,
+        effects: IrEffects {
+            sets_flags,
+            sp_delta: None,
+        },
     }]
 }
 
@@ -891,6 +1020,7 @@ pub fn lift_aarch64(insn: &Insn) -> Vec<IrInsn> {
         s if is_arm_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
         _ => return unlifted(insn),
     };
+    let sets_flags = matches!(op, IrOp::Add | IrOp::Sub | IrOp::Cmp) && arm_sets_flags(mnem);
     vec![IrInsn {
         addr: insn.addr,
         op,
@@ -898,6 +1028,10 @@ pub fn lift_aarch64(insn: &Insn) -> Vec<IrInsn> {
         outputs,
         target,
         warning: None,
+        effects: IrEffects {
+            sets_flags,
+            sp_delta: None,
+        },
     }]
 }
 
@@ -965,6 +1099,8 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
         s if is_arm32_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
         _ => return unlifted(insn),
     };
+    let sets_flags =
+        matches!(op, IrOp::Add | IrOp::Sub | IrOp::Cmp) && arm32_sets_flags(base, &insn.mnem);
     vec![IrInsn {
         addr: insn.addr,
         op,
@@ -972,6 +1108,10 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
         outputs,
         target,
         warning: None,
+        effects: IrEffects {
+            sets_flags,
+            sp_delta: None,
+        },
     }]
 }
 
@@ -1051,7 +1191,148 @@ fn unlifted(insn: &Insn) -> Vec<IrInsn> {
         outputs: Vec::new(),
         target: None,
         warning: Some(format!("unlifted '{}'; emitted NOP", insn.mnem)),
+        effects: IrEffects::default(),
     }]
+}
+
+/// Whether x86 `mnem` writes EFLAGS in the common integer case.
+///
+/// Call only with a mnemonic that already lifted as Add/Sub/Cmp: plain
+/// integer `add`/`adc`/`adcx`/`adox`/`inc`, `sub`/`sbb`/`dec`/`neg`,
+/// integer and string compares and tests, `bt`, and the EFLAGS-writing FP
+/// compares (`comiss*`, `ucomiss*`, `vtestps`/`vtestpd`, `vptest`,
+/// `fcomi*`). `lea`, x87 FPU-condition writers, packed mask writers, and
+/// the imm-folded `cmp<cc>`/`vcmp<cc>` pseudo-ops report false.
+fn x86_sets_flags(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "add"
+            | "adc"
+            | "adcx"
+            | "adox"
+            | "inc"
+            | "sub"
+            | "sbb"
+            | "dec"
+            | "neg"
+            | "cmp"
+            | "test"
+            | "bt"
+            | "cmps"
+            | "cmpsb"
+            | "cmpsw"
+            | "cmpsd"
+            | "cmpsq"
+            | "scas"
+            | "scasb"
+            | "scasw"
+            | "scasd"
+            | "scasq"
+            | "comiss"
+            | "comisd"
+            | "ucomiss"
+            | "ucomisd"
+            | "vcomiss"
+            | "vcomisd"
+            | "vucomiss"
+            | "vucomisd"
+            | "vtestps"
+            | "vtestpd"
+            | "vptest"
+            | "fcomi"
+            | "fcomip"
+            | "fucomi"
+            | "fucomip"
+    )
+}
+
+/// Whether an AArch64 `mnem` writes NZCV in the common integer case.
+///
+/// Call only with a mnemonic that already lifted as Add/Sub/Cmp: the
+/// `s`-suffixed integer forms (`adds`, `adcs`, `subs`, `sbcs`, `negs`,
+/// `ngcs`) and the scalar compares (`cmp`, `cmn`, `tst`, `ccmp`,
+/// `ccmn`, `cmtst`, `fcmp`, `fcmpe`, `fccmp`, `fccmpe`). Plain
+/// `add`/`sub`, FP/SIMD ALU, vector compares, and compare-and-swap
+/// report false.
+fn arm_sets_flags(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "adds"
+            | "adcs"
+            | "subs"
+            | "sbcs"
+            | "negs"
+            | "ngcs"
+            | "cmp"
+            | "cmn"
+            | "tst"
+            | "ccmp"
+            | "ccmn"
+            | "cmtst"
+            | "fcmp"
+            | "fcmpe"
+            | "fccmp"
+            | "fccmpe"
+    )
+}
+
+/// Whether an ARM32/Thumb `base`+full-mnemonic pair writes NZCV: any
+/// compare base (`cmp`/`cmn`/`tst`/`teq`), or an add/sub base with the
+/// flag `s` suffix (`adds`, `subs.w`, ...).
+///
+/// Mirrors [`split_arm_mnem`]: one `.w`/`.n` width suffix and one guarded
+/// condition suffix peel first, then the trailing `s` must leave exactly
+/// `base`, so `svc`/`mrs`/`teq` keep their own meaning.
+fn arm32_sets_flags(base: &str, full: &str) -> bool {
+    if ARM32_CMP.contains(&base) {
+        return true;
+    }
+    if !(is_arm32_alu(base, IrOp::Add) || is_arm32_alu(base, IrOp::Sub)) {
+        return false;
+    }
+    let w = full
+        .strip_suffix(".w")
+        .or_else(|| full.strip_suffix(".n"))
+        .unwrap_or(full);
+    let core = if w.len() > 2 {
+        let (prefix, suffix) = w.split_at(w.len() - 2);
+        if ARM_CONDS.contains(&suffix) && arm_base_mnem(prefix) {
+            prefix
+        } else {
+            w
+        }
+    } else {
+        w
+    };
+    core.strip_suffix('s').is_some_and(|p| p == base)
+}
+
+/// Signed stack-pointer delta in bytes for `arch`+`insn`, if the effect is
+/// a single known slot move.
+///
+/// x86 only: `push`/`pop`/`pushf*`/`popf*` move one slot (-/+8 on x86-64,
+/// -/+4 on x86-32), `pusha`/`popa` move 16 and `pushad`/`popad` 32,
+/// `call` pushes one return slot, and operand-free `ret`/`retn` pop one.
+/// Everything else reports `None`: `ret` with an immediate (extra
+/// argument pop), far/privileged returns, traps, and all ARM mnemonics
+/// (multi-register push/pop need register-list decoding; `bl`/`ret` are
+/// link-register moves with no SP effect).
+fn sp_delta_for(arch: Arch, insn: &Insn) -> Option<i64> {
+    if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
+        return None;
+    }
+    let slot: i64 = if arch == Arch::X86_64 { 8 } else { 4 };
+    match insn.mnem.as_str() {
+        "push" | "pushf" | "pushfd" | "pushfq" => Some(-slot),
+        "pop" | "popf" | "popfd" | "popfq" => Some(slot),
+        "pusha" => Some(-16),
+        "popa" => Some(16),
+        "pushad" => Some(-32),
+        "popad" => Some(32),
+        "call" => Some(-slot),
+        "ret" | "retn" if insn.ops.is_empty() => Some(slot),
+        _ => None,
+    }
 }
 
 fn is_x86_copy(s: &str) -> bool {
