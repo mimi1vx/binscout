@@ -113,6 +113,11 @@ pub struct StringsParams {
     pub section: Option<String>,
     /// Show strings in executable memory (hidden by default).
     pub include_code: Option<bool>,
+    /// Decode-and-display view over an in-memory transform: `xor:<byte>`,
+    /// `add:<byte>`, or `rot:<0-7>` (byte is `0x`-hex or decimal). Reveals
+    /// single-byte-obfuscated text with original offsets; never writes the
+    /// binary.
+    pub decode: Option<String>,
 }
 
 /// Parameters for the `functions` tool: paged list with optional filters.
@@ -593,7 +598,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>"
     )]
     fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
@@ -601,20 +606,32 @@ impl BinscoutMcp {
         if p.offset.is_some() {
             eprintln!("warning: strings offset is deprecated, use start");
         }
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
-        let rows = proj
-            .query_strings(&crate::analysis::StringsFilter {
-                pattern: p.pattern,
-                min_len: p.min_len,
-                section: p.section,
-                include_code: p.include_code.unwrap_or(false),
-                start: p.start.or(p.offset).unwrap_or(0),
-                limit: p.limit.unwrap_or(50),
-            })
+        let decode = p
+            .decode
+            .as_deref()
+            .map(crate::loader::strings::parse_decode_spec)
+            .transpose()
             .map_err(|e| match e {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
                 other => ErrorData::internal_error(other.to_string(), None),
             })?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let filter = crate::analysis::StringsFilter {
+            pattern: p.pattern,
+            min_len: p.min_len,
+            section: p.section,
+            include_code: p.include_code.unwrap_or(false),
+            start: p.start.or(p.offset).unwrap_or(0),
+            limit: p.limit.unwrap_or(50),
+        };
+        let rows = match decode {
+            Some(spec) => proj.query_strings_decoded(&filter, spec),
+            None => proj.query_strings(&filter),
+        }
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })?;
         ok(serde_json::to_value(rows).expect("strings serialize"))
     }
 

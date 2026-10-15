@@ -75,6 +75,77 @@ impl Serialize for StringHit {
     }
 }
 
+/// Decoded-view transform for the `strings --decode` helper.
+///
+/// Explicit allowlist, nothing else: single-byte XOR, wrapping add, and
+/// bitwise left rotation. Applied to an in-memory copy of the mapped bytes
+/// before extraction, so the binary and the sidecar are never written; hit
+/// offsets and virtual addresses still refer to the original binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeSpec {
+    /// XOR every byte with the key (`xor:<byte>`).
+    Xor(u8),
+    /// Wrapping-add the key to every byte (`add:<byte>`).
+    Add(u8),
+    /// Rotate every byte left by this many bits (`rot:<0-7>`).
+    Rot(u8),
+}
+
+impl DecodeSpec {
+    /// Apply the transform to `bytes`, returning the decoded copy.
+    ///
+    /// Pure and bounded: output length equals input length, no I/O.
+    #[must_use]
+    pub fn apply(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Xor(key) => bytes.iter().map(|b| b ^ key).collect(),
+            Self::Add(key) => bytes.iter().map(|b| b.wrapping_add(key)).collect(),
+            Self::Rot(n) => bytes.iter().map(|b| b.rotate_left(u32::from(n))).collect(),
+        }
+    }
+}
+
+/// Parse a `strings --decode` spec: `xor:<byte>`, `add:<byte>`, or `rot:<n>`.
+///
+/// Byte/key values parse as `0x`-hex or decimal (`xor:0x41`, `add:65`);
+/// `rot` takes `0`-`7` (data obfuscated with a right rotation by `n` needs
+/// `rot:<8-n>`). Matching is case-insensitive on the op name. Anything
+/// outside the allowlist is an error, never a silent fallback.
+///
+/// # Errors
+/// [`Error::Invalid`] for any other shape or out-of-range value.
+pub fn parse_decode_spec(s: &str) -> Result<DecodeSpec> {
+    const HELP: &str =
+        "expected one of xor:<byte>, add:<byte>, rot:<0-7> (byte is 0x-hex or decimal)";
+    let (op, val) = s
+        .split_once(':')
+        .ok_or_else(|| Error::Invalid(format!("bad decode spec {s:?}: {HELP}")))?;
+    let byte = parse_decode_byte(val)
+        .ok_or_else(|| Error::Invalid(format!("bad decode spec {s:?}: {HELP}")))?;
+    match op.to_lowercase().as_str() {
+        "xor" => Ok(DecodeSpec::Xor(byte)),
+        "add" => Ok(DecodeSpec::Add(byte)),
+        "rot" => {
+            if byte > 7 {
+                return Err(Error::Invalid(format!("bad decode spec {s:?}: {HELP}")));
+            }
+            Ok(DecodeSpec::Rot(byte))
+        }
+        _ => Err(Error::Invalid(format!("bad decode spec {s:?}: {HELP}"))),
+    }
+}
+
+/// Parse a `0x`-hex or decimal byte value (`0`-`255`).
+fn parse_decode_byte(s: &str) -> Option<u8> {
+    let s = s.trim();
+    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()?
+    } else {
+        s.parse::<u64>().ok()?
+    };
+    u8::try_from(v).ok()
+}
+
 /// Test `value` against a `strings` query pattern.
 ///
 /// A `regex:`-prefixed pattern compiles the rest as a [`regex`] expression
@@ -493,5 +564,68 @@ mod tests {
                 .expect("old rows must still decode");
         assert_eq!(hit.section, None);
         assert!(!hit.executable);
+    }
+
+    #[test]
+    fn decode_specs_parse_hex_and_decimal() {
+        assert_eq!(
+            parse_decode_spec("xor:0x41").expect("hex parses"),
+            DecodeSpec::Xor(0x41)
+        );
+        assert_eq!(
+            parse_decode_spec("XOR:65").expect("op is case-insensitive"),
+            DecodeSpec::Xor(65)
+        );
+        assert_eq!(
+            parse_decode_spec("add:7").expect("add parses"),
+            DecodeSpec::Add(7)
+        );
+        assert_eq!(
+            parse_decode_spec("rot:3").expect("rot parses"),
+            DecodeSpec::Rot(3)
+        );
+    }
+
+    #[test]
+    fn decode_specs_reject_everything_off_allowlist() {
+        for bad in [
+            "",
+            "xor",
+            "aes:0x41",
+            "xor:",
+            "xor:0x100",
+            "xor:256",
+            "xor:-1",
+            "xor:zz",
+            "add:999",
+            "rot:8",
+            "rot:0x41",
+            "rotl:3",
+            "xor:0x41:extra",
+        ] {
+            assert!(
+                parse_decode_spec(bad).is_err(),
+                "{bad:?} must be rejected, never a silent fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_round_trips_reveal_printable_runs() {
+        let plain = b"hidden-marker";
+        let xor: Vec<u8> = plain.iter().map(|b| b ^ 0x41).collect();
+        let decoded = DecodeSpec::Xor(0x41).apply(&xor);
+        assert_eq!(decoded, plain);
+        let hits = extract(&decoded, 4, 100, Some(0x1000));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value, "hidden-marker");
+
+        let added: Vec<u8> = plain.iter().map(|b| b.wrapping_sub(7)).collect();
+        let hits = extract(&DecodeSpec::Add(7).apply(&added), 4, 100, None);
+        assert_eq!(hits[0].value, "hidden-marker");
+
+        let rord: Vec<u8> = plain.iter().map(|b| b.rotate_right(3)).collect();
+        let hits = extract(&DecodeSpec::Rot(3).apply(&rord), 4, 100, None);
+        assert_eq!(hits[0].value, "hidden-marker");
     }
 }

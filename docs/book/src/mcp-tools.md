@@ -25,7 +25,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `callers` | binary, addr, depth?/offset?/limit? | Transitive callers out to `depth` hops, ordered by entry with shortest distance, under the page envelope; `addr` snaps to its containing function |
 | `diagnostics` | binary, kind?, func?, offset/limit | Provenance records (unresolved indirect sites, decode failures) ordered by (`kind`, `addr`) under the page envelope, filtered by `kind` and containing-function `func`; queries never write a sidecar |
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind (`code`, `data`, `string`, `inferred-code`), paged behind a `total` match count |
-| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`) |
+| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`); `decode` (`xor:<byte>`, `add:<byte>`, `rot:<0-7>`) re-extracts over a read-only in-memory transform with original offsets |
 | `symbols` | binary | Imports and exports of the binary |
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |

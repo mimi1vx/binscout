@@ -1394,6 +1394,26 @@ impl Project {
         self.analysis.strings_page_filtered(filter)
     }
 
+    /// Decoded-view strings: `strings --decode` over an in-memory transform.
+    ///
+    /// Re-extracts over a per-segment decoded copy (see
+    /// [`Analysis::strings_decoded_view`]) with the same filter semantics
+    /// as [`Project::query_strings`]: single-byte XOR/add/rot-obfuscated
+    /// text shows up with its original offsets and addresses. Strictly
+    /// read-only: the binary and the sidecar are never written.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings_decoded(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+    ) -> Result<Vec<StringHit>> {
+        self.analysis
+            .strings_decoded_view(&self.binary, filter, decode)
+    }
+
     /// Search mapped file bytes for a literal/wildcard pattern, paged.
     ///
     /// `pattern` is whitespace-separated full-byte tokens, each two hex

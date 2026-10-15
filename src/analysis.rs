@@ -1164,58 +1164,112 @@ impl Analysis {
     /// [`Error::Invalid`] when `pattern` is overlong or a `regex:`
     /// expression fails to compile.
     pub fn strings_page_filtered(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
-        let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
-        // Compiled once, lazily at the first row reaching pattern evaluation:
-        // a malformed/overlong pattern errors only when a row survives the
-        // earlier filters, and costs zero compilations otherwise.
-        let mut matcher: Option<strings::PatternMatcher<'_>> = None;
-        let cap = truncate_limit(filter.limit);
-        let start = filter.start;
-        let mut out: Vec<StringHit> = Vec::new();
-        let mut matched: usize = 0;
-        for h in &self.strings {
-            if h.executable && !show_code {
-                continue;
-            }
-            if let Some(sec) = &filter.section
-                && h.section.as_deref() != Some(sec.as_str())
-            {
-                continue;
-            }
-            if let Some(min) = filter.min_len
-                && h.value.chars().count() < min
-            {
-                continue;
-            }
-            if let Some(pat) = &filter.pattern {
-                if matcher.is_none() {
-                    matcher = Some(strings::PatternMatcher::compile(pat)?);
-                }
-                let Some(m) = matcher.as_ref() else {
-                    continue;
-                };
-                if !m.is_match(&h.value) {
-                    continue;
-                }
-            }
-            // Storage-order match at dense index `matched`; clone only the
-            // selected page. Comparisons stay split (`matched >= start` plus
-            // `out.len() < cap`) so `start + cap` can never overflow.
-            if matched >= start && out.len() < cap {
-                out.push(h.clone());
-            }
-            matched += 1;
-            // No future row can fail once the matcher outcome is settled, so
-            // a filled page ends the scan. With an uncompiled pattern the
-            // outcome is unset (no eligible row seen yet), and the scan must
-            // continue: this keeps zero-limit/beyond-end error semantics
-            // identical to the old collect-all pass.
-            if out.len() >= cap && (filter.pattern.is_none() || matcher.is_some()) {
-                break;
+        filter_string_hits(&self.strings, filter)
+    }
+
+    /// Decoded-view strings: re-extract over an in-memory decoded copy.
+    ///
+    /// Each segment's bytes are transformed with `decode` (see
+    /// [`strings::DecodeSpec`]), then extracted and section-tagged exactly
+    /// like [`analyze`], so single-byte
+    /// XOR/add/rot-obfuscated text shows up with its original offsets and
+    /// virtual addresses. The same [`StringsFilter`] semantics apply to the
+    /// decoded rows (a `pattern` matches decoded text). Strictly read-only:
+    /// the binary and the sidecar are never written.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `pattern` is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn strings_decoded_view(
+        &self,
+        bin: &LoadedBinary,
+        filter: &StringsFilter,
+        decode: strings::DecodeSpec,
+    ) -> Result<Vec<StringHit>> {
+        let mut hits: Vec<StringHit> = Vec::new();
+        for seg in &bin.segments {
+            let decoded = decode.apply(&seg.data);
+            for mut h in strings::extract(
+                &decoded,
+                strings::DEFAULT_MIN_LEN,
+                strings::DEFAULT_MAX_HITS,
+                Some(seg.vaddr),
+            ) {
+                // Same tagging as `analyze`: sections win, raw blobs and
+                // unmapped hits inherit the segment's flags.
+                let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
+                h.section = section;
+                h.executable = executable;
+                hits.push(h);
             }
         }
-        Ok(out)
+        hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
+        filter_string_hits(&hits, filter)
     }
+}
+
+/// Filter stored or decoded-view string hits, then page.
+///
+/// Shared by [`Analysis::strings_page_filtered`] and
+/// [`Analysis::strings_decoded_view`] so the `strings --decode` view keeps
+/// the default-view semantics (executable-memory hiding, lazy pattern
+/// compile, filter-before-page).
+///
+/// # Errors
+/// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
+/// expression fails to compile.
+fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<StringHit>> {
+    let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
+    // Compiled once, lazily at the first row reaching pattern evaluation:
+    // a malformed/overlong pattern errors only when a row survives the
+    // earlier filters, and costs zero compilations otherwise.
+    let mut matcher: Option<strings::PatternMatcher<'_>> = None;
+    let cap = truncate_limit(filter.limit);
+    let start = filter.start;
+    let mut out: Vec<StringHit> = Vec::new();
+    let mut matched: usize = 0;
+    for h in hits {
+        if h.executable && !show_code {
+            continue;
+        }
+        if let Some(sec) = &filter.section
+            && h.section.as_deref() != Some(sec.as_str())
+        {
+            continue;
+        }
+        if let Some(min) = filter.min_len
+            && h.value.chars().count() < min
+        {
+            continue;
+        }
+        if let Some(pat) = &filter.pattern {
+            if matcher.is_none() {
+                matcher = Some(strings::PatternMatcher::compile(pat)?);
+            }
+            let Some(m) = matcher.as_ref() else {
+                continue;
+            };
+            if !m.is_match(&h.value) {
+                continue;
+            }
+        }
+        // Storage-order match at dense index `matched`; clone only the
+        // selected page. Comparisons stay split (`matched >= start` plus
+        // `out.len() < cap`) so `start + cap` can never overflow.
+        if matched >= start && out.len() < cap {
+            out.push(h.clone());
+        }
+        matched += 1;
+        // No future row can fail once the matcher outcome is settled, so
+        // a filled page ends the scan. With an uncompiled pattern the
+        // outcome is unset (no eligible row seen yet), and the scan must
+        // continue: this keeps zero-limit/beyond-end error semantics
+        // identical to the old collect-all pass.
+        if out.len() >= cap && (filter.pattern.is_none() || matcher.is_some()) {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Control-flow effect of one instruction, from its M3 lift.

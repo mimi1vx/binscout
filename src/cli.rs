@@ -184,6 +184,12 @@ pub enum Cmd {
         /// Show strings in executable memory (hidden by default).
         #[arg(long)]
         include_code: bool,
+        /// Decode-and-display view over an in-memory transform:
+        /// `xor:<byte>`, `add:<byte>`, or `rot:<0-7>` (byte is `0x`-hex or
+        /// decimal). Reveals single-byte-obfuscated text with original
+        /// offsets; never writes the binary.
+        #[arg(long)]
+        decode: Option<String>,
     },
     /// Imports and exports.
     Symbols { binary: PathBuf },
@@ -352,10 +358,21 @@ impl Cli {
                 min_len,
                 section,
                 include_code,
+                decode,
             } => {
                 if offset.is_some() {
                     eprintln!("warning: --offset is deprecated, use --start");
                 }
+                let decode = match decode
+                    .map(|s| binscout::loader::strings::parse_decode_spec(&s))
+                    .transpose()
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        println!("{}", serde_json::json!({ "error": e.to_string() }));
+                        std::process::exit(1);
+                    }
+                };
                 strings(
                     &binary,
                     db,
@@ -368,6 +385,7 @@ impl Cli {
                         start: start.or(offset).unwrap_or(0),
                         limit,
                     },
+                    decode,
                 )
             }
             Cmd::Symbols { binary } => symbols(&binary, db, raw_opts),
@@ -630,9 +648,13 @@ fn strings(
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
     filter: &binscout::analysis::StringsFilter,
+    decode: Option<binscout::loader::strings::DecodeSpec>,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
-    let rows = p.query_strings(filter)?;
+    let rows = match decode {
+        Some(spec) => p.query_strings_decoded(filter, spec)?,
+        None => p.query_strings(filter)?,
+    };
     Ok(serde_json::to_value(rows).expect("strings serialize"))
 }
 
