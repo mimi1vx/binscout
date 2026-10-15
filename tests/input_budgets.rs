@@ -686,6 +686,8 @@ fn save_rejects_oversize_annotations_before_writing() {
         analysis_rev: Some(binscout::db::ANALYSIS_REVISION),
         diagnostics_truncated: false,
         diagnostics_omitted: 0,
+        inferred_truncated: false,
+        inferred_omitted: 0,
     };
     let mut annotations = BTreeMap::new();
     annotations.insert(

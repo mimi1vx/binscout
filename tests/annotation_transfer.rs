@@ -550,6 +550,8 @@ fn oversized_export_fails_explicitly() {
         analysis_rev: Some(db::ANALYSIS_REVISION),
         diagnostics_truncated: p.analysis().diagnostics.truncated,
         diagnostics_omitted: p.analysis().diagnostics.omitted,
+        inferred_truncated: p.analysis().diagnostics.inferred_truncated,
+        inferred_omitted: p.analysis().diagnostics.inferred_omitted,
     };
     let handle = db::open_db(&db).expect("create db");
     db::save(&handle, &meta, p.analysis(), &annotations).expect("bulk save");

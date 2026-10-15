@@ -246,6 +246,8 @@ fn fresh_db_bootstraps_full_snapshot() {
             analysis_rev: Some(db::ANALYSIS_REVISION),
             diagnostics_truncated: false,
             diagnostics_omitted: 0,
+            inferred_truncated: false,
+            inferred_omitted: 0,
         };
         let ann = Annotation {
             name: Some("probe".to_string()),

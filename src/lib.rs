@@ -180,6 +180,12 @@ pub struct FuncMeta {
     /// still decodes.
     #[serde(default)]
     pub reasons: Vec<crate::analysis::DiscoveryReason>,
+    /// Inferred-edge count (resolved single-slot indirect jumps, not the
+    /// edge array: see [`Project::cfg_of`] for the pairs).
+    ///
+    /// Defaults to zero so metadata written before inference still decodes.
+    #[serde(default)]
+    pub inferred_edges: usize,
 }
 
 impl Serialize for FuncMeta {
@@ -188,7 +194,7 @@ impl Serialize for FuncMeta {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("FuncMeta", 8)?;
+        let mut st = serializer.serialize_struct("FuncMeta", 9)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("entry", &self.entry)?;
         st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
@@ -197,6 +203,7 @@ impl Serialize for FuncMeta {
         st.serialize_field("insns", &self.insns)?;
         st.serialize_field("calls", &self.calls)?;
         st.serialize_field("reasons", &self.reasons)?;
+        st.serialize_field("inferred_edges", &self.inferred_edges)?;
         st.end()
     }
 }
@@ -379,6 +386,8 @@ impl Project {
                         records: diagnostics,
                         truncated: meta.diagnostics_truncated,
                         omitted: meta.diagnostics_omitted,
+                        inferred_truncated: meta.inferred_truncated,
+                        inferred_omitted: meta.inferred_omitted,
                     },
                 )?;
                 Ok(Self {
@@ -463,6 +472,8 @@ impl Project {
             analysis_rev: Some(db::ANALYSIS_REVISION),
             diagnostics_truncated: self.analysis.diagnostics.truncated,
             diagnostics_omitted: self.analysis.diagnostics.omitted,
+            inferred_truncated: self.analysis.diagnostics.inferred_truncated,
+            inferred_omitted: self.analysis.diagnostics.inferred_omitted,
         }
     }
 
@@ -526,6 +537,8 @@ impl Project {
             diagnostics: self.analysis.diagnostics.records.len(),
             diagnostics_truncated: self.analysis.diagnostics.truncated,
             diagnostics_omitted: self.analysis.diagnostics.omitted,
+            inferred_truncated: self.analysis.diagnostics.inferred_truncated,
+            inferred_omitted: self.analysis.diagnostics.inferred_omitted,
             analysis_revision: crate::analysis::ANALYSIS_REVISION,
         }
     }
@@ -573,6 +586,8 @@ impl Project {
             "diagnostics": self.analysis.diagnostics.records.len(),
             "diagnostics_truncated": self.analysis.diagnostics.truncated,
             "diagnostics_omitted": self.analysis.diagnostics.omitted,
+            "inferred_truncated": self.analysis.diagnostics.inferred_truncated,
+            "inferred_omitted": self.analysis.diagnostics.inferred_omitted,
             "analysis_revision": crate::analysis::ANALYSIS_REVISION,
         }))
     }
@@ -932,6 +947,7 @@ impl Project {
             "containing_entry": entry, "containing_entry_hex": containing_hex,
             "name": self.function_name(entry),
             "blocks": blocks, "edges": f.edges(),
+            "inferred_edges": f.inferred_edges(),
             "calls": self.analysis.calls_of(entry),
         }))
     }
@@ -963,6 +979,7 @@ impl Project {
             insns: f.insn_count(),
             calls: self.analysis.calls_count(entry),
             reasons: f.reason_list(),
+            inferred_edges: f.inferred_edges().len(),
         })
     }
 
@@ -1075,7 +1092,7 @@ impl Project {
             .collect();
         let (_, entry_hex) = addr_pair(entry);
         Ok(
-            serde_json::json!({ "entry": entry, "entry_hex": entry_hex, "containing_entry": entry, "containing_entry_hex": entry_hex, "nodes": nodes, "edges": f.edges() }),
+            serde_json::json!({ "entry": entry, "entry_hex": entry_hex, "containing_entry": entry, "containing_entry_hex": entry_hex, "nodes": nodes, "edges": f.edges(), "inferred_edges": f.inferred_edges() }),
         )
     }
 
@@ -1407,7 +1424,8 @@ pub fn parse_addr(s: &str) -> Result<u64> {
     v.map_err(|_| Error::Invalid(format!("bad address: {s:?}")))
 }
 
-/// Parse an xref kind filter: `code`, `data`, or `string`.
+/// Parse an xref kind filter: `code`, `data`, `string`, or
+/// `inferred-code` (provenance-marked single-slot resolutions).
 ///
 /// # Errors
 /// [`Error::Invalid`] for anything else.
@@ -1416,6 +1434,7 @@ pub fn parse_xref_kind(s: &str) -> Result<XrefKind> {
         "code" => Ok(XrefKind::Code),
         "data" => Ok(XrefKind::Data),
         "string" => Ok(XrefKind::String),
+        "inferred-code" => Ok(XrefKind::InferredCode),
         _ => Err(Error::Invalid(format!("bad xref kind: {s:?}"))),
     }
 }
@@ -1548,6 +1567,8 @@ mod tests {
             ("code", XrefKind::Code),
             ("Data", XrefKind::Data),
             ("STRING", XrefKind::String),
+            ("inferred-code", XrefKind::InferredCode),
+            ("Inferred-Code", XrefKind::InferredCode),
         ] {
             assert_eq!(parse_xref_kind(s).expect("known kind"), want);
         }

@@ -40,11 +40,11 @@ use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
 ///
-/// Version 4 records discovery provenance and bounded diagnostics alongside
-/// the mapping-aware v3 snapshot, so same bytes opened under different
+/// Version 5 records inferred single-slot indirect-jump edges alongside
+/// the mapping-aware v4 snapshot, so same bytes opened under different
 /// raw options never share cached layouts and old snapshots re-analyze
 /// rather than synthesizing clean diagnostics.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -62,6 +62,8 @@ pub const MAX_SNAPSHOT_STRINGS: usize = 3_000_000;
 pub const MAX_SNAPSHOT_ANNOTATIONS: usize = 10_000;
 /// Cap on cached diagnostic rows (mirrors analysis [`MAX_DIAGNOSTICS`](crate::analysis::MAX_DIAGNOSTICS)).
 pub const MAX_SNAPSHOT_DIAGNOSTICS: usize = 100_000;
+/// Cap on cached inferred-edge rows (mirrors analysis [`MAX_INFERRED_EDGES`](crate::analysis::MAX_INFERRED_EDGES)).
+pub const MAX_SNAPSHOT_INFERRED_EDGES: usize = 100_000;
 /// Cap on one annotation name/comment in bytes.
 ///
 /// 8 KiB holds pasted stack traces while keeping a single row trivial.
@@ -317,6 +319,20 @@ pub struct BinaryMeta {
     /// [`BinaryMeta::diagnostics_truncated`].
     #[serde(default)]
     pub diagnostics_omitted: usize,
+    /// Whether indirect-jump resolution produced more inferred edges than
+    /// the project cap.
+    ///
+    /// Defaults to false so pre-v5 snapshots without the field still
+    /// decode; such snapshots never hit the cache (their schema version
+    /// mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub inferred_truncated: bool,
+    /// Inferred edges omitted by the project cap (zero unless truncated).
+    ///
+    /// Defaults to zero for pre-v5 snapshots; see
+    /// [`BinaryMeta::inferred_truncated`].
+    #[serde(default)]
+    pub inferred_omitted: usize,
 }
 
 fn default_supported() -> bool {
@@ -359,6 +375,14 @@ pub struct BlockRecord {
     pub insns: Vec<crate::analysis::InsnLayout>,
     /// Successor block starts.
     pub succs: Vec<u64>,
+    /// Inferred successor block starts from resolved single-slot indirect
+    /// jumps; direct successors stay in [`BlockRecord::succs`].
+    ///
+    /// Defaults to empty so rows written before inference still decode;
+    /// such snapshots never hit the cache (their analysis revision
+    /// mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub inferred_succs: Vec<u64>,
 }
 
 /// User annotation at one address: rename and/or free-text comment.
@@ -448,6 +472,13 @@ pub struct ProjectInfo {
     /// Diagnostics omitted by the record cap (zero unless truncated).
     #[serde(default)]
     pub diagnostics_omitted: usize,
+    /// Whether indirect-jump resolution produced more inferred edges than
+    /// the project cap (see [`crate::analysis::Diagnostics`]).
+    #[serde(default)]
+    pub inferred_truncated: bool,
+    /// Inferred edges omitted by the project cap (zero unless truncated).
+    #[serde(default)]
+    pub inferred_omitted: usize,
     /// Analysis revision the in-memory result was taken over (see
     /// [`crate::analysis::ANALYSIS_REVISION`]).
     #[serde(default)]
@@ -468,7 +499,7 @@ impl Serialize for ProjectInfo {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("ProjectInfo", 25)?;
+        let mut st = serializer.serialize_struct("ProjectInfo", 27)?;
         st.serialize_field("binary", &self.binary)?;
         st.serialize_field("db_path", &self.db_path)?;
         st.serialize_field("version", &self.version)?;
@@ -493,6 +524,8 @@ impl Serialize for ProjectInfo {
         st.serialize_field("diagnostics", &self.diagnostics)?;
         st.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
         st.serialize_field("diagnostics_omitted", &self.diagnostics_omitted)?;
+        st.serialize_field("inferred_truncated", &self.inferred_truncated)?;
+        st.serialize_field("inferred_omitted", &self.inferred_omitted)?;
         st.serialize_field("analysis_revision", &self.analysis_revision)?;
         st.end()
     }
@@ -548,6 +581,8 @@ impl Loaded {
                 records: self.diagnostics,
                 truncated: self.meta.diagnostics_truncated,
                 omitted: self.meta.diagnostics_omitted,
+                inferred_truncated: self.meta.inferred_truncated,
+                inferred_omitted: self.meta.inferred_omitted,
             },
         )
     }
@@ -591,6 +626,7 @@ fn xref_kind_name(kind: crate::analysis::XrefKind) -> &'static str {
         crate::analysis::XrefKind::Code => "code",
         crate::analysis::XrefKind::Data => "data",
         crate::analysis::XrefKind::String => "string",
+        crate::analysis::XrefKind::InferredCode => "inferred-code",
     }
 }
 
@@ -657,6 +693,16 @@ fn check_analysis_budgets(
     }
     if analysis.diagnostics.records.len() > MAX_SNAPSHOT_DIAGNOSTICS {
         return Err(Error::Limit("snapshot diagnostics exceed cap".to_string()));
+    }
+    let inferred: usize = analysis
+        .functions
+        .values()
+        .map(|f| f.inferred_edges().len())
+        .sum();
+    if inferred > MAX_SNAPSHOT_INFERRED_EDGES {
+        return Err(Error::Limit(
+            "snapshot inferred edges exceed cap".to_string(),
+        ));
     }
     let live = annotations.values().filter(|a| !a.is_empty()).count();
     if live > MAX_SNAPSHOT_ANNOTATIONS {
@@ -1058,6 +1104,7 @@ pub fn save(
                     end: b.end,
                     insns: b.insns.clone(),
                     succs: b.succs.clone(),
+                    inferred_succs: b.inferred_succs.clone(),
                 };
                 t.insert(block_key(f.entry, b.start), json(&rec)?)
                     .map_err(|e| Error::Storage(format!("write blocks: {e}")))?;
@@ -1179,6 +1226,7 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
     }
     let mut blocks_by_func: BTreeMap<u64, Vec<crate::analysis::BlockLayout>> = BTreeMap::new();
     let mut block_count: usize = 0;
+    let mut inferred_count: usize = 0;
     {
         let t = rtxn
             .open_table(BLOCKS)
@@ -1194,6 +1242,12 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
                 return Err(Error::Limit("snapshot blocks exceed cap".to_string()));
             }
             let rec: BlockRecord = decode(&raw)?;
+            inferred_count += rec.inferred_succs.len();
+            if inferred_count > MAX_SNAPSHOT_INFERRED_EDGES {
+                return Err(Error::Limit(
+                    "snapshot inferred edges exceed cap".to_string(),
+                ));
+            }
             blocks_by_func
                 .entry(rec.func_entry)
                 .or_default()
@@ -1202,6 +1256,7 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
                     end: rec.end,
                     insns: rec.insns,
                     succs: rec.succs,
+                    inferred_succs: rec.inferred_succs,
                 });
         }
     }

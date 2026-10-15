@@ -1160,7 +1160,7 @@ fn diagnostics_filters_and_cli_parity() {
     assert_eq!(info["diagnostics"], 3);
     assert_eq!(info["diagnostics_truncated"], false);
     assert_eq!(info["diagnostics_omitted"], 0);
-    assert_eq!(info["analysis_revision"], 2);
+    assert_eq!(info["analysis_revision"], 3);
 
     // Invalid kind, unparseable func, and gap func are tool errors.
     let lines = vec![

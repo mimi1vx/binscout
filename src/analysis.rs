@@ -29,7 +29,7 @@ use crate::disasm::{Arch, Insn};
 use crate::error::{Error, Result};
 use crate::ir::IrOp;
 use crate::loader::strings::{self, Encoding, StringHit};
-use crate::loader::{LoadedBinary, RawOptions, Section, Segment, load_raw};
+use crate::loader::{BinaryFormat, LoadedBinary, RawOptions, Section, Segment, load_raw};
 
 /// Cap on decoded instructions per [`analyze`] call.
 pub const MAX_TOTAL_INSNS: usize = 1_000_000;
@@ -44,7 +44,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 2;
+pub const ANALYSIS_REVISION: u32 = 3;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -52,6 +52,20 @@ pub const ANALYSIS_REVISION: u32 = 2;
 /// set; hard analysis budgets still
 /// return [`Error::Limit`].
 pub const MAX_DIAGNOSTICS: usize = 100_000;
+/// Cap on recovered single-slot indirect-jump edges per site.
+///
+/// The approved pattern is a singleton by construction (one slot holds one
+/// target), so a site yields at most one edge; the constant states that
+/// structural bound against the investigation's 1024/site ceiling
+/// (`1 <= 1024`).
+pub const MAX_INFERRED_PER_SITE: usize = 1;
+/// Cap on recovered single-slot indirect-jump edges per [`analyze`] call.
+///
+/// On exhaustion the site stays unresolved with its diagnostic retained and
+/// the excess is counted in [`Diagnostics::inferred_omitted`] with
+/// [`Diagnostics::inferred_truncated`] set, never silently clipped from the
+/// inferred graph.
+pub const MAX_INFERRED_EDGES: usize = 100_000;
 /// Query pages longer than this are truncated.
 pub const MAX_PAGE: usize = 1024;
 
@@ -64,6 +78,14 @@ pub enum XrefKind {
     Data,
     /// Reference into an extracted string.
     String,
+    /// Provenance-marked inferred code edge: a resolved single-slot
+    /// absolute indirect jump (`site -> target`). Direct edges stay
+    /// [`XrefKind::Code`]; counts jointly against the `Code` per-kind
+    /// budget so inferred rows cannot evade the cap by relabeling.
+    /// Wire form is kebab-case (`inferred-code`); the direct kinds keep
+    /// their historical CamelCase spelling.
+    #[serde(rename = "inferred-code")]
+    InferredCode,
 }
 
 /// One cross-reference: instruction at `from` refers to `to`.
@@ -246,6 +268,13 @@ pub struct Diagnostics {
     /// Records omitted by the [`MAX_DIAGNOSTICS`] cap (zero unless
     /// [`Diagnostics::truncated`]).
     pub omitted: usize,
+    /// Whether indirect-jump resolution produced more edges than
+    /// [`MAX_INFERRED_EDGES`].
+    pub inferred_truncated: bool,
+    /// Edges omitted by the [`MAX_INFERRED_EDGES`] cap (zero unless
+    /// [`Diagnostics::inferred_truncated`]); skipped sites stay unresolved
+    /// with their diagnostic retained.
+    pub inferred_omitted: usize,
 }
 
 impl Diagnostics {
@@ -272,12 +301,16 @@ impl Diagnostics {
                 records: sorted,
                 truncated: true,
                 omitted: omitted.saturating_add(excess),
+                inferred_truncated: false,
+                inferred_omitted: 0,
             }
         } else {
             Self {
                 records: sorted,
                 truncated,
                 omitted,
+                inferred_truncated: false,
+                inferred_omitted: 0,
             }
         }
     }
@@ -319,6 +352,11 @@ pub struct Function {
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
     cfg: DiGraphMap<u64, ()>,
+    /// Provenance-marked inferred block edges (`from_block -> to_block`)
+    /// from resolved single-slot indirect jumps. Direct edges stay in
+    /// `cfg` (see [`Function::edges`]); inferred edges never become
+    /// callgraph edges or new function entries.
+    inferred: BTreeSet<(u64, u64)>,
     /// How this entry was discovered, sorted and deduplicated.
     ///
     /// Evidence, not confidence: coexisting [`DiscoveryReason`]s record
@@ -346,9 +384,22 @@ impl Function {
     }
 
     /// All CFG edges as `(from_block, to_block)` pairs.
+    ///
+    /// Direct edges only; inferred single-slot resolutions live in
+    /// [`Function::inferred_edges`].
     #[must_use]
     pub fn edges(&self) -> Vec<(u64, u64)> {
         self.cfg.all_edges().map(|(a, b, _)| (a, b)).collect()
+    }
+
+    /// Inferred block edges as sorted `(from_block, to_block)` pairs.
+    ///
+    /// Provenance-marked single-slot indirect-jump resolutions, at most one
+    /// per site (see [`MAX_INFERRED_PER_SITE`]). Same-function only: these
+    /// never become callgraph edges or new function entries.
+    #[must_use]
+    pub fn inferred_edges(&self) -> Vec<(u64, u64)> {
+        self.inferred.iter().copied().collect()
     }
 
     /// Sorted, deduplicated discovery reasons.
@@ -360,8 +411,9 @@ impl Function {
     /// Rebuild a function from persisted rows (M5 redb round-trip).
     ///
     /// `edges` are `(from_block, to_block)` pairs within this function;
-    /// `reasons` may arrive in any order with duplicates and are stored
-    /// sorted and deduplicated.
+    /// `inferred` are the provenance-marked inferred pairs, replayed with
+    /// the same unknown-endpoint drop as `edges`. `reasons` may arrive in
+    /// any order with duplicates and are stored sorted and deduplicated.
     #[must_use]
     pub fn from_parts(
         entry: u64,
@@ -369,6 +421,7 @@ impl Function {
         blocks: BTreeMap<u64, BasicBlock>,
         edges: &[(u64, u64)],
         reasons: Vec<DiscoveryReason>,
+        inferred: &[(u64, u64)],
     ) -> Self {
         let mut cfg = DiGraphMap::new();
         for &start in blocks.keys() {
@@ -379,11 +432,18 @@ impl Function {
                 cfg.add_edge(a, b, ());
             }
         }
+        let mut inferred_set = BTreeSet::new();
+        for &(a, b) in inferred {
+            if blocks.contains_key(&a) && blocks.contains_key(&b) {
+                inferred_set.insert((a, b));
+            }
+        }
         Self {
             entry,
             name,
             blocks,
             cfg,
+            inferred: inferred_set,
             reasons: reasons.into_iter().collect(),
         }
     }
@@ -478,11 +538,15 @@ impl Analysis {
                 callgraph.add_edge(a, b, ());
             }
         }
-        let diagnostics = Diagnostics::collect(
+        let inferred_truncated = diagnostics.inferred_truncated;
+        let inferred_omitted = diagnostics.inferred_omitted;
+        let mut diagnostics = Diagnostics::collect(
             diagnostics.records,
             diagnostics.truncated,
             diagnostics.omitted,
         );
+        diagnostics.inferred_truncated = inferred_truncated;
+        diagnostics.inferred_omitted = inferred_omitted;
         Self {
             arch,
             functions,
@@ -514,6 +578,14 @@ pub struct BlockLayout {
     pub insns: Vec<InsnLayout>,
     /// Successor block starts.
     pub succs: Vec<u64>,
+    /// Inferred successor block starts from resolved single-slot indirect
+    /// jumps; direct successors stay in [`BlockLayout::succs`].
+    ///
+    /// Defaults to empty so layouts written before inference still decode;
+    /// such snapshots never hit the cache (their analysis revision
+    /// mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub inferred_succs: Vec<u64>,
 }
 
 /// Persisted instruction boundary: address plus byte length.
@@ -571,11 +643,19 @@ pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
                             size: i.size,
                         })
                         .collect();
+                    let mut inferred_succs: Vec<u64> = f
+                        .inferred_edges()
+                        .into_iter()
+                        .filter(|(a, _)| *a == b.start)
+                        .map(|(_, t)| t)
+                        .collect();
+                    inferred_succs.sort_unstable();
                     BlockLayout {
                         start: b.start,
                         end: b.end(),
                         insns,
                         succs,
+                        inferred_succs,
                     }
                 })
                 .collect();
@@ -635,6 +715,7 @@ pub fn rebuild(
     for f in functions {
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
         let mut edges: Vec<(u64, u64)> = Vec::new();
+        let mut inferred: Vec<(u64, u64)> = Vec::new();
         for b in &f.blocks {
             let len = b.end.wrapping_sub(b.start);
             ranged = ranged
@@ -648,10 +729,18 @@ pub fn rebuild(
                 })?;
             blocks.insert(b.start, decode_block(arch, &space, b)?);
             edges.extend(b.succs.iter().map(|s| (b.start, *s)));
+            inferred.extend(b.inferred_succs.iter().map(|s| (b.start, *s)));
         }
         rebuilt.insert(
             f.entry,
-            Function::from_parts(f.entry, f.name.clone(), blocks, &edges, f.reasons.clone()),
+            Function::from_parts(
+                f.entry,
+                f.name.clone(),
+                blocks,
+                &edges,
+                f.reasons.clone(),
+                &inferred,
+            ),
         );
     }
     Ok(Analysis::from_parts(
@@ -1139,6 +1228,32 @@ impl<'a> AddrSpace<'a> {
         seg.data.get(off..)
     }
 
+    /// Exactly `len` file-backed bytes at `va` within a single segment, if
+    /// any.
+    ///
+    /// Data slots live outside executable segments, so unlike
+    /// [`AddrSpace::code_bytes`] every segment is eligible; unlike
+    /// `bytes_at` this never zero-pads. BSS/zero-fill tails, truncated
+    /// tables, and cross-segment spans report `None` so the single-slot
+    /// resolver rejects them instead of reading phantom bytes.
+    fn file_bytes_at(&self, va: u64, len: usize) -> Option<&'a [u8]> {
+        for seg in &self.all {
+            let Some(off) = va.checked_sub(seg.vaddr) else {
+                continue;
+            };
+            let Ok(off) = usize::try_from(off) else {
+                continue;
+            };
+            let Some(end) = off.checked_add(len) else {
+                continue;
+            };
+            if end <= seg.data.len() {
+                return seg.data.get(off..end);
+            }
+        }
+        None
+    }
+
     /// Whether `va` lies in any loaded segment (backed or zero-fill).
     fn contains(&self, va: u64) -> bool {
         Self::seg_at(&self.all, va).is_some()
@@ -1561,6 +1676,154 @@ pub fn function_owner(entries: &[u64], va: u64) -> u64 {
     }
 }
 
+/// Recovered single-slot indirect-jump resolutions: `(site, target)` pairs
+/// in ascending site order plus explicit cap accounting.
+struct InferredJumps {
+    /// Resolved `(site, target)` pairs, at most one per site.
+    pairs: Vec<(u64, u64)>,
+    /// Whether the edge budget cut resolution short.
+    truncated: bool,
+    /// Sites skipped by the edge budget (each keeps its diagnostic).
+    omitted: usize,
+}
+
+/// Check one `UnresolvedIndirectJump` site against the single-slot absolute
+/// indirect-jump pattern, returning its target when every check passes.
+///
+/// All evidence is typed decoder facts, never operand text. Rejections:
+/// - R1: `insn.mnem == "jmp"` with a `Branch { None }` lift (excludes
+///   immediate-reporting `mov`/`push`, calls, and predicated forms).
+/// - R2: `branch_target` is `None` (direct jumps never reach this set).
+/// - R3: `mem_target == Some(slot)` (excludes indexed/multi-entry and
+///   register-indirect shapes, which report no typed slot).
+/// - R4: raw mappings only (container and LE slot values are not known
+///   final: relocations are never applied to segment bytes).
+/// - R5: the arch-width slot bytes are fully file-backed in one segment
+///   (excludes truncated slots, BSS tails, and cross-segment spans; a
+///   `Data` xref via `contains` is necessary but not sufficient here).
+/// - R6: the little-endian slot value lies in executable file-backed bytes.
+/// - R7: those bytes decode via `disasm_first`.
+/// - R8: the target attributes to the site's function under the Pass-A
+///   entry set (same-function only: no new entries, no callgraph edges).
+///
+/// Slot width is the arch pointer width (4 for x86-32, 8 for x86-64); other
+/// arches have no approved shape and are rejected outright.
+fn resolve_indirect_site(
+    arch: Arch,
+    format: BinaryFormat,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<u64> {
+    let found = decoded.get(&site)?;
+    if found.insn.mnem != "jmp" {
+        return None;
+    }
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    if found.insn.branch_target.is_some() {
+        return None;
+    }
+    let slot = found.insn.mem_target?;
+    let width: usize = match arch {
+        Arch::X86_32 => 4,
+        Arch::X86_64 => 8,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+    };
+    if format != BinaryFormat::Raw {
+        return None;
+    }
+    let raw = space.file_bytes_at(slot, width)?;
+    let target = match width {
+        4 => u64::from(u32::from_le_bytes(raw.try_into().ok()?)),
+        _ => u64::from_le_bytes(raw.try_into().ok()?),
+    };
+    let target_bytes = space.code_bytes(target)?;
+    if !matches!(
+        crate::disasm::disasm_first(arch, target_bytes, target),
+        Ok(Some(_))
+    ) {
+        return None;
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    if function_owner(entries, target) != function_owner(entries, site) {
+        return None;
+    }
+    Some(target)
+}
+
+/// Resolve single-slot absolute indirect jumps over the walker's
+/// `UnresolvedIndirectJump` sites in ascending address order.
+///
+/// Each site is checked once via [`resolve_indirect_site`]; a pass decodes
+/// the target's continuation with the existing [`Walker::run`] (so case
+/// bodies decode normally) and registers the target for block splitting.
+/// Continuation decoding can surface further indirect sites, which join the
+/// same ascending pass. At most one edge per site
+/// ([`MAX_INFERRED_PER_SITE`], singleton by construction); past
+/// `max_edges` (normally [`MAX_INFERRED_EDGES`]) sites stay unresolved
+/// with `truncated` set and each omission counted, never silently clipped.
+///
+/// # Errors
+/// [`Error::Limit`] when continuation decoding exceeds the analysis
+/// instruction budget (hard budgets stay errors, as in [`Walker::run`]).
+fn resolve_indirect_jumps(
+    walk: &mut Walker,
+    arch: Arch,
+    format: BinaryFormat,
+    space: &AddrSpace,
+    entries: &[u64],
+    max_edges: usize,
+) -> Result<InferredJumps> {
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    let mut processed: BTreeSet<u64> = BTreeSet::new();
+    let mut truncated = false;
+    let mut omitted: usize = 0;
+    while let Some(site) = walk
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.kind == DiagnosticKind::UnresolvedIndirectJump && !processed.contains(&d.addr)
+        })
+        .map(|d| d.addr)
+        .next()
+    {
+        // Each site contributes at most one pair: the check returns an
+        // `Option`, and the processed set keeps sites single-visit.
+        debug_assert!(processed.insert(site));
+        if let Some(target) =
+            resolve_indirect_site(arch, format, space, &walk.decoded, entries, site)
+        {
+            if pairs.len() >= max_edges {
+                truncated = true;
+                omitted += 1;
+                continue;
+            }
+            pairs.push((site, target));
+            walk.run(vec![target])?;
+            walk.jump_targets.insert(target);
+        }
+    }
+    // Singleton by construction: one `Option` per site, one visit per site.
+    debug_assert_eq!(
+        pairs
+            .iter()
+            .map(|(site, _)| site)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        pairs.len()
+    );
+    Ok(InferredJumps {
+        pairs,
+        truncated,
+        omitted,
+    })
+}
+
 /// Index over string spans preserving the linear scan's first-match rule.
 ///
 /// Holds `(start, exclusive end)` spans sorted ascending by start, with ends
@@ -1643,17 +1906,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
     let seeds2 = prologue_seeds(arch, &space, &round1)?;
     walk.run(seeds2.clone())?;
-    let Walker {
-        decoded,
-        jump_targets,
-        fallthroughs,
-        call_targets,
-        diagnostics: diagnostic_set,
-        ..
-    } = walk;
-    let diagnostics = Diagnostics::collect(diagnostic_set.into_iter().collect(), false, 0);
 
-    if decoded.is_empty() {
+    if walk.decoded.is_empty() {
+        let diagnostics = Diagnostics::collect(walk.diagnostics.into_iter().collect(), false, 0);
         return Ok(Analysis {
             arch,
             functions: BTreeMap::new(),
@@ -1669,17 +1924,17 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // holds prologue matches outside round-one code.
     let mut entries: BTreeSet<u64> = BTreeSet::new();
     for s in seeds1.iter().chain(seeds2.iter()) {
-        if decoded.contains_key(s) {
+        if walk.decoded.contains_key(s) {
             entries.insert(*s);
         }
     }
-    for t in &call_targets {
-        if decoded.contains_key(t) {
+    for t in &walk.call_targets {
+        if walk.decoded.contains_key(t) {
             entries.insert(*t);
         }
     }
     if entries.is_empty()
-        && let Some((&first, _)) = decoded.iter().next()
+        && let Some((&first, _)) = walk.decoded.iter().next()
     {
         entries.insert(first);
     }
@@ -1703,7 +1958,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         if export_addrs.contains(e) {
             r.insert(DiscoveryReason::Export);
         }
-        if call_targets.contains(e) {
+        if walk.call_targets.contains(e) {
             r.insert(DiscoveryReason::DirectCall);
         }
         if seeds2_set.contains(e) {
@@ -1719,6 +1974,26 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     let entry_list: Vec<u64> = entries.iter().copied().collect();
     let owner = |va: u64| -> u64 { function_owner(&entry_list, va) };
+
+    // Pass A2: resolve single-slot absolute indirect jumps (raw x86 only).
+    // Entries are fixed above so the resolver can check same-function
+    // attribution without creating entries; resolved targets decode next
+    // via the walker's continuation and join block splitting below.
+    let jumps = resolve_indirect_jumps(
+        &mut walk,
+        arch,
+        bin.format,
+        &space,
+        &entry_list,
+        MAX_INFERRED_EDGES,
+    )?;
+    let Walker {
+        decoded,
+        jump_targets,
+        fallthroughs,
+        diagnostics: mut diagnostic_set,
+        ..
+    } = walk;
 
     // Pass B: split decoded runs into blocks at seeds, targets, fallthroughs.
     let mut starts: BTreeSet<u64> = BTreeSet::new();
@@ -1774,6 +2049,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
                 name: names.get(e).cloned(),
                 blocks: BTreeMap::new(),
                 cfg: DiGraphMap::new(),
+                inferred: BTreeSet::new(),
                 reasons: reasons.remove(e).unwrap_or_default(),
             },
         );
@@ -1786,6 +2062,44 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
     }
     functions.retain(|_, f| !f.blocks.is_empty());
+
+    // Inferred edges: attribute each resolved `(site, target)` to its
+    // site/target blocks, recording the edge only when attribution confirms
+    // the same function. Anything else (including a target whose block
+    // landed elsewhere) rolls back to unresolved: no edge, no xref, and the
+    // site keeps its diagnostic.
+    let mut block_func: BTreeMap<u64, u64> = BTreeMap::new();
+    for (entry, f) in &functions {
+        for start in f.blocks.keys() {
+            block_func.insert(*start, *entry);
+        }
+    }
+    let mut resolved_sites: BTreeSet<u64> = BTreeSet::new();
+    for (site, target) in &jumps.pairs {
+        // Blocks partition decoded addresses across functions, so the site
+        // sits in exactly one block; the target is a block start by
+        // construction (it joined `jump_targets` before Pass B).
+        let mut hit: Option<(u64, u64)> = None;
+        for (entry, f) in &functions {
+            if let Some((&start, b)) = f.blocks.range(..=*site).next_back()
+                && *site < b.end()
+            {
+                hit = Some((*entry, start));
+                break;
+            }
+        }
+        match (hit, block_func.get(target)) {
+            (Some((func, site_block)), Some(target_func)) if func == *target_func => {
+                functions
+                    .get_mut(&func)
+                    .expect("function retained")
+                    .inferred
+                    .insert((site_block, *target));
+                resolved_sites.insert(*site);
+            }
+            _ => {}
+        }
+    }
 
     let mut callgraph = DiGraphMap::<u64, ()>::new();
     for e in functions.keys() {
@@ -1855,6 +2169,8 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // Pass D: xrefs. Code from direct branch/call targets, data from
     // PC-relative accesses and x86-32 absolute immediates/displacements
     // into a segment, string refs where data lands in a recovered string.
+    // Inferred edges add one provenance-marked `InferredCode` xref per
+    // resolved site; the site's `Data` slot xref above is retained.
     let mut xrefs: BTreeSet<(u64, XrefKind, u64)> = BTreeSet::new();
     for (&va, d) in &decoded {
         let target = match d.flow {
@@ -1868,6 +2184,11 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             && space.contains(m)
         {
             xrefs.insert((va, XrefKind::Data, m));
+        }
+    }
+    for (site, target) in &jumps.pairs {
+        if resolved_sites.contains(site) {
+            xrefs.insert((*site, XrefKind::InferredCode, *target));
         }
     }
     let mut strings: Vec<StringHit> = Vec::new();
@@ -1912,13 +2233,37 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         .into_iter()
         .map(|(from, kind, to)| Xref { from, to, kind })
         .collect();
-    for kind in [XrefKind::Code, XrefKind::Data, XrefKind::String] {
+    // Inferred rows count jointly against the `Code` budget so they cannot
+    // evade the cap by relabeling; hard budgets stay [`Error::Limit`].
+    let code_like = xrefs
+        .iter()
+        .filter(|x| matches!(x.kind, XrefKind::Code | XrefKind::InferredCode))
+        .count();
+    if code_like > MAX_XREFS_PER_KIND {
+        return Err(Error::Limit(format!(
+            "more than {MAX_XREFS_PER_KIND} {:?} xrefs",
+            XrefKind::Code
+        )));
+    }
+    for kind in [XrefKind::Data, XrefKind::String] {
         if xrefs.iter().filter(|x| x.kind == kind).count() > MAX_XREFS_PER_KIND {
             return Err(Error::Limit(format!(
                 "more than {MAX_XREFS_PER_KIND} {kind:?} xrefs"
             )));
         }
     }
+
+    // Resolved sites leave the diagnostics set; failed and skipped sites
+    // keep theirs.
+    for site in &resolved_sites {
+        diagnostic_set.remove(&Diagnostic {
+            addr: *site,
+            kind: DiagnosticKind::UnresolvedIndirectJump,
+        });
+    }
+    let mut diagnostics = Diagnostics::collect(diagnostic_set.into_iter().collect(), false, 0);
+    diagnostics.inferred_truncated = jumps.truncated;
+    diagnostics.inferred_omitted = jumps.omitted;
 
     Ok(Analysis {
         arch,
@@ -2192,6 +2537,82 @@ mod tests {
         assert_eq!(got, [vaddr, u64::MAX]);
         let want = oracle_seeds(Arch::X86_64, &space, &reached).expect("oracle");
         assert_eq!(got, want);
+    }
+
+    /// Drive Pass A plus entry computation over `bytes`, then resolve with
+    /// an explicit edge budget. Mirrors [`analyze`] without block building.
+    fn run_inferred_cap(
+        bytes: &[u8],
+        max_edges: usize,
+    ) -> (Vec<(u64, u64)>, bool, usize, Vec<u64>) {
+        let bin = load_raw(
+            bytes,
+            RawOptions {
+                base: 0x1000,
+                arch: Arch::X86_32,
+                entry: Some(0x1000),
+            },
+        )
+        .expect("raw loads");
+        let space = AddrSpace::new(&bin);
+        let mut walk = Walker::new(Arch::X86_32, &space);
+        let seeds = authoritative_seeds(&space, &bin);
+        walk.run(seeds.clone()).expect("round one walks");
+        let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
+        let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");
+        walk.run(seeds2.clone()).expect("round two walks");
+        let mut entries: BTreeSet<u64> = BTreeSet::new();
+        for s in seeds.iter().chain(seeds2.iter()) {
+            if walk.decoded.contains_key(s) {
+                entries.insert(*s);
+            }
+        }
+        let targets: Vec<u64> = walk.call_targets.iter().copied().collect();
+        for t in targets {
+            if walk.decoded.contains_key(&t) {
+                entries.insert(t);
+            }
+        }
+        let entry_list: Vec<u64> = entries.into_iter().collect();
+        let jumps = resolve_indirect_jumps(
+            &mut walk,
+            Arch::X86_32,
+            BinaryFormat::Raw,
+            &space,
+            &entry_list,
+            max_edges,
+        )
+        .expect("resolution walks");
+        (jumps.pairs, jumps.truncated, jumps.omitted, entry_list)
+    }
+
+    #[test]
+    fn inferred_cap_reports_omissions_without_clipping() {
+        // Two Pass-A-visible single-slot sites (x86-32, 27 bytes): the
+        // entry calls 0x1010, each site jumps through its own slot at a
+        // same-function ret.
+        let bytes = vec![
+            0xE8, 0x0B, 0x00, 0x00, 0x00, // 0x1000: call 0x1010
+            0xFF, 0x25, 0x0B, 0x10, 0x00, 0x00, // 0x1005: jmp [0x100b]
+            0x0F, 0x10, 0x00, 0x00, // 0x100b: dd 0x100f
+            0xC3, // 0x100f: ret
+            0xFF, 0x25, 0x16, 0x10, 0x00, 0x00, // 0x1010: jmp [0x1016]
+            0x1A, 0x10, 0x00, 0x00, // 0x1016: dd 0x101a
+            0xC3, // 0x101a: ret
+        ];
+        assert_eq!(bytes.len(), 27);
+        // A budget of one resolves the first site and counts the skip
+        // explicitly; the skipped site is left for the caller unresolved.
+        let (pairs, truncated, omitted, entries) = run_inferred_cap(&bytes, 1);
+        assert_eq!(entries, [0x1000, 0x1010]);
+        assert_eq!(pairs, [(0x1005, 0x100F)]);
+        assert!(truncated);
+        assert_eq!(omitted, 1);
+        // A full budget resolves both with clean accounting.
+        let (pairs, truncated, omitted, _) = run_inferred_cap(&bytes, MAX_INFERRED_EDGES);
+        assert_eq!(pairs, [(0x1005, 0x100F), (0x1010, 0x101A)]);
+        assert!(!truncated);
+        assert_eq!(omitted, 0);
     }
 
     #[test]

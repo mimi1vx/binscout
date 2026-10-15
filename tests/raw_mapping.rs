@@ -257,6 +257,8 @@ fn mapping_conflict_with_annotations_errors_without_writes() {
         analysis_rev: Some(db::ANALYSIS_REVISION),
         diagnostics_truncated: q.analysis().diagnostics.truncated,
         diagnostics_omitted: q.analysis().diagnostics.omitted,
+        inferred_truncated: q.analysis().diagnostics.inferred_truncated,
+        inferred_omitted: q.analysis().diagnostics.inferred_omitted,
     };
     let err = db::save(&hog, &meta, q.analysis(), q.annotations()).unwrap_err();
     assert!(

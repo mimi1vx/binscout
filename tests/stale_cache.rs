@@ -153,6 +153,8 @@ fn hit_loads_cached_snapshot() {
                         records: hit.diagnostics,
                         truncated: hit.meta.diagnostics_truncated,
                         omitted: hit.meta.diagnostics_omitted,
+                        inferred_truncated: hit.meta.inferred_truncated,
+                        inferred_omitted: hit.meta.inferred_omitted,
                     },
                 )
                 .expect("rebuild");
@@ -360,6 +362,8 @@ fn healthy_stale_carries_annotations_matches_fresh_and_never_saves() {
                 records: stored.diagnostics,
                 truncated: stored.meta.diagnostics_truncated,
                 omitted: stored.meta.diagnostics_omitted,
+                inferred_truncated: stored.meta.inferred_truncated,
+                inferred_omitted: stored.meta.inferred_omitted,
             },
         )
         .expect("rebuild");

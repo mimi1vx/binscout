@@ -353,13 +353,15 @@ fn compact_meta_has_no_unbounded_arrays() {
             "blocks",
             "insns",
             "calls",
-            "reasons"
+            "reasons",
+            "inferred_edges"
         ]),
         "compact metadata carries counts plus the reason set only"
     );
     assert!(obj["blocks"].is_number());
     assert!(obj["insns"].is_number());
     assert!(obj["calls"].is_number());
+    assert!(obj["inferred_edges"].is_number());
     assert_eq!(obj["entry_hex"], "0x1000");
     assert!(
         obj["reasons"].is_array(),
