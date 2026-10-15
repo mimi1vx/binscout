@@ -1793,7 +1793,8 @@ fn resolve_indirect_jumps(
     {
         // Each site contributes at most one pair: the check returns an
         // `Option`, and the processed set keeps sites single-visit.
-        debug_assert!(processed.insert(site));
+        let inserted = processed.insert(site);
+        debug_assert!(inserted);
         if let Some(target) =
             resolve_indirect_site(arch, format, space, &walk.decoded, entries, site)
         {
