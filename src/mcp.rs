@@ -240,7 +240,7 @@ pub struct XrefsParams {
     pub to: Option<String>,
     /// Only xrefs originating at this address.
     pub from: Option<String>,
-    /// Only `code`, `data`, or `string` xrefs.
+    /// Only `code`, `data`, `string`, or `inferred-code` xrefs.
     pub kind: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
