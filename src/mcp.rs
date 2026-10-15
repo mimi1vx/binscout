@@ -1,4 +1,4 @@
-//! binscout MCP server: 23 stateless tools over [`Project`].
+//! binscout MCP server: 24 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as

@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 23 tools, and call every one against fixtures.
+//! list the 24 tools, and call every one against fixtures.
 
 mod common;
 
@@ -134,7 +134,7 @@ fn handshake_lists_twenty_three_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 23 tools"
+        "exactly the 24 tools"
     );
     let search = tools
         .iter()
