@@ -1,3 +1,5 @@
 /target
 docs/book/book/
 *.rsdbg.redb
+# Local manual LE oracle corpus (untracked); hermetic tests use tests/fixtures builders
+_testdata/
