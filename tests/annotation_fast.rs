@@ -242,6 +242,8 @@ fn fresh_db_bootstraps_full_snapshot() {
             entry: info.entry,
             supported: true,
             reason: None,
+            mapping: Some(probe.mapping().clone()),
+            analysis_rev: Some(db::ANALYSIS_REVISION),
         };
         let ann = Annotation {
             name: Some("probe".to_string()),

@@ -14,15 +14,17 @@
 //! [`save`] rewrites every table in one transaction; [`load`] rebuilds the
 //! skeleton [`Loaded`] snapshot and the caller re-decodes instructions via
 //! [`Analysis::rebuild`](crate::analysis::rebuild), returning stored
-//! annotations untouched. [`load_cached`] filters by
-//! content hash in one read transaction: matching snapshots load the
-//! skeleton fully, stale ones (different hash, or an older schema version)
-//! return metadata plus annotations without decoding the
-//! discarded derived rows (see its stale-cache policy). Callers detect a
-//! changed binary by comparing [`content_hash`] against
-//! [`BinaryMeta::content_hash`]: re-analysis runs, annotations carry over by
-//! address, and only an explicit [`save`] writes — the analyzed binary
-//! itself is only ever read.
+//! annotations untouched. [`load_cached`] filters by content hash, loader
+//! mapping, and analysis revision in one read transaction: matching
+//! snapshots load the skeleton fully, stale ones (different hash, mapping,
+//! revision, or an older schema version) return metadata plus annotations
+//! without decoding the discarded derived rows (see its stale-cache
+//! policy). A mapping mismatch over a populated annotation sidecar errors
+//! with a separate-DB message instead of reusing layouts or remapping
+//! annotations. Callers detect a changed binary by comparing
+//! [`content_hash`] against [`BinaryMeta::content_hash`]: re-analysis runs,
+//! same-mapping annotations carry over by address, and only an explicit
+//! [`save`] writes — the analyzed binary itself is only ever read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,7 +39,16 @@ use crate::loader::BinaryFormat;
 use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 records the effective loader mapping plus the analysis
+/// revision in every snapshot, so same bytes opened under different
+/// raw options never share cached layouts.
+pub const SCHEMA_VERSION: u32 = 3;
+/// Revision of the analysis engine covered by cached snapshots.
+///
+/// Re-exported from [`crate::analysis`] so cache identity has one source:
+/// a stored revision mismatch re-analyzes instead of replaying layouts.
+pub use crate::analysis::ANALYSIS_REVISION;
 /// Cap on cached function rows (mirrors analysis [`MAX_FUNCTIONS`](crate::analysis::MAX_FUNCTIONS)).
 pub const MAX_SNAPSHOT_FUNCTIONS: usize = 100_000;
 /// Cap on cached block rows (blocks never exceed decoded instructions).
@@ -175,6 +186,80 @@ pub fn parse_format(s: &str) -> Result<BinaryFormat> {
     }
 }
 
+/// Effective loader configuration recorded in a snapshot.
+///
+/// `Auto` means the binary was opened without explicit raw options
+/// (container parse with raw x86-64-at-0 fallback for unrecognized bytes).
+/// `Explicit` records the caller-supplied raw mapping. Auto and explicit
+/// never alias, even when the effective bytes coincide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum StoredMapping {
+    /// Opened without explicit raw options.
+    Auto,
+    /// Opened with explicit raw `arch`/`base`/`entry`.
+    Explicit {
+        /// Canonical arch string (see [`arch_name`]).
+        arch: String,
+        /// Virtual address of the first byte.
+        base: u64,
+        /// Entry-point address, if supplied.
+        entry: Option<u64>,
+    },
+}
+
+impl StoredMapping {
+    /// Mapping identity for an open request (`None` = auto detection).
+    #[must_use]
+    pub fn for_request(raw: Option<crate::loader::RawOptions>) -> Self {
+        match raw {
+            None => Self::Auto,
+            Some(opts) => Self::Explicit {
+                arch: arch_name(opts.arch).to_string(),
+                base: opts.base,
+                entry: opts.entry,
+            },
+        }
+    }
+
+    /// One-line description for mapping-conflict errors.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::Explicit { arch, base, entry } => match entry {
+                Some(e) => format!("explicit raw {arch} base {base:#x} entry {e:#x}"),
+                None => format!("explicit raw {arch} base {base:#x}"),
+            },
+        }
+    }
+}
+
+/// Mapping-conflict error: the sidecar holds `stored_count` live
+/// annotation(s) under `stored`, but the current open requests `expected`.
+///
+/// Annotations are never remapped across address spaces; the caller must
+/// open with a separate `--db PATH` for this mapping.
+fn mapping_conflict(
+    stored: &StoredMapping,
+    stored_count: usize,
+    expected: &StoredMapping,
+) -> Error {
+    Error::Storage(format!(
+        "mapping mismatch: project db holds {stored_count} annotation(s) under {}, but current open requests {}; use a separate --db PATH for this mapping (annotations are never remapped)",
+        stored.describe(),
+        expected.describe(),
+    ))
+}
+
+/// Legacy-ambiguous error: a pre-mapping snapshot holds annotations whose
+/// address space cannot be established, so no mapping can safely reuse it.
+fn legacy_ambiguous(stored_count: usize, version: u32) -> Error {
+    Error::Storage(format!(
+        "mapping mismatch: project db holds {stored_count} annotation(s) under an unknown legacy mapping (schema v{version}); use a separate --db PATH for this mapping (annotations are never remapped)"
+    ))
+}
+
 /// What binary a snapshot was taken over; row 0 of the `binaries` table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryMeta {
@@ -202,6 +287,19 @@ pub struct BinaryMeta {
     /// Why `supported` is false, if so.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Effective loader mapping the snapshot was taken over.
+    ///
+    /// `None` marks a pre-v3 snapshot whose mapping cannot be established;
+    /// such snapshots are rebuilt, never trusted, and require a separate DB
+    /// when they hold annotations.
+    #[serde(default)]
+    pub mapping: Option<StoredMapping>,
+    /// Analysis revision the snapshot was taken over.
+    ///
+    /// `None` marks a pre-v3 snapshot; a mismatch re-analyzes while
+    /// carrying same-mapping annotations forward.
+    #[serde(default)]
+    pub analysis_rev: Option<u32>,
 }
 
 fn default_supported() -> bool {
@@ -501,6 +599,30 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
     }
 }
 
+/// Count live (non-empty) annotation rows inside a write transaction.
+///
+/// Used by writers to decide whether overwriting a mapping-incompatible
+/// snapshot would drop user data. Corrupt rows error rather than reading
+/// as empty.
+fn live_annotations_in_wtxn(wtxn: &redb::WriteTransaction) -> Result<usize> {
+    let t = wtxn
+        .open_table(ANNOTATIONS)
+        .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
+    let mut live = 0usize;
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read annotations: {e}")))?
+    {
+        let (_, v) = row.map_err(|e| Error::Storage(format!("read annotations: {e}")))?;
+        let ann: Annotation = decode(&v.value())?;
+        check_annotation_text(&ann)?;
+        if !ann.is_empty() {
+            live += 1;
+        }
+    }
+    Ok(live)
+}
+
 /// Outcome of [`save_annotation`]: whether the single-row fast path applied.
 ///
 /// [`AnnotationSave::Fast`] means only the `annotations` table changed;
@@ -521,14 +643,18 @@ pub enum AnnotationSave {
 /// on a snapshot written for different bytes by another process. On match,
 /// inserts (`Some` non-empty) or deletes (`None`/empty) only that row and
 /// commits; the `functions`/`blocks`/`xrefs`/`strings` tables are never
-/// opened for writing. On a fresh DB or any metadata mismatch, aborts
-/// without writing and returns [`AnnotationSave::NeedsFull`]. Never touches
-/// the analyzed binary.
+/// opened for writing. On a fresh DB or any content/revision mismatch under
+/// the same mapping, aborts without writing and returns
+/// [`AnnotationSave::NeedsFull`]. A populated sidecar under an incompatible
+/// mapping (or an ambiguous legacy mapping) errors instead of returning
+/// `NeedsFull`, so a single-row write never migrates annotations across
+/// address spaces. Never touches the analyzed binary.
 ///
 /// # Errors
 /// [`Error::Limit`] when the annotation text exceeds
 /// [`MAX_ANNOTATION_BYTES`], [`Error::Storage`] on any `redb` or encoding
-/// failure (including write contention with another process).
+/// failure (including write contention with another process) and on
+/// mapping conflicts holding live annotations.
 pub fn save_annotation(
     db: &Database,
     meta: &BinaryMeta,
@@ -569,6 +695,17 @@ pub fn save_annotation(
             return Ok(AnnotationSave::NeedsFull);
         };
         let persisted: BinaryMeta = decode(&row.value())?;
+        if persisted.mapping != meta.mapping {
+            let live = live_annotations_in_wtxn(&wtxn)?;
+            if live > 0 {
+                let expected = meta.mapping.clone().unwrap_or(StoredMapping::Auto);
+                match persisted.mapping {
+                    Some(stored) => return Err(mapping_conflict(&stored, live, &expected)),
+                    None => return Err(legacy_ambiguous(live, persisted.version)),
+                }
+            }
+            return Ok(AnnotationSave::NeedsFull);
+        }
         if persisted != *meta {
             return Ok(AnnotationSave::NeedsFull);
         }
@@ -593,17 +730,68 @@ pub fn save_annotation(
     Ok(AnnotationSave::Fast)
 }
 
+/// Refuse to overwrite a populated snapshot under an incompatible mapping.
+///
+/// Reads the existing `binaries` row plus live annotations inside the same
+/// write transaction the caller will commit, so a concurrent mapping change
+/// cannot slip past the check. A fresh DB (no version marker or binary row)
+/// never conflicts; an incompatible or ambiguous legacy mapping with live
+/// annotations errors, while an empty sidecar overwrites freely.
+fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) -> Result<()> {
+    let version: Option<String> = {
+        let t = wtxn
+            .open_table(META)
+            .map_err(|e| Error::Storage(format!("open meta: {e}")))?;
+        t.get("version")
+            .map_err(|e| Error::Storage(format!("read meta: {e}")))?
+            .map(|v| v.value())
+    };
+    let Some(_) = version else {
+        return Ok(());
+    };
+    let persisted: Option<BinaryMeta> = {
+        let t = wtxn
+            .open_table(BINARIES)
+            .map_err(|e| Error::Storage(format!("open binaries: {e}")))?;
+        match t
+            .get(0u64)
+            .map_err(|e| Error::Storage(format!("read binaries: {e}")))?
+        {
+            Some(row) => Some(decode(&row.value())?),
+            None => None,
+        }
+    };
+    let Some(persisted) = persisted else {
+        return Ok(());
+    };
+    if persisted.mapping == meta.mapping {
+        return Ok(());
+    }
+    let live = live_annotations_in_wtxn(wtxn)?;
+    if live == 0 {
+        return Ok(());
+    }
+    let expected = meta.mapping.clone().unwrap_or(StoredMapping::Auto);
+    match persisted.mapping {
+        Some(stored) => Err(mapping_conflict(&stored, live, &expected)),
+        None => Err(legacy_ambiguous(live, persisted.version)),
+    }
+}
+
 /// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
 ///
 /// Clears all seven tables first so a smaller re-analysis leaves no stale
 /// rows. Row counts are checked against the snapshot budgets before
 /// committing, so a snapshot that [`load`] could not read back is never
 /// written. Only block layouts persist; instructions re-decode on open.
-/// Never touches the analyzed binary.
+/// Never touches the analyzed binary. Overwriting a populated sidecar under
+/// an incompatible (or ambiguous legacy) mapping errors instead of dropping
+/// annotations; use a separate DB path for the new mapping.
 ///
 /// # Errors
 /// [`Error::Limit`] when row budgets are exceeded,
-/// [`Error::Storage`] on any `redb` or encoding failure.
+/// [`Error::Storage`] on any `redb` or encoding failure, and on mapping
+/// conflicts holding live annotations.
 pub fn save(
     db: &Database,
     meta: &BinaryMeta,
@@ -614,6 +802,7 @@ pub fn save(
     let wtxn = db
         .begin_write()
         .map_err(|e| Error::Storage(format!("begin write: {e}")))?;
+    reject_mapping_overwrite(&wtxn, meta)?;
     for t in [
         "meta",
         "binaries",
@@ -935,21 +1124,22 @@ fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u6
     Ok(annotations)
 }
 
-/// Hash-filtered snapshot read back by [`load_cached`].
+/// Hash- and mapping-filtered snapshot read back by [`load_cached`].
 ///
-/// The stale variant carries only what a content-hash mismatch or a schema
-/// version mismatch preserves: metadata plus annotations. Derived rows are
+/// The stale variant carries only what a content-hash, mapping, revision, or
+/// schema mismatch preserves: metadata plus annotations. Derived rows are
 /// never decoded on that path (see the stale-cache policy on
 /// [`load_cached`]).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Snapshot {
-    /// Stored hash matches on the current schema: cached layouts plus
-    /// annotations. The caller re-decodes instructions from the binary via
-    /// [`rebuild`](crate::analysis::rebuild).
+    /// Stored hash, mapping, and revisions match on the current schema:
+    /// cached layouts plus annotations. The caller re-decodes instructions
+    /// from the binary via [`rebuild`](crate::analysis::rebuild).
     Hit(Box<Loaded>),
-    /// Stored hash differs, or the schema version differs: metadata plus
-    /// annotations only; the derived `functions`/`blocks`/`xrefs`/`strings`
-    /// tables were never opened.
+    /// Stored hash, mapping, analysis revision, or schema version differs:
+    /// metadata plus annotations only; the derived
+    /// `functions`/`blocks`/`xrefs`/`strings` tables were never opened.
     Stale {
         /// Snapshot metadata (row 0 of `binaries`).
         meta: BinaryMeta,
@@ -960,21 +1150,30 @@ pub enum Snapshot {
     Miss,
 }
 
-/// Load the snapshot for one binary hash in a single read transaction.
+/// Load the snapshot for one binary hash and loader mapping in a single read
+/// transaction.
 ///
 /// Accepts any readable handle ([`Database`] or [`redb::ReadOnlyDatabase`]);
 /// read opens pass a read-only handle from [`open_db_read_only`].
 ///
-/// Reads and validates the `meta`/`binaries` rows first. When the stored
-/// `content_hash` differs from `expected_hash`, or the stored schema
-/// version differs from [`SCHEMA_VERSION`], returns [`Snapshot::Stale`]
-/// with the stored annotations after decoding only the `annotations` table;
-/// the derived tables are never opened, so opening a small binary against a
-/// sidecar written for a large one costs no decoding proportional to the
-/// discarded rows. An older schema is not an error: annotations carry over
-/// and the binary simply re-analyzes. On a hash and version match the full
-/// skeleton loads exactly as [`load`] does. Metadata and rows come from one
-/// read transaction, so a concurrent writer cannot interleave a metadata row
+/// Cache identity covers the binary content (`expected_hash`), the
+/// auto-versus-explicit raw mode plus raw arch/base/entry
+/// (`expected_mapping`), and the analysis revision: layouts replay only when
+/// all three agree with the stored snapshot on the current
+/// [`SCHEMA_VERSION`]. A mapping mismatch never reuses layouts, even when
+/// the bytes are identical; auto and explicit opens never alias.
+///
+/// Reads and validates the `meta`/`binaries` rows first. On any identity
+/// mismatch the derived tables are never opened, so opening a small binary
+/// against a sidecar written for a large one costs no decoding proportional
+/// to the discarded rows. A version, hash, or revision mismatch under the
+/// same mapping returns [`Snapshot::Stale`] with the stored annotations and
+/// the binary re-analyzes. A legacy snapshot whose mapping cannot be
+/// established is rebuilt, never trusted. A mapping mismatch (or an
+/// ambiguous legacy mapping) over a populated annotation sidecar errors
+/// with a separate-DB message instead of carrying annotations across address
+/// spaces or silently dropping them. Metadata and rows come from one read
+/// transaction, so a concurrent writer cannot interleave a metadata row
 /// from one snapshot with rows from another.
 ///
 /// Stale-cache policy (a deliberate behavior change; strict all-input
@@ -988,15 +1187,20 @@ pub enum Snapshot {
 /// error, as without metadata no hash comparison is possible), and every
 /// annotation row (a corrupt annotation errors because annotations carry
 /// over into the re-analysis; a missing annotations table reads as empty).
-/// A matching hash and version keeps the exact [`load`] validation:
+/// A full identity match keeps the exact [`load`] validation:
 /// unknown arch/format, and any corrupt or missing table error.
 ///
 /// # Errors
-/// [`Error::Storage`] on unreadable metadata, on corrupt annotations, and —
-/// for matching hashes only — on corrupt derived rows, missing tables, or
-/// unknown arch/format values. [`Error::Limit`] when snapshot row
+/// [`Error::Storage`] on unreadable metadata, on corrupt annotations, on
+/// mapping conflicts holding live annotations, and — for full identity
+/// matches only — on corrupt derived rows, missing tables, or unknown
+/// arch/format values. [`Error::Limit`] when snapshot row
 /// budgets are exceeded (forged sidecar).
-pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Snapshot> {
+pub fn load_cached(
+    db: &impl ReadableDatabase,
+    expected_hash: u64,
+    expected_mapping: &StoredMapping,
+) -> Result<Snapshot> {
     let rtxn = db
         .begin_read()
         .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
@@ -1004,7 +1208,40 @@ pub fn load_cached(db: &impl ReadableDatabase, expected_hash: u64) -> Result<Sna
         None => return Ok(Snapshot::Miss),
         Some(meta) => meta,
     };
-    if meta.content_hash != expected_hash || meta.version != SCHEMA_VERSION {
+    if meta.version != SCHEMA_VERSION {
+        let annotations = read_annotations_or_empty(&rtxn)?;
+        if !annotations.is_empty() {
+            match meta.mapping.clone() {
+                None => return Err(legacy_ambiguous(annotations.len(), meta.version)),
+                Some(stored) if &stored != expected_mapping => {
+                    return Err(mapping_conflict(
+                        &stored,
+                        annotations.len(),
+                        expected_mapping,
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        return Ok(Snapshot::Stale { meta, annotations });
+    }
+    if meta.mapping.as_ref() != Some(expected_mapping) {
+        let annotations = read_annotations_or_empty(&rtxn)?;
+        if !annotations.is_empty() {
+            match meta.mapping.clone() {
+                Some(stored) => {
+                    return Err(mapping_conflict(
+                        &stored,
+                        annotations.len(),
+                        expected_mapping,
+                    ));
+                }
+                None => return Err(legacy_ambiguous(annotations.len(), meta.version)),
+            }
+        }
+        return Ok(Snapshot::Stale { meta, annotations });
+    }
+    if meta.content_hash != expected_hash || meta.analysis_rev != Some(ANALYSIS_REVISION) {
         let annotations = read_annotations_or_empty(&rtxn)?;
         return Ok(Snapshot::Stale { meta, annotations });
     }

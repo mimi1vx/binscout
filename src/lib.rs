@@ -58,6 +58,7 @@ pub struct Project {
     binary: LoadedBinary,
     analysis: Analysis,
     annotations: BTreeMap<u64, Annotation>,
+    mapping: db::StoredMapping,
 }
 
 impl Project {
@@ -79,12 +80,14 @@ impl Project {
     /// through [`Project::open_raw`]. Unrecognized bytes fall back to raw
     /// x86-64 at base 0 so fixture blobs and shellcode open without options;
     /// explicit bases/arches go through [`Project::open_raw`]. Reads the
-    /// sidecar when present: a matching content hash loads the cached
-    /// snapshot, a mismatch re-analyzes while keeping stored annotations.
-    /// A stale sidecar's derived rows are never decoded (only its metadata
-    /// and annotations are read), so a large obsolete snapshot costs no
-    /// decoding proportional to its discarded rows. Never writes; call
-    /// [`Project::save`].
+    /// sidecar when present: a matching content hash, loader mapping, and
+    /// analysis revision loads the cached snapshot, a mismatch re-analyzes
+    /// while keeping same-mapping stored annotations. A populated sidecar
+    /// under an incompatible mapping errors with a separate-DB message
+    /// instead of reusing layouts. A stale sidecar's derived rows are never
+    /// decoded (only its metadata and annotations are read), so a large
+    /// obsolete snapshot costs no decoding proportional to its discarded
+    /// rows. Never writes; call [`Project::save`].
     ///
     /// Input policy: at most 512 MiB are read (single open, chunked with
     /// checked growth); containers with large unmapped overlays still open
@@ -112,6 +115,11 @@ impl Project {
 
     /// Open a raw blob with explicit mapping options plus explicit DB path.
     ///
+    /// The mapping is part of the cache identity: same bytes opened with
+    /// different arch/base/entry (or auto vs explicit) never share cached
+    /// layouts, and populated annotation sidecars under another mapping
+    /// require a separate DB path.
+    ///
     /// # Errors
     /// Same as [`Project::open`].
     pub fn open_raw(binary: &Path, db_path: &Path, opts: RawOptions) -> Result<Self> {
@@ -124,15 +132,16 @@ impl Project {
         let bytes = read_input_bytes(binary)?;
         let hash = db::content_hash(&bytes);
         let size = bytes.len() as u64;
+        let mapping = db::StoredMapping::for_request(raw);
 
-        // Metadata-first snapshot read over a read-only handle: a stale
-        // sidecar yields its annotations without decoding the discarded
-        // derived rows (see the stale-cache policy on `db::load_cached`),
-        // and the read-only open itself costs nothing proportional to the
-        // file. Reads never save and never create the sidecar.
+        // Metadata-first snapshot read over a read-only handle: cache
+        // identity covers content, loader mapping, and analysis revision
+        // before any layout replay (see `db::load_cached`), and the
+        // read-only open itself costs nothing proportional to the file.
+        // Reads never save and never create the sidecar.
         let cached = if db_path.exists() {
             match db::open_db_read_only(db_path) {
-                Ok(db) => Some(db::load_cached(&db, hash)?),
+                Ok(db) => Some(db::load_cached(&db, hash, &mapping)?),
                 // Raced with a concurrent sidecar deletion: read as absent.
                 Err(_) if !db_path.exists() => None,
                 Err(e) => return Err(e),
@@ -169,6 +178,7 @@ impl Project {
                     binary: loaded,
                     analysis,
                     annotations,
+                    mapping,
                 })
             }
             Some(db::Snapshot::Stale { annotations, .. }) => {
@@ -182,8 +192,10 @@ impl Project {
 
     /// Re-analyze `bytes` from scratch, carrying `annotations` forward.
     ///
-    /// Stale sidecars keep user renames and comments by address; the derived
-    /// analysis always comes from the current bytes, never from storage.
+    /// Stale sidecars keep user renames and comments by address under the
+    /// same mapping; the derived analysis always comes from the current
+    /// bytes, never from storage. A mapping mismatch over populated
+    /// annotations never reaches this path: [`db::load_cached`] errors first.
     fn reanalyze(
         binary: &Path,
         db_path: &Path,
@@ -193,6 +205,7 @@ impl Project {
         size: u64,
         annotations: BTreeMap<u64, Annotation>,
     ) -> Result<Self> {
+        let mapping = db::StoredMapping::for_request(raw);
         let loaded = match raw {
             Some(opts) => load_raw(&bytes, opts)?,
             None => load_or_raw(&bytes)?,
@@ -206,6 +219,7 @@ impl Project {
             binary: loaded,
             analysis,
             annotations,
+            mapping,
         })
     }
 
@@ -232,15 +246,28 @@ impl Project {
             entry: self.binary.entry,
             supported: true,
             reason: None,
+            mapping: Some(self.mapping.clone()),
+            analysis_rev: Some(db::ANALYSIS_REVISION),
         }
+    }
+
+    /// Loader mapping this project was opened with (auto vs explicit raw).
+    ///
+    /// Part of the cache identity: snapshots replay layouts only when the
+    /// stored mapping agrees with this value.
+    #[must_use]
+    pub fn mapping(&self) -> &db::StoredMapping {
+        &self.mapping
     }
 
     /// Persist one changed annotation row, falling back to a full snapshot.
     ///
     /// Tries [`db::save_annotation`](crate::db::save_annotation) first: when
-    /// the sidecar holds a snapshot for this binary, only the `annotations`
-    /// row changes. Otherwise (fresh DB or content mismatch) rewrites the
-    /// full snapshot via [`Project::save`].
+    /// the sidecar holds a snapshot for this binary and mapping, only the
+    /// `annotations` row changes. Otherwise (fresh DB or same-mapping
+    /// content mismatch) rewrites the full snapshot via [`Project::save`].
+    /// A populated sidecar under an incompatible mapping errors instead of
+    /// overwriting.
     fn persist_annotation(&self, addr: u64) -> Result<()> {
         let db = db::open_db(&self.db_path)?;
         let ann = self.annotations.get(&addr).filter(|a| !a.is_empty());

@@ -39,6 +39,12 @@ pub const MAX_FUNCTIONS: usize = 100_000;
 pub const MAX_XREFS_PER_KIND: usize = 1_000_000;
 /// Cap on discovery seeds (entry/exports/prologues) per call.
 pub const MAX_SEEDS: usize = 100_000;
+/// Revision of the analysis engine covered by cached snapshots.
+///
+/// Bumped whenever [`analyze`] output for identical bytes and mappings can
+/// change; [`crate::db`] treats a stored revision mismatch as stale and
+/// re-analyzes while carrying same-mapping annotations forward.
+pub const ANALYSIS_REVISION: u32 = 1;
 /// Query pages longer than this are truncated.
 pub const MAX_PAGE: usize = 1024;
 

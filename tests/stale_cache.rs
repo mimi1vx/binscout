@@ -13,6 +13,8 @@ use std::path::Path;
 
 use binscout::Project;
 use binscout::db::{self, Annotation};
+use binscout::disasm::Arch;
+use binscout::loader::RawOptions;
 use redb::ReadableTable;
 
 // Table handles for hand-crafted sidecars (mirror `binscout::db` layouts).
@@ -123,7 +125,7 @@ fn hit_loads_cached_snapshot() {
     let hash = db::content_hash(&std::fs::read(&bin).expect("read"));
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, hash).expect("load_cached") {
+        match db::load_cached(&handle, hash, &db::StoredMapping::Auto).expect("load_cached") {
             db::Snapshot::Hit(hit) => {
                 assert_eq!(hit.meta.content_hash, hash);
                 let raw = std::fs::read(&bin).expect("read");
@@ -163,7 +165,7 @@ fn miss_on_fresh_db() {
     let handle = db::open_db(&db).expect("create db");
     assert!(
         matches!(
-            db::load_cached(&handle, 1234).expect("load_cached"),
+            db::load_cached(&handle, 1234, &db::StoredMapping::Auto).expect("load_cached"),
             db::Snapshot::Miss
         ),
         "fresh sidecar has no snapshot"
@@ -191,7 +193,7 @@ fn meta_without_binaries_row_errors() {
             let _ = wtxn.open_table(BINARIES).expect("create binaries");
         }
         wtxn.commit().expect("commit");
-        let err = db::load_cached(&handle, 0).unwrap_err();
+        let err = db::load_cached(&handle, 0, &db::StoredMapping::Auto).unwrap_err();
         assert!(
             err.to_string().contains("no binary row"),
             "unexpected: {err:?}"
@@ -227,7 +229,7 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
     // Matching hash: the snapshot is corrupt, still an error.
     {
         let handle = db::open_db(&db).expect("open db");
-        let err = db::load_cached(&handle, old_hash).unwrap_err();
+        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
         assert!(
             err.to_string().contains("open functions"),
             "unexpected: {err:?}"
@@ -241,7 +243,12 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
         let handle = db::open_db(&db).expect("open db");
         assert!(
             matches!(
-                db::load_cached(&handle, db::content_hash(&new_bytes)).expect("load_cached"),
+                db::load_cached(
+                    &handle,
+                    db::content_hash(&new_bytes),
+                    &db::StoredMapping::Auto
+                )
+                .expect("load_cached"),
                 db::Snapshot::Stale { .. }
             ),
             "missing derived tables must not fail the stale path"
@@ -267,7 +274,7 @@ fn version_mismatch_is_stale_but_carries_annotations() {
     // annotations carry over and the binary re-analyzes on open.
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, old_hash).expect("load_cached") {
+        match db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).expect("load_cached") {
             db::Snapshot::Stale { meta, annotations } => {
                 assert_eq!(meta.version, 999);
                 assert_eq!(
@@ -288,7 +295,13 @@ fn version_mismatch_is_stale_but_carries_annotations() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, db::content_hash(&new_bytes)).expect("load_cached") {
+        match db::load_cached(
+            &handle,
+            db::content_hash(&new_bytes),
+            &db::StoredMapping::Auto,
+        )
+        .expect("load_cached")
+        {
             db::Snapshot::Stale { meta, annotations } => {
                 assert_eq!(meta.version, 999);
                 assert_eq!(
@@ -403,7 +416,7 @@ fn stale_corrupt_derived_rows_are_discarded() {
             err.to_string().contains("decode row"),
             "full load must still validate: {err:?}"
         );
-        let err = db::load_cached(&handle, old_hash).unwrap_err();
+        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
         assert!(
             err.to_string().contains("decode row"),
             "hit path must still validate: {err:?}"
@@ -417,7 +430,12 @@ fn stale_corrupt_derived_rows_are_discarded() {
         let handle = db::open_db(&db).expect("open db");
         assert!(
             matches!(
-                db::load_cached(&handle, db::content_hash(&new_bytes)).expect("load_cached"),
+                db::load_cached(
+                    &handle,
+                    db::content_hash(&new_bytes),
+                    &db::StoredMapping::Auto
+                )
+                .expect("load_cached"),
                 db::Snapshot::Stale { .. }
             ),
             "stale path must skip corrupt derived rows"
@@ -450,7 +468,12 @@ fn stale_corrupt_annotations_still_error() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
-        let err = db::load_cached(&handle, db::content_hash(&new_bytes)).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            db::content_hash(&new_bytes),
+            &db::StoredMapping::Auto,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("decode row"),
             "corrupt annotations must error: {err:?}"
@@ -523,7 +546,7 @@ fn stale_snapshot_reads_one_coherent_sidecar_generation() {
         .expect("load")
         .expect("generation b snapshot");
     assert_eq!(expected.meta.content_hash, hash_b);
-    match db::load_cached(&handle, hash_a).expect("load_cached") {
+    match db::load_cached(&handle, hash_a, &db::StoredMapping::Auto).expect("load_cached") {
         db::Snapshot::Stale { meta, annotations } => {
             assert_eq!(meta, expected.meta, "stale meta is generation b");
             assert_eq!(
@@ -593,7 +616,7 @@ fn corrupt_unknown_arch_still_errors_on_hit_but_stale_skips() {
             t.insert(0u64, v.to_string()).expect("rewrite meta");
         }
         wtxn.commit().expect("commit");
-        let err = db::load_cached(&handle, old_hash).unwrap_err();
+        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
         assert!(
             err.to_string().contains("unknown arch"),
             "hit path must validate arch: {err:?}"
@@ -672,5 +695,125 @@ fn read_opens_work_on_write_protected_sidecars() {
     // Restore writability so temp-dir cleanup cannot trip on the mode.
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644))
         .expect("restore sidecar mode");
+    common::cleanup(&dir);
+}
+
+/// Explicit raw view of [`small_elf`] bytes: same file, another mapping.
+fn elf_as_raw() -> RawOptions {
+    RawOptions {
+        base: 0x400000,
+        arch: Arch::X86_64,
+        entry: Some(0x400000),
+    }
+}
+
+#[test]
+fn auto_snapshot_explicit_open_rebuilds_when_empty() {
+    // Same container bytes, no annotations: an explicit raw open against an
+    // auto snapshot rebuilds instead of reusing layouts, without error.
+    let dir = common::tmpdir("stale-mode-empty");
+    let bytes = small_elf();
+    let bin = common::write_bin(&dir, "m.bin", &bytes);
+    let db = common::temp_db(&dir, "m");
+
+    let p = Project::open_with_db(&bin, &db).expect("auto open");
+    p.save().expect("save auto snapshot");
+    drop(p);
+
+    let hash = db::content_hash(&bytes);
+    let explicit = db::StoredMapping::for_request(Some(elf_as_raw()));
+    {
+        let handle = db::open_db_read_only(&db).expect("open db");
+        assert!(
+            matches!(
+                db::load_cached(&handle, hash, &explicit).expect("load_cached"),
+                db::Snapshot::Stale { .. }
+            ),
+            "explicit open must not hit an auto snapshot"
+        );
+    }
+    let q = Project::open_raw(&bin, &db, elf_as_raw()).expect("explicit rebuilds");
+    assert!(q.annotations().is_empty());
+    assert!(q.analysis().functions.contains_key(&0x400000));
+    common::cleanup(&dir);
+}
+
+#[test]
+fn auto_snapshot_explicit_open_conflicts_when_annotated() {
+    // Same container bytes, populated annotations: an explicit raw open
+    // against an auto snapshot errors with a separate-DB message and leaves
+    // the sidecar alone — annotations are never remapped across mappings.
+    let dir = common::tmpdir("stale-mode-conflict");
+    let bytes = small_elf();
+    let bin = common::write_bin(&dir, "m.bin", &bytes);
+    let db = common::temp_db(&dir, "m");
+
+    bootstrap_with_annotations(&bin, &db);
+    let (old_meta, old_ann) = {
+        let handle = db::open_db(&db).expect("open db");
+        let stored = db::load(&handle).expect("load").expect("snapshot exists");
+        (stored.meta, stored.annotations)
+    };
+    assert_eq!(old_meta.mapping, Some(db::StoredMapping::Auto));
+
+    let explicit = db::StoredMapping::for_request(Some(elf_as_raw()));
+    {
+        let handle = db::open_db_read_only(&db).expect("open db");
+        let err = db::load_cached(&handle, db::content_hash(&bytes), &explicit).unwrap_err();
+        assert!(
+            err.to_string().contains("separate --db"),
+            "mode mismatch must name a separate DB: {err:?}"
+        );
+    }
+    let err = Project::open_raw(&bin, &db, elf_as_raw()).unwrap_err();
+    assert!(
+        err.to_string().contains("separate --db"),
+        "explicit open must require a separate DB: {err:?}"
+    );
+
+    // No read-side save or remap: the stored snapshot is intact.
+    {
+        let handle = db::open_db(&db).expect("open db");
+        let stored = db::load(&handle)
+            .expect("load")
+            .expect("old snapshot intact");
+        assert_eq!(stored.meta, old_meta);
+        assert_eq!(stored.annotations, old_ann);
+    }
+    common::cleanup(&dir);
+}
+
+#[test]
+fn same_mapping_stale_patch_never_saves() {
+    // Same auto mapping, patched bytes: the stale open carries annotations
+    // and re-analyzes without writing the sidecar.
+    let dir = common::tmpdir("stale-same-nosave");
+    let bytes = small_elf();
+    let bin = common::write_bin(&dir, "s.bin", &bytes);
+    let db = common::temp_db(&dir, "s");
+
+    bootstrap_with_annotations(&bin, &db);
+    let old_hash = db::content_hash(&bytes);
+    let (old_meta, old_ann) = {
+        let handle = db::open_db(&db).expect("open db");
+        let stored = db::load(&handle).expect("load").expect("snapshot exists");
+        (stored.meta, stored.annotations)
+    };
+
+    let new_bytes = patched(bytes);
+    std::fs::write(&bin, &new_bytes).expect("patch fixture");
+    let q = Project::open_with_db(&bin, &db).expect("stale open");
+    assert_eq!(q.function_name(0x400000).as_deref(), Some("main"));
+    assert_same_analysis(q.analysis(), &fresh_analysis(&new_bytes));
+
+    {
+        let handle = db::open_db(&db).expect("open db");
+        let stored = db::load(&handle)
+            .expect("load")
+            .expect("old snapshot intact");
+        assert_eq!(stored.meta, old_meta);
+        assert_eq!(stored.meta.content_hash, old_hash);
+        assert_eq!(stored.annotations, old_ann);
+    }
     common::cleanup(&dir);
 }
