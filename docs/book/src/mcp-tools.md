@@ -31,3 +31,14 @@ document as text; failures are tool errors. Attach it to any MCP client:
 Addresses are `0x`-hex or decimal strings. `kind` is one of `code`,
 `data`, or `string`. Calls are serialized behind one lock because `redb`
 allows a single open handle per file per process.
+
+## Frozen upcoming tools (not yet implemented)
+
+The protocol-1 contract freezes these names and shapes; they land with
+their roadmap steps (13 tools today, 20 after). See
+[JSON protocol](json-protocol.md) for the full request/response
+definitions: `blocks`, `block_insns`, `diagnostics`, `ir_coverage`,
+`search_bytes`, `annotations_export`, `annotations_import`, plus the
+optional `raw` (`arch`/`base`/`entry?`) mapping object on every
+binary-taking tool. Until these ship, `func` keeps its current
+full-detail shape.

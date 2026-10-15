@@ -6,7 +6,6 @@ binscout [--db PATH] <command> <binary> [args]
 
 `--db` overrides the sidecar database (default `<binary>.rsdbg.redb`).
 See [JSON protocol](json-protocol.md) for the output contract.
-
 | Command | Example | Output |
 |---|---|---|
 | `load` | `binscout load fw.elf` | project info; caches the analysis snapshot |
@@ -34,3 +33,23 @@ mapped the section at), `size` (in-memory bytes), `file_off`/`file_size`
 On PE, `vaddr = IMAGE_BASE + RVA`: `.text` at RVA `0x1000` in a
 `0x400000`-based image lives at `0x401000`, with `file_off` pointing at its
 `PointerToRawData`. Raw blobs have no section table and report `[]`.
+
+## Frozen upcoming commands (not yet implemented)
+
+The protocol-1 contract freezes these names and shapes; they land with
+their roadmap steps. See [JSON protocol](json-protocol.md) for the full
+request/response definitions.
+
+| Command | Step | Does |
+|---|---|---|
+| `blocks B ADDR` | bounded function views | page block summaries of the containing function |
+| `block-insns B ADDR BLOCK` | bounded function views | page one block's instructions in address order |
+| `diagnostics B` | diagnostic queries | page provenance records, filterable by `--kind`/`--func` |
+| `ir-coverage --arch ARCH` | IR coverage | lift coverage without opening a binary; optional range counts |
+| `search-bytes B PATTERN` | byte search | paged `??`-wildcard matches with section/range filters |
+| `annotations-export B` | annotation transfer | emit the portable JSON annotation document |
+| `annotations-import B` | annotation transfer | atomically merge a document (`--input`, `--overwrite`) |
+
+Raw mapping also arrives as global flags
+`[--raw --arch ARCH --base ADDR [--entry ADDR]]` on every binary-taking
+command. Until these ship, `func` keeps its current full-detail shape.
