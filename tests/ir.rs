@@ -433,3 +433,431 @@ fn range_accounting_agrees_with_actual_lifts() {
     assert!(!db.exists(), "reads never create the sidecar");
     cleanup(&dir);
 }
+
+#[test]
+fn x86_sse_basic_lifts() {
+    // movaps/addps anchors plus one member per packed family.
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0x0f, 0x28, 0xc0], IrOp::Copy),       // movaps
+        (&[0x0f, 0x58, 0xc0], IrOp::Add),        // addps
+        (&[0x0f, 0x5c, 0xc0], IrOp::Sub),        // subps
+        (&[0x0f, 0x59, 0xc0], IrOp::Mul),        // mulps
+        (&[0x0f, 0x5e, 0xc0], IrOp::Div),        // divps
+        (&[0x66, 0x0f, 0xdb, 0xc0], IrOp::And),  // pand
+        (&[0x0f, 0x56, 0xc0], IrOp::Or),         // orps
+        (&[0x0f, 0x57, 0xc0], IrOp::Xor),        // xorps
+        (&[0x66, 0x0f, 0xf1, 0xc0], IrOp::Shl),  // psllw
+        (&[0x66, 0x0f, 0xd1, 0xc0], IrOp::Shr),  // psrlw
+        (&[0x66, 0x0f, 0x74, 0xc0], IrOp::Cmp),  // pcmpeqb
+        (&[0x0f, 0xc6, 0xc0, 0x00], IrOp::Copy), // shufps
+        (&[0xf3, 0x0f, 0x10, 0xc0], IrOp::Copy), // movss
+    ];
+    for (bytes, want) in cases {
+        let v = x86(bytes, 0x1000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+}
+
+#[test]
+fn x86_imm_folded_cmp_pseudo_ops_lift() {
+    // iced-x86 folds the imm predicate into the mnemonic: there is no plain
+    // `cmpps` row, only cmpeqps/cmpltps/...; the vowels match by pattern.
+    let v = x86(&[0x0f, 0xc2, 0xc0, 0x00], 0x1000); // cmpeqps
+    assert_eq!(v[0].op, IrOp::Cmp);
+    assert_eq!(v[0].warning, None);
+    let v = x86(&[0xc5, 0xf8, 0xc2, 0xc0, 0x00], 0x1000); // vcmpeqps
+    assert_eq!(v[0].op, IrOp::Cmp);
+    assert_eq!(v[0].warning, None);
+    for m in [
+        "cmpeqps",
+        "cmpltps",
+        "cmpunordss",
+        "cmpnlesd",
+        "cmpeqpd",
+        "cmpordps",
+        "vcmpeqps",
+        "vcmpltpd",
+        "vcmpneqss",
+        "vcmpordsd",
+        "cmp",
+        "test",
+        "cmpsb",
+        "scasd",
+    ] {
+        assert!(is_mapped(Arch::X86_64, m), "{m}");
+        let v = lift(Arch::X86_64, &synth(m, &[]));
+        assert_eq!(v[0].op, IrOp::Cmp, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+    // Near-miss non-compares stay out.
+    for m in ["cmpxchg", "cpuid", "popcnt"] {
+        assert!(!is_mapped(Arch::X86_64, m), "{m}");
+    }
+}
+
+#[test]
+fn x86_avx_crypto_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0xc5, 0xf8, 0x58, 0xc0], IrOp::Add),             // vaddps
+        (&[0xc5, 0xf8, 0x28, 0xc0], IrOp::Copy),            // vmovaps
+        (&[0xc5, 0xf9, 0xef, 0xc0], IrOp::Xor),             // vpxor
+        (&[0xc4, 0xe2, 0x79, 0x18, 0xc0], IrOp::Copy),      // vbroadcastss
+        (&[0x66, 0x0f, 0x38, 0xdc, 0xc0], IrOp::Xor),       // aesenc
+        (&[0x66, 0x0f, 0x38, 0xdd, 0xc0], IrOp::Xor),       // aesenclast
+        (&[0x66, 0x0f, 0x3a, 0xdf, 0xc0, 0x01], IrOp::Xor), // aeskeygenassist
+        (&[0x66, 0x0f, 0x3a, 0x44, 0xc0, 0x00], IrOp::Xor), // pclmullqlqdq
+        (&[0x0f, 0x38, 0xcb, 0xc0], IrOp::Xor),             // sha256rnds2
+        (&[0x0f, 0x3a, 0xcc, 0xc0, 0x00], IrOp::Xor),       // sha1rnds4
+        (&[0xf2, 0x0f, 0x38, 0xf1, 0xc0], IrOp::Xor),       // crc32
+    ];
+    for (bytes, want) in cases {
+        let v = x86(bytes, 0x1000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+}
+
+#[test]
+fn x86_int_bit_string_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0x0f, 0x45, 0xc3], IrOp::Copy),             // cmovne
+        (&[0x0f, 0x95, 0xc0], IrOp::Copy),             // setne
+        (&[0x0f, 0xc8], IrOp::Copy),                   // bswap
+        (&[0x99], IrOp::Copy),                         // cdq
+        (&[0x0f, 0xa4, 0xd8, 0x01], IrOp::Shl),        // shld
+        (&[0x0f, 0xac, 0xd8, 0x01], IrOp::Shr),        // shrd
+        (&[0x0f, 0xba, 0xe0, 0x01], IrOp::Cmp),        // bt
+        (&[0x0f, 0xab, 0xd8], IrOp::Or),               // bts
+        (&[0x0f, 0xb3, 0xd8], IrOp::And),              // btr
+        (&[0x0f, 0xbb, 0xd8], IrOp::Xor),              // btc
+        (&[0xc4, 0xe2, 0x78, 0xf3, 0xd8], IrOp::And),  // blsi
+        (&[0x0f, 0xc7, 0xf0], IrOp::Copy),             // rdrand
+        (&[0x0f, 0x31], IrOp::Copy),                   // rdtsc
+        (&[0xa4], IrOp::Copy),                         // movsb
+        (&[0xab], IrOp::Store),                        // stosd
+        (&[0xac], IrOp::Load),                         // lodsb
+        (&[0xae], IrOp::Cmp),                          // scasb
+        (&[0xa6], IrOp::Cmp),                          // cmpsb
+        (&[0xec], IrOp::Load),                         // in al, dx
+        (&[0xd7], IrOp::Load),                         // xlat
+        (&[0x66, 0x0f, 0x38, 0x2a, 0x00], IrOp::Load), // movntdqa
+        (&[0x0f, 0xae, 0x00], IrOp::Store),            // fxsave
+        (&[0x0f, 0x07], IrOp::Return),                 // sysret
+    ];
+    for (bytes, want) in cases {
+        let v = x86(bytes, 0x1000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+    // Prefixed string/atomic forms lift through the stripped mnemonic.
+    let v = x86(&[0xf3, 0xa4], 0x1000); // rep movsb
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Copy, None));
+    let v = x86(&[0xf0, 0x01, 0x00], 0x1000); // lock add [rax], eax
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Add, None));
+    let v = x86(&[0xf3, 0xc3], 0x1000); // rep ret
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Return, None));
+}
+
+#[test]
+fn x86_fpu_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0xd9, 0x00], IrOp::Load),  // fld dword [rax]
+        (&[0xd9, 0xe8], IrOp::Copy),  // fld1
+        (&[0xd8, 0xc1], IrOp::Add),   // fadd
+        (&[0xde, 0xc1], IrOp::Add),   // faddp
+        (&[0xda, 0x00], IrOp::Add),   // fiadd
+        (&[0xd8, 0xe0], IrOp::Sub),   // fsub
+        (&[0xd8, 0xc9], IrOp::Mul),   // fmul
+        (&[0xde, 0xf9], IrOp::Div),   // fdivp
+        (&[0xd9, 0x18], IrOp::Store), // fstp dword [rax]
+        (&[0xdf, 0x38], IrOp::Store), // fistp qword [rax]
+        (&[0xd8, 0x10], IrOp::Cmp),   // fcom
+        (&[0xdb, 0xf0], IrOp::Cmp),   // fcomi
+        (&[0xda, 0xc0], IrOp::Copy),  // fcmovb
+        (&[0xd9, 0xc9], IrOp::Copy),  // fxch
+        (&[0xd9, 0xe1], IrOp::Copy),  // fabs
+        (&[0xd9, 0xe0], IrOp::Sub),   // fchs
+        (&[0xd9, 0x28], IrOp::Load),  // fldcw
+        (&[0xd9, 0x38], IrOp::Store), // fnstcw
+    ];
+    for (bytes, want) in cases {
+        let v = x86(bytes, 0x1000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+    // fnstsw ax writes ax: single-operand copy.
+    let v = x86(&[0xdf, 0xe0], 0x1000);
+    assert_eq!(v[0].op, IrOp::Copy);
+    assert_eq!(v[0].outputs, ["ax"]);
+}
+
+#[test]
+fn x86_system_nop_lifts() {
+    for bytes in [
+        vec![0x0f, 0xae, 0xf0], // mfence
+        vec![0x0f, 0xae, 0xe8], // lfence
+        vec![0x0f, 0xae, 0xf8], // sfence
+        vec![0x0f, 0xae, 0x38], // clflush
+        vec![0x0f, 0x18, 0x00], // prefetchnta
+        vec![0x0f, 0x77],       // emms
+        vec![0xfc],             // cld
+        vec![0x9e],             // sahf
+        vec![0xc5, 0xf8, 0x77], // vzeroupper
+        vec![0x9b],             // fwait
+        vec![0xd9, 0xd0],       // fnop
+    ] {
+        let v = x86(&bytes, 0x1000);
+        assert_eq!(
+            (v[0].op, v[0].warning.clone()),
+            (IrOp::Nop, None),
+            "{bytes:02x?}"
+        );
+    }
+    // Deliberately unmapped: queries, counts, atomics, faults.
+    for bytes in [
+        vec![0x0f, 0xa2],             // cpuid
+        vec![0xf3, 0x0f, 0xb8, 0xc0], // popcnt
+        vec![0x0f, 0x0b],             // ud2
+        vec![0x0f, 0xc1, 0xc0],       // xadd
+        vec![0x0f, 0xb1, 0xc0],       // cmpxchg
+    ] {
+        let v = x86(&bytes, 0x1000);
+        assert_eq!(v[0].op, IrOp::Nop, "{bytes:02x?}");
+        assert!(v[0].warning.is_some(), "{bytes:02x?}");
+    }
+}
+
+#[test]
+fn arm_fp_simd_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0x00, 0x28, 0x21, 0x1e], IrOp::Add),   // fadd s0, s1, s2
+        (&[0x00, 0x38, 0x21, 0x1e], IrOp::Sub),   // fsub
+        (&[0x00, 0x08, 0x22, 0x1e], IrOp::Mul),   // fmul
+        (&[0x00, 0x18, 0x21, 0x1e], IrOp::Div),   // fdiv
+        (&[0x00, 0x00, 0x22, 0x1e], IrOp::Copy),  // scvtf
+        (&[0x20, 0x20, 0x21, 0x1e], IrOp::Cmp),   // fcmp
+        (&[0x20, 0x00, 0x82, 0x9a], IrOp::Copy),  // csel
+        (&[0x20, 0x84, 0x21, 0x4e], IrOp::Add),   // add v0.16b, v1.16b, v2.16b
+        (&[0x0f, 0xe4, 0x00, 0x0f], IrOp::Copy),  // movi
+        (&[0x00, 0x07, 0x40, 0x0c], IrOp::Load),  // ld4
+        (&[0x00, 0x07, 0x00, 0x0d], IrOp::Store), // st1
+        (&[0x00, 0xc0, 0x40, 0x0d], IrOp::Load),  // ld1r
+    ];
+    for (bytes, want) in cases {
+        let v = arm(bytes, 0x4000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+    // Aliases and scalar/SIMD rows without hand-encoded bytes.
+    for (m, want) in [
+        ("fmov", IrOp::Copy),
+        ("fabs", IrOp::Copy),
+        ("fneg", IrOp::Sub),
+        ("mvn", IrOp::Copy),
+        ("sxtb", IrOp::Copy),
+        ("ubfx", IrOp::Copy),
+        ("bfi", IrOp::Copy),
+        ("cinc", IrOp::Copy),
+        ("cset", IrOp::Copy),
+        ("fcsel", IrOp::Copy),
+        ("fmax", IrOp::Copy),
+        ("smaxv", IrOp::Copy),
+        ("umax", IrOp::Copy),
+        ("clz", IrOp::Copy),
+        ("cnt", IrOp::Copy),
+        ("rbit", IrOp::Copy),
+        ("dup", IrOp::Copy),
+        ("smov", IrOp::Copy),
+        ("ext", IrOp::Copy),
+        ("tbl", IrOp::Copy),
+        ("addv", IrOp::Add),
+        ("faddp", IrOp::Add),
+        ("fmla", IrOp::Mul),
+        ("fmadd", IrOp::Mul),
+        ("udot", IrOp::Mul),
+        ("pmull", IrOp::Mul),
+        ("mneg", IrOp::Mul),
+        ("ngc", IrOp::Sub),
+        ("fabd", IrOp::Sub),
+        ("subp", IrOp::Sub),
+        ("shl", IrOp::Shl),
+        ("sqrshl", IrOp::Shl),
+        ("shrn", IrOp::Shr),
+        ("uqrshrn", IrOp::Shr),
+        ("cmeq", IrOp::Cmp),
+        ("cmhi", IrOp::Cmp),
+        ("fcmp", IrOp::Cmp),
+        ("fccmp", IrOp::Cmp),
+        ("ccmp", IrOp::Cmp),
+        ("bsl", IrOp::Or),
+        ("eor3", IrOp::Xor),
+        ("mvni", IrOp::Xor),
+        ("crc32b", IrOp::Xor),
+        ("crc32cx", IrOp::Xor),
+        ("aese", IrOp::Xor),
+        ("sha256h", IrOp::Xor),
+        ("sha512su0", IrOp::Xor),
+        ("sm4e", IrOp::Xor),
+        ("xar", IrOp::Xor),
+    ] {
+        assert!(is_mapped(Arch::Aarch64, m), "{m}");
+        let v = lift(Arch::Aarch64, &synth(m, &[]));
+        assert_eq!(v[0].op, want, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+}
+
+#[test]
+fn arm_atomics_and_system_lifts() {
+    // w/zr-destination store-only forms lift as STORE.
+    for (m, want) in [
+        ("ldadd", IrOp::Add),
+        ("ldaddl", IrOp::Add),
+        ("ldaddalb", IrOp::Add),
+        ("ldclr", IrOp::And),
+        ("ldeor", IrOp::Xor),
+        ("ldeoralh", IrOp::Xor),
+        ("ldset", IrOp::Or),
+        ("stadd", IrOp::Store),
+        ("staddl", IrOp::Store),
+        ("steorh", IrOp::Store),
+        ("cas", IrOp::Cmp),
+        ("casal", IrOp::Cmp),
+        ("swp", IrOp::Copy),
+        ("swpalh", IrOp::Copy),
+        ("ldpsw", IrOp::Load),
+        ("ldaxr", IrOp::Load),
+        ("stlxr", IrOp::Store),
+        ("sys", IrOp::Nop),
+        ("sysl", IrOp::Nop),
+        ("rmif", IrOp::Nop),
+        ("hlt", IrOp::Nop),
+        ("clrex", IrOp::Nop),
+        ("sb", IrOp::Nop),
+        ("yield", IrOp::Nop),
+        ("sevl", IrOp::Nop),
+        ("psb", IrOp::Nop),
+        ("esb", IrOp::Nop),
+        ("csdb", IrOp::Nop),
+        ("dcps1", IrOp::Nop),
+    ] {
+        assert!(is_mapped(Arch::Aarch64, m), "{m}");
+        let v = lift(Arch::Aarch64, &synth(m, &[]));
+        assert_eq!(v[0].op, want, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+    // Real bytes: waits, prefetches, halts.
+    for (bytes, want) in [
+        (&[0x5f, 0x20, 0x03, 0xd5][..], IrOp::Nop), // wfe
+        (&[0x3f, 0x20, 0x03, 0xd5][..], IrOp::Nop), // yield
+        (&[0x00, 0x00, 0x80, 0xf9][..], IrOp::Nop), // prfm
+        (&[0x00, 0x00, 0x42, 0xd4][..], IrOp::Nop), // hlt
+    ] {
+        let v = arm(bytes, 0x4000);
+        assert_eq!(
+            (v[0].op, v[0].warning.clone()),
+            (want, None),
+            "{bytes:02x?}"
+        );
+    }
+    // mrs/msr/udf stay unmapped.
+    for m in ["mrs", "msr", "udf"] {
+        assert!(!is_mapped(Arch::Aarch64, m), "{m}");
+    }
+}
+
+#[test]
+fn arm32_extended_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0x11, 0x0f, 0x6f, 0xe1], IrOp::Copy), // clz
+        (&[0x91, 0x00, 0x02, 0xe1], IrOp::Copy), // swp
+        (&[0x90, 0x21, 0x43, 0xe0], IrOp::Mul),  // umaal
+        (&[0x90, 0x31, 0x62, 0xe0], IrOp::Mul),  // mls
+        (&[0x81, 0x32, 0x00, 0xe1], IrOp::Mul),  // smlabb
+        (&[0x81, 0x32, 0x20, 0xe1], IrOp::Mul),  // smlawb
+        (&[0x81, 0x30, 0x42, 0xe1], IrOp::Mul),  // smlalbb
+        (&[0x81, 0x21, 0x60, 0xe1], IrOp::Mul),  // smulbb
+        (&[0x52, 0x00, 0x41, 0xe1], IrOp::Add),  // qdadd
+        (&[0x9f, 0x0f, 0x91, 0xe1], IrOp::Load), // ldrex
+    ];
+    for (bytes, want) in cases {
+        let v = arm32(bytes, 0x10000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+    // Addressing-mode spellings of ldm/stm join the tables; pc-naming
+    // still steers to RETURN (CBRANCH when predicated).
+    for m in ["ldmia", "ldmdb", "ldmda", "stmia", "stmdb", "stmda"] {
+        assert!(is_mapped(Arch::Arm32, m), "{m}");
+        assert!(is_mapped(Arch::Thumb, m), "{m}");
+    }
+    let v = lift(Arch::Arm32, &synth("ldmia", &["{r4", "pc}"]));
+    assert_eq!(v[0].op, IrOp::Return);
+    let v = lift(Arch::Arm32, &synth("ldmiaeq", &["{r4", "pc}"]));
+    assert_eq!(v[0].op, IrOp::CBranch);
+    let v = lift(Arch::Arm32, &synth("stmdb", &["sp!", "{r4", "lr}"]));
+    assert_eq!(v[0].op, IrOp::Store);
+    for (m, want) in [
+        ("ldrt", IrOp::Load),
+        ("ldrsbt", IrOp::Load),
+        ("strt", IrOp::Store),
+        ("strex", IrOp::Store),
+        ("qadd", IrOp::Add),
+        ("qadd16", IrOp::Add),
+        ("uqadd8", IrOp::Add),
+        ("qdsub", IrOp::Sub),
+        ("qsub8", IrOp::Sub),
+        ("rev", IrOp::Copy),
+        ("sxth", IrOp::Copy),
+        ("uxtb", IrOp::Copy),
+        ("bkpt", IrOp::Nop),
+        ("it", IrOp::Nop),
+        ("hint", IrOp::Nop),
+        ("wfe", IrOp::Nop),
+        ("cpsid", IrOp::Nop),
+        ("setend", IrOp::Nop),
+    ] {
+        assert!(is_mapped(Arch::Arm32, m), "{m}");
+        let v = lift(Arch::Arm32, &synth(m, &[]));
+        assert_eq!(v[0].op, want, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+}
+
+#[test]
+fn thumb_extended_lifts() {
+    let cases: &[(&[u8], IrOp)] = &[
+        (&[0x08, 0xba][..], IrOp::Copy),             // rev
+        (&[0x48, 0xba][..], IrOp::Copy),             // rev16
+        (&[0xc9, 0xba][..], IrOp::Copy),             // revsh
+        (&[0x09, 0xb2][..], IrOp::Copy),             // sxth
+        (&[0x49, 0xb2][..], IrOp::Copy),             // sxtb
+        (&[0x89, 0xb2][..], IrOp::Copy),             // uxth
+        (&[0xc9, 0xb2][..], IrOp::Copy),             // uxtb
+        (&[0x20, 0xbf][..], IrOp::Nop),              // wfe
+        (&[0x08, 0xbf][..], IrOp::Nop),              // it
+        (&[0x72, 0xb6][..], IrOp::Nop),              // cpsid
+        (&[0x62, 0xb6][..], IrOp::Nop),              // cpsie
+        (&[0x50, 0xb6][..], IrOp::Nop),              // setend
+        (&[0x00, 0xbe][..], IrOp::Nop),              // bkpt
+        (&[0x80, 0xbf][..], IrOp::Nop),              // hint
+        (&[0x91, 0xfb, 0xf2, 0xf0][..], IrOp::Div),  // sdiv.w
+        (&[0xb1, 0xfb, 0xf2, 0xf0][..], IrOp::Div),  // udiv.w
+        (&[0x90, 0xfa, 0xa0, 0xf0][..], IrOp::Copy), // rbit.w
+        (&[0xaf, 0xf3, 0xf0, 0x80][..], IrOp::Nop),  // dbg.w
+        (&[0x00, 0xdf][..], IrOp::Call),             // svc
+    ];
+    for (bytes, want) in cases {
+        let v = thumb(bytes, 0x20000);
+        assert_eq!(v.len(), 1, "{bytes:02x?}");
+        assert_eq!(v[0].op, *want, "{bytes:02x?}");
+        assert_eq!(v[0].warning, None, "{bytes:02x?}");
+    }
+}

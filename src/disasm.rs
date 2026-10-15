@@ -453,16 +453,44 @@ fn limit_err(max_insns: usize) -> Error {
     Error::Limit(format!("more than {max_insns} instructions in range"))
 }
 
+/// Legacy x86 prefixes folded into iced-x86's formatted text. [`split_asm`]
+/// strips these so the mnemonic is the real operation (`rep movsb` becomes
+/// `movsb`, `lock add ..` becomes `add`); no ARM backend prints these words
+/// as a mnemonic head, so the strip is x86-only in effect.
+const X86_PREFIXES: &[&str] = &["rep", "repe", "repne", "lock"];
+
 /// Split `mnem op1, op2` into a lowercase mnemonic and operand strings.
 ///
-/// Operand immediates leave iced-x86 in MASM suffix form (`402100h`); each
+/// iced-x86 folds legacy prefixes into the formatted text
+/// (`rep movsb`, `lock add ..`), which would otherwise surface as bogus
+/// `rep`/`lock` mnemonics. [`X86_PREFIXES`] are stripped here so both the
+/// disassembly listing and the IR lift see the real operation; operand
+/// immediates leave iced-x86 in MASM suffix form (`402100h`), so each
 /// operand goes through [`masm_to_hex`] so agents only ever see `0x` form.
 fn split_asm(text: &str) -> (String, Vec<String>) {
     let text = text.trim();
-    let (head, tail) = match text.find(char::is_whitespace) {
+    let (mut head, mut tail) = match text.find(char::is_whitespace) {
         Some(i) => (&text[..i], text[i..].trim()),
         None => (text, ""),
     };
+    // At most one prefix is ever present, but loop against the table length
+    // so stacked prefixes (`lock` + `rep`) still terminate.
+    for _ in 0..X86_PREFIXES.len() {
+        if !X86_PREFIXES.contains(&head.to_ascii_lowercase().as_str()) {
+            break;
+        }
+        match tail.find(char::is_whitespace) {
+            Some(i) => {
+                head = &tail[..i];
+                tail = tail[i..].trim();
+            }
+            None => {
+                head = tail;
+                tail = "";
+                break;
+            }
+        }
+    }
     let ops = if tail.is_empty() {
         Vec::new()
     } else {

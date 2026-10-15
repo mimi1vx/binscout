@@ -13,56 +13,182 @@
 //! # ISA coverage
 //!
 //! `lift_x86` covers both 32- and 64-bit x86 (same mnemonic table; only the
-//! decoder differs):
+//! decoder differs). The `rep`/`repe`/`repne`/`lock` prefixes are stripped by
+//! the disassembler, so prefixed string/atomic operations lift as their core
+//! mnemonic (`rep movsb` lifts as `movsb`):
 //!
-//! - `COPY`: `mov`, `movsx`, `movsxd`, `movzx`, `movabs`, `xchg`, `leave`,
-//!   `enter`.
-//! - `LOAD`: `pop`, `popa`, `popad`. `STORE`: `push`, `pusha`,
-//!   `pushad`.
+//! - `COPY`: `mov`, `movsx`, `movsxd`, `movzx`, `movabs`, `movbe`, `xchg`,
+//!   `leave`, `enter`, `cbw`/`cwde`/`cdqe`/`cdq`/`cqo`, `bswap`, all 16
+//!   `cmovcc`/`setcc` forms, `movs`/`movsb`/`movsw`/`movsd`/`movsq`, scalar
+//!   and packed SSE/AVX moves (`movss`, `movaps`, `movups`, `movdqa`,
+//!   `vmovaps`, ...), shuffles and unpacks (`shufps`, `pshufb`, `unpcklps`,
+//!   `vshufps`, ...), inserts/extracts/broadcasts/converts (`pinsrw`,
+//!   `vextractps`, `vbroadcastss`, `vpmovsxbw`, ...), `bextr`/`pdep`/`pext`,
+//!   x87 `fld1`/`fabs`/`fxch`/`fcmovcc`/`fnstsw`, `rdtsc`/`rdtscp`/`rdpmc`,
+//!   `rdrand`/`rdseed`, `xgetbv`.
+//! - `LOAD`: `pop`, `popa`, `popad`, `popf`/`popfd`/`popfq`, `lods*`,
+//!   `xlat`, `in`/`ins*`, `movntdqa`, x87 `fld`/`fild`/`fbld`/`fldenv`/
+//!   `fldcw`, `frstor`/`fxrstor`/`xrstor` (x87 stack/control effects
+//!   unmodeled).
+//! - `STORE`: `push`, `pusha`, `pushad`, `pushf`/`pushfd`/`pushfq`,
+//!   `stos*`, `out`/`outs*`, nontemporal `movnt*`/`vmovnt*`, x87
+//!   `fst`/`fstp`/`fist*`/`fbstp`/`fnstcw`/`fnstenv`/`fnsave`/`fxsave`/
+//!   `xsave`.
 //! - `ADD`: `add`, `adc`, `adcx`, `adox`, `lea` (address math, not a load),
-//!   `inc`. `SUB`: `sub`, `sbb`, `dec`, `neg`. `MUL`: `mul`, `imul`.
-//!   `DIV`: `div`, `idiv`. `AND`: `and`. `OR`: `or`. `XOR`: `xor`, `pxor`,
-//!   `not`. `SHL`: `shl`, `sal`. `SHR`: `shr`, `sar`, plus rotates `rol`,
-//!   `ror`, `rcl`, `rcr` (approximated as shifts; exact bit motion is out of
-//!   scope).
-//! - `CMP`: `cmp`, `test`. `BRANCH`: direct `jmp` (indirect keeps operands,
-//!   no target). `CBRANCH`: all `jcc` forms plus `jcxz`/`jecxz`/`jrcxz` and
+//!   `inc`, x87 `fadd`/`faddp`/`fiadd`, packed `addps`/`addpd`/`addss`/
+//!   `addsd`/`paddb`-`paddq`/`haddps`/`phaddw` plus `v`-prefixed AVX forms.
+//!   `SUB`: `sub`, `sbb`, `dec`, `neg`, x87 `fsub`/`fsubp`/`fsubr`/
+//!   `fisub`/`fisubr`, packed `subps`/`psubb`-`psubq`/`hsubps`/`phsubw` plus
+//!   AVX, `psadbw`/`mpsadbw` (+`v` forms). `MUL`: `mul`, `imul`, `mulx`,
+//!   x87 `fmul`/`fmulp`/`fimul`, packed `mulps`/`pmullw`/`pmulld`/
+//!   `pmuludq`/`pmulhw`/`pmaddwd` plus AVX, and 48 FMA `vfmadd*`/`vfmsub*`/
+//!   `vfnmadd*`/`vfnmsub*` forms. `DIV`: `div`, `idiv`, x87
+//!   `fdiv`/`fdivp`/`fdivr`/`fidiv`/`fidivr`, packed `divps` plus AVX.
+//!   `AND`: `and`, `pand`/`vpand`, `pandn`/`vpandn`, `andps`/`andpd`/
+//!   `vandps`/`vandpd`, `andn`, `blsi`/`blsr`/`bzhi`. `OR`: `or`,
+//!   `por`/`vpor`, `orps`/`orpd`/`vorps`/`vorpd`. `XOR`: `xor`, `pxor`/
+//!   `vpxor`, `not`, `xorps`/`xorpd`/`vxorps`/`vxorpd`, `blsmsk`, AES
+//!   (`aesenc`, `aesenclast`, `aesdec`, `aesdeclast`, `aeskeygenassist`,
+//!   `aesimc`), `pclmulqdq` (all four imm-folded spellings), SHA
+//!   (`sha1msg1`, `sha1msg2`, `sha1nexte`, `sha1rnds4`, `sha256rnds2`,
+//!   `sha256msg1`, `sha256msg2`), `crc32` (crypto folded to XOR).
+//!   `SHL`: `shl`, `sal`, `shld`, `shlx`, `psllw`/`pslld`/`psllq`/
+//!   `pslldq` plus AVX. `SHR`: `shr`, `sar`, plus rotates `rol`, `ror`,
+//!   `rcl`, `rcr` (approximated as shifts; exact bit motion is out of
+//!   scope), `shrd`, `sarx`/`shrx`/`rorx`, `psrlw`/`psrld`/`psrlq`/
+//!   `psrldq`, `psraw`/`psrad` plus AVX, `palignr`/`vpalignr`.
+//! - `CMP`: `cmp`, `test`, string `cmps*`/`scas*`, `comiss`/`comisd`/
+//!   `ucomiss`/`ucomisd` (+`v` forms), `vtestps`/`vtestpd`/`vptest`,
+//!   imm-folded `cmp<cc>ps`/`pd`/`ss`/`sd` and `vcmp<cc>*` pseudo-ops
+//!   (`cmpeqps`, `vcmpltps`, ...), x87 `fcom`/`fcomp`/`fcompp`/`fucom*`/
+//!   `fcomi*`/`fucomi*`/`ftst`/`fxam`/`ficom`/`ficomp`, `pcmpeqb`-`pcmpgtq`
+//!   (+`v` forms), `pcmpestri`/`pcmpistri` (+`m` forms), `phminposuw`/
+//!   `vphminposuw`.
+//! - `BRANCH`: direct `jmp` (indirect keeps operands, no target).
+//!   `CBRANCH`: all `jcc` forms plus `jcxz`/`jecxz`/`jrcxz` and
 //!   `loop`/`loope`/`loopne`. `CALL`: `call`, `syscall`, `sysenter`, `int`,
-//!   `int3`. `RETURN`: `ret`, `retn`, `retf`, `iret`, `iretd`, `iretq`.
-//! - `NOP`: `nop`, `pause`, `hlt`, `wait`, `endbr32`, `endbr64`.
+//!   `int3`. `RETURN`: `ret`, `retn`, `retf`, `iret`, `iretd`, `iretq`,
+//!   `sysret`, `sysexit`.
+//! - `NOP`: `nop`, `pause`, `hlt`, `fwait`, `endbr32`, `endbr64`, fences
+//!   (`mfence`, `lfence`, `sfence`), `clflush`/`clflushopt`/`clwb`, `emms`,
+//!   `femms`, `prefetch*`, flag-only `clc`/`stc`/`cmc`/`cld`/`std`/`cli`/
+//!   `sti`/`clac`/`stac`/`lahf`/`sahf`, `monitor`/`mwait`, `vzeroupper`/
+//!   `vzeroall`, x87 `fnop`/`ffree`/`fdecstp`/`fincstp`/`fnclex`/`fninit`.
+//!   Still unmapped by design: `cpuid`, `popcnt`/`tzcnt`/`lzcnt`/`bsf`/
+//!   `bsr` (bit counts/scans), `cmpxchg`/`xadd` (conditional/atomic RMW),
+//!   `ud2`, x87 transcendentals.
 //!
-//! `lift_aarch64` covers A64 mnemonics as printed by the disassembler:
+//! `lift_aarch64` covers A64 mnemonics as printed by the disassembler (which
+//! folds common aliases: `movz`/`movn`/`orr`-with-zero print as `mov`,
+//! `orn`/`not` print as `mvn`, `adds`-with-zero-dest prints as `cmn`,
+//! `sbc`-with-zero prints as `ngc`, `madd`-with-zero prints as `mul`,
+//! `csinc`-with-zero prints as `cset`, `ubfm`/`sbfm`/`bfm` always print as
+//! `lsl`/`lsr`/`asr`/`sxtb`/`ubfx`/`bfi`/..., `lslv`/`lsrv`/`asrv`/`rorv`
+//! print as `lsl`/`lsr`/`asr`/`ror`, and `dmb`/`dsb` carry their option in
+//! the operands, not the mnemonic):
 //!
-//! - `COPY`: `mov`, `movz`, `movn`, `movk`, `adr`, `adrp`. `LOAD`: `ldr`,
-//!   `ldp`, `ldur`, `ldrb`, `ldrh`, `ldrsb`, `ldrsh`, `ldrsw`. `STORE`:
-//!   `str`, `stp`, `stur`, `strb`, `strh`.
-//! - `ADD`: `add`, `adds`, `adc`, `adcs`. `SUB`: `sub`, `subs`, `sbc`,
-//!   `sbcs`, `neg`, `negs`. `MUL`: `mul`, `madd`, `msub`, `smull`, `smulh`,
-//!   `umull`, `umulh`. `DIV`: `sdiv`, `udiv`. `AND`: `and`, `ands`, `bic`,
-//!   `bics`. `OR`: `orr`, `orn`. `XOR`: `eor`, `eon`. `SHL`: `lsl`, `lslv`.
-//!   `SHR`: `lsr`, `lsrv`, `asr`, `asrv`, `ror`, `rorv`.
-//! - `CMP`: `cmp`, `cmn`, `tst`. `BRANCH`: direct `b`/`br` (indirect keeps
-//!   operands). `CBRANCH`: `cbz`, `cbnz`, `tbz`, `tbnz`, `b.<cond>`,
-//!   `bc.<cond>`. `CALL`: direct `bl`/`blr` (indirect keeps operands) plus
-//!   `svc`, `hvc`, `smc`. `RETURN`: `ret`, `eret`. `NOP`: `nop`, `hint`,
-//!   `dmb`, `dsb`, `isb`, `brk`.
+//! - `COPY`: `mov`, `movz`, `movn`, `movk`, `mvn`, `movi`, `dup`, `smov`,
+//!   `umov`, `adr`, `adrp`, `ext`, `tbl`, `tbx`, `uzp1`/`uzp2`, `trn1`/
+//!   `trn2`, `zip1`/`zip2`, `rev`/`rev16`/`rev32`/`rev64`, `rbit`,
+//!   `csel`/`csinc`/`csinv`/`csneg` (plus `cinc`/`cset`/`cinv`/`csetm`/
+//!   `cneg` spellings), `fcsel`, `uxtb`/`uxth`/`sxtb`/`sxth`/`sxtw`,
+//!   `ubfx`/`sbfx`/`ubfiz`/`sbfiz`/`bfc`/`bfi`/`bfxil`, `extr`, `clz`,
+//!   `cls`, `cnt`, `abs`, `sqabs`, narrowing `xtn`/`xtn2`/`sqxtn`/
+//!   `sqxtn2`/`sqxtun`/`sqxtun2`/`uqxtn`/`uqxtn2`, FP `fmov`/`fabs`,
+//!   `scvtf`/`ucvtf`, `fcvt`/`fcvtl`/`fcvtn`/`fcvtxn`/`fcvtns`/`fcvtnu`/
+//!   `fcvtps`/`fcvtpu`/`fcvtms`/`fcvtmu`/`fcvtas`/`fcvtau`/`fcvtzs`/
+//!   `fcvtzu`/`fjcvtzs`/`bfcvt`, `frint*`, min/max selects (`fmax`/`fmin`/
+//!   `fmaxnm`/`fminnm`/`smax`/`smin`/`umax`/`umin` and `p`/`v` forms),
+//!   `frecpe`/`frecps`/`frecpx`/`frsqrte`/`frsqrts`, atomic swaps
+//!   (`swp*`, store half unmodeled), atomic max/min (`ldsmax*`/
+//!   `ldsmin*`/`ldumax*`/`ldumin*`, store half unmodeled).
+//! - `LOAD`: `ldr`, `ldp`, `ldpsw`, `ldur`, `ldrb`, `ldrh`, `ldrsb`,
+//!   `ldrsh`, `ldrsw`, unscaled `ldurb`-`ldursw`, unprivileged
+//!   `ldtr`-`ldtrsw`, acquire/exclusive `ldar*`/`ldaxr*`/`ldxr*`/`ldlar*`/
+//!   `ldapr*`/`ldapur*`, `ldnp`, SIMD `ld1`-`ld4`/`ld1r`-`ld4r`,
+//!   pointer-authenticated `ldraa`/`ldrab`. `STORE`: `str`, `stp`, `stur`,
+//!   `strb`, `strh`, unscaled `sturb`/`sturh`, unprivileged `sttr*`,
+//!   release/exclusive `stlr*`/`stxr*`/`stllr*`/`stlur*`, `stnp`, SIMD
+//!   `st1`-`st4`, store-only atomics (`stadd*`, `stclr*`, `stset*`,
+//!   `steor*`, `stsmax*`, `stsmin*`, `stumax*`, `stumin*`; read-modify-write
+//!   folded to STORE, ALU part unmodeled).
+//! - `ADD`: `add`, `adds`, `adc`, `adcs`, FP `fadd`/`faddp`, `fcadd`, `addv`, `saddlv`/`uaddlv`, `saddlp`/`sadalp`/
+//!   `uaddlp`/`uadalp`, `addp`, long `saddl`/`saddw`/`uaddl`/`uaddw` (+`2`),
+//!   halving `shadd`/`uhadd`/`srhadd`/`urhadd`, saturating `sqadd`/
+//!   `uqadd`/`suqadd`/`usqadd`, `saba`/`uaba`, narrowing `addhn`/
+//!   `raddhn` (+`2`), atomic `ldadd*`. `SUB`: `sub`, `subs`, `sbc`,
+//!   `sbcs`, `neg`, `negs`, `ngc`, `ngcs`, `fsub`, `fneg`, `sqneg`,
+//!   `fabd`, long `ssubl`/`ssubw`/`usubl`/`usubw` (+`2`), halving
+//!   `shsub`/`uhsub`, saturating `sqsub`/`uqsub`, `sabd`/`uabd`,
+//!   narrowing `subhn`/`rsubhn` (+`2`), `sabdl`/`uabdl` (+`2`), `subp`/
+//!   `subps`. `MUL`: `mul`, `madd`, `msub`, `mneg`, `mla`, `mls`,
+//!   `smaddl`/`smsubl`/`umaddl`/`umsubl`, `smnegl`/`umnegl`, `smull`,
+//!   `smulh`, `umull`, `umulh` (+`2`/`l2` long forms, `smlal`/`smlsl`/
+//!   `umlsl` families), FP `fmul`/`fmulx`, `fmla`/`fmls`/`fmlal`/`fmlsl`/
+//!   `fcmla` (+`2`), `fmadd`/`fmsub`/`fnmadd`/`fnmsub`/`fnmul`,
+//!   polynomial `pmul`/`pmull`/`pmull2`, dot products `sdot`/`udot`,
+//!   saturating `sqdmulh`/`sqrdmulh`/`sqdmull`/`sqdmlal`/`sqdmlsl`/
+//!   `sqrdmlah`/`sqrdmlsh` (+`2`). `DIV`: `sdiv`, `udiv`, `fdiv`.
+//!   `AND`: `and`, `ands`, `bic`, `bics`, atomic `ldclr*`. `OR`: `orr`,
+//!   `orn`, bitwise selects `bsl`/`bit`/`bif`, atomic `ldset*`. `XOR`:
+//!   `eor`, `eon`, `mvni`, `eor3`, `bcax`, `rax1`, `xar`, AES
+//!   (`aese`/`aesd`/`aesmc`/`aesimc`), SHA-1/SHA-2/SHA-512
+//!   (`sha1c`/`sha1h`/`sha1m`/`sha1p`/`sha1su0`/`sha1su1`/`sha256h`/
+//!   `sha256h2`/`sha256su0`/`sha256su1`/`sha512h`/`sha512h2`/`sha512su0`/
+//!   `sha512su1`), SM3/SM4 (`sm3tt1a`-`sm3ss1`, `sm4e`/`sm4ekey`), CRC
+//!   (`crc32b`/`crc32h`/`crc32w`/`crc32x` and `cb`/`ch`/`cw`/`cx`),
+//!   atomic `ldeor*` (crypto folded to XOR). `SHL`: `lsl`, `lslv`, `shl`,
+//!   `sshl`/`ushl`/`srshl`/`urshl`/`sqrshl`/`uqrshl`, saturating
+//!   `sqshl`/`uqshl`/`sqshlu`, `sli`, long `shll`/`sshll`/`ushll` (+`2`).
+//!   `SHR`: `lsr`, `lsrv`, `asr`, `asrv`, `ror`, `rorv`, `ushr`/`sshr`/
+//!   `urshr`/`srshr`, accumulate `usra`/`ssra`/`ursra`/`srsra`, `sri`,
+//!   narrowing `shrn`/`rshrn`/`sqshrn`/`sqrshrn`/`sqshrun`/`sqrshrun`/
+//!   `uqshrn`/`uqrshrn` (+`2`).
+//! - `CMP`: `cmp`, `cmn`, `tst`, `ccmn`, `ccmp`, `cmtst`, FP `fcmp`/
+//!   `fcmpe`/`fccmp`/`fccmpe`, vector `cmeq`/`cmgt`/`cmge`/`cmle`/
+//!   `cmlt`/`cmhi`/`cmhs`/`cmtst`, FP `fcmeq`/`fcmge`/`fcmgt`/`fcmle`/
+//!   `fcmlt`/`facge`/`facgt`, compare-and-swap `cas*` (conditional store
+//!   unmodeled). `BRANCH`: direct `b`/`br` (indirect keeps operands).
+//!   `CBRANCH`: `cbz`, `cbnz`, `tbz`, `tbnz`, `b.<cond>`, `bc.<cond>`.
+//!   `CALL`: direct `bl`/`blr` (indirect keeps operands) plus `svc`,
+//!   `hvc`, `smc`. `RETURN`: `ret`, `eret`. `NOP`: `nop`, `hint`,
+//!   `dmb`, `dsb`, `isb`, `brk`, `hlt`, barriers `sb`/`ssbb`/`pssbb`,
+//!   `clrex`, waits/events `wfe`/`wfi`/`sev`/`sevl`/`yield`,
+//!   `esb`/`csdb`/`psb`/`tsb`, prefetches `prfm`/`prfum`, `sys`/`sysl`,
+//!   flag sets `rmif`/`setf8`/`setf16`, `dcps1`-`dcps3`/`drps`. Still
+//!   unmapped by design: `mrs`/`msr` (system registers), `udf`, pointer
+//!   authentication, MTE tags.
 //!
 //! `lift_arm32` covers ARMv7/ARM32 and Thumb mnemonics as printed by the
 //! disassembler (one `.w`/`.n` width suffix, one condition suffix, and one
-//! flag `s` stripped first):
+//! flag `s` stripped first; the decoder has no VFP/NEON or media
+//! instructions, so those stay unmapped rather than mislifting):
 //!
-//! - `COPY`: `mov`, `movw`, `movt`, `mvn`, `adr`. `LOAD`: `ldr`, `ldrb`,
-//!   `ldrh`, `ldrsb`, `ldrsh`, `ldrd`, `ldm`, `pop` (`pop`/`ldm` naming `pc`
-//!   lifts to `RETURN`, or `CBRANCH` when conditioned). `STORE`: `str`,
-//!   `strb`, `strh`, `strd`, `stm`, `push`.
-//! - `ADD`: `add`, `adc`. `SUB`: `sub`, `sbc`, `rsb`, `rsc`. `MUL`: `mul`,
-//!   `mla`. `DIV`: `sdiv`, `udiv`. `AND`: `and`, `bic`. `OR`: `orr`, `orn`.
-//!   `XOR`: `eor`. `SHL`: `lsl`. `SHR`: `lsr`, `asr`, `ror`, `rrx`.
+//! - `COPY`: `mov`, `movw`, `movt`, `mvn`, `adr`, `swp`, `swpb`, `clz`,
+//!   `rev`, `rev16`, `revsh`, `sxth`, `sxtb`, `uxth`, `uxtb`. `LOAD`:
+//!   `ldr`, `ldrb`, `ldrh`, `ldrsb`, `ldrsh`, `ldrd`, `ldm` (plus `ldmia`/
+//!   `ldmdb`/`ldmda`), unprivileged `ldrt`/`ldrbt`/`ldrht`/`ldrsbt`/
+//!   `ldrsht`, exclusives `ldrex`/`ldrexb`/`ldrexh`/`ldrexd`
+//!   (`pop`/`ldm*` naming `pc` lifts to `RETURN`, or `CBRANCH` when
+//!   conditioned). `STORE`: `str`, `strb`, `strh`, `strd`, `stm` (plus
+//!   `stmia`/`stmdb`/`stmda`), unprivileged `strt`/`strbt`/`strht`,
+//!   exclusives `strex`/`strexb`/`strexh`/`strexd`, `push`.
+//! - `ADD`: `add`, `adc`, saturating `qadd`, `qdadd`, `qadd16`, `qadd8`,
+//!   `uqadd16`, `uqadd8`. `SUB`: `sub`, `sbc`, `rsb`, `rsc`, saturating
+//!   `qsub`, `qdsub`, `qsub16`, `qsub8`, `uqsub16`, `uqsub8`. `MUL`:
+//!   `mul`, `mla`, `umaal`, `mls`, halfword `smlabb`/`smlabt`/`smlatb`/
+//!   `smlatt`, `smlawb`/`smlawt`, `smulbb`/`smulbt`/`smultb`/`smultt`,
+//!   `smlalbb`/`smlalbt`/`smlaltb`/`smlaltt`. `DIV`: `sdiv`, `udiv`
+//!   (Thumb only; ARM-mode divide is outside the decoder). `AND`: `and`,
+//!   `bic`. `OR`: `orr`, `orn`. `XOR`: `eor`. `SHL`: `lsl`. `SHR`:
+//!   `lsr`, `asr`, `ror`, `rrx`.
 //! - `CMP`: `cmp`, `cmn`, `tst`, `teq`. `BRANCH`: plain `b`/`bx` (indirect
 //!   keeps operands), `tbb`/`tbh`. `CBRANCH`: conditioned `b`/`bx`,
 //!   `cbz`/`cbnz`. `CALL`: direct `bl`/`blx` (indirect keeps operands) plus
-//!   `svc`, `hvc`, `smc`. `RETURN`: `pop`/`ldm` with `pc`, plain `bx lr`.
-//!   `NOP`: `nop`, `dmb`, `dsb`, `isb`.
+//!   `svc`, `hvc`, `smc`. `RETURN`: `pop`/`ldm*` with `pc`, plain `bx lr`.
+//!   `NOP`: `nop`, `dmb`, `dsb`, `isb`, `bkpt`, `it`, `hint`, `wfe`/
+//!   `wfi`/`sev`/`yield`, `cpsid`/`cpsie`, `setend`, `dbg` (mostly Thumb;
+//!   ARM-mode hints/barriers are outside the decoder).
 //!
 //! # Warning semantics
 //!
@@ -237,7 +363,7 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || is_x86_alu(mnem, IrOp::Xor)
                 || is_x86_alu(mnem, IrOp::Shl)
                 || is_x86_alu(mnem, IrOp::Shr)
-                || X86_CMP.contains(&mnem)
+                || is_x86_cmp(mnem)
                 || mnem == "jmp"
                 || is_x86_jcc(mnem)
                 || is_x86_call(mnem)
@@ -376,21 +502,27 @@ fn x86_families() -> Vec<FamilyCoverage> {
             Implemented,
             X86_COPY,
             &[],
-            Some("xchg swaps both operands; leave/enter copy the frame pointer"),
+            Some(
+                "xchg swaps both operands; leave/enter copy the frame pointer; cmovcc/setcc conditions, SIMD lanes/shuffles, and x87 stack effects unmodeled",
+            ),
         ),
         fam(
             IrOp::Load,
             Implemented,
             X86_LOAD,
             &[],
-            Some("pop lifts as LOAD; stack-pointer effects unmodeled"),
+            Some(
+                "pop lifts as LOAD; stack-pointer effects unmodeled; x87 control/state loads approximated as LOAD",
+            ),
         ),
         fam(
             IrOp::Store,
             Implemented,
             X86_STORE,
             &[],
-            Some("push lifts as STORE; stack-pointer effects unmodeled"),
+            Some(
+                "push lifts as STORE; stack-pointer effects unmodeled; x87 control/state stores approximated as STORE",
+            ),
         ),
         fam(
             IrOp::Add,
@@ -406,10 +538,12 @@ fn x86_families() -> Vec<FamilyCoverage> {
         fam(IrOp::Or, Implemented, X86_OR, &[], None),
         fam(
             IrOp::Xor,
-            Implemented,
+            Partial,
             X86_XOR,
             &[],
-            Some("not lifts as XOR"),
+            Some(
+                "not folds bitwise complement to XOR; AES/SHA/carryless-multiply rounds and crc32 folded to XOR, exact transforms unmodeled",
+            ),
         ),
         fam(IrOp::Shl, Implemented, X86_SHL, &[], None),
         fam(
@@ -417,14 +551,16 @@ fn x86_families() -> Vec<FamilyCoverage> {
             Partial,
             X86_SHR,
             &[],
-            Some("rol/ror/rcl/rcr approximated as shifts; exact bit motion out of scope"),
+            Some(
+                "rol/ror/rcl/rcr/shlx/shrx/sarx/rorx approximated as shifts; exact bit motion out of scope",
+            ),
         ),
         fam(
             IrOp::Cmp,
             Partial,
             X86_CMP,
-            &[],
-            Some("flag effects unmodeled"),
+            X86_CMP_PATTERNS,
+            Some("flag effects unmodeled; imm-folded cmp<cc>/vcmp<cc> pseudo-ops match by pattern"),
         ),
         fam(
             IrOp::Branch,
@@ -450,30 +586,60 @@ fn x86_families() -> Vec<FamilyCoverage> {
 fn aarch64_families() -> Vec<FamilyCoverage> {
     use CoverageStatus::{Implemented, Partial};
     vec![
-        fam(IrOp::Copy, Implemented, ARM_COPY, &[], None),
-        fam(IrOp::Load, Implemented, ARM_LOAD, &[], None),
-        fam(IrOp::Store, Implemented, ARM_STORE, &[], None),
+        fam(
+            IrOp::Copy,
+            Implemented,
+            ARM_COPY,
+            &[],
+            Some(
+                "conditional selects, min/max selects, saturating narrowing, and crypto-adjacent permutations approximated as COPY",
+            ),
+        ),
+        fam(
+            IrOp::Load,
+            Implemented,
+            ARM_LOAD,
+            &[],
+            Some("acquire/exclusive/pair/SIMD loads carry no ordering effects"),
+        ),
+        fam(
+            IrOp::Store,
+            Implemented,
+            ARM_STORE,
+            &[],
+            Some(
+                "release/exclusive/pair/SIMD stores carry no ordering effects; store-only atomics fold the ALU part away",
+            ),
+        ),
         fam(IrOp::Add, Implemented, ARM_ADD, &[], None),
         fam(IrOp::Sub, Implemented, ARM_SUB, &[], None),
         fam(IrOp::Mul, Implemented, ARM_MUL, &[], None),
         fam(IrOp::Div, Implemented, ARM_DIV, &[], None),
         fam(IrOp::And, Implemented, ARM_AND, &[], None),
         fam(IrOp::Or, Implemented, ARM_OR, &[], None),
-        fam(IrOp::Xor, Implemented, ARM_XOR, &[], None),
+        fam(
+            IrOp::Xor,
+            Partial,
+            ARM_XOR,
+            &[],
+            Some(
+                "AES/SHA/SM3/SM4 rounds, CRC, and atomic xor folded to XOR; exact transforms unmodeled",
+            ),
+        ),
         fam(IrOp::Shl, Implemented, ARM_SHL, &[], None),
         fam(
             IrOp::Shr,
             Partial,
             ARM_SHR,
             &[],
-            Some("ror/rorv are rotates, approximated as shifts"),
+            Some("ror/rorv are rotates, approximated as shifts; narrowing shifts drop lanes"),
         ),
         fam(
             IrOp::Cmp,
             Partial,
             ARM_CMP,
             &[],
-            Some("flag effects unmodeled"),
+            Some("flag effects unmodeled; compare-and-swap drops the conditional store"),
         ),
         fam(
             IrOp::Branch,
@@ -511,7 +677,9 @@ fn arm32_families() -> Vec<FamilyCoverage> {
             Implemented,
             ARM32_LOAD,
             &[],
-            Some("pop/ldm naming pc lift as RETURN (CBRANCH when predicated), not LOAD"),
+            Some(
+                "pop/ldm/ldmia/ldmdb/ldmda naming pc lift as RETURN (CBRANCH when predicated), not LOAD; exclusives carry no ordering effects",
+            ),
         ),
         fam(IrOp::Store, Implemented, ARM32_STORE, &[], None),
         fam(IrOp::Add, Implemented, ARM32_ADD, &[], None),
@@ -669,7 +837,7 @@ pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
             let (outputs, inputs) = alu_out_in(insn);
             (IrOp::Shr, inputs, outputs, None)
         }
-        s if X86_CMP.contains(&s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
+        s if is_x86_cmp(s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
         "jmp" => direct_or_indirect(insn, IrOp::Branch),
         s if is_x86_jcc(s) => (
             IrOp::CBranch,
@@ -752,7 +920,7 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
     let (op, inputs, outputs, target) = match base {
         s if is_arm32_copy(s) => first_out_rest_in(insn, IrOp::Copy),
         s if is_arm32_load(s) => {
-            if (s == "pop" || s == "ldm") && ops_contain_pc(insn) {
+            if is_arm32_ldm(s) && ops_contain_pc(insn) {
                 if cond {
                     (IrOp::CBranch, insn.ops.clone(), Vec::new(), None)
                 } else {
@@ -853,22 +1021,10 @@ fn arm_base_mnem(s: &str) -> bool {
         || is_arm32_alu(s, IrOp::Shl)
         || is_arm32_alu(s, IrOp::Shr)
         || ARM32_CMP.contains(&s)
+        || is_arm32_nop(s)
         || matches!(
             s,
-            "b" | "bl"
-                | "blx"
-                | "bx"
-                | "cbz"
-                | "cbnz"
-                | "tbb"
-                | "tbh"
-                | "svc"
-                | "hvc"
-                | "smc"
-                | "nop"
-                | "dmb"
-                | "dsb"
-                | "isb"
+            "b" | "bl" | "blx" | "bx" | "cbz" | "cbnz" | "tbb" | "tbh" | "svc" | "hvc" | "smc"
         )
 }
 
@@ -930,60 +1086,845 @@ fn is_x86_alu(s: &str, op: IrOp) -> bool {
 /// and [`coverage`] publishes the same slices, so the machine-readable
 /// report cannot drift from the lifters.
 const X86_COPY: &[&str] = &[
-    "mov", "movsx", "movsxd", "movzx", "movabs", "xchg", "leave", "enter",
+    "mov",
+    "movsx",
+    "movsxd",
+    "movzx",
+    "movabs",
+    "movbe",
+    "xchg",
+    "leave",
+    "enter",
+    "cbw",
+    "cwde",
+    "cdqe",
+    "cdq",
+    "cqo",
+    "bswap",
+    "cmovo",
+    "cmovno",
+    "cmovb",
+    "cmovae",
+    "cmove",
+    "cmovne",
+    "cmovbe",
+    "cmova",
+    "cmovs",
+    "cmovns",
+    "cmovp",
+    "cmovnp",
+    "cmovl",
+    "cmovge",
+    "cmovle",
+    "cmovg",
+    "seto",
+    "setno",
+    "setb",
+    "setae",
+    "sete",
+    "setne",
+    "setbe",
+    "seta",
+    "sets",
+    "setns",
+    "setp",
+    "setnp",
+    "setl",
+    "setge",
+    "setle",
+    "setg",
+    "movs",
+    "movsb",
+    "movsw",
+    "movsd",
+    "movsq",
+    "movss",
+    "movaps",
+    "movups",
+    "movapd",
+    "movupd",
+    "movdqa",
+    "movdqu",
+    "movd",
+    "movq",
+    "movlps",
+    "movlpd",
+    "movhps",
+    "movhpd",
+    "movlhps",
+    "movhlps",
+    "movmskps",
+    "movmskpd",
+    "lddqu",
+    "shufps",
+    "shufpd",
+    "pshufb",
+    "pshufd",
+    "pshufhw",
+    "pshuflw",
+    "unpcklps",
+    "unpcklpd",
+    "unpckhps",
+    "unpckhpd",
+    "punpcklbw",
+    "punpcklwd",
+    "punpckldq",
+    "punpcklqdq",
+    "punpckhbw",
+    "punpckhwd",
+    "punpckhdq",
+    "punpckhqdq",
+    "pinsrw",
+    "pextrw",
+    "bextr",
+    "pdep",
+    "pext",
+    "vmovaps",
+    "vmovups",
+    "vmovapd",
+    "vmovupd",
+    "vmovdqa",
+    "vmovdqu",
+    "vmovss",
+    "vmovsd",
+    "vmovd",
+    "vmovq",
+    "vmovlps",
+    "vmovlpd",
+    "vmovhps",
+    "vmovhpd",
+    "vshufps",
+    "vshufpd",
+    "vpshufb",
+    "vpshufd",
+    "vpshufhw",
+    "vpshuflw",
+    "vunpcklps",
+    "vunpcklpd",
+    "vunpckhps",
+    "vunpckhpd",
+    "vpunpcklbw",
+    "vpunpcklwd",
+    "vpunpckldq",
+    "vpunpcklqdq",
+    "vpunpckhbw",
+    "vpunpckhwd",
+    "vpunpckhdq",
+    "vpunpckhqdq",
+    "vpermps",
+    "vpermd",
+    "vpermq",
+    "vpermilps",
+    "vpermilpd",
+    "vperm2f128",
+    "vinsertps",
+    "vextractps",
+    "vinsertf128",
+    "vextractf128",
+    "vpinsrb",
+    "vpinsrw",
+    "vpinsrd",
+    "vpinsrq",
+    "vpextrb",
+    "vpextrw",
+    "vpextrd",
+    "vpextrq",
+    "vbroadcastss",
+    "vbroadcastsd",
+    "vpbroadcastb",
+    "vpbroadcastw",
+    "vpbroadcastd",
+    "vpbroadcastq",
+    "vpmovsxbw",
+    "vpmovsxbd",
+    "vpmovsxbq",
+    "vpmovsxwd",
+    "vpmovsxwq",
+    "vpmovsxdq",
+    "vpmovzxbw",
+    "vpmovzxbd",
+    "vpmovzxbq",
+    "vpmovzxwd",
+    "vpmovzxwq",
+    "vpmovzxdq",
+    "vpsignb",
+    "vpsignw",
+    "vpsignd",
+    "psignb",
+    "psignw",
+    "psignd",
+    "fld1",
+    "fldl2t",
+    "fldl2e",
+    "fldpi",
+    "fldlg2",
+    "fldln2",
+    "fldz",
+    "fabs",
+    "fsqrt",
+    "fxch",
+    "frndint",
+    "fnstsw",
+    "fcmovb",
+    "fcmove",
+    "fcmovbe",
+    "fcmovu",
+    "fcmovnb",
+    "fcmovne",
+    "fcmovnbe",
+    "fcmovnu",
+    "rdtsc",
+    "rdtscp",
+    "rdpmc",
+    "rdrand",
+    "rdseed",
+    "xgetbv",
 ];
-const X86_LOAD: &[&str] = &["pop", "popa", "popad"];
-const X86_STORE: &[&str] = &["push", "pusha", "pushad"];
-const X86_ADD: &[&str] = &["add", "adc", "adcx", "adox", "lea", "inc"];
-const X86_SUB: &[&str] = &["sub", "sbb", "dec", "neg"];
-const X86_MUL: &[&str] = &["mul", "imul"];
-const X86_DIV: &[&str] = &["div", "idiv"];
-const X86_AND: &[&str] = &["and"];
-const X86_OR: &[&str] = &["or"];
-const X86_XOR: &[&str] = &["xor", "pxor", "not"];
-const X86_SHL: &[&str] = &["shl", "sal"];
-const X86_SHR: &[&str] = &["shr", "sar", "rol", "ror", "rcl", "rcr"];
-const X86_CMP: &[&str] = &["cmp", "test"];
+const X86_LOAD: &[&str] = &[
+    "pop", "popa", "popad", "popf", "popfd", "popfq", "lods", "lodsb", "lodsw", "lodsd", "lodsq",
+    "xlat", "in", "insb", "insw", "insd", "movntdqa", "fld", "fild", "fbld", "fldenv", "fldcw",
+    "frstor", "fxrstor", "xrstor",
+];
+const X86_STORE: &[&str] = &[
+    "push", "pusha", "pushad", "pushf", "pushfd", "pushfq", "stos", "stosb", "stosw", "stosd",
+    "stosq", "out", "outsb", "outsw", "outsd", "movntps", "movntpd", "movntdq", "movnti",
+    "vmovntps", "vmovntpd", "vmovntdq", "fst", "fstp", "fist", "fistp", "fisttp", "fbstp",
+    "fnstcw", "fnstenv", "fnsave", "fxsave", "xsave",
+];
+const X86_ADD: &[&str] = &[
+    "add", "adc", "adcx", "adox", "lea", "inc", "fadd", "faddp", "fiadd", "addps", "addpd",
+    "addss", "addsd", "vaddps", "vaddpd", "vaddss", "vaddsd", "paddb", "paddw", "paddd", "paddq",
+    "vpaddb", "vpaddw", "vpaddd", "vpaddq", "haddps", "haddpd", "vhaddps", "vhaddpd", "phaddw",
+    "phaddd",
+];
+const X86_SUB: &[&str] = &[
+    "sub", "sbb", "dec", "neg", "fchs", "fsub", "fsubp", "fsubr", "fisub", "fisubr", "subps",
+    "subpd", "subss", "subsd", "vsubps", "vsubpd", "vsubss", "vsubsd", "psubb", "psubw", "psubd",
+    "psubq", "vpsubb", "vpsubw", "vpsubd", "vpsubq", "hsubps", "hsubpd", "vhsubps", "vhsubpd",
+    "phsubw", "phsubd", "psadbw", "mpsadbw", "vpsadbw", "vmpsadbw",
+];
+const X86_MUL: &[&str] = &[
+    "mul",
+    "imul",
+    "mulx",
+    "fmul",
+    "fmulp",
+    "fimul",
+    "mulps",
+    "mulpd",
+    "mulss",
+    "mulsd",
+    "vmulps",
+    "vmulpd",
+    "vmulss",
+    "vmulsd",
+    "pmullw",
+    "pmulld",
+    "vpmullw",
+    "vpmulld",
+    "pmuldq",
+    "vpmuldq",
+    "pmuludq",
+    "vpmuludq",
+    "pmulhw",
+    "pmulhuw",
+    "vpmulhw",
+    "vpmulhuw",
+    "pmaddwd",
+    "vpmaddwd",
+    "vfmadd132ps",
+    "vfmadd132pd",
+    "vfmadd132ss",
+    "vfmadd132sd",
+    "vfmadd213ps",
+    "vfmadd213pd",
+    "vfmadd213ss",
+    "vfmadd213sd",
+    "vfmadd231ps",
+    "vfmadd231pd",
+    "vfmadd231ss",
+    "vfmadd231sd",
+    "vfmsub132ps",
+    "vfmsub132pd",
+    "vfmsub132ss",
+    "vfmsub132sd",
+    "vfmsub213ps",
+    "vfmsub213pd",
+    "vfmsub213ss",
+    "vfmsub213sd",
+    "vfmsub231ps",
+    "vfmsub231pd",
+    "vfmsub231ss",
+    "vfmsub231sd",
+    "vfnmadd132ps",
+    "vfnmadd132pd",
+    "vfnmadd132ss",
+    "vfnmadd132sd",
+    "vfnmadd213ps",
+    "vfnmadd213pd",
+    "vfnmadd213ss",
+    "vfnmadd213sd",
+    "vfnmadd231ps",
+    "vfnmadd231pd",
+    "vfnmadd231ss",
+    "vfnmadd231sd",
+    "vfnmsub132ps",
+    "vfnmsub132pd",
+    "vfnmsub132ss",
+    "vfnmsub132sd",
+    "vfnmsub213ps",
+    "vfnmsub213pd",
+    "vfnmsub213ss",
+    "vfnmsub213sd",
+    "vfnmsub231ps",
+    "vfnmsub231pd",
+    "vfnmsub231ss",
+    "vfnmsub231sd",
+];
+const X86_DIV: &[&str] = &[
+    "div", "idiv", "fdiv", "fdivp", "fdivr", "fidiv", "fidivr", "divps", "divpd", "divss", "divsd",
+    "vdivps", "vdivpd", "vdivss", "vdivsd",
+];
+const X86_AND: &[&str] = &[
+    "and", "pand", "vpand", "pandn", "vpandn", "andps", "andpd", "vandps", "vandpd", "andn",
+    "blsi", "blsr", "bzhi", "btr",
+];
+const X86_OR: &[&str] = &["or", "por", "vpor", "orps", "orpd", "vorps", "vorpd", "bts"];
+const X86_XOR: &[&str] = &[
+    "xor",
+    "pxor",
+    "vpxor",
+    "not",
+    "xorps",
+    "xorpd",
+    "vxorps",
+    "vxorpd",
+    "blsmsk",
+    "btc",
+    "aesenc",
+    "aesenclast",
+    "aesdec",
+    "aesdeclast",
+    "aeskeygenassist",
+    "aesimc",
+    "pclmullqlqdq",
+    "pclmulhqlqdq",
+    "pclmullqhqdq",
+    "pclmulhqhqdq",
+    "sha1nexte",
+    "sha1msg1",
+    "sha1msg2",
+    "sha1rnds4",
+    "sha256rnds2",
+    "sha256msg1",
+    "sha256msg2",
+    "crc32",
+];
+const X86_SHL: &[&str] = &[
+    "shl", "sal", "shld", "shlx", "psllw", "pslld", "psllq", "pslldq", "vpsllw", "vpslld",
+    "vpsllq", "vpslldq",
+];
+const X86_SHR: &[&str] = &[
+    "shr", "sar", "rol", "ror", "rcl", "rcr", "shrd", "shrx", "sarx", "rorx", "psrlw", "psrld",
+    "psrlq", "psrldq", "vpsrlw", "vpsrld", "vpsrlq", "vpsrldq", "psraw", "psrad", "vpsraw",
+    "vpsrad", "palignr", "vpalignr",
+];
+const X86_CMP: &[&str] = &[
+    "cmp",
+    "test",
+    "bt",
+    "cmps",
+    "cmpsb",
+    "cmpsw",
+    "cmpsd",
+    "cmpsq",
+    "scas",
+    "scasb",
+    "scasw",
+    "scasd",
+    "scasq",
+    "comiss",
+    "comisd",
+    "ucomiss",
+    "ucomisd",
+    "vcomiss",
+    "vcomisd",
+    "vucomiss",
+    "vucomisd",
+    "vtestps",
+    "vtestpd",
+    "vptest",
+    "fcom",
+    "fcomp",
+    "fcompp",
+    "fucom",
+    "fucomp",
+    "fucompp",
+    "fcomi",
+    "fcomip",
+    "fucomi",
+    "fucomip",
+    "ftst",
+    "fxam",
+    "ficom",
+    "ficomp",
+    "pcmpeqb",
+    "pcmpeqw",
+    "pcmpeqd",
+    "pcmpeqq",
+    "vpcmpeqb",
+    "vpcmpeqw",
+    "vpcmpeqd",
+    "vpcmpeqq",
+    "pcmpgtb",
+    "pcmpgtw",
+    "pcmpgtd",
+    "pcmpgtq",
+    "vpcmpgtb",
+    "vpcmpgtw",
+    "vpcmpgtd",
+    "vpcmpgtq",
+    "pcmpestri",
+    "pcmpestrm",
+    "pcmpistri",
+    "pcmpistrm",
+    "phminposuw",
+    "vphminposuw",
+];
+/// Imm-folded x86 compare pseudo-ops: iced-x86 folds the immediate predicate
+/// into the mnemonic (`cmpeqps`, `vcmpltps`, ...), so these publish as
+/// patterns with the same `<cond>` placeholder style as AArch64 `b.<cond>`.
+const X86_CMP_PATTERNS: &[&str] = &[
+    "cmp<cond>ps",
+    "cmp<cond>pd",
+    "cmp<cond>ss",
+    "cmp<cond>sd",
+    "vcmp<cond>ps",
+    "vcmp<cond>pd",
+    "vcmp<cond>ss",
+    "vcmp<cond>sd",
+];
 const X86_JCC: &[&str] = &[
     "jo", "jno", "jb", "jnae", "jc", "jnb", "jae", "jnc", "je", "jz", "jne", "jnz", "jbe", "jna",
     "jnbe", "ja", "js", "jns", "jp", "jpe", "jnp", "jpo", "jl", "jnge", "jnl", "jge", "jle", "jng",
     "jnle", "jg", "jcxz", "jecxz", "jrcxz", "loop", "loope", "loopne",
 ];
 const X86_CALL: &[&str] = &["call", "syscall", "sysenter", "int", "int3"];
-const X86_RETURN: &[&str] = &["ret", "retn", "retf", "iret", "iretd", "iretq"];
-const X86_NOP: &[&str] = &["nop", "pause", "hlt", "wait", "endbr32", "endbr64"];
-
-const ARM_COPY: &[&str] = &["mov", "movz", "movn", "movk", "adr", "adrp"];
-const ARM_LOAD: &[&str] = &[
-    "ldr", "ldp", "ldur", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw",
+const X86_RETURN: &[&str] = &[
+    "ret", "retn", "retf", "iret", "iretd", "iretq", "sysret", "sysexit",
 ];
-const ARM_STORE: &[&str] = &["str", "stp", "stur", "strb", "strh"];
-const ARM_ADD: &[&str] = &["add", "adds", "adc", "adcs"];
-const ARM_SUB: &[&str] = &["sub", "subs", "sbc", "sbcs", "neg", "negs"];
-const ARM_MUL: &[&str] = &["mul", "madd", "msub", "smull", "smulh", "umull", "umulh"];
-const ARM_DIV: &[&str] = &["sdiv", "udiv"];
-const ARM_AND: &[&str] = &["and", "ands", "bic", "bics"];
-const ARM_OR: &[&str] = &["orr", "orn"];
-const ARM_XOR: &[&str] = &["eor", "eon"];
-const ARM_SHL: &[&str] = &["lsl", "lslv"];
-const ARM_SHR: &[&str] = &["lsr", "lsrv", "asr", "asrv", "ror", "rorv"];
-const ARM_CMP: &[&str] = &["cmp", "cmn", "tst"];
+const X86_NOP: &[&str] = &[
+    "nop",
+    "pause",
+    "hlt",
+    "fwait",
+    "endbr32",
+    "endbr64",
+    "mfence",
+    "lfence",
+    "sfence",
+    "clflush",
+    "clflushopt",
+    "clwb",
+    "emms",
+    "femms",
+    "prefetchnta",
+    "prefetcht0",
+    "prefetcht1",
+    "prefetcht2",
+    "prefetchw",
+    "clc",
+    "stc",
+    "cmc",
+    "cld",
+    "std",
+    "cli",
+    "sti",
+    "clac",
+    "stac",
+    "lahf",
+    "sahf",
+    "monitor",
+    "mwait",
+    "vzeroupper",
+    "vzeroall",
+    "fnop",
+    "ffree",
+    "fdecstp",
+    "fincstp",
+    "fnclex",
+    "fninit",
+];
+
+const ARM_COPY: &[&str] = &[
+    "mov",
+    "movz",
+    "movn",
+    "movk",
+    "adr",
+    "adrp",
+    "mvn",
+    "movi",
+    "dup",
+    "smov",
+    "umov",
+    "ext",
+    "tbl",
+    "tbx",
+    "uzp1",
+    "uzp2",
+    "trn1",
+    "trn2",
+    "zip1",
+    "zip2",
+    "rev",
+    "rev16",
+    "rev32",
+    "rev64",
+    "rbit",
+    "csel",
+    "csinc",
+    "csinv",
+    "csneg",
+    "cinc",
+    "cset",
+    "cinv",
+    "csetm",
+    "cneg",
+    "fcsel",
+    "uxtb",
+    "uxth",
+    "sxtb",
+    "sxth",
+    "sxtw",
+    "ubfx",
+    "sbfx",
+    "ubfiz",
+    "sbfiz",
+    "bfc",
+    "bfi",
+    "bfxil",
+    "extr",
+    "clz",
+    "cls",
+    "cnt",
+    "abs",
+    "sqabs",
+    "xtn",
+    "xtn2",
+    "sqxtn",
+    "sqxtn2",
+    "sqxtun",
+    "sqxtun2",
+    "uqxtn",
+    "uqxtn2",
+    "fmov",
+    "fabs",
+    "scvtf",
+    "ucvtf",
+    "fcvt",
+    "fcvtl",
+    "fcvtl2",
+    "fcvtn",
+    "fcvtn2",
+    "fcvtxn",
+    "fcvtxn2",
+    "fcvtns",
+    "fcvtnu",
+    "fcvtps",
+    "fcvtpu",
+    "fcvtms",
+    "fcvtmu",
+    "fcvtas",
+    "fcvtau",
+    "fcvtzs",
+    "fcvtzu",
+    "fjcvtzs",
+    "bfcvt",
+    "frintn",
+    "frintp",
+    "frintm",
+    "frintz",
+    "frinta",
+    "frintx",
+    "frinti",
+    "frint32x",
+    "frint32z",
+    "frint64x",
+    "frint64z",
+    "fmax",
+    "fmin",
+    "fmaxnm",
+    "fminnm",
+    "fmaxp",
+    "fmaxnmp",
+    "fminp",
+    "fminnmp",
+    "fmaxv",
+    "fmaxnmv",
+    "fminv",
+    "fminnmv",
+    "smax",
+    "smin",
+    "umax",
+    "umin",
+    "smaxp",
+    "sminp",
+    "umaxp",
+    "uminp",
+    "smaxv",
+    "sminv",
+    "umaxv",
+    "uminv",
+    "frecpe",
+    "frecps",
+    "frecpx",
+    "frsqrte",
+    "frsqrts",
+    "swp",
+    "swpl",
+    "swpa",
+    "swpal",
+    "swpb",
+    "swplb",
+    "swpab",
+    "swpalb",
+    "swph",
+    "swplh",
+    "swpah",
+    "swpalh",
+    "ldsmax",
+    "ldsmaxl",
+    "ldsmaxa",
+    "ldsmaxal",
+    "ldsmaxh",
+    "ldsmaxlh",
+    "ldsmaxah",
+    "ldsmaxalh",
+    "ldsmaxb",
+    "ldsmaxlb",
+    "ldsmaxab",
+    "ldsmaxalb",
+    "ldsmin",
+    "ldsminl",
+    "ldsmina",
+    "ldsminal",
+    "ldsminh",
+    "ldsminlh",
+    "ldsminah",
+    "ldsminalh",
+    "ldsminb",
+    "ldsminlb",
+    "ldsminab",
+    "ldsminalb",
+    "ldumax",
+    "ldumaxl",
+    "ldumaxa",
+    "ldumaxal",
+    "ldumaxh",
+    "ldumaxlh",
+    "ldumaxah",
+    "ldumaxalh",
+    "ldumaxb",
+    "ldumaxlb",
+    "ldumaxab",
+    "ldumaxalb",
+    "ldumin",
+    "lduminl",
+    "ldumina",
+    "lduminal",
+    "lduminh",
+    "lduminlh",
+    "lduminah",
+    "lduminalh",
+    "lduminb",
+    "lduminlb",
+    "lduminab",
+    "lduminalb",
+];
+const ARM_LOAD: &[&str] = &[
+    "ldr", "ldp", "ldpsw", "ldur", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrsw", "ldurb", "ldurh",
+    "ldursb", "ldursh", "ldursw", "ldtr", "ldtrb", "ldtrh", "ldtrsb", "ldtrsh", "ldtrsw", "ldar",
+    "ldarb", "ldarh", "ldaxr", "ldaxrb", "ldaxrh", "ldaxp", "ldxr", "ldxrb", "ldxrh", "ldxp",
+    "ldlar", "ldlarb", "ldlarh", "ldapr", "ldaprh", "ldaprb", "ldapur", "ldapurb", "ldapurh",
+    "ldapursb", "ldapursh", "ldapursw", "ldnp", "ld1", "ld2", "ld3", "ld4", "ld1r", "ld2r", "ld3r",
+    "ld4r", "ldraa", "ldrab",
+];
+const ARM_STORE: &[&str] = &[
+    "str", "stp", "stur", "strb", "strh", "sturb", "sturh", "sttr", "sttrb", "sttrh", "stlr",
+    "stlrb", "stlrh", "stxr", "stxrb", "stxrh", "stxp", "stlxr", "stlxrb", "stlxrh", "stllr",
+    "stllrb", "stllrh", "stlur", "stlurb", "stlurh", "stnp", "st1", "st2", "st3", "st4", "stadd",
+    "staddl", "staddh", "staddlh", "staddb", "staddlb", "stclr", "stclrl", "stclrh", "stclrlh",
+    "stclrb", "stclrlb", "stset", "stsetl", "stseth", "stsetlh", "stsetb", "stsetlb", "steor",
+    "steorl", "steorh", "steorlh", "steorb", "steorlb", "stsmax", "stsmaxl", "stsmaxh", "stsmaxlh",
+    "stsmaxb", "stsmaxlb", "stsmin", "stsminl", "stsminh", "stsminlh", "stsminb", "stsminlb",
+    "stumax", "stumaxl", "stumaxh", "stumaxlh", "stumaxb", "stumaxlb", "stumin", "stuminl",
+    "stuminh", "stuminlh", "stuminb", "stuminlb",
+];
+const ARM_ADD: &[&str] = &[
+    "add", "adds", "adc", "adcs", "fadd", "faddp", "fcadd", "addv", "saddlv", "uaddlv", "saddlp",
+    "sadalp", "uaddlp", "uadalp", "addp", "saddl", "saddl2", "uaddl", "uaddl2", "saddw", "saddw2",
+    "uaddw", "uaddw2", "shadd", "uhadd", "srhadd", "urhadd", "sqadd", "uqadd", "suqadd", "usqadd",
+    "saba", "uaba", "sabal", "sabal2", "uabal", "uabal2", "addhn", "addhn2", "raddhn", "raddhn2",
+    "ldadd", "ldaddl", "ldadda", "ldaddal", "ldaddh", "ldaddlh", "ldaddah", "ldaddalh", "ldaddb",
+    "ldaddlb", "ldaddab", "ldaddalb",
+];
+const ARM_SUB: &[&str] = &[
+    "sub", "subs", "sbc", "sbcs", "neg", "negs", "ngc", "ngcs", "fsub", "fneg", "sqneg", "fabd",
+    "ssubl", "ssubl2", "usubl", "usubl2", "ssubw", "ssubw2", "usubw", "usubw2", "shsub", "uhsub",
+    "sqsub", "uqsub", "sabd", "uabd", "subhn", "subhn2", "rsubhn", "rsubhn2", "sabdl", "sabdl2",
+    "uabdl", "uabdl2", "subp", "subps",
+];
+const ARM_MUL: &[&str] = &[
+    "mul", "madd", "msub", "mneg", "mla", "mls", "smaddl", "smsubl", "umaddl", "umsubl", "smnegl",
+    "umnegl", "smull", "smulh", "umull", "umulh", "smull2", "umull2", "umlal", "umlal2", "smlal",
+    "smlal2", "smlsl", "smlsl2", "umlsl", "umlsl2", "sqdmulh", "sqrdmulh", "sqdmull", "sqdmull2",
+    "sqdmlal", "sqdmlal2", "sqdmlsl", "sqdmlsl2", "sqrdmlah", "sqrdmlsh", "fmul", "fmulx", "fmla",
+    "fmls", "fmlal", "fmlal2", "fmlsl", "fmlsl2", "fcmla", "fmadd", "fmsub", "fnmadd", "fnmsub",
+    "fnmul", "pmul", "pmull", "pmull2", "sdot", "udot",
+];
+const ARM_DIV: &[&str] = &["sdiv", "udiv", "fdiv"];
+const ARM_AND: &[&str] = &[
+    "and", "ands", "bic", "bics", "ldclr", "ldclrl", "ldclra", "ldclral", "ldclrh", "ldclrlh",
+    "ldclrah", "ldclralh", "ldclrb", "ldclrlb", "ldclrab", "ldclralb",
+];
+const ARM_OR: &[&str] = &[
+    "orr", "orn", "bsl", "bit", "bif", "ldset", "ldsetl", "ldseta", "ldsetal", "ldseth", "ldsetlh",
+    "ldsetah", "ldsetalh", "ldsetb", "ldsetlb", "ldsetab", "ldsetalb",
+];
+const ARM_XOR: &[&str] = &[
+    "eor",
+    "eon",
+    "mvni",
+    "eor3",
+    "bcax",
+    "rax1",
+    "xar",
+    "aese",
+    "aesd",
+    "aesmc",
+    "aesimc",
+    "sha1c",
+    "sha1h",
+    "sha1m",
+    "sha1p",
+    "sha1su0",
+    "sha1su1",
+    "sha256h",
+    "sha256h2",
+    "sha256su0",
+    "sha256su1",
+    "sha512h",
+    "sha512h2",
+    "sha512su0",
+    "sha512su1",
+    "sm3tt1a",
+    "sm3tt1b",
+    "sm3tt2a",
+    "sm3tt2b",
+    "sm3partw1",
+    "sm3partw2",
+    "sm3ss1",
+    "sm4e",
+    "sm4ekey",
+    "crc32b",
+    "crc32h",
+    "crc32w",
+    "crc32x",
+    "crc32cb",
+    "crc32ch",
+    "crc32cw",
+    "crc32cx",
+    "ldeor",
+    "ldeorl",
+    "ldeora",
+    "ldeoral",
+    "ldeorh",
+    "ldeorlh",
+    "ldeorah",
+    "ldeoralh",
+    "ldeorb",
+    "ldeorlb",
+    "ldeorab",
+    "ldeoralb",
+];
+const ARM_SHL: &[&str] = &[
+    "lsl", "lslv", "shl", "sshl", "ushl", "srshl", "urshl", "sqrshl", "uqrshl", "sqshl", "uqshl",
+    "sqshlu", "sli", "shll", "shll2", "sshll", "sshll2", "ushll", "ushll2",
+];
+const ARM_SHR: &[&str] = &[
+    "lsr",
+    "lsrv",
+    "asr",
+    "asrv",
+    "ror",
+    "rorv",
+    "ushr",
+    "sshr",
+    "urshr",
+    "srshr",
+    "usra",
+    "ssra",
+    "ursra",
+    "srsra",
+    "sri",
+    "shrn",
+    "shrn2",
+    "rshrn",
+    "rshrn2",
+    "sqshrn",
+    "sqshrn2",
+    "sqrshrn",
+    "sqrshrn2",
+    "sqshrun",
+    "sqshrun2",
+    "sqrshrun",
+    "sqrshrun2",
+    "uqshrn",
+    "uqshrn2",
+    "uqrshrn",
+    "uqrshrn2",
+];
+const ARM_CMP: &[&str] = &[
+    "cmp", "cmn", "tst", "ccmn", "ccmp", "cmtst", "fcmp", "fcmpe", "fccmp", "fccmpe", "cmeq",
+    "cmgt", "cmge", "cmle", "cmlt", "cmhi", "cmhs", "fcmeq", "fcmge", "fcmgt", "fcmle", "fcmlt",
+    "facge", "facgt", "cas", "casl", "casa", "casal", "casb", "caslb", "casab", "casalb", "cash",
+    "caslh", "casah", "casalh", "casp", "caspl", "caspa", "caspal",
+];
 const ARM_CBRANCH: &[&str] = &["cbz", "cbnz", "tbz", "tbnz"];
 /// Non-literal AArch64 members: `b.<cond>` / `bc.<cond>` match the
 /// [`is_arm_cbranch`] prefix rule, so they publish as patterns, not mnemonics.
 const ARM_CBRANCH_PATTERNS: &[&str] = &["b.<cond>", "bc.<cond>"];
 const ARM_CALL: &[&str] = &["svc", "hvc", "smc"];
 const ARM_RETURN: &[&str] = &["ret", "eret"];
-const ARM_NOP: &[&str] = &["nop", "hint", "dmb", "dsb", "isb", "brk"];
-
-const ARM32_COPY: &[&str] = &["mov", "movw", "movt", "mvn", "adr"];
-const ARM32_LOAD: &[&str] = &[
-    "ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrd", "ldm", "pop",
+const ARM_NOP: &[&str] = &[
+    "nop", "hint", "dmb", "dsb", "isb", "brk", "hlt", "sb", "ssbb", "pssbb", "clrex", "wfe", "wfi",
+    "sev", "sevl", "yield", "esb", "csdb", "psb", "tsb", "prfm", "prfum", "sys", "sysl", "rmif",
+    "setf8", "setf16", "dcps1", "dcps2", "dcps3", "drps",
 ];
-const ARM32_STORE: &[&str] = &["str", "strb", "strh", "strd", "stm", "push"];
-const ARM32_ADD: &[&str] = &["add", "adc"];
-const ARM32_SUB: &[&str] = &["sub", "sbc", "rsb", "rsc"];
-const ARM32_MUL: &[&str] = &["mul", "mla"];
+
+const ARM32_COPY: &[&str] = &[
+    "mov", "movw", "movt", "mvn", "adr", "swp", "swpb", "clz", "rev", "rev16", "revsh", "rbit",
+    "sxth", "sxtb", "uxth", "uxtb",
+];
+const ARM32_LOAD: &[&str] = &[
+    "ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "ldrd", "ldm", "ldmia", "ldmdb", "ldmda", "pop",
+    "ldrt", "ldrbt", "ldrht", "ldrsbt", "ldrsht", "ldrex", "ldrexb", "ldrexh", "ldrexd",
+];
+const ARM32_STORE: &[&str] = &[
+    "str", "strb", "strh", "strd", "stm", "stmia", "stmdb", "stmda", "push", "strt", "strbt",
+    "strht", "strex", "strexb", "strexh", "strexd",
+];
+const ARM32_ADD: &[&str] = &[
+    "add", "adc", "qadd", "qdadd", "qadd16", "qadd8", "uqadd16", "uqadd8",
+];
+const ARM32_SUB: &[&str] = &[
+    "sub", "sbc", "rsb", "rsc", "qsub", "qdsub", "qsub16", "qsub8", "uqsub16", "uqsub8",
+];
+const ARM32_MUL: &[&str] = &[
+    "mul", "mla", "umaal", "mls", "smlabb", "smlabt", "smlatb", "smlatt", "smlawb", "smlawt",
+    "smulbb", "smulbt", "smultb", "smultt", "smlalbb", "smlalbt", "smlaltb", "smlaltt",
+];
 const ARM32_DIV: &[&str] = &["sdiv", "udiv"];
 const ARM32_AND: &[&str] = &["and", "bic"];
 const ARM32_OR: &[&str] = &["orr", "orn"];
@@ -992,10 +1933,26 @@ const ARM32_SHL: &[&str] = &["lsl"];
 const ARM32_SHR: &[&str] = &["lsr", "asr", "ror", "rrx"];
 const ARM32_CMP: &[&str] = &["cmp", "cmn", "tst", "teq"];
 const ARM32_CALL: &[&str] = &["svc", "hvc", "smc"];
-const ARM32_NOP: &[&str] = &["nop", "dmb", "dsb", "isb"];
+const ARM32_NOP: &[&str] = &[
+    "nop", "dmb", "dsb", "isb", "bkpt", "it", "hint", "wfe", "wfi", "sev", "yield", "cpsid",
+    "cpsie", "setend", "dbg",
+];
 
 fn is_x86_jcc(s: &str) -> bool {
     X86_JCC.contains(&s)
+}
+
+/// Whether `s` is an x86 compare: the literal table plus iced-x86's
+/// imm-folded pseudo-ops (`cmpeqps`, `vcmpltps`, ...), which never print in
+/// their generic `cmpps`/`vcmpps` form. The `cmp`/`vcmp` prefix with a lane
+/// width suffix only ever matches compares; `cmpxchg` and the string
+/// `cmps*` forms do not end in a width and stay literal-only.
+fn is_x86_cmp(s: &str) -> bool {
+    if X86_CMP.contains(&s) {
+        return true;
+    }
+    let t = s.strip_prefix('v').unwrap_or(s);
+    t.starts_with("cmp") && ["ps", "pd", "ss", "sd"].iter().any(|w| t.ends_with(w))
 }
 
 fn is_x86_call(s: &str) -> bool {
@@ -1082,6 +2039,12 @@ fn is_arm32_alu(s: &str, op: IrOp) -> bool {
 
 fn is_arm32_call(s: &str) -> bool {
     ARM32_CALL.contains(&s)
+}
+
+/// Whether `s` is a load-multiple covered by the `pop`/`ldm`-with-`pc`
+/// return rule (`ldm` and its `ia`/`db`/`da` addressing-mode spellings).
+fn is_arm32_ldm(s: &str) -> bool {
+    s == "pop" || s == "ldm" || s == "ldmia" || s == "ldmdb" || s == "ldmda"
 }
 
 fn is_arm32_nop(s: &str) -> bool {

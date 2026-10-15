@@ -465,3 +465,23 @@ fn partial_thumb_cap_still_errors() {
     .unwrap_err();
     assert!(matches!(err, Error::Limit(_)), "got {err:?}");
 }
+
+#[test]
+fn x86_rep_lock_prefixes_expose_real_mnemonic() {
+    // rep movsb: the prefix is not the mnemonic.
+    let v = x86(&[0xf3, 0xa4], 0x1000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].mnem, "movsb");
+    assert_eq!(v[0].ops, ["[rdi]", "[rsi]"]);
+    // repe cmpsb keeps the compare operands.
+    let v = x86(&[0xf3, 0xa6], 0x1000);
+    assert_eq!(v[0].mnem, "cmpsb");
+    // lock add [rax], eax lifts the add with memory operands intact.
+    let v = x86(&[0xf0, 0x01, 0x00], 0x1000);
+    assert_eq!(v[0].mnem, "add");
+    assert_eq!(v[0].ops, ["[rax]", "eax"]);
+    // rep ret still returns.
+    let v = x86(&[0xf3, 0xc3], 0x1000);
+    assert_eq!(v[0].mnem, "ret");
+    assert!(v[0].ops.is_empty());
+}
