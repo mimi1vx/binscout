@@ -168,7 +168,7 @@ pub fn parse_document(text: &str) -> Result<AnnotationDocument> {
 
 /// Whether `s` is a 64-char lowercase hex digest (malformed identity).
 fn is_digest(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Validate a parsed document against the open project and merge it over

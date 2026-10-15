@@ -180,6 +180,13 @@ fn identity_mismatch_leaves_everything() {
         .unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
 
+    // Uppercase hex is well-formed hex but not the lowercase digest form:
+    // malformed identity, never a storage mismatch.
+    let mut upper = doc_value(&doc);
+    upper["sha256"] = p.content_sha256().to_ascii_uppercase().into();
+    let err = p.import_annotations(&upper.to_string(), false).unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+
     assert_eq!(state_of(&p, &db), before);
     common::cleanup(&dir);
 }
