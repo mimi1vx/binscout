@@ -346,6 +346,29 @@ pub struct CallgraphParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for the `slice` tool: depth-bounded backward reachability
+/// to one address, paged under the protocol-1 envelope.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SliceParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Slice root: every returned instruction can reach this address
+    /// (`0x`-hex or decimal string; any address is valid, including
+    /// data/string targets in no function).
+    pub to: String,
+    /// Max reverse hops from the root (direct predecessors are depth 1;
+    /// defaults to the 64-hop cap).
+    pub depth: Option<usize>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
 /// Parameters for the `annotations_import` tool: merge a portable document.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AnnotationsImportParams {
@@ -592,6 +615,28 @@ impl BinscoutMcp {
             other => ErrorData::internal_error(other.to_string(), None),
         })
         .and_then(|page| ok(serde_json::to_value(page).expect("callers page serializes")))
+    }
+
+    #[tool(
+        name = "slice",
+        description = "Backward slice of one address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors, out to depth hops (direct predecessors are depth 1), ordered by address with shortest distance, paged under the protocol-1 envelope. Any address is a valid root"
+    )]
+    fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let to = parse_addr(&p.to).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.slice_page(
+            to,
+            p.depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
+            p.offset.unwrap_or(0),
+            p.limit.unwrap_or(50),
+        )
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
+        .and_then(|page| ok(serde_json::to_value(page).expect("slice page serializes")))
     }
 
     #[tool(

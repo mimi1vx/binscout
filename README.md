@@ -70,6 +70,7 @@ container auto-detection applies.
 | `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only) |
 | `callees` | `binscout callees fw.elf 0x400000 --depth 5` | transitive callees out to `--depth` hops (direct are depth 1), ordered by entry with shortest distance, paged under the page envelope |
 | `callers` | `binscout callers fw.elf 0x400000 --depth 5` | transitive callers out to `--depth` hops, ordered by entry with shortest distance, paged under the page envelope |
+| `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, paged under the page envelope |
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default); paged by `--start`/`--limit` |
 | `symbols` | `binscout symbols fw.elf` | imports and exports |
@@ -90,9 +91,9 @@ omitting the flag leaves that field alone.
 
 ## MCP server
 
-`binscout-mcp` serves 22 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 23 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `functions`, `func`, `blocks`, `block_insns`,
-`diagnostics`, `disasm`, `cfg`, `callees`, `callers`, `xrefs`, `strings`, `symbols`, `stats`,
+`diagnostics`, `disasm`, `cfg`, `callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
 `sections`, `ir`, `ir_coverage`, `rename`, `comment`, `search_bytes`,
 `annotations_export`, `annotations_import`. Each takes `binary` plus
 optional `db` (and an optional `raw` mapping object on binary-taking

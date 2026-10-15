@@ -75,6 +75,13 @@ pub const MAX_PAGE: usize = 1024;
 /// so a large depth cannot inflate work past one bounded walk over the
 /// function set.
 pub const MAX_CALL_DEPTH: usize = 64;
+/// Cap on backward-slice hops per query.
+///
+/// Bounds BFS in [`Analysis::slice_to`]: deeper requests clip to this
+/// depth so a large depth cannot inflate work past one bounded walk
+/// over the instruction set. Mirrors [`MAX_CALL_DEPTH`]: direct
+/// predecessors are depth 1, zero yields an empty set.
+pub const MAX_SLICE_DEPTH: usize = 64;
 
 /// What a cross-reference points through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -390,6 +397,19 @@ impl Function {
         self.cfg.neighbors(block).collect()
     }
 
+    /// Predecessor block starts of `block`.
+    ///
+    /// Reverse of [`Function::successors`] over the direct CFG only;
+    /// inferred single-slot resolutions are covered separately through
+    /// their provenance-marked [`XrefKind::InferredCode`] xrefs, so the
+    /// backward slice needs no second edge set here.
+    #[must_use]
+    pub fn predecessors(&self, block: u64) -> Vec<u64> {
+        self.cfg
+            .neighbors_directed(block, petgraph::Direction::Incoming)
+            .collect()
+    }
+
     /// All CFG edges as `(from_block, to_block)` pairs.
     ///
     /// Direct edges only; inferred single-slot resolutions live in
@@ -539,6 +559,95 @@ impl Analysis {
     #[must_use]
     pub fn callers_transitive(&self, entry: u64, max_depth: usize) -> Vec<(u64, usize)> {
         self.reachable(entry, max_depth, petgraph::Direction::Incoming)
+    }
+
+    /// Backward slice of `to` as `(addr, depth)` pairs.
+    ///
+    /// Bounded reverse walk over xref edges (every [`XrefKind`]: code,
+    /// data, string, and inferred-code) plus intra-function CFG
+    /// predecessors at instruction granularity: the previous
+    /// instruction in the same block, or the last instruction of each
+    /// predecessor block (see [`Function::predecessors`]) at block
+    /// starts. Breadth-first out to `max_depth` hops, clipped to
+    /// [`MAX_SLICE_DEPTH`], cycle-guarded with a visited set, never
+    /// reporting `to` itself even when a cycle reaches it. Pairs sort
+    /// by address for deterministic paging; a depth of zero yields an
+    /// empty set. Any address is a valid root (data/string targets lie
+    /// in no function and contribute only xref predecessors), so unlike
+    /// the callgraph walks there is no unknown-entry case.
+    #[must_use]
+    pub fn slice_to(&self, to: u64, max_depth: usize) -> Vec<(u64, usize)> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let cap = max_depth.min(MAX_SLICE_DEPTH);
+        if cap == 0 {
+            return Vec::new();
+        }
+        let mut xref_preds: HashMap<u64, Vec<u64>> = HashMap::new();
+        for x in &self.xrefs {
+            xref_preds.entry(x.to).or_default().push(x.from);
+        }
+        let mut seen: HashSet<u64> = HashSet::from([to]);
+        let mut queue: VecDeque<(u64, usize)> = VecDeque::from([(to, 0)]);
+        let mut out: Vec<(u64, usize)> = Vec::new();
+        while let Some((cur, depth)) = queue.pop_front() {
+            if depth >= cap {
+                continue;
+            }
+            let mut next: Vec<u64> = Vec::new();
+            if let Some(v) = xref_preds.get(&cur) {
+                next.extend(v.iter().copied());
+            }
+            next.extend(self.insn_preds(cur));
+            next.sort_unstable();
+            next.dedup();
+            for n in next {
+                if seen.insert(n) {
+                    out.push((n, depth + 1));
+                    queue.push_back((n, depth + 1));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Instruction predecessors of `cur` within its function, if any.
+    ///
+    /// The previous instruction in the same block, or at a block start
+    /// the last instruction of each direct predecessor block. Empty
+    /// when `cur` lies in no function, in no block, or mid-instruction
+    /// (an arbitrary root with only xref predecessors).
+    fn insn_preds(&self, cur: u64) -> Vec<u64> {
+        let Some(entry) = self.containing_function(cur) else {
+            return Vec::new();
+        };
+        let Some(f) = self.functions.get(&entry) else {
+            return Vec::new();
+        };
+        let Some((&start, block)) = f
+            .blocks
+            .range(..=cur)
+            .next_back()
+            .filter(|(_, b)| cur < b.end())
+        else {
+            return Vec::new();
+        };
+        let addrs: Vec<u64> = block.insns.iter().map(|i| i.addr).collect();
+        match addrs.iter().position(|&a| a == cur) {
+            Some(i) if i > 0 => vec![addrs[i - 1]],
+            Some(_) => {
+                let mut preds = f.predecessors(start);
+                preds.sort_unstable();
+                let mut out = Vec::new();
+                for p in preds {
+                    if let Some(last) = f.blocks.get(&p).and_then(|b| b.insns.last()) {
+                        out.push(last.addr);
+                    }
+                }
+                out
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Breadth-first reachable set in one callgraph direction.
