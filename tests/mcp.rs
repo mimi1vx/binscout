@@ -652,3 +652,130 @@ fn annotate_round_trip_rename_comment_reopen_clear() {
     assert_eq!(v["name"], common::builders::BASIC_EXPORT);
     cleanup(&dir);
 }
+
+fn mcp_raw_bytes(arch: &str) -> Vec<u8> {
+    match arch {
+        "x86_64" | "x86_32" => vec![0x90, 0x90, 0xC3],
+        "aarch64" => vec![0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6],
+        "arm32" => vec![0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1],
+        "thumb" => vec![0x00, 0xBF, 0x70, 0x47],
+        _ => unreachable!("test arch"),
+    }
+}
+
+fn mcp_raw_base(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" => "0x1000",
+        "x86_32" => "0x2000",
+        "aarch64" => "0x10000",
+        "arm32" => "0x11000",
+        "thumb" => "0x20000",
+        _ => unreachable!("test arch"),
+    }
+}
+
+#[test]
+fn raw_mapping_reports_across_arches() {
+    for arch in ["x86_64", "x86_32", "aarch64", "arm32", "thumb"] {
+        let dir = tmpdir("mcp-raw-parity");
+        let bin = write_bin(&dir, "r.bin", &mcp_raw_bytes(arch))
+            .display()
+            .to_string();
+        let db = temp_db(&dir, "r").display().to_string();
+        let base = mcp_raw_base(arch);
+
+        let info = tool_once(
+            10,
+            "project_info",
+            json!({"binary": bin, "db": db, "raw": {"arch": arch, "base": base}}),
+        );
+        assert_eq!(info["arch"], arch, "{arch}");
+        assert_eq!(info["format"], "raw", "{arch}");
+        assert_eq!(info["mode"], "raw", "{arch}");
+        assert_eq!(info["functions"], 1, "{arch}");
+
+        let funcs = tool_once(
+            11,
+            "functions",
+            json!({"binary": bin, "db": db, "raw": {"arch": arch, "base": base}}),
+        );
+        assert_eq!(funcs.as_array().expect("array").len(), 1, "{arch}");
+
+        let stats = tool_once(
+            12,
+            "stats",
+            json!({"binary": bin, "db": db, "raw": {"arch": arch, "base": base}}),
+        );
+        assert_eq!(stats["mode"], "raw", "{arch}");
+        assert_eq!(stats["arch"], arch, "{arch}");
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn raw_errors_are_tool_errors() {
+    let dir = tmpdir("mcp-raw-errors");
+    let bin = write_bin(&dir, "r.bin", &[0x90, 0x90, 0xC3])
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "r").display().to_string();
+
+    // Missing base in raw mode.
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            10,
+            "project_info",
+            json!({"binary": bin, "db": db, "raw": {"arch": "x86_64"}}),
+        ),
+        call(
+            11,
+            "project_info",
+            json!({"binary": bin, "db": db, "raw": {"arch": "mips", "base": "0x1000"}}),
+        ),
+        call(
+            12,
+            "project_info",
+            json!({"binary": bin, "db": db, "raw": {"arch": "aarch64", "base": "0x10000", "entry": "0x10001"}}),
+        ),
+        call(
+            13,
+            "project_info",
+            json!({"binary": bin, "db": db, "raw": {"arch": "x86_64", "base": "0x1000", "entry": "0x2000"}}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 5, "{resps:?}");
+    for resp in resps.iter().skip(1) {
+        assert!(
+            resp.get("error").is_some(),
+            "raw misuse must error: {resp:?}"
+        );
+        assert!(resp.get("result").is_none());
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn raw_reads_do_not_write_sidecars() {
+    let dir = tmpdir("mcp-raw-no-save");
+    let bin_path = write_bin(&dir, "r.bin", &[0x90, 0x90, 0xC3]);
+    let bin = bin_path.display().to_string();
+    let db_path = temp_db(&dir, "fresh");
+    let db = db_path.display().to_string();
+
+    let funcs = tool_once(
+        10,
+        "functions",
+        json!({"binary": bin, "db": db, "raw": {"arch": "x86_64", "base": "0x1000"}}),
+    );
+    assert_eq!(funcs.as_array().expect("array").len(), 1);
+    assert!(!db_path.exists(), "raw reads never create the sidecar");
+    cleanup(&dir);
+}

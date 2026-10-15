@@ -12,9 +12,11 @@ pub mod mcp;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::analysis::{Analysis, StringsFilter, Xref, XrefKind, analyze};
+use serde::{Deserialize, Serialize};
+
+use crate::analysis::{Analysis, BlockSummary, StringsFilter, Xref, XrefKind, analyze};
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
-use crate::disasm::{Disassembler, PartialDisasm};
+use crate::disasm::{Disassembler, Insn, PartialDisasm};
 use crate::error::{Error, Result};
 use crate::loader::strings::StringHit;
 use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
@@ -22,6 +24,97 @@ use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Parse an explicit raw architecture name.
+///
+/// Accepts the five disassembler modes (`x86_64`, `x86_32`, `aarch64`,
+/// `arm32`, `thumb`), case-insensitively.
+///
+/// # Errors
+/// [`Error::Invalid`] for anything else.
+pub fn parse_raw_arch(s: &str) -> Result<crate::disasm::Arch> {
+    match s.to_lowercase().as_str() {
+        "x86_64" => Ok(crate::disasm::Arch::X86_64),
+        "x86_32" => Ok(crate::disasm::Arch::X86_32),
+        "aarch64" => Ok(crate::disasm::Arch::Aarch64),
+        "arm32" => Ok(crate::disasm::Arch::Arm32),
+        "thumb" => Ok(crate::disasm::Arch::Thumb),
+        _ => Err(Error::Invalid(format!(
+            "unknown arch: {s:?} (expected one of x86_64, x86_32, aarch64, arm32, thumb)"
+        ))),
+    }
+}
+
+/// Parse the shared explicit-raw options used by the CLI (`--raw --arch
+/// --base [--entry]`) and MCP (`raw: {arch, base, entry?}`).
+///
+/// `raw` is the explicit-mode flag; `arch`/`base`/`entry` are the raw-only
+/// strings. Returns `None` for auto mode (unchanged container detection
+/// with raw x86-64-at-0 fallback) and `Some` for explicit raw. Entry
+/// range/alignment and base-plus-length overflow are validated later in
+/// [`crate::loader::load_raw`], so explicit failures error without falling
+/// back to another mode.
+///
+/// # Errors
+/// [`Error::Invalid`] when raw-only options appear without raw mode, when
+/// `arch`/`base` are missing in raw mode, or on bad arch/address strings.
+pub fn parse_raw_options(
+    raw: bool,
+    arch: Option<&str>,
+    base: Option<&str>,
+    entry: Option<&str>,
+) -> Result<Option<RawOptions>> {
+    if !raw {
+        if arch.is_some() || base.is_some() || entry.is_some() {
+            return Err(Error::Invalid(
+                "raw options (--arch/--base/--entry) require --raw (or MCP raw object)".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    let Some(arch) = arch else {
+        return Err(Error::Invalid(
+            "explicit raw mode requires --arch (or MCP raw.arch)".to_string(),
+        ));
+    };
+    let Some(base) = base else {
+        return Err(Error::Invalid(
+            "explicit raw mode requires --base (or MCP raw.base)".to_string(),
+        ));
+    };
+    Ok(Some(RawOptions {
+        base: parse_addr(base)?,
+        arch: parse_raw_arch(arch)?,
+        entry: entry.map(parse_addr).transpose()?,
+    }))
+}
+
+/// Open a binary with an optional explicit raw mapping and optional explicit
+/// DB path.
+///
+/// Shared by the CLI and MCP so every binary-taking operation interprets
+/// raw options identically: `None` preserves auto detection (container
+/// parse with raw x86-64-at-0 fallback), `Some` opens the explicit mapping
+/// with no fallback. Reads never save or create the sidecar.
+///
+/// # Errors
+/// Same as [`Project::open`] plus raw-mapping validation from
+/// [`crate::loader::load_raw`].
+pub fn open_mapped(binary: &Path, db: Option<&Path>, raw: Option<RawOptions>) -> Result<Project> {
+    let owned;
+    let db_path = match db {
+        Some(p) => p,
+        None => {
+            owned = db::default_db_path(binary);
+            // Borrow lives until the open call below returns.
+            &owned
+        }
+    };
+    match raw {
+        Some(opts) => Project::open_raw(binary, db_path, opts),
+        None => Project::open_with_db(binary, db_path),
+    }
 }
 
 /// Filters for [`Project::functions_filtered`]: every present field must match.
@@ -42,6 +135,103 @@ pub struct FunctionFilter {
     pub callee: Option<u64>,
     /// Keep functions with `entry` in `lo..=hi`.
     pub range: Option<(u64, u64)>,
+}
+
+/// Wire protocol revision served in every [`Page`] envelope.
+///
+/// Frozen by `docs/book/src/json-protocol.md`: additive fields do not bump
+/// it, any shape change or removal does. It is distinct from the crate
+/// version and the sidecar schema version.
+pub const WIRE_PROTOCOL: u32 = 1;
+
+/// Compact function metadata: entry, rename-resolved name, and counts.
+///
+/// `blocks`/`insns` are row counts and `calls` is the direct-callee count:
+/// unlike [`Project::func_detail`], this carries no instruction arrays, no
+/// block rows, and no unbounded call-target array, so it stays small for
+/// arbitrarily large functions.
+///
+/// JSON pairs `entry` with `entry_hex`; `entry_hex` is recomputed on
+/// serialize and ignored on deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FuncMeta {
+    /// Stable ID (`func@0x...`).
+    pub id: String,
+    /// Function entry address (canonical; interior queries snap here).
+    pub entry: u64,
+    /// Rename-resolved display name, if any.
+    pub name: Option<String>,
+    /// Basic block count.
+    pub blocks: usize,
+    /// Instruction count across all blocks.
+    pub insns: usize,
+    /// Direct-callee count (not the target array).
+    pub calls: usize,
+}
+
+impl Serialize for FuncMeta {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("FuncMeta", 7)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("entry", &self.entry)?;
+        st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("blocks", &self.blocks)?;
+        st.serialize_field("insns", &self.insns)?;
+        st.serialize_field("calls", &self.calls)?;
+        st.end()
+    }
+}
+
+/// One page of rows under the protocol-1 envelope
+/// (`docs/book/src/json-protocol.md`).
+///
+/// `total` is the exact row count before paging; `offset` echoes the
+/// request; `limit` is the effective limit clipped to the 1024-row cap;
+/// `next_offset` is the next page's offset, or null when the page is
+/// exhausted (`offset + limit >= total`) or the effective limit is zero;
+/// `items` holds this page's rows in deterministic address order. An
+/// offset past the end is a normal empty page, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page<T> {
+    /// Wire revision (see [`WIRE_PROTOCOL`]).
+    pub protocol: u32,
+    /// Exact row count before paging.
+    pub total: usize,
+    /// Requested offset, echoed back.
+    pub offset: usize,
+    /// Effective limit after the 1024-row clip.
+    pub limit: usize,
+    /// Offset for the next page, or null when exhausted.
+    pub next_offset: Option<usize>,
+    /// This page's rows.
+    pub items: Vec<T>,
+}
+
+/// Wrap `items` in the protocol-1 [`Page`] envelope.
+///
+/// `limit` is clipped to [`MAX_ROWS`]; `next_offset` uses the effective
+/// limit with saturating arithmetic, so extreme offsets cannot wrap.
+fn page_envelope<T>(total: usize, offset: usize, limit: usize, items: Vec<T>) -> Page<T> {
+    let effective = limit.min(MAX_ROWS);
+    let end = offset.saturating_add(effective);
+    let next_offset = if effective == 0 || end >= total {
+        None
+    } else {
+        Some(end)
+    };
+    Page {
+        protocol: WIRE_PROTOCOL,
+        total,
+        offset,
+        limit: effective,
+        next_offset,
+        items,
+    }
 }
 
 /// Opened analysis project: binary plus its cached analysis and annotations.
@@ -284,10 +474,17 @@ impl Project {
     #[must_use]
     pub fn project_info(&self) -> ProjectInfo {
         let s = self.analysis.summary();
+        let (mode, base) = match &self.mapping {
+            db::StoredMapping::Auto => ("auto".to_string(), None),
+            db::StoredMapping::Explicit { base, .. } => ("raw".to_string(), Some(*base)),
+        };
         ProjectInfo {
             binary: self.path.display().to_string(),
             db_path: self.db_path.display().to_string(),
             version: version().to_string(),
+            protocol: WIRE_PROTOCOL,
+            mode,
+            base,
             arch: db::arch_name(self.binary.arch).to_string(),
             format: db::format_name(self.binary.format).to_string(),
             entry: self.binary.entry,
@@ -316,12 +513,25 @@ impl Project {
     pub fn stats_json(&self) -> Result<serde_json::Value> {
         let s = self.analysis.summary();
         let db_size = db::db_file_size(&self.db_path)?;
+        let (mode, (base, base_hex)) = match &self.mapping {
+            db::StoredMapping::Auto => ("auto".to_string(), crate::opt_addr_pair(None)),
+            db::StoredMapping::Explicit { base, .. } => {
+                ("raw".to_string(), crate::opt_addr_pair(Some(*base)))
+            }
+        };
+        let (entry, entry_hex) = crate::opt_addr_pair(self.binary.entry);
         Ok(serde_json::json!({
             "binary": self.path.display().to_string(),
             "db_path": self.db_path.display().to_string(),
             "version": version(),
+            "protocol": WIRE_PROTOCOL,
+            "mode": mode,
+            "base": base,
+            "base_hex": base_hex,
             "arch": db::arch_name(self.binary.arch),
             "format": db::format_name(self.binary.format),
+            "entry": entry,
+            "entry_hex": entry_hex,
             "content_hash": self.content_hash,
             "size": self.size,
             "db_size": db_size,
@@ -600,6 +810,111 @@ impl Project {
             "blocks": blocks, "edges": f.edges(),
             "calls": self.analysis.calls_of(entry),
         }))
+    }
+
+    /// Compact function metadata: entry, rename-resolved name, and counts.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::func_detail`]. `calls` is
+    /// the direct-callee count, never the target array, so metadata stays
+    /// bounded for arbitrarily large functions.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn func_meta(&self, addr: u64) -> Result<FuncMeta> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let f = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        Ok(FuncMeta {
+            id: f.id(),
+            entry,
+            name: self.function_name(entry),
+            blocks: f.blocks.len(),
+            insns: f.insn_count(),
+            calls: self.analysis.calls_count(entry),
+        })
+    }
+
+    /// Block summaries of one function ordered by block start, paged.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::func_detail`]. Rows come
+    /// from [`Analysis::blocks_page`](crate::analysis::Analysis::blocks_page),
+    /// so only the selected page is materialized; `total` is the block
+    /// count read without building rows.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn func_blocks_page(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<BlockSummary>> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let total = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?
+            .blocks
+            .len();
+        let items = self
+            .analysis
+            .blocks_page(entry, offset, limit)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Instructions of one function-owned block in address order, paged.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::func_detail`]. `block`
+    /// must be a block start belonging to that function: a foreign block
+    /// (or any non-start address) is [`Error::NotFound`], never a silent
+    /// cross-function read. Rows come from
+    /// [`Analysis::block_insns`](crate::analysis::Analysis::block_insns),
+    /// so only the selected page is cloned; `total` is the instruction
+    /// count read without cloning rows.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function, or when
+    /// `block` is not a block of that function.
+    pub fn func_block_insns_page(
+        &self,
+        addr: u64,
+        block: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<Insn>> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let total = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?
+            .blocks
+            .get(&block)
+            .ok_or_else(|| Error::NotFound(format!("block {block:#x} in function {entry:#x}")))?
+            .insns
+            .len();
+        let items = self
+            .analysis
+            .block_insns(entry, block, offset, limit)
+            .ok_or_else(|| Error::NotFound(format!("block {block:#x} in function {entry:#x}")))?;
+        Ok(page_envelope(total, offset, limit, items))
     }
 
     /// CFG of one function: block nodes plus `(from, to)` block edges.

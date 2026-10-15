@@ -19,6 +19,22 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 
+    /// Explicit raw mapping mode (requires `--arch` and `--base`).
+    #[arg(long, global = true)]
+    pub raw: bool,
+
+    /// Raw arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb` (requires `--raw`).
+    #[arg(long, global = true)]
+    pub arch: Option<String>,
+
+    /// Raw base address (`0x`-hex or decimal, requires `--raw`).
+    #[arg(long, global = true)]
+    pub base: Option<String>,
+
+    /// Raw entry address (`0x`-hex or decimal, requires `--raw`).
+    #[arg(long, global = true)]
+    pub entry: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -129,9 +145,21 @@ pub enum Cmd {
 
 impl Cli {
     pub fn run(self) -> ! {
+        let raw_opts = match binscout::parse_raw_options(
+            self.raw,
+            self.arch.as_deref(),
+            self.base.as_deref(),
+            self.entry.as_deref(),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                println!("{}", serde_json::json!({ "error": e.to_string() }));
+                std::process::exit(1);
+            }
+        };
         let db = self.db.as_deref();
         let result = match self.cmd {
-            Cmd::Load { binary } => load(&binary, db),
+            Cmd::Load { binary } => load(&binary, db, raw_opts),
             Cmd::Functions {
                 binary,
                 query,
@@ -141,10 +169,10 @@ impl Cli {
                 offset,
                 limit,
             } => functions_filter(query, caller, callee, range)
-                .and_then(|filter| functions(&binary, db, &filter, offset, limit)),
-            Cmd::Func { binary, addr } => func(&binary, db, &addr),
-            Cmd::Disasm { binary, addr, len } => disasm(&binary, db, &addr, len),
-            Cmd::Cfg { binary, addr } => cfg(&binary, db, &addr),
+                .and_then(|filter| functions(&binary, db, raw_opts, &filter, offset, limit)),
+            Cmd::Func { binary, addr } => func(&binary, db, raw_opts, &addr),
+            Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
+            Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
             Cmd::Xrefs {
                 binary,
                 to,
@@ -155,6 +183,7 @@ impl Cli {
             } => xrefs(
                 &binary,
                 db,
+                raw_opts,
                 to.as_deref(),
                 from.as_deref(),
                 kind.as_deref(),
@@ -177,6 +206,7 @@ impl Cli {
                 strings(
                     &binary,
                     db,
+                    raw_opts,
                     &binscout::analysis::StringsFilter {
                         pattern,
                         min_len,
@@ -187,16 +217,23 @@ impl Cli {
                     },
                 )
             }
-            Cmd::Symbols { binary } => symbols(&binary, db),
-            Cmd::Sections { binary } => sections(&binary, db),
-            Cmd::Ir { binary, addr, len } => ir(&binary, db, &addr, len),
-            Cmd::Stats { binary } => stats(&binary, db),
+            Cmd::Symbols { binary } => symbols(&binary, db, raw_opts),
+            Cmd::Sections { binary } => sections(&binary, db, raw_opts),
+            Cmd::Ir { binary, addr, len } => ir(&binary, db, raw_opts, &addr, len),
+            Cmd::Stats { binary } => stats(&binary, db, raw_opts),
             Cmd::Annotate {
                 binary,
                 addr,
                 rename,
                 comment,
-            } => annotate(&binary, db, &addr, rename.as_deref(), comment.as_deref()),
+            } => annotate(
+                &binary,
+                db,
+                raw_opts,
+                &addr,
+                rename.as_deref(),
+                comment.as_deref(),
+            ),
         };
         match result {
             Ok(value) => {
@@ -214,8 +251,9 @@ impl Cli {
 fn open(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<binscout::Project> {
-    binscout::Project::open_any(binary, db)
+    binscout::open_mapped(binary, db, raw)
 }
 
 fn opt_addr(s: Option<&str>) -> binscout::error::Result<Option<u64>> {
@@ -225,8 +263,9 @@ fn opt_addr(s: Option<&str>) -> binscout::error::Result<Option<u64>> {
 fn load(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     p.save()?;
     Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
 }
@@ -255,11 +294,12 @@ fn functions_filter(
 fn functions(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     filter: &binscout::FunctionFilter,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     Ok(serde_json::Value::Array(
         p.functions_filtered(filter, offset, limit),
     ))
@@ -268,19 +308,21 @@ fn functions(
 fn func(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     p.func_detail(binscout::parse_addr(addr)?)
 }
 
 fn disasm(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     addr: &str,
     len: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     let addr = binscout::parse_addr(addr)?;
     Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("partial disasm serializes"))
 }
@@ -288,22 +330,28 @@ fn disasm(
 fn cfg(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     p.cfg_of(binscout::parse_addr(addr)?)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw"
+)]
 fn xrefs(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     to: Option<&str>,
     from: Option<&str>,
     kind: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
     let total = p.count_xrefs(to, from, kind);
@@ -314,9 +362,10 @@ fn xrefs(
 fn strings(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     filter: &binscout::analysis::StringsFilter,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     let rows = p.query_strings(filter)?;
     Ok(serde_json::to_value(rows).expect("strings serialize"))
 }
@@ -324,42 +373,47 @@ fn strings(
 fn symbols(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db)?.symbols_json())
+    Ok(open(binary, db, raw)?.symbols_json())
 }
 
 fn sections(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db)?.sections_json())
+    Ok(open(binary, db, raw)?.sections_json())
 }
 
 fn ir(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     addr: &str,
     len: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db)?;
+    let p = open(binary, db, raw)?;
     p.ir_at(binscout::parse_addr(addr)?, len)
 }
 
 fn stats(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
 ) -> binscout::error::Result<serde_json::Value> {
-    open(binary, db)?.stats_json()
+    open(binary, db, raw)?.stats_json()
 }
 
 fn annotate(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
     addr: &str,
     rename: Option<&str>,
     comment: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let mut p = open(binary, db)?;
+    let mut p = open(binary, db, raw)?;
     let addr = binscout::parse_addr(addr)?;
     if let Some(name) = rename {
         p.rename_function(addr, name)?;

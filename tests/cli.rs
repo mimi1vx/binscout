@@ -552,3 +552,163 @@ fn load_hostile_arm_elf_stays_json() {
     assert_eq!(v["insns"], 2);
     cleanup(&dir);
 }
+
+/// Synthetic code per arch for raw CLI/MCP parity.
+fn raw_arch_bytes(arch: &str) -> Vec<u8> {
+    match arch {
+        "x86_64" | "x86_32" => vec![0x90, 0x90, 0xC3],
+        "aarch64" => vec![0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6],
+        "arm32" => vec![0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1],
+        "thumb" => vec![0x00, 0xBF, 0x70, 0x47],
+        _ => unreachable!("test arch"),
+    }
+}
+
+fn raw_arch_base(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" => "0x1000",
+        "x86_32" => "0x2000",
+        "aarch64" => "0x10000",
+        "arm32" => "0x11000",
+        "thumb" => "0x20000",
+        _ => unreachable!("test arch"),
+    }
+}
+
+#[test]
+fn raw_flags_report_mapping_across_arches() {
+    for arch in ["x86_64", "x86_32", "aarch64", "arm32", "thumb"] {
+        let dir = tmpdir("cli-raw-parity");
+        let base = raw_arch_base(arch);
+        let bin = write_bin(&dir, "r.bin", &raw_arch_bytes(arch));
+        let bin_s = bin.display().to_string();
+        let db = temp_db(&dir, "r").display().to_string();
+        let d = db.as_str();
+
+        let (ok, v) = run(&[
+            "--db", d, "--raw", "--arch", arch, "--base", base, "load", &bin_s,
+        ]);
+        assert!(ok, "{arch}: {v}");
+        assert_eq!(v["arch"], arch, "{arch}");
+        assert_eq!(v["format"], "raw", "{arch}");
+        assert_eq!(v["mode"], "raw", "{arch}");
+        assert_eq!(
+            v["base_hex"],
+            format!(
+                "0x{:x}",
+                u64::from_str_radix(base.trim_start_matches("0x"), 16).expect("base")
+            ),
+            "{arch}"
+        );
+        assert_eq!(v["functions"], 1, "{arch}");
+
+        // Reads under the same mapping agree and disassemble at the base.
+        let (ok, f) = run(&[
+            "--db",
+            d,
+            "--raw",
+            "--arch",
+            arch,
+            "--base",
+            base,
+            "functions",
+            &bin_s,
+        ]);
+        assert!(ok, "{arch}: {f}");
+        assert_eq!(f.as_array().expect("array").len(), 1, "{arch}");
+        let (ok, s) = run(&[
+            "--db", d, "--raw", "--arch", arch, "--base", base, "stats", &bin_s,
+        ]);
+        assert!(ok, "{arch}: {s}");
+        assert_eq!(s["mode"], "raw", "{arch}");
+        assert_eq!(s["arch"], arch, "{arch}");
+        cleanup(&dir);
+    }
+}
+
+#[test]
+fn raw_flag_errors_are_json() {
+    let dir = tmpdir("cli-raw-errors");
+    let bin = write_bin(&dir, "r.bin", &[0x90, 0x90, 0xC3]);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "r").display().to_string();
+    let d = db.as_str();
+
+    // Missing --arch in raw mode.
+    let (ok, v) = run(&["--db", d, "--raw", "--base", "0x1000", "load", &bin_s]);
+    assert!(!ok && v.get("error").is_some(), "missing arch: {v}");
+    // Unknown arch.
+    let (ok, v) = run(&[
+        "--db", d, "--raw", "--arch", "mips", "--base", "0x1000", "load", &bin_s,
+    ]);
+    assert!(!ok && v.get("error").is_some(), "unknown arch: {v}");
+    // Raw-only options without --raw.
+    let (ok, v) = run(&["--db", d, "--arch", "x86_64", "load", &bin_s]);
+    assert!(
+        !ok && v.get("error").is_some(),
+        "raw-only without --raw: {v}"
+    );
+    // Misaligned entry for aarch64.
+    let aarch = write_bin(&dir, "a.bin", &raw_arch_bytes("aarch64"));
+    let aarch_s = aarch.display().to_string();
+    let (ok, v) = run(&[
+        "--db", d, "--raw", "--arch", "aarch64", "--base", "0x10000", "--entry", "0x10001", "load",
+        &aarch_s,
+    ]);
+    assert!(!ok && v.get("error").is_some(), "misaligned entry: {v}");
+    // Out-of-range entry.
+    let (ok, v) = run(&[
+        "--db", d, "--raw", "--arch", "x86_64", "--base", "0x1000", "--entry", "0x2000", "load",
+        &bin_s,
+    ]);
+    assert!(!ok && v.get("error").is_some(), "out-of-range entry: {v}");
+    // Base-plus-length overflow.
+    let (ok, v) = run(&[
+        "--db",
+        d,
+        "--raw",
+        "--arch",
+        "x86_64",
+        "--base",
+        "0xFFFFFFFFFFFFFFFF",
+        "load",
+        &bin_s,
+    ]);
+    assert!(!ok && v.get("error").is_some(), "overflow: {v}");
+    assert!(!Path::new(d).exists(), "failed raw opens must not write");
+    cleanup(&dir);
+}
+
+#[test]
+fn raw_reads_do_not_write_sidecars() {
+    let dir = tmpdir("cli-raw-no-save");
+    let bin = write_bin(&dir, "r.bin", &[0x90, 0x90, 0xC3]);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "fresh");
+    let db_s = db.display().to_string();
+    let (ok, _) = run(&[
+        "--db",
+        &db_s,
+        "--raw",
+        "--arch",
+        "x86_64",
+        "--base",
+        "0x1000",
+        "functions",
+        &bin_s,
+    ]);
+    assert!(ok);
+    assert!(!db.exists(), "raw reads never create the sidecar");
+    cleanup(&dir);
+}
+
+#[test]
+fn auto_mode_without_flags_is_unchanged() {
+    // Raw blob without flags keeps the auto fallback and reports auto/null.
+    let (bin, db, _dir, dir) = raw_case("auto-mode");
+    let (ok, v) = run(&["--db", &db, "load", &bin]);
+    assert!(ok, "{v}");
+    assert_eq!(v["mode"], "auto");
+    assert!(v["base"].is_null() && v["base_hex"].is_null());
+    cleanup(&dir);
+}

@@ -13,8 +13,26 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 
 use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
 
-/// Shared opener: explicit `db` path or the default sidecar.
-fn open(binary: &str, db: Option<&str>) -> Result<Project, ErrorData> {
+/// Explicit raw mapping for MCP binary-taking tools.
+///
+/// Mirrors the CLI `--raw --arch ARCH --base ADDR [--entry ADDR]` flags:
+/// `arch`/`base` are required when `raw` is present, `entry` is optional,
+/// and addresses parse as `0x`-hex or decimal via [`parse_addr`].
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RawParams {
+    /// Raw arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`.
+    pub arch: Option<String>,
+    /// Raw base address (`0x`-hex or decimal string).
+    pub base: Option<String>,
+    /// Raw entry address (`0x`-hex or decimal string).
+    pub entry: Option<String>,
+}
+
+/// Shared validated opener: explicit `db` path (or the default sidecar) plus
+/// the optional explicit raw mapping, parsed through
+/// [`crate::parse_raw_options`] so CLI and MCP interpret options identically.
+fn open(binary: &str, db: Option<&str>, raw: Option<&RawParams>) -> Result<Project, ErrorData> {
+    let raw_opts = raw_options(raw)?;
     let db_path;
     let db_ref = match db {
         Some(d) => {
@@ -23,8 +41,27 @@ fn open(binary: &str, db: Option<&str>) -> Result<Project, ErrorData> {
         }
         None => None,
     };
-    Project::open_any(Path::new(binary), db_ref)
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    crate::open_mapped(Path::new(binary), db_ref, raw_opts).map_err(|e| match e {
+        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+        other => ErrorData::internal_error(other.to_string(), None),
+    })
+}
+
+/// Parse an MCP `raw` object through the shared CLI/MCP validator.
+fn raw_options(raw: Option<&RawParams>) -> Result<Option<crate::loader::RawOptions>, ErrorData> {
+    let (present, arch, base, entry) = match raw {
+        None => (false, None, None, None),
+        Some(r) => (
+            true,
+            r.arch.as_deref(),
+            r.base.as_deref(),
+            r.entry.as_deref(),
+        ),
+    };
+    crate::parse_raw_options(present, arch, base, entry).map_err(|e| match e {
+        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+        other => ErrorData::internal_error(other.to_string(), None),
+    })
 }
 
 fn ok(value: serde_json::Value) -> Result<String, ErrorData> {
@@ -47,8 +84,10 @@ fn all_params<T>(p: Parameters<T>) -> T {
 pub struct BinaryParams {
     /// Path to the analyzed binary.
     pub binary: String,
-    /// Explicit project DB path (default: `<binary>.rsdbg.redb` sidecar).
+    /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping (`arch`/`base` required, `entry` optional).
+    pub raw: Option<RawParams>,
 }
 
 /// Parameters for the `strings` tool: filtered, paged string search.
@@ -58,6 +97,8 @@ pub struct StringsParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Rows to skip after filtering.
     pub start: Option<usize>,
     /// Deprecated alias of `start`.
@@ -81,6 +122,8 @@ pub struct FunctionsParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Case-insensitive substring over the rename-resolved name.
     pub query: Option<String>,
     /// Keep functions that call the function containing this address.
@@ -104,6 +147,8 @@ pub struct AddrParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
 }
@@ -115,6 +160,8 @@ pub struct RangeParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
     /// Bytes to decode.
@@ -128,6 +175,8 @@ pub struct XrefsParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Only xrefs pointing at this address (`0x`-hex or decimal).
     pub to: Option<String>,
     /// Only xrefs originating at this address.
@@ -147,6 +196,8 @@ pub struct RenameParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Function entry address (`0x`-hex or decimal string).
     pub addr: String,
     /// New name (empty string clears).
@@ -160,6 +211,8 @@ pub struct CommentParams {
     pub binary: String,
     /// Explicit project DB path.
     pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
     /// Address to comment (`0x`-hex or decimal string).
     pub addr: String,
     /// Comment text (empty string clears).
@@ -201,7 +254,7 @@ impl BinscoutMcp {
     fn project_info(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
 
@@ -212,7 +265,7 @@ impl BinscoutMcp {
     fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let filter = FunctionFilter {
             query: p.query,
             caller: opt_addr(p.caller)?,
@@ -242,7 +295,7 @@ impl BinscoutMcp {
     fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.func_detail(addr)
@@ -257,7 +310,7 @@ impl BinscoutMcp {
     fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.disasm_at(addr, p.len)
@@ -272,7 +325,7 @@ impl BinscoutMcp {
     fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.cfg_of(addr)
@@ -287,7 +340,7 @@ impl BinscoutMcp {
     fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let kind = p
             .kind
             .as_deref()
@@ -310,7 +363,7 @@ impl BinscoutMcp {
         if p.offset.is_some() {
             eprintln!("warning: strings offset is deprecated, use start");
         }
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let rows = proj
             .query_strings(&crate::analysis::StringsFilter {
                 pattern: p.pattern,
@@ -331,7 +384,7 @@ impl BinscoutMcp {
     fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        ok(open(&p.binary, p.db.as_deref())?.symbols_json())
+        ok(open(&p.binary, p.db.as_deref(), p.raw.as_ref())?.symbols_json())
     }
 
     #[tool(
@@ -341,7 +394,7 @@ impl BinscoutMcp {
     fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        open(&p.binary, p.db.as_deref())?
+        open(&p.binary, p.db.as_deref(), p.raw.as_ref())?
             .stats_json()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
@@ -354,7 +407,7 @@ impl BinscoutMcp {
     fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        ok(open(&p.binary, p.db.as_deref())?.sections_json())
+        ok(open(&p.binary, p.db.as_deref(), p.raw.as_ref())?.sections_json())
     }
 
     #[tool(
@@ -364,7 +417,7 @@ impl BinscoutMcp {
     fn ir(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref())?;
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.ir_at(addr, p.len)
@@ -379,7 +432,7 @@ impl BinscoutMcp {
     fn rename(&self, p: Parameters<RenameParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let mut proj = open(&p.binary, p.db.as_deref())?;
+        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.rename_function(addr, &p.name)
@@ -394,7 +447,7 @@ impl BinscoutMcp {
     fn comment(&self, p: Parameters<CommentParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let mut proj = open(&p.binary, p.db.as_deref())?;
+        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.set_comment(addr, &p.comment)

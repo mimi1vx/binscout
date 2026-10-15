@@ -218,6 +218,15 @@ impl Analysis {
         v
     }
 
+    /// Count of direct callees of `entry` (function entries only).
+    ///
+    /// The same set as [`Analysis::calls_of`] without materializing the
+    /// sorted target array, for compact metadata over large callgraphs.
+    #[must_use]
+    pub fn calls_count(&self, entry: u64) -> usize {
+        self.callgraph.neighbors(entry).count()
+    }
+
     /// Direct callers of `entry` (function entries only).
     #[must_use]
     pub fn callers_of(&self, entry: u64) -> Vec<u64> {

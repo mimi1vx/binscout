@@ -423,3 +423,248 @@ fn reads_never_create_sidecars() {
     assert_eq!(stored.meta.content_hash, db::content_hash(&bytes));
     common::cleanup(&dir);
 }
+
+/// Synthetic code per arch decoding to at least one function at its base.
+fn arch_bytes(arch: Arch) -> Vec<u8> {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => vec![0x90, 0x90, 0xC3],
+        // aarch64 `nop; ret`.
+        Arch::Aarch64 => vec![0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6],
+        // arm32 `mov r0, r1; bx lr`.
+        Arch::Arm32 => vec![0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1],
+        // thumb `nop; bx lr`.
+        Arch::Thumb => vec![0x00, 0xBF, 0x70, 0x47],
+    }
+}
+
+fn arch_base(arch: Arch) -> u64 {
+    match arch {
+        Arch::X86_64 => 0x1000,
+        Arch::X86_32 => 0x2000,
+        Arch::Aarch64 => 0x10000,
+        Arch::Arm32 => 0x11000,
+        Arch::Thumb => 0x20000,
+    }
+}
+
+#[test]
+fn explicit_raw_parity_across_arches() {
+    for arch in [
+        Arch::X86_64,
+        Arch::X86_32,
+        Arch::Aarch64,
+        Arch::Arm32,
+        Arch::Thumb,
+    ] {
+        let dir = common::tmpdir("raw-parity");
+        let bytes = arch_bytes(arch);
+        let base = arch_base(arch);
+        let bin = write_raw(&dir, "r.bin", &bytes);
+        let db = common::temp_db(&dir, "r");
+        let o = opts(arch, base, None);
+
+        let p = Project::open_raw(&bin, &db, o).expect("explicit raw open");
+        assert_eq!(p.binary().arch, arch, "{arch:?}");
+        assert!(
+            p.analysis().functions.contains_key(&base),
+            "{arch:?} must find a function at its base {base:#x}"
+        );
+        let info = p.project_info();
+        assert_eq!(info.protocol, binscout::WIRE_PROTOCOL, "{arch:?}");
+        assert_eq!(info.mode, "raw", "{arch:?}");
+        assert_eq!(info.base, Some(base), "{arch:?}");
+        assert_eq!(info.arch, db::arch_name(arch), "{arch:?}");
+        assert_eq!(info.format, "raw", "{arch:?}");
+        let stats = p.stats_json().expect("stats");
+        assert_eq!(stats["mode"], "raw", "{arch:?}");
+        assert_eq!(stats["base"], base, "{arch:?}");
+        assert_eq!(stats["protocol"], binscout::WIRE_PROTOCOL, "{arch:?}");
+        assert!(!db.exists(), "{arch:?} reads never create the sidecar");
+        common::cleanup(&dir);
+    }
+}
+
+#[test]
+fn explicit_raw_entry_reports_and_seeds() {
+    let dir = common::tmpdir("raw-entry-info");
+    let bytes = nop_ret();
+    let base = 0x4000;
+    let bin = write_raw(&dir, "r.bin", &bytes);
+    let db = common::temp_db(&dir, "r");
+    let o = opts(Arch::X86_64, base, Some(base));
+
+    let p = Project::open_raw(&bin, &db, o).expect("raw open with entry");
+    assert_eq!(p.binary().entry, Some(base));
+    let info = p.project_info();
+    assert_eq!(info.mode, "raw");
+    assert_eq!(info.base, Some(base));
+    assert_eq!(info.entry, Some(base));
+    assert!(p.analysis().functions.contains_key(&base));
+    common::cleanup(&dir);
+}
+
+#[test]
+fn shared_parser_rejects_misuse() {
+    // Raw-only options without raw mode are errors.
+    for (arch, base, entry) in [
+        (Some("x86_64"), None, None),
+        (None, Some("0x1000"), None),
+        (None, None, Some("0x1000")),
+    ] {
+        let err = binscout::parse_raw_options(false, arch, base, entry).unwrap_err();
+        assert!(
+            err.to_string().contains("--raw"),
+            "raw-only without --raw must name --raw: {err:?}"
+        );
+    }
+    // Explicit mode requires arch and base.
+    assert!(
+        binscout::parse_raw_options(true, None, Some("0x1000"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("--arch")
+    );
+    assert!(
+        binscout::parse_raw_options(true, Some("x86_64"), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("--base")
+    );
+    // Unknown arch and bad addresses fail.
+    assert!(
+        binscout::parse_raw_options(true, Some("mips"), Some("0x1000"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown arch")
+    );
+    assert!(binscout::parse_raw_options(true, Some("x86_64"), Some("zz"), None).is_err());
+    // Well-formed explicit and auto parses succeed.
+    assert!(
+        binscout::parse_raw_options(true, Some("thumb"), Some("0x20000"), None)
+            .expect("valid raw")
+            .is_some()
+    );
+    assert!(
+        binscout::parse_raw_options(false, None, None, None)
+            .expect("valid auto")
+            .is_none()
+    );
+}
+
+#[test]
+fn raw_mapping_validation_fails_without_fallback() {
+    // Misaligned entries per mode.
+    for (arch, base, entry) in [
+        (Arch::Aarch64, 0x10000, 0x10001),
+        (Arch::Arm32, 0x10000, 0x10002),
+        (Arch::Thumb, 0x20000, 0x20001),
+    ] {
+        let bytes = arch_bytes(arch);
+        let err = binscout::loader::load_raw(
+            &bytes,
+            RawOptions {
+                base,
+                arch,
+                entry: Some(entry),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("misaligned"),
+            "{arch:?} misaligned entry must fail: {err:?}"
+        );
+    }
+    // Out-of-range entry.
+    let err = binscout::loader::load_raw(
+        &nop_ret(),
+        RawOptions {
+            base: 0x1000,
+            arch: Arch::X86_64,
+            entry: Some(0x2000),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("outside"),
+        "out-of-range entry must fail: {err:?}"
+    );
+    // Base-plus-length overflow.
+    let err = binscout::loader::load_raw(
+        &nop_ret(),
+        RawOptions {
+            base: u64::MAX - 1,
+            arch: Arch::X86_64,
+            entry: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("overflow"),
+        "overflowing mapping must fail: {err:?}"
+    );
+    // Explicit opens surface the same errors instead of falling back.
+    let dir = common::tmpdir("raw-no-fallback");
+    let bin = write_raw(&dir, "r.bin", &arch_bytes(Arch::Aarch64));
+    let db = common::temp_db(&dir, "r");
+    let err = Project::open_raw(
+        &bin,
+        &db,
+        RawOptions {
+            base: 0x10000,
+            arch: Arch::Aarch64,
+            entry: Some(0x10001),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("misaligned"),
+        "explicit raw must error, never fall back: {err:?}"
+    );
+    assert!(!db.exists(), "failed explicit open must not write");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn auto_mode_reports_auto_mapping() {
+    // Unrecognized bytes keep the auto fallback; info reports auto/null.
+    let dir = common::tmpdir("raw-auto-info");
+    let bin = write_raw(&dir, "r.bin", &nop_ret());
+    let db = common::temp_db(&dir, "r");
+    let p = Project::open_with_db(&bin, &db).expect("auto open");
+    let info = p.project_info();
+    assert_eq!(info.mode, "auto");
+    assert_eq!(info.base, None);
+    assert_eq!(info.protocol, binscout::WIRE_PROTOCOL);
+
+    // Containers without flags are unchanged: ELF stays auto/elf.
+    let elf = common::write_bin(&dir, "t.elf", &common::minimal_elf());
+    let elf_db = common::temp_db(&dir, "elf");
+    let q = Project::open_with_db(&elf, &elf_db).expect("elf auto open");
+    let info = q.project_info();
+    assert_eq!(info.mode, "auto");
+    assert_eq!(info.base, None);
+    assert_eq!(info.format, "elf");
+    assert_eq!(info.arch, "x86_64");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn open_mapped_shares_parser_with_open_raw() {
+    let dir = common::tmpdir("raw-open-mapped");
+    let bytes = nop_ret();
+    let bin = write_raw(&dir, "r.bin", &bytes);
+    let parsed = binscout::parse_raw_options(true, Some("x86_64"), Some("0x1000"), None)
+        .expect("parse")
+        .expect("explicit");
+    let db_a = common::temp_db(&dir, "a");
+    let via_mapped = binscout::open_mapped(&bin, Some(&db_a), Some(parsed)).expect("open_mapped");
+    let db_b = common::temp_db(&dir, "b");
+    let via_raw = Project::open_raw(&bin, &db_b, parsed).expect("open_raw");
+    let (m, r) = (via_mapped.project_info(), via_raw.project_info());
+    assert_eq!(
+        (m.mode, m.base, m.arch, m.format, m.entry, m.functions),
+        (r.mode, r.base, r.arch, r.format, r.entry, r.functions),
+        "shared opener must agree with open_raw"
+    );
+    common::cleanup(&dir);
+}

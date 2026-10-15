@@ -281,20 +281,70 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
     }
 }
 
+/// Canonical raw arch name for diagnostics (`x86_64`, `x86_32`, `aarch64`,
+/// `arm32`, `thumb`).
+#[must_use]
+pub fn raw_arch_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "x86_64",
+        Arch::X86_32 => "x86_32",
+        Arch::Aarch64 => "aarch64",
+        Arch::Arm32 => "arm32",
+        Arch::Thumb => "thumb",
+    }
+}
+
+/// Required entry alignment in bytes for a raw [`Arch`].
+///
+/// x86 targets decode from any byte; AArch64/ARM32 need 4-byte words and
+/// Thumb needs 2-byte halfwords. Bases accept any alignment: only the entry
+/// must satisfy the mode.
+#[must_use]
+pub fn raw_entry_alignment(arch: Arch) -> u64 {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => 1,
+        Arch::Aarch64 | Arch::Arm32 => 4,
+        Arch::Thumb => 2,
+    }
+}
+
 /// Map a raw blob to a single `RWX` segment at `opts.base`.
 ///
 /// Permissions are unknown for raw input; the segment is marked `RWX` as the
 /// neutral stand-in. Sections/imports/exports are empty: raw has no tables.
 ///
 /// # Errors
-/// [`Error::Invalid`] on empty input, [`Error::Limit`] when the blob exceeds
-/// [`MAX_MAPPED_BYTES`].
+/// [`Error::Invalid`] on empty input, base-plus-length overflow, an entry
+/// outside the mapped range, or a mode-misaligned entry;
+/// [`Error::Limit`] when the blob exceeds [`MAX_MAPPED_BYTES`].
 pub fn load_raw(bytes: &[u8], opts: RawOptions) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty raw input".to_string()));
     }
     if bytes.len() as u64 > MAX_MAPPED_BYTES {
         return Err(Error::Limit("raw blob exceeds 256 MiB".to_string()));
+    }
+    let len = bytes.len() as u64;
+    let end = opts.base.checked_add(len).ok_or_else(|| {
+        Error::Invalid(format!(
+            "raw base {:#x} with length {len} overflows address space",
+            opts.base
+        ))
+    })?;
+    if let Some(entry) = opts.entry {
+        if entry < opts.base || entry >= end {
+            return Err(Error::Invalid(format!(
+                "raw entry {entry:#x} outside mapped range {:#x}..{end:#x}",
+                opts.base
+            )));
+        }
+        let align = raw_entry_alignment(opts.arch);
+        if entry % align != 0 {
+            return Err(Error::Invalid(format!(
+                "raw entry {entry:#x} misaligned for {} (needs {align}-byte alignment)",
+                raw_arch_name(opts.arch)
+            )));
+        }
     }
     Ok(LoadedBinary {
         format: BinaryFormat::Raw,

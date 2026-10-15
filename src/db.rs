@@ -360,7 +360,8 @@ impl Annotation {
 /// Agent-facing project summary; always JSON-serializable (M6 CLI/MCP).
 ///
 /// JSON pairs `entry` with `entry_hex` (`null` on both sides when the
-/// container names no entry).
+/// container names no entry) and `base` with `base_hex` (`null` on both
+/// sides in auto mode).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ProjectInfo {
     /// Analyzed binary path.
@@ -369,6 +370,15 @@ pub struct ProjectInfo {
     pub db_path: String,
     /// Crate version.
     pub version: String,
+    /// Wire protocol revision (see `docs/book/src/json-protocol.md`).
+    #[serde(default = "default_protocol")]
+    pub protocol: u32,
+    /// Effective loader mode: `"auto"` or `"raw"`.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Effective raw base address (`None` in auto mode).
+    #[serde(default)]
+    pub base: Option<u64>,
     /// Architecture string.
     pub arch: String,
     /// Format string.
@@ -404,16 +414,28 @@ pub struct ProjectInfo {
     pub annotations: usize,
 }
 
+fn default_protocol() -> u32 {
+    crate::WIRE_PROTOCOL
+}
+
+fn default_mode() -> String {
+    "auto".to_string()
+}
+
 impl Serialize for ProjectInfo {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("ProjectInfo", 17)?;
+        let mut st = serializer.serialize_struct("ProjectInfo", 21)?;
         st.serialize_field("binary", &self.binary)?;
         st.serialize_field("db_path", &self.db_path)?;
         st.serialize_field("version", &self.version)?;
+        st.serialize_field("protocol", &self.protocol)?;
+        st.serialize_field("mode", &self.mode)?;
+        st.serialize_field("base", &self.base)?;
+        st.serialize_field("base_hex", &self.base.map(crate::addr_hex))?;
         st.serialize_field("arch", &self.arch)?;
         st.serialize_field("format", &self.format)?;
         st.serialize_field("entry", &self.entry)?;
