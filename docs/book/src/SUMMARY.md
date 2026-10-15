@@ -7,4 +7,5 @@
 - [MCP tools](mcp-tools.md)
 - [Architecture](architecture.md)
 - [Sidecar format](sidecar-format.md)
+- [Performance](performance.md)
 - [Contributing](contributing.md)
