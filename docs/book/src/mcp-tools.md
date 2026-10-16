@@ -55,7 +55,9 @@ per file per process.
 Every binary-taking tool accepts an optional `raw` object
 (`arch`/`base`/`entry?`) with the same rules as the CLI flags:
 `arch` and `base` are required in raw mode, and raw-only options
-without `raw` are errors. `func` returns the compact metadata shape;
+without `raw` are errors. Fat Mach-O containers take an optional
+`fat_arch` string with the same arch names as the CLI flag; without
+it a fat input errors listing the available archs. `func` returns the compact metadata shape;
 `cfg` separates direct `edges` from provenance-marked
 `inferred_edges`. Inferred edges come from the indirect-jump
 resolver: single-slot absolute jumps plus guarded scaled-index

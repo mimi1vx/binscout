@@ -28,7 +28,7 @@ use crate::disasm::{Disassembler, Insn, PartialDisasm};
 use crate::error::{Error, Result};
 use crate::flirt::FlirtHint;
 use crate::loader::strings::StringHit;
-use crate::loader::{LoadedBinary, RawOptions, load, load_raw};
+use crate::loader::{LoadedBinary, RawOptions, load_raw, load_with_slice};
 use crate::search::{ByteMatch, BytePattern};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
@@ -100,18 +100,28 @@ pub fn parse_raw_options(
     }))
 }
 
-/// Open a binary with an optional explicit raw mapping and optional explicit
-/// DB path.
+/// Open a binary with an optional explicit raw mapping, an optional fat
+/// Mach-O slice selection, and an optional explicit DB path.
 ///
 /// Shared by the CLI and MCP so every binary-taking operation interprets
-/// raw options identically: `None` preserves auto detection (container
-/// parse with raw x86-64-at-0 fallback), `Some` opens the explicit mapping
-/// with no fallback. Reads never save or create the sidecar.
+/// options identically: `raw` `Some` opens the explicit mapping with no
+/// fallback, `fat_arch` `Some` analyzes that fat slice (passed through
+/// unchanged to [`crate::loader::load_with_slice`]; missing/unknown
+/// selections on fat input error listing the available archs), and both
+/// `None` preserves auto detection (container parse with raw x86-64-at-0
+/// fallback). Raw and fat selections are exclusive. Reads never save or
+/// create the sidecar.
 ///
 /// # Errors
 /// Same as [`Project::open`] plus raw-mapping validation from
-/// [`crate::loader::load_raw`].
-pub fn open_mapped(binary: &Path, db: Option<&Path>, raw: Option<RawOptions>) -> Result<Project> {
+/// [`crate::loader::load_raw`], plus [`Error::Invalid`] when raw and fat
+/// selections are combined.
+pub fn open_mapped(
+    binary: &Path,
+    db: Option<&Path>,
+    raw: Option<RawOptions>,
+    fat_arch: Option<&str>,
+) -> Result<Project> {
     let owned;
     let db_path = match db {
         Some(p) => p,
@@ -121,9 +131,26 @@ pub fn open_mapped(binary: &Path, db: Option<&Path>, raw: Option<RawOptions>) ->
             &owned
         }
     };
-    match raw {
-        Some(opts) => Project::open_raw(binary, db_path, opts),
-        None => Project::open_with_db(binary, db_path),
+    match (raw, fat_arch) {
+        (Some(_), Some(_)) => Err(Error::Invalid(
+            "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)".to_string(),
+        )),
+        (Some(opts), None) => Project::open_raw(binary, db_path, opts),
+        (None, Some(arch)) => Project::open_fat(binary, db_path, arch),
+        (None, None) => Project::open_with_db(binary, db_path),
+    }
+}
+
+/// Cache identity for an open request: explicit raw wins, else the fat
+/// slice selection, else auto detection. Raw and fat are exclusive.
+fn mapping_for(raw: Option<RawOptions>, fat_arch: Option<&str>) -> Result<db::StoredMapping> {
+    match (raw, fat_arch) {
+        (Some(_), Some(_)) => Err(Error::Invalid(
+            "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)".to_string(),
+        )),
+        (Some(opts), None) => Ok(db::StoredMapping::for_request(Some(opts))),
+        (None, Some(arch)) => Ok(db::StoredMapping::for_fat_slice(arch)),
+        (None, None) => Ok(db::StoredMapping::for_request(None)),
     }
 }
 
@@ -401,7 +428,7 @@ impl Project {
     /// # Errors
     /// Same as [`Project::open`].
     pub fn open_with_db(binary: &Path, db_path: &Path) -> Result<Self> {
-        Self::open_inner(binary, db_path, None)
+        Self::open_inner(binary, db_path, None, None)
     }
 
     /// Open a raw blob with explicit mapping options plus explicit DB path.
@@ -414,16 +441,39 @@ impl Project {
     /// # Errors
     /// Same as [`Project::open`].
     pub fn open_raw(binary: &Path, db_path: &Path, opts: RawOptions) -> Result<Self> {
-        Self::open_inner(binary, db_path, Some(opts))
+        Self::open_inner(binary, db_path, Some(opts), None)
     }
 
-    fn open_inner(binary: &Path, db_path: &Path, raw: Option<RawOptions>) -> Result<Self> {
+    /// Open the selected slice of a fat (universal) Mach-O binary plus
+    /// explicit DB path.
+    ///
+    /// `fat_arch` is the caller-supplied slice selector, passed through
+    /// unchanged to [`crate::loader::load_with_slice`] (canonical names
+    /// `x86_64`/`x86_32`/`aarch64`/`arm32` case-insensitively, plus the
+    /// `lipo` aliases); it is ignored for thin containers. The selection is
+    /// part of the cache identity: each slice keeps its own snapshot, and
+    /// populated annotation sidecars under another mapping require a
+    /// separate DB path.
+    ///
+    /// # Errors
+    /// Same as [`Project::open`], plus [`Error::Invalid`] when fat input
+    /// has no usable selection (missing, unknown, or ambiguous).
+    pub fn open_fat(binary: &Path, db_path: &Path, fat_arch: &str) -> Result<Self> {
+        Self::open_inner(binary, db_path, None, Some(fat_arch))
+    }
+
+    fn open_inner(
+        binary: &Path,
+        db_path: &Path,
+        raw: Option<RawOptions>,
+        fat_arch: Option<&str>,
+    ) -> Result<Self> {
         // Single-open bounded read: one handle, chunked with checked
         // accumulation, so a growing file cannot slip past a stat cap.
         let bytes = read_input_bytes(binary)?;
         let hash = db::content_hash(&bytes);
         let size = bytes.len() as u64;
-        let mapping = db::StoredMapping::for_request(raw);
+        let mapping = mapping_for(raw, fat_arch)?;
 
         // Metadata-first snapshot read over a read-only handle: cache
         // identity covers content, loader mapping, and analysis revision
@@ -443,7 +493,7 @@ impl Project {
 
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
-                let loaded = reload_binary(&bytes, raw)?;
+                let loaded = reload_binary(&bytes, raw, fat_arch)?;
                 let db::Loaded {
                     arch,
                     functions,
@@ -481,12 +531,26 @@ impl Project {
                     mapping,
                 })
             }
-            Some(db::Snapshot::Stale { annotations, .. }) => {
-                Self::reanalyze(binary, db_path, bytes, raw, hash, size, annotations)
-            }
-            Some(db::Snapshot::Miss) | None => {
-                Self::reanalyze(binary, db_path, bytes, raw, hash, size, BTreeMap::new())
-            }
+            Some(db::Snapshot::Stale { annotations, .. }) => Self::reanalyze(
+                binary,
+                db_path,
+                bytes,
+                raw,
+                fat_arch,
+                hash,
+                size,
+                annotations,
+            ),
+            Some(db::Snapshot::Miss) | None => Self::reanalyze(
+                binary,
+                db_path,
+                bytes,
+                raw,
+                fat_arch,
+                hash,
+                size,
+                BTreeMap::new(),
+            ),
         }
     }
 
@@ -496,19 +560,24 @@ impl Project {
     /// same mapping; the derived analysis always comes from the current
     /// bytes, never from storage. A mapping mismatch over populated
     /// annotations never reaches this path: [`db::load_cached`] errors first.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open plumbing: paths plus raw/fat mapping, content, and annotations"
+    )]
     fn reanalyze(
         binary: &Path,
         db_path: &Path,
         bytes: Vec<u8>,
         raw: Option<RawOptions>,
+        fat_arch: Option<&str>,
         hash: u64,
         size: u64,
         annotations: BTreeMap<u64, Annotation>,
     ) -> Result<Self> {
-        let mapping = db::StoredMapping::for_request(raw);
+        let mapping = mapping_for(raw, fat_arch)?;
         let loaded = match raw {
             Some(opts) => load_raw(&bytes, opts)?,
-            None => load_or_raw(&bytes)?,
+            None => load_or_raw(&bytes, fat_arch)?,
         };
         let analysis = analyze(&loaded)?;
         Ok(Self {
@@ -592,6 +661,7 @@ impl Project {
         let (mode, base) = match &self.mapping {
             db::StoredMapping::Auto => ("auto".to_string(), None),
             db::StoredMapping::Explicit { base, .. } => ("raw".to_string(), Some(*base)),
+            db::StoredMapping::Fat { .. } => ("fat".to_string(), None),
         };
         ProjectInfo {
             binary: self.path.display().to_string(),
@@ -639,6 +709,7 @@ impl Project {
             db::StoredMapping::Explicit { base, .. } => {
                 ("raw".to_string(), crate::opt_addr_pair(Some(*base)))
             }
+            db::StoredMapping::Fat { .. } => ("fat".to_string(), crate::opt_addr_pair(None)),
         };
         let (entry, entry_hex) = crate::opt_addr_pair(self.binary.entry);
         Ok(serde_json::json!({
@@ -1830,11 +1901,16 @@ pub fn parse_diagnostic_kind(s: &str) -> Result<DiagnosticKind> {
 
 /// Re-read the binary bytes for a hash-matching cached snapshot.
 ///
-/// Raw blobs need their mapping options again; containers re-parse.
-fn reload_binary(bytes: &[u8], raw: Option<RawOptions>) -> Result<LoadedBinary> {
+/// Raw blobs need their mapping options again; containers re-parse with the
+/// same fat slice selection.
+fn reload_binary(
+    bytes: &[u8],
+    raw: Option<RawOptions>,
+    fat_arch: Option<&str>,
+) -> Result<LoadedBinary> {
     match raw {
         Some(opts) => load_raw(bytes, opts),
-        None => load_or_raw(bytes),
+        None => load_or_raw(bytes, fat_arch),
     }
 }
 
@@ -1900,12 +1976,15 @@ fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) ->
 
 /// Container parse with raw x86-64 fallback for unrecognized bytes.
 ///
-/// Only [`Error::Invalid`] on unrecognized input falls back; recognized
+/// `fat_arch` passes through to [`load_with_slice`](crate::loader::load_with_slice):
+/// it selects the slice for fat input (missing/unknown selections error
+/// listing the available archs) and is ignored for thin containers. Only
+/// [`Error::Invalid`] on unrecognized input falls back; recognized
 /// containers that fail to parse (LE included) report the parse error,
 /// and [`Error::Limit`]/[`Error::Unsupported`] propagate unchanged. LE
 /// images that parse flow to analysis as x86_32.
-fn load_or_raw(bytes: &[u8]) -> Result<LoadedBinary> {
-    match load(bytes) {
+fn load_or_raw(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
+    match load_with_slice(bytes, fat_arch) {
         Ok(bin) => Ok(bin),
         Err(Error::Invalid(_)) if !crate::loader::is_recognized(bytes) => load_raw(
             bytes,

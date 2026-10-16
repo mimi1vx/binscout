@@ -1,7 +1,7 @@
 # CLI reference
 
 ```sh
-binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] <command> <binary> [args]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] <command> <binary> [args]
 ```
 
 `--db` overrides the sidecar database (default `<binary>.rsdbg.redb`).
@@ -13,6 +13,11 @@ misaligned entries, and base-plus-length overflow. Without `--raw`,
 container auto-detection (and the raw x86-64-at-0 fallback) is
 unchanged, and explicit raw mode never falls back to another mode on
 failure.
+`--fat-arch` selects a slice of a fat Mach-O container: `x86_64`,
+`x86_32`, `aarch64`, `arm32` (plus `lipo` aliases like `arm64`,
+case-insensitive); it is required for fat inputs, which error
+listing the available archs without it. `--raw` and `--fat-arch`
+are exclusive. Different slices never share cached snapshots.
 See [JSON protocol](json-protocol.md) for the output contract.
 | Command | Example | Output |
 |---|---|---|

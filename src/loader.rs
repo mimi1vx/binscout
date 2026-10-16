@@ -300,12 +300,39 @@ pub fn is_recognized(bytes: &[u8]) -> bool {
 /// [`Error::Limit`] (never [`Error::Invalid`]) so
 /// [`crate::load_or_raw`](crate::Project) does not fall back to raw.
 ///
+/// Fat (universal) Mach-O containers need a slice selection; without one
+/// this errors listing the available slice archs (see [`load_with_slice`]).
+///
 /// # Errors
 /// [`Error::Invalid`] on empty or unrecognized input, [`Error::Unsupported`]
 /// on recognized formats this loader does not handle (Wasm, archives, …)
 /// or architectures without a disassembler, [`Error::Limit`] when input,
 /// table, byte, name, demangled, or aggregate metadata caps are exceeded.
 pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
+    load_with_slice(bytes, None)
+}
+
+/// Parse any supported binary, selecting a fat Mach-O slice by arch name.
+///
+/// Identical to [`load`] for thin containers: `fat_arch` is ignored unless
+/// the input is a fat (universal) Mach-O container. For fat input the slice
+/// is required — a missing, unknown, or ambiguous selection errors with
+/// [`Error::Invalid`] listing the available slice archs, so the failure
+/// names what to retry with instead of surfacing an `object` parse error.
+/// The selected slice bytes re-enter the `load_object` Mach-O path, so thin and
+/// sliced opens share every table cap and mapping rule.
+///
+/// `fat_arch` accepts the canonical loader arch names case-insensitively
+/// (`x86_64`, `x86_32`, `aarch64`, `arm32`) plus the common `lipo` aliases
+/// (`x86-64`, `i386`/`x86`, `arm64`, `arm`). This is the internal hook the
+/// CLI `--fat-arch` / MCP `fat_arch` plumbing wires to: pass the flag value
+/// through unchanged.
+///
+/// # Errors
+/// Same as [`load`], plus [`Error::Invalid`] when fat input has no usable
+/// selection (missing, unknown, or ambiguous) or the selected slice range
+/// is unreadable.
+pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty input".to_string()));
     }
@@ -320,9 +347,8 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
     match kind {
         FileKind::Elf32 | FileKind::Elf64 => load_object(bytes, BinaryFormat::Elf),
         FileKind::Pe32 | FileKind::Pe64 => load_object(bytes, BinaryFormat::Pe),
-        FileKind::MachO32 | FileKind::MachO64 | FileKind::MachOFat32 | FileKind::MachOFat64 => {
-            load_object(bytes, BinaryFormat::MachO)
-        }
+        FileKind::MachO32 | FileKind::MachO64 => load_object(bytes, BinaryFormat::MachO),
+        FileKind::MachOFat32 | FileKind::MachOFat64 => load_fat_slice(bytes, kind, fat_arch),
         FileKind::Coff => load_object(bytes, BinaryFormat::Coff),
         other => Err(Error::Unsupported(format!("file kind {other:?}"))),
     }
@@ -557,6 +583,265 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         imports,
         exports,
     })
+}
+
+/// Derive Mach-O stub entry addresses in import order, or `None` on any doubt.
+///
+/// Pairs the i-th `__stubs`/`__auth_stubs` entry (section-table order) with
+/// the i-th import (`object` bind order). Every guard must hold, otherwise
+/// nothing maps rather than misattributing an address to the wrong import:
+/// thin little-endian Mach-O magic, no `LC_DYLD_CHAINED_FIXUPS` (chained
+/// fixups reorder binds away from stub order), at least one stub section of
+/// type `S_SYMBOL_STUBS` in a `__TEXT*` segment with a nonzero `reserved2`
+/// stride dividing its size, checked entry arithmetic, and total entries
+/// exactly equal to `import_count`. Real binaries routinely fail the last
+/// two guards: `/bin/ls` (arm64e) carries 84 `__auth_stubs` for 90
+/// chained-fixup imports, and its x86_64 slice 84 `__stubs` for 91
+/// `LC_DYLD_INFO` imports (stub-less data binds have no entry).
+fn macho_stub_addresses<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    bytes: &'a [u8],
+    import_count: usize,
+) -> Option<Vec<u64>> {
+    use object::{Object, ObjectSection};
+    if import_count == 0 || import_count > MAX_IMPORTS {
+        return None;
+    }
+    if !is_thin_le_macho(bytes) {
+        return None;
+    }
+    if macho_has_chained_fixups(bytes) != Some(false) {
+        return None;
+    }
+    let mut addrs = Vec::new();
+    let mut stubbed = false;
+    for sec in file.sections() {
+        if !matches!(sec.name(), Ok("__stubs" | "__auth_stubs")) {
+            continue;
+        }
+        let in_text = sec
+            .segment_name()
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.starts_with("__TEXT"));
+        let stride = match sec.flags() {
+            object::SectionFlags::MachO { flags, reserved2 }
+                if flags.typ() == object::macho::S_SYMBOL_STUBS && reserved2 != 0 =>
+            {
+                u64::from(reserved2)
+            }
+            _ => return None,
+        };
+        if !in_text {
+            return None;
+        }
+        let size = sec.size();
+        if size == 0 || size % stride != 0 {
+            return None;
+        }
+        let base = sec.address();
+        for i in 0..size / stride {
+            addrs.push(base.checked_add(i.checked_mul(stride)?)?);
+            if addrs.len() > import_count {
+                return None;
+            }
+        }
+        stubbed = true;
+    }
+    if !stubbed || addrs.len() != import_count {
+        return None;
+    }
+    Some(addrs)
+}
+
+/// True for thin little-endian Mach-O images (32- or 64-bit).
+///
+/// Fat container bytes and big-endian images are not stub-mapped; fat
+/// slices re-enter this path as thin images, so they map normally.
+fn is_thin_le_macho(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    magic == 0xFEED_FACE || magic == 0xFEED_FACF
+}
+
+/// Whether thin Mach-O `bytes` carry `LC_DYLD_CHAINED_FIXUPS`.
+///
+/// `None` on bad magic or any truncation (unknown means "veto the mapping",
+/// never "assume classic binds"). The walk is bound-checked and capped well
+/// past real command counts, so hostile `ncmds` cannot loop: exceeding the
+/// cap is also `None`.
+fn macho_has_chained_fixups(bytes: &[u8]) -> Option<bool> {
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+    const MAX_COMMANDS: u32 = 4096;
+    if bytes.len() < 32 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let header: usize = match magic {
+        0xFEED_FACE => 28,
+        0xFEED_FACF => 32,
+        _ => return None,
+    };
+    let ncmds = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    if ncmds > MAX_COMMANDS {
+        return None;
+    }
+    let mut off = header;
+    for _ in 0..ncmds {
+        if off.saturating_add(8) > bytes.len() {
+            return None;
+        }
+        let cmd = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let cmdsize = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        if cmd == LC_DYLD_CHAINED_FIXUPS {
+            return Some(true);
+        }
+        if cmdsize < 8 {
+            return None;
+        }
+        off = off.saturating_add(cmdsize as usize);
+        if off > bytes.len() {
+            return None;
+        }
+    }
+    Some(false)
+}
+
+/// Canonical slice name for a fat entry's `object` architecture.
+///
+/// `None` when the entry targets no disassembler; such slices still appear
+/// in the available-arch listing under their `object` debug name.
+/// Canonical names match [`raw_arch_name`].
+fn canonical_fat_name(arch: object::Architecture) -> Option<&'static str> {
+    use object::Architecture as A;
+    match arch {
+        A::X86_64 | A::X86_64_X32 => Some("x86_64"),
+        A::I386 => Some("x86_32"),
+        A::Aarch64 | A::Aarch64_Ilp32 => Some("aarch64"),
+        A::Arm => Some("arm32"),
+        _ => None,
+    }
+}
+
+/// Normalize a user-supplied slice selector to a canonical arch name.
+///
+/// Accepts the canonical names plus `lipo`-style aliases; anything else
+/// is unknown (never guessed to a slice).
+fn normalize_fat_selector(s: &str) -> Option<&'static str> {
+    match s.to_lowercase().as_str() {
+        "x86_64" | "x86-64" => Some("x86_64"),
+        "x86_32" | "i386" | "x86" => Some("x86_32"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        "arm32" | "arm" => Some("arm32"),
+        _ => None,
+    }
+}
+
+/// Display label for one fat entry: canonical name, else `object` debug.
+fn fat_label(arch: object::Architecture) -> String {
+    match canonical_fat_name(arch) {
+        Some(name) => name.to_string(),
+        None => format!("{arch:?}"),
+    }
+}
+
+/// One fat entry: `object` architecture plus its byte range in the container.
+fn fat_table<Fat>(
+    fat: &object::read::macho::MachOFatFile<'_, Fat>,
+) -> Vec<(object::Architecture, u64, u64)>
+where
+    Fat: object::read::macho::FatArch,
+{
+    fat.arches()
+        .iter()
+        .map(|a| {
+            let (offset, size) = a.file_range();
+            (a.architecture(), offset, size)
+        })
+        .collect()
+}
+
+/// Extract the selected slice from a fat Mach-O container and load it.
+///
+/// Parses the fat header with `object::read::macho` (`MachOFatFile32` for
+/// `MachOFat32`, `MachOFatFile64` for `MachOFat64`), resolves `fat_arch`
+/// against the entry architectures, and loads the selected slice bytes via
+/// [`load_object`] as Mach-O. Only the selected slice is copied; the rest
+/// of the container is never parsed.
+fn load_fat_slice(bytes: &[u8], kind: FileKind, fat_arch: Option<&str>) -> Result<LoadedBinary> {
+    use object::read::macho::{MachOFatFile32, MachOFatFile64};
+    let table: Vec<(object::Architecture, u64, u64)> = match kind {
+        FileKind::MachOFat32 => {
+            let fat = MachOFatFile32::parse(bytes)
+                .map_err(|e| Error::Invalid(format!("bad fat Mach-O header: {e}")))?;
+            fat_table(&fat)
+        }
+        FileKind::MachOFat64 => {
+            let fat = MachOFatFile64::parse(bytes)
+                .map_err(|e| Error::Invalid(format!("bad fat Mach-O header: {e}")))?;
+            fat_table(&fat)
+        }
+        _ => return Err(Error::Invalid("not a fat Mach-O container".to_string())),
+    };
+    if table.is_empty() {
+        return Err(Error::Invalid(
+            "fat Mach-O container holds no slices".to_string(),
+        ));
+    }
+    let available: Vec<String> = table.iter().map(|(a, _, _)| fat_label(*a)).collect();
+    let Some(want) = fat_arch else {
+        let plural = if table.len() == 1 { "" } else { "s" };
+        return Err(Error::Invalid(format!(
+            "fat Mach-O container with {} slice{plural} requires a slice selection (available: {})",
+            table.len(),
+            available.join(", "),
+        )));
+    };
+    let Some(canonical) = normalize_fat_selector(want) else {
+        return Err(Error::Invalid(format!(
+            "unknown fat slice arch {want:?} (available: {})",
+            available.join(", "),
+        )));
+    };
+    let hits: Vec<usize> = table
+        .iter()
+        .enumerate()
+        .filter(|(_, (a, _, _))| canonical_fat_name(*a) == Some(canonical))
+        .map(|(i, _)| i)
+        .collect();
+    let idx = match hits.len() {
+        0 => {
+            return Err(Error::Invalid(format!(
+                "fat Mach-O container has no {canonical} slice (available: {})",
+                available.join(", "),
+            )));
+        }
+        1 => hits[0],
+        n => {
+            return Err(Error::Invalid(format!(
+                "ambiguous fat slice arch {want:?}: matches {n} slices (available: {})",
+                available.join(", "),
+            )));
+        }
+    };
+    let (_, offset, size) = table[idx];
+    let start = usize::try_from(offset)
+        .ok()
+        .and_then(|o| {
+            usize::try_from(size)
+                .ok()
+                .and_then(|s| o.checked_add(s).map(|e| (o, e)))
+        })
+        .and_then(|(s, e)| bytes.get(s..e))
+        .ok_or_else(|| Error::Invalid(format!("bad fat slice range {offset:#x}+{size:#x}")))?;
+    load_object(start, BinaryFormat::MachO)
 }
 
 /// Add `len` owned metadata bytes to the aggregate budget.

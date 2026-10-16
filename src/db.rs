@@ -201,8 +201,10 @@ pub fn parse_format(s: &str) -> Result<BinaryFormat> {
 ///
 /// `Auto` means the binary was opened without explicit raw options
 /// (container parse with raw x86-64-at-0 fallback for unrecognized bytes).
-/// `Explicit` records the caller-supplied raw mapping. Auto and explicit
-/// never alias, even when the effective bytes coincide.
+/// `Explicit` records the caller-supplied raw mapping. `Fat` records a fat
+/// Mach-O slice open by canonical slice arch name: different slices never
+/// share snapshots, even over identical container bytes. Auto, explicit,
+/// and fat never alias each other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum StoredMapping {
@@ -216,6 +218,12 @@ pub enum StoredMapping {
         base: u64,
         /// Entry-point address, if supplied.
         entry: Option<u64>,
+    },
+    /// Opened with a fat Mach-O slice selection.
+    Fat {
+        /// Canonical slice arch name (see
+        /// [`crate::loader::load_with_slice`]).
+        arch: String,
     },
 }
 
@@ -233,6 +241,20 @@ impl StoredMapping {
         }
     }
 
+    /// Mapping identity for a fat Mach-O slice open.
+    ///
+    /// `arch` is the caller-supplied slice selector (the CLI `--fat-arch` /
+    /// MCP `fat_arch` value the follow-up plumbing passes through
+    /// unchanged); it is lowercased so `X86_64` and `x86_64` share one
+    /// snapshot. Prefer the canonical names (`x86_64`, `x86_32`,
+    /// `aarch64`, `arm32`); aliases resolve at load time, not here.
+    #[must_use]
+    pub fn for_fat_slice(arch: &str) -> Self {
+        Self::Fat {
+            arch: arch.to_lowercase(),
+        }
+    }
+
     /// One-line description for mapping-conflict errors.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -242,6 +264,7 @@ impl StoredMapping {
                 Some(e) => format!("explicit raw {arch} base {base:#x} entry {e:#x}"),
                 None => format!("explicit raw {arch} base {base:#x}"),
             },
+            Self::Fat { arch } => format!("fat slice {arch}"),
         }
     }
 }
@@ -426,7 +449,7 @@ pub struct ProjectInfo {
     /// Wire protocol revision (see `docs/book/src/json-protocol.md`).
     #[serde(default = "default_protocol")]
     pub protocol: u32,
-    /// Effective loader mode: `"auto"` or `"raw"`.
+    /// Effective loader mode: `"auto"`, `"raw"`, or `"fat"`.
     #[serde(default = "default_mode")]
     pub mode: String,
     /// Effective raw base address (`None` in auto mode).
@@ -1446,8 +1469,8 @@ pub enum Snapshot {
 /// read opens pass a read-only handle from [`open_db_read_only`].
 ///
 /// Cache identity covers the binary content (`expected_hash`), the
-/// auto-versus-explicit raw mode plus raw arch/base/entry
-/// (`expected_mapping`), and the analysis revision: layouts replay only when
+/// loader mapping — auto, explicit raw arch/base/entry, or fat slice arch
+/// (`expected_mapping`) — and the analysis revision: layouts replay only when
 /// all three agree with the stored snapshot on the current
 /// [`SCHEMA_VERSION`]. A mapping mismatch never reuses layouts, even when
 /// the bytes are identical; auto and explicit opens never alias.

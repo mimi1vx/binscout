@@ -661,7 +661,8 @@ fn open_mapped_shares_parser_with_open_raw() {
         .expect("parse")
         .expect("explicit");
     let db_a = common::temp_db(&dir, "a");
-    let via_mapped = binscout::open_mapped(&bin, Some(&db_a), Some(parsed)).expect("open_mapped");
+    let via_mapped =
+        binscout::open_mapped(&bin, Some(&db_a), Some(parsed), None).expect("open_mapped");
     let db_b = common::temp_db(&dir, "b");
     let via_raw = Project::open_raw(&bin, &db_b, parsed).expect("open_raw");
     let (m, r) = (via_mapped.project_info(), via_raw.project_info());

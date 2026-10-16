@@ -28,10 +28,16 @@ pub struct RawParams {
     pub entry: Option<String>,
 }
 
-/// Shared validated opener: explicit `db` path (or the default sidecar) plus
-/// the optional explicit raw mapping, parsed through
-/// [`crate::parse_raw_options`] so CLI and MCP interpret options identically.
-fn open(binary: &str, db: Option<&str>, raw: Option<&RawParams>) -> Result<Project, ErrorData> {
+/// Shared validated opener: explicit `db` path (or the default sidecar),
+/// the optional explicit raw mapping, and the optional fat Mach-O slice
+/// selection, parsed through [`crate::parse_raw_options`] so CLI and MCP
+/// interpret options identically.
+fn open(
+    binary: &str,
+    db: Option<&str>,
+    raw: Option<&RawParams>,
+    fat_arch: Option<&str>,
+) -> Result<Project, ErrorData> {
     let raw_opts = raw_options(raw)?;
     let db_path;
     let db_ref = match db {
@@ -41,7 +47,7 @@ fn open(binary: &str, db: Option<&str>, raw: Option<&RawParams>) -> Result<Proje
         }
         None => None,
     };
-    crate::open_mapped(Path::new(binary), db_ref, raw_opts).map_err(|e| match e {
+    crate::open_mapped(Path::new(binary), db_ref, raw_opts, fat_arch).map_err(|e| match e {
         crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
         other => ErrorData::internal_error(other.to_string(), None),
     })
@@ -88,6 +94,9 @@ pub struct BinaryParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping (`arch`/`base` required, `entry` optional).
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
 }
 
 /// Parameters for the `strings` tool: filtered, paged string search.
@@ -99,6 +108,9 @@ pub struct StringsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Rows to skip after filtering.
     pub start: Option<usize>,
     /// Deprecated alias of `start`.
@@ -129,6 +141,9 @@ pub struct FunctionsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Case-insensitive substring over the rename-resolved name.
     pub query: Option<String>,
     /// Keep functions that call the function containing this address.
@@ -154,6 +169,9 @@ pub struct AddrParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
 }
@@ -167,6 +185,9 @@ pub struct BlocksParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Function address: any address inside the function snaps to its
     /// containing entry.
     pub addr: String,
@@ -185,6 +206,9 @@ pub struct BlockInsnsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Function address: any address inside the function snaps to its
     /// containing entry.
     pub addr: String,
@@ -205,6 +229,9 @@ pub struct DiagnosticsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Only `unresolved-indirect-jump`, `unresolved-indirect-call`, or
     /// `decode-failure` sites.
     pub kind: Option<String>,
@@ -226,6 +253,9 @@ pub struct RangeParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
     /// Bytes to decode.
@@ -241,6 +271,9 @@ pub struct XrefsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Only xrefs pointing at this address (`0x`-hex or decimal).
     pub to: Option<String>,
     /// Only xrefs originating at this address.
@@ -265,6 +298,9 @@ pub struct IrCoverageParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Range address (`0x`-hex or decimal string; needs `binary` and `len`).
     pub addr: Option<String>,
     /// Range length in bytes (needs `binary` and `addr`).
@@ -280,6 +316,9 @@ pub struct RenameParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Function entry address (`0x`-hex or decimal string).
     pub addr: String,
     /// New name (empty string clears).
@@ -295,6 +334,9 @@ pub struct CommentParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Address to comment (`0x`-hex or decimal string).
     pub addr: String,
     /// Comment text (empty string clears).
@@ -310,6 +352,9 @@ pub struct SearchBytesParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Whitespace-separated full-byte tokens: two hex digits or `??`.
     pub pattern: String,
     /// Keep matches fully inside this section (e.g. `.text`).
@@ -334,6 +379,9 @@ pub struct CallgraphParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Query address: any address inside the root function snaps to its
     /// containing entry.
     pub addr: String,
@@ -356,6 +404,9 @@ pub struct SliceParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Slice root: every returned instruction can reach this address
     /// (`0x`-hex or decimal string; any address is valid, including
     /// data/string targets in no function).
@@ -378,6 +429,9 @@ pub struct AnnotationsImportParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Interchange document, as returned by `annotations_export`.
     pub document: String,
     /// Replace supplied fields on conflict instead of failing.
@@ -393,6 +447,9 @@ pub struct FlirtHintsParams {
     pub db: Option<String>,
     /// Optional explicit raw mapping.
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
     /// Only hints for the function containing this address (`0x`-hex or
     /// decimal string).
     pub addr: Option<String>,
@@ -416,6 +473,9 @@ pub struct DiffParams {
     /// Optional explicit raw mapping, applied to both binaries (the
     /// two-builds case shares one mapping).
     pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection, applied to both binaries (the two-builds
+    /// case shares one selection); required for fat containers.
+    pub fat_arch: Option<String>,
 }
 
 /// MCP server handler; serializes tool calls behind one lock.
@@ -453,7 +513,12 @@ impl BinscoutMcp {
     fn project_info(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
 
@@ -464,7 +529,12 @@ impl BinscoutMcp {
     fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let filter = FunctionFilter {
             query: p.query,
             caller: opt_addr(p.caller)?,
@@ -494,7 +564,12 @@ impl BinscoutMcp {
     fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.func_meta(addr)
@@ -509,7 +584,12 @@ impl BinscoutMcp {
     fn blocks(&self, p: Parameters<BlocksParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.func_blocks_page(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
@@ -524,7 +604,12 @@ impl BinscoutMcp {
     fn block_insns(&self, p: Parameters<BlockInsnsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let block =
@@ -541,7 +626,12 @@ impl BinscoutMcp {
     fn diagnostics(&self, p: Parameters<DiagnosticsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let kind = p
             .kind
             .as_deref()
@@ -564,7 +654,12 @@ impl BinscoutMcp {
     fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.disasm_at(addr, p.len)
@@ -579,7 +674,12 @@ impl BinscoutMcp {
     fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.cfg_of(addr)
@@ -594,7 +694,12 @@ impl BinscoutMcp {
     fn structure(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.structure_of(addr)
@@ -609,7 +714,12 @@ impl BinscoutMcp {
     fn pseudo(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.pseudo_of(addr)
@@ -624,7 +734,12 @@ impl BinscoutMcp {
     fn callees(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.callees_page(
@@ -647,7 +762,12 @@ impl BinscoutMcp {
     fn callers(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.callers_page(
@@ -670,7 +790,12 @@ impl BinscoutMcp {
     fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.slice_page(
@@ -693,7 +818,12 @@ impl BinscoutMcp {
     fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let kind = p
             .kind
             .as_deref()
@@ -725,7 +855,12 @@ impl BinscoutMcp {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
                 other => ErrorData::internal_error(other.to_string(), None),
             })?;
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let filter = crate::analysis::StringsFilter {
             pattern: p.pattern,
             min_len: p.min_len,
@@ -749,7 +884,13 @@ impl BinscoutMcp {
     fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        ok(open(&p.binary, p.db.as_deref(), p.raw.as_ref())?.symbols_json())
+        ok(open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?
+        .symbols_json())
     }
 
     #[tool(
@@ -759,10 +900,15 @@ impl BinscoutMcp {
     fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        open(&p.binary, p.db.as_deref(), p.raw.as_ref())?
-            .stats_json()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+        open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?
+        .stats_json()
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        .and_then(ok)
     }
 
     #[tool(
@@ -772,7 +918,13 @@ impl BinscoutMcp {
     fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        ok(open(&p.binary, p.db.as_deref(), p.raw.as_ref())?.sections_json())
+        ok(open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?
+        .sections_json())
     }
 
     #[tool(
@@ -782,7 +934,12 @@ impl BinscoutMcp {
     fn ir(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.ir_at(addr, p.len)
@@ -802,7 +959,12 @@ impl BinscoutMcp {
         match (p.binary, p.addr, p.len) {
             (None, None, None) => ok(crate::ir_coverage(arch)),
             (Some(binary), Some(addr), Some(len)) => {
-                let proj = open(&binary, p.db.as_deref(), p.raw.as_ref())?;
+                let proj = open(
+                    &binary,
+                    p.db.as_deref(),
+                    p.raw.as_ref(),
+                    p.fat_arch.as_deref(),
+                )?;
                 let addr = parse_addr(&addr)
                     .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
                 proj.ir_coverage_at(arch, addr, len)
@@ -826,7 +988,12 @@ impl BinscoutMcp {
     fn rename(&self, p: Parameters<RenameParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let mut proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.rename_function(addr, &p.name)
@@ -841,7 +1008,12 @@ impl BinscoutMcp {
     fn comment(&self, p: Parameters<CommentParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let mut proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.set_comment(addr, &p.comment)
@@ -856,7 +1028,12 @@ impl BinscoutMcp {
     fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let range = match (p.range_start, p.range_end) {
             (None, None) => None,
             (Some(lo), Some(hi)) => Some((
@@ -891,7 +1068,12 @@ impl BinscoutMcp {
     fn annotations_export(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let doc = proj
             .export_annotations()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -917,7 +1099,12 @@ impl BinscoutMcp {
         // layer; the core re-checks the 16 MiB serialized cap plus row/text
         // budgets during validation, before any write, and every failure
         // leaves the DB and memory unchanged.
-        let mut proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let mut proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         proj.import_annotations(&p.document, p.overwrite.unwrap_or(false))
             .map_err(|e| match e {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
@@ -933,7 +1120,12 @@ impl BinscoutMcp {
     fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);
-        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let proj = open(
+            &p.binary,
+            p.db.as_deref(),
+            p.raw.as_ref(),
+            p.fat_arch.as_deref(),
+        )?;
         let addr = opt_addr(p.addr)?;
         proj.query_flirt_hints(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
@@ -968,8 +1160,20 @@ impl BinscoutMcp {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
             other => ErrorData::internal_error(other.to_string(), None),
         };
-        let a = crate::open_mapped(Path::new(&p.binary_a), db_a, raw_opts).map_err(map_err)?;
-        let b = crate::open_mapped(Path::new(&p.binary_b), db_b, raw_opts).map_err(map_err)?;
+        let a = crate::open_mapped(
+            Path::new(&p.binary_a),
+            db_a,
+            raw_opts,
+            p.fat_arch.as_deref(),
+        )
+        .map_err(map_err)?;
+        let b = crate::open_mapped(
+            Path::new(&p.binary_b),
+            db_b,
+            raw_opts,
+            p.fat_arch.as_deref(),
+        )
+        .map_err(map_err)?;
         let report = crate::diff::diff_projects(&a, &b);
         ok(serde_json::to_value(report).expect("diff report serializes"))
     }

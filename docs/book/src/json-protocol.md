@@ -190,7 +190,7 @@ common `--db PATH` / `db` sidecar override and the raw-mapping options.
 Opt-in firmware/raw workflow. CLI global flags (like `--db`):
 
 ```sh
-binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] <command> B [...]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] <command> B [...]
 ```
 
 MCP: optional `raw: {"arch": ..., "base": ..., "entry"?}` object on
@@ -214,6 +214,13 @@ Same bytes under a different mapping never reuse cached layouts: the
 open re-analyzes. A sidecar holding annotations opened under an
 incompatible mapping fails with a separate-DB error instead of
 remapping them (see [CLI reference](cli-reference.md)).
+
+Fat Mach-O containers need `--fat-arch ARCH` (CLI) or `fat_arch`
+(MCP, on every binary-taking tool): `x86_64`, `x86_32`, `aarch64`,
+`arm32`, plus `lipo` aliases like `arm64`, case-insensitive.
+Without it a fat input errors listing the available archs; `--raw`
+and `--fat-arch` are exclusive. `project_info` reports `mode`
+`"fat"` with a null base, and slices never share snapshots.
 
 ### `blocks` / `block_insns`
 

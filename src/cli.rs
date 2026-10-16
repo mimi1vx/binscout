@@ -35,6 +35,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub entry: Option<String>,
 
+    /// Fat Mach-O slice: `x86_64`, `x86_32`, `aarch64`, `arm32` (plus `lipo`
+    /// aliases like `arm64`); required for fat containers.
+    #[arg(long, global = true)]
+    pub fat_arch: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -299,8 +304,8 @@ pub enum Cmd {
     /// `matched`, content-matched pairs are `changed` (with the match
     /// reason), the rest is `added` (only in B) / `removed` (only in A).
     /// Both projects open read-only: never creates or modifies a sidecar.
-    /// The global `--raw` mapping (if any) applies to both binaries;
-    /// use `--db-a`/`--db-b` instead of the global `--db`.
+    /// The global `--raw` mapping or `--fat-arch` selection (if any) applies
+    /// to both binaries; use `--db-a`/`--db-b` instead of the global `--db`.
     Diff {
         /// First (baseline) binary.
         binary_a: PathBuf,
@@ -330,8 +335,9 @@ impl Cli {
             }
         };
         let db = self.db.as_deref();
+        let fat_arch = self.fat_arch.as_deref();
         let result = match self.cmd {
-            Cmd::Load { binary } => load(&binary, db, raw_opts),
+            Cmd::Load { binary } => load(&binary, db, raw_opts, fat_arch),
             Cmd::Functions {
                 binary,
                 query,
@@ -340,22 +346,25 @@ impl Cli {
                 range,
                 offset,
                 limit,
-            } => functions_filter(query, caller, callee, range)
-                .and_then(|filter| functions(&binary, db, raw_opts, &filter, offset, limit)),
-            Cmd::Func { binary, addr } => func(&binary, db, raw_opts, &addr),
+            } => functions_filter(query, caller, callee, range).and_then(|filter| {
+                functions(&binary, db, raw_opts, fat_arch, &filter, offset, limit)
+            }),
+            Cmd::Func { binary, addr } => func(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Blocks {
                 binary,
                 addr,
                 offset,
                 limit,
-            } => blocks(&binary, db, raw_opts, &addr, offset, limit),
+            } => blocks(&binary, db, raw_opts, fat_arch, &addr, offset, limit),
             Cmd::BlockInsns {
                 binary,
                 addr,
                 block,
                 offset,
                 limit,
-            } => block_insns(&binary, db, raw_opts, &addr, &block, offset, limit),
+            } => block_insns(
+                &binary, db, raw_opts, fat_arch, &addr, &block, offset, limit,
+            ),
             Cmd::Diagnostics {
                 binary,
                 kind,
@@ -366,36 +375,39 @@ impl Cli {
                 &binary,
                 db,
                 raw_opts,
+                fat_arch,
                 kind.as_deref(),
                 func.as_deref(),
                 offset,
                 limit,
             ),
-            Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
-            Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
-            Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, &addr),
-            Cmd::Pseudo { binary, addr } => pseudo(&binary, db, raw_opts, &addr),
+            Cmd::Disasm { binary, addr, len } => {
+                disasm(&binary, db, raw_opts, fat_arch, &addr, len)
+            }
+            Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, fat_arch, &addr),
+            Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, fat_arch, &addr),
+            Cmd::Pseudo { binary, addr } => pseudo(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Callees {
                 binary,
                 addr,
                 depth,
                 offset,
                 limit,
-            } => callees(&binary, db, raw_opts, &addr, depth, offset, limit),
+            } => callees(&binary, db, raw_opts, fat_arch, &addr, depth, offset, limit),
             Cmd::Callers {
                 binary,
                 addr,
                 depth,
                 offset,
                 limit,
-            } => callers(&binary, db, raw_opts, &addr, depth, offset, limit),
+            } => callers(&binary, db, raw_opts, fat_arch, &addr, depth, offset, limit),
             Cmd::Slice {
                 binary,
                 addr,
                 depth,
                 offset,
                 limit,
-            } => slice(&binary, db, raw_opts, &addr, depth, offset, limit),
+            } => slice(&binary, db, raw_opts, fat_arch, &addr, depth, offset, limit),
             Cmd::Xrefs {
                 binary,
                 to,
@@ -407,6 +419,7 @@ impl Cli {
                 &binary,
                 db,
                 raw_opts,
+                fat_arch,
                 to.as_deref(),
                 from.as_deref(),
                 kind.as_deref(),
@@ -441,6 +454,7 @@ impl Cli {
                     &binary,
                     db,
                     raw_opts,
+                    fat_arch,
                     &binscout::analysis::StringsFilter {
                         pattern,
                         min_len,
@@ -452,9 +466,9 @@ impl Cli {
                     decode,
                 )
             }
-            Cmd::Symbols { binary } => symbols(&binary, db, raw_opts),
-            Cmd::Sections { binary } => sections(&binary, db, raw_opts),
-            Cmd::Ir { binary, addr, len } => ir(&binary, db, raw_opts, &addr, len),
+            Cmd::Symbols { binary } => symbols(&binary, db, raw_opts, fat_arch),
+            Cmd::Sections { binary } => sections(&binary, db, raw_opts, fat_arch),
+            Cmd::Ir { binary, addr, len } => ir(&binary, db, raw_opts, fat_arch, &addr, len),
             Cmd::IrCoverage {
                 coverage_arch,
                 binary,
@@ -465,16 +479,25 @@ impl Cli {
                 binary.as_deref(),
                 db,
                 raw_opts,
+                fat_arch,
                 addr.as_deref(),
                 len,
             ),
-            Cmd::Stats { binary } => stats(&binary, db, raw_opts),
+            Cmd::Stats { binary } => stats(&binary, db, raw_opts, fat_arch),
             Cmd::FlirtHints {
                 binary,
                 addr,
                 offset,
                 limit,
-            } => flirt_hints(&binary, db, raw_opts, addr.as_deref(), offset, limit),
+            } => flirt_hints(
+                &binary,
+                db,
+                raw_opts,
+                fat_arch,
+                addr.as_deref(),
+                offset,
+                limit,
+            ),
             Cmd::Annotate {
                 binary,
                 addr,
@@ -484,6 +507,7 @@ impl Cli {
                 &binary,
                 db,
                 raw_opts,
+                fat_arch,
                 &addr,
                 rename.as_deref(),
                 comment.as_deref(),
@@ -499,18 +523,21 @@ impl Cli {
                 &binary,
                 db,
                 raw_opts,
+                fat_arch,
                 &pattern,
                 section.as_deref(),
                 range,
                 offset,
                 limit,
             ),
-            Cmd::AnnotationsExport { binary } => annotations_export(&binary, db, raw_opts),
+            Cmd::AnnotationsExport { binary } => {
+                annotations_export(&binary, db, raw_opts, fat_arch)
+            }
             Cmd::AnnotationsImport {
                 binary,
                 input,
                 overwrite,
-            } => annotations_import(&binary, db, raw_opts, &input, overwrite),
+            } => annotations_import(&binary, db, raw_opts, fat_arch, &input, overwrite),
             Cmd::Diff {
                 binary_a,
                 binary_b,
@@ -523,6 +550,7 @@ impl Cli {
                 db_a.as_deref(),
                 db_b.as_deref(),
                 raw_opts,
+                fat_arch,
             ),
         };
         match result {
@@ -542,8 +570,9 @@ fn open(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<binscout::Project> {
-    binscout::open_mapped(binary, db, raw)
+    binscout::open_mapped(binary, db, raw, fat_arch)
 }
 
 fn opt_addr(s: Option<&str>) -> binscout::error::Result<Option<u64>> {
@@ -554,8 +583,9 @@ fn load(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     p.save()?;
     Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
 }
@@ -585,11 +615,12 @@ fn functions(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     filter: &binscout::FunctionFilter,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     Ok(serde_json::Value::Array(
         p.functions_filtered(filter, offset, limit),
     ))
@@ -599,9 +630,10 @@ fn func(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let meta = p.func_meta(binscout::parse_addr(addr)?)?;
     Ok(serde_json::to_value(meta).expect("func_meta serializes"))
 }
@@ -610,25 +642,31 @@ fn blocks(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.func_blocks_page(binscout::parse_addr(addr)?, offset, limit)?;
     Ok(serde_json::to_value(page).expect("blocks page serializes"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn block_insns(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     block: &str,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.func_block_insns_page(
         binscout::parse_addr(addr)?,
         binscout::parse_addr(block)?,
@@ -638,16 +676,21 @@ fn block_insns(
     Ok(serde_json::to_value(page).expect("block_insns page serializes"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn diagnostics(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     kind: Option<&str>,
     func: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let kind = kind.map(binscout::parse_diagnostic_kind).transpose()?;
     let func = opt_addr(func)?;
     let page = p.query_diagnostics(kind, func, offset, limit)?;
@@ -658,10 +701,11 @@ fn disasm(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     len: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let addr = binscout::parse_addr(addr)?;
     Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("partial disasm serializes"))
 }
@@ -670,9 +714,10 @@ fn cfg(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     p.cfg_of(binscout::parse_addr(addr)?)
 }
 
@@ -680,9 +725,10 @@ fn structure(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     p.structure_of(binscout::parse_addr(addr)?)
 }
 
@@ -690,69 +736,86 @@ fn pseudo(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     p.pseudo_of(binscout::parse_addr(addr)?)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn callees(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     depth: usize,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.callees_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
     Ok(serde_json::to_value(page).expect("callees page serializes"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn callers(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     depth: usize,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.callers_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
     Ok(serde_json::to_value(page).expect("callers page serializes"))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn slice(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     depth: usize,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.slice_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
     Ok(serde_json::to_value(page).expect("slice page serializes"))
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors subcommand args plus shared db/raw"
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
 )]
 fn xrefs(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     to: Option<&str>,
     from: Option<&str>,
     kind: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
     let total = p.count_xrefs(to, from, kind);
@@ -764,10 +827,11 @@ fn strings(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     filter: &binscout::analysis::StringsFilter,
     decode: Option<binscout::loader::strings::DecodeSpec>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let rows = match decode {
         Some(spec) => p.query_strings_decoded(filter, spec)?,
         None => p.query_strings(filter)?,
@@ -779,26 +843,29 @@ fn symbols(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db, raw)?.symbols_json())
+    Ok(open(binary, db, raw, fat_arch)?.symbols_json())
 }
 
 fn sections(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db, raw)?.sections_json())
+    Ok(open(binary, db, raw, fat_arch)?.sections_json())
 }
 
 fn ir(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     len: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     p.ir_at(binscout::parse_addr(addr)?, len)
 }
 
@@ -807,6 +874,7 @@ fn ir_coverage(
     binary: Option<&std::path::Path>,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: Option<&str>,
     len: Option<usize>,
 ) -> binscout::error::Result<serde_json::Value> {
@@ -814,7 +882,7 @@ fn ir_coverage(
     match (binary, addr, len) {
         (None, None, None) => Ok(binscout::ir_coverage(arch)),
         (Some(binary), Some(addr), Some(len)) => {
-            open(binary, db, raw)?.ir_coverage_at(arch, binscout::parse_addr(addr)?, len)
+            open(binary, db, raw, fat_arch)?.ir_coverage_at(arch, binscout::parse_addr(addr)?, len)
         }
         _ => Err(binscout::error::Error::Invalid(
             "ir-coverage range needs BINARY ADDR LEN together".to_string(),
@@ -826,19 +894,21 @@ fn stats(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    open(binary, db, raw)?.stats_json()
+    open(binary, db, raw, fat_arch)?.stats_json()
 }
 
 fn flirt_hints(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let page = p.query_flirt_hints(opt_addr(addr)?, offset, limit)?;
     Ok(serde_json::to_value(page).expect("flirt hints page serializes"))
 }
@@ -847,11 +917,12 @@ fn annotate(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     addr: &str,
     rename: Option<&str>,
     comment: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let mut p = open(binary, db, raw)?;
+    let mut p = open(binary, db, raw, fat_arch)?;
     let addr = binscout::parse_addr(addr)?;
     if let Some(name) = rename {
         p.rename_function(addr, name)?;
@@ -864,19 +935,20 @@ fn annotate(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors subcommand args plus shared db/raw"
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
 )]
 fn search_bytes(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     pattern: &str,
     section: Option<&str>,
     range: Option<Vec<String>>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw)?;
+    let p = open(binary, db, raw, fat_arch)?;
     let range = range
         .map(|pair| match &pair[..] {
             [lo, hi] => Ok((binscout::parse_addr(lo)?, binscout::parse_addr(hi)?)),
@@ -893,8 +965,9 @@ fn annotations_export(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let doc = open(binary, db, raw)?.export_annotations()?;
+    let doc = open(binary, db, raw, fat_arch)?.export_annotations()?;
     serde_json::from_str(&doc)
         .map_err(|e| binscout::error::Error::Storage(format!("encode annotation document: {e}")))
 }
@@ -903,11 +976,12 @@ fn annotations_import(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
     input: &std::path::Path,
     overwrite: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     let text = read_transfer_document(input)?;
-    let mut p = open(binary, db, raw)?;
+    let mut p = open(binary, db, raw, fat_arch)?;
     let summary = p.import_annotations(&text, overwrite)?;
     Ok(serde_json::json!({"rows": summary.rows, "changed": summary.changed}))
 }
@@ -917,9 +991,9 @@ fn annotations_import(
 /// The global `--db` cannot serve two projects, so `diff` takes per-side
 /// `--db-a`/`--db-b` (each defaulting to its binary's sidecar) and rejects
 /// the global flag explicitly instead of sharing one sidecar path. The
-/// global `--raw` mapping (if any) applies to both binaries: the two-builds
-/// case shares one mapping. Neither project is saved, so no sidecar is
-/// ever created or modified.
+/// global `--raw` mapping or `--fat-arch` selection (if any) applies to both
+/// binaries: the two-builds case shares one mapping. Neither project is
+/// saved, so no sidecar is ever created or modified.
 fn bindiff(
     binary_a: &std::path::Path,
     binary_b: &std::path::Path,
@@ -927,14 +1001,15 @@ fn bindiff(
     db_a: Option<&std::path::Path>,
     db_b: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
     if global_db.is_some() {
         return Err(binscout::error::Error::Invalid(
             "diff takes --db-a/--db-b, not the global --db".to_string(),
         ));
     }
-    let a = binscout::open_mapped(binary_a, db_a, raw)?;
-    let b = binscout::open_mapped(binary_b, db_b, raw)?;
+    let a = binscout::open_mapped(binary_a, db_a, raw, fat_arch)?;
+    let b = binscout::open_mapped(binary_b, db_b, raw, fat_arch)?;
     let report = binscout::diff::diff_projects(&a, &b);
     Ok(serde_json::to_value(report).expect("diff report serializes"))
 }
