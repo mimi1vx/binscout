@@ -1541,7 +1541,9 @@ impl Project {
     ///
     /// Ordinal-only imports carry `ordinal` plus `unresolved: true`;
     /// C++ imports/exports carry `demangled` when [`crate::loader::demangle_cpp`]
-    /// recognizes the mangling.
+    /// recognizes the mangling. Mach-O imports resolved to a
+    /// `__stubs`/`__auth_stubs` entry carry its `address`/`address_hex`;
+    /// every other row carries null on both sides.
     #[must_use]
     pub fn symbols_json(&self) -> serde_json::Value {
         serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })

@@ -56,6 +56,7 @@ fn imp(library: &str, name: &str, ordinal: Option<u32>, unresolved: bool) -> Imp
         ordinal,
         unresolved,
         demangled: None,
+        address: None,
     }
 }
 

@@ -44,7 +44,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 4;
+pub const ANALYSIS_REVISION: u32 = 5;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -386,7 +386,7 @@ impl BasicBlock {
 pub struct Function {
     /// Function entry address; the stable key.
     pub entry: u64,
-    /// Export/symbol name when one resolves to `entry`.
+    /// Export or stub-import name when one resolves to `entry`.
     pub name: Option<String>,
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
@@ -1746,9 +1746,10 @@ struct Decoded {
     flow: Flow,
 }
 
-/// Seed addresses from the entry point and exports resolving to executable
-/// code. When neither exists (raw blobs, stripped objects), the first
-/// executable byte seeds analysis so some function is always found.
+/// Seed addresses from the entry point, exports, and Mach-O stub entries
+/// resolving to executable code. When none exists (raw blobs, stripped
+/// objects), the first executable byte seeds analysis so some function is
+/// always found.
 fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
     let mut seeds: Vec<u64> = Vec::new();
     if let Some(entry) = bin.entry
@@ -1758,6 +1759,18 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
     }
     for exp in &bin.exports {
         if let Some(addr) = exp.address
+            && seeds.len() < MAX_SEEDS
+            && space.code_bytes(addr).is_some()
+        {
+            seeds.push(addr);
+        }
+    }
+    // Mach-O stub entries carry their import's address (see
+    // `LoadedBinary.imports`): seeding them makes each stub its own
+    // function even when no call targets it. Unmapped imports
+    // (`address: None`) contribute nothing.
+    for imp in &bin.imports {
+        if let Some(addr) = imp.address
             && seeds.len() < MAX_SEEDS
             && space.code_bytes(addr).is_some()
         {
@@ -2654,11 +2667,17 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries.
+    // Export names for entries; Mach-O stub entries take their import's
+    // name when no export claims the address.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
             names.entry(addr).or_insert_with(|| exp.name.clone());
+        }
+    }
+    for imp in &bin.imports {
+        if let Some(addr) = imp.address {
+            names.entry(addr).or_insert_with(|| imp.name.clone());
         }
     }
 

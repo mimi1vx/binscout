@@ -137,7 +137,11 @@ pub struct Section {
 /// importing image; named imports carry `ordinal: None` and
 /// `unresolved: false`. C++ names (MSVC `?...` and Itanium `_Z...`)
 /// additionally carry `demangled: Some(...)` when the demangler succeeds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Mach-O imports resolved to a `__stubs`/`__auth_stubs` entry carry its
+/// address; every other import carries `address: None`. JSON pairs
+/// `address` with `address_hex` (`null` on both sides for address-less
+/// imports).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImportRef {
     /// Providing module (`""` when the format names none).
     pub library: String,
@@ -152,6 +156,43 @@ pub struct ImportRef {
     /// Demangled C++ name, when `name` is a recognized mangling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
+    /// `__stubs`/`__auth_stubs` entry address (`None` for non-Mach-O and
+    /// unmapped Mach-O imports; see `load` stub mapping).
+    #[serde(default)]
+    pub address: Option<u64>,
+}
+
+impl Serialize for ImportRef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut len = 5;
+        if self.ordinal.is_some() {
+            len += 1;
+        }
+        if self.demangled.is_some() {
+            len += 1;
+        }
+        let mut st = serializer.serialize_struct("ImportRef", len)?;
+        st.serialize_field("library", &self.library)?;
+        st.serialize_field("name", &self.name)?;
+        if self.ordinal.is_some() {
+            st.serialize_field("ordinal", &self.ordinal)?;
+        } else {
+            st.skip_field("ordinal")?;
+        }
+        st.serialize_field("unresolved", &self.unresolved)?;
+        if self.demangled.is_some() {
+            st.serialize_field("demangled", &self.demangled)?;
+        } else {
+            st.skip_field("demangled")?;
+        }
+        st.serialize_field("address", &self.address)?;
+        st.serialize_field("address_hex", &self.address.map(crate::addr_hex))?;
+        st.end()
+    }
 }
 
 /// Identity key for LE import dedupe: the [`ImportRef`] fields compared by
@@ -479,6 +520,14 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         )?);
     }
 
+    if format == BinaryFormat::MachO
+        && let Some(stubs) = macho_stub_addresses(&file, bytes, imports.len())
+    {
+        for (imp, addr) in imports.iter_mut().zip(stubs) {
+            imp.address = Some(addr);
+        }
+    }
+
     let mut exports = Vec::new();
     for exp in file
         .exports()
@@ -614,6 +663,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
                 ordinal: Some(*ordinal),
                 unresolved: true,
                 demangled: None,
+                address: None,
             },
             LeTarget::ImportName {
                 module,
@@ -624,6 +674,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
                 ordinal: None,
                 unresolved: false,
                 demangled: None,
+                address: None,
             },
         };
         let key: LeImportKey = (
@@ -709,6 +760,7 @@ fn import_from_object(
                 ordinal: Some(u32::from(o)),
                 unresolved: true,
                 demangled: None,
+                address: None,
             })
         }
         object::NameOrOrdinal::Name(b) => {
@@ -720,6 +772,7 @@ fn import_from_object(
                 ordinal: None,
                 unresolved: false,
                 demangled,
+                address: None,
             })
         }
     }
@@ -879,6 +932,7 @@ mod tests {
                 ordinal: Some(7),
                 unresolved: true,
                 demangled: None,
+                address: None,
             }]
         );
         assert_eq!(
@@ -893,6 +947,36 @@ mod tests {
         assert_eq!(bin.sections.len(), 1);
         assert_eq!(bin.sections[0].name, "obj1");
         assert_eq!(bin.sections[0].data, [0x90, 0x90, 0xC3]);
+    }
+
+    #[test]
+    fn chained_fixups_scan_vetoes_only_on_evidence() {
+        fn header(ncmds: u32, cmds: &[u8]) -> Vec<u8> {
+            let mut f = vec![0u8; 32];
+            f[0..4].copy_from_slice(&0xFEED_FACFu32.to_le_bytes());
+            f[16..20].copy_from_slice(&ncmds.to_le_bytes());
+            f.extend_from_slice(cmds);
+            f
+        }
+        fn cmd(id: u32, size: u32) -> Vec<u8> {
+            let mut c = vec![0u8; size as usize];
+            c[0..4].copy_from_slice(&id.to_le_bytes());
+            c[4..8].copy_from_slice(&size.to_le_bytes());
+            c
+        }
+        let plain = header(1, &cmd(0x19, 72));
+        assert_eq!(macho_has_chained_fixups(&plain), Some(false));
+        // ncmds says 2 but only 1 present above; rebuild honestly:
+        let chained = header(2, &[cmd(0x19, 72), cmd(0x8000_0034, 16)].concat());
+        assert_eq!(macho_has_chained_fixups(&chained), Some(true));
+        assert_eq!(macho_has_chained_fixups(&[]), None);
+        assert_eq!(macho_has_chained_fixups(b"garbage........"), None);
+        // Truncated command claims more than the bytes hold.
+        assert_eq!(macho_has_chained_fixups(&header(4, &cmd(0x19, 72))), None);
+        // Fat magic is not a thin image: unknown, so veto.
+        let mut fat = plain.clone();
+        fat[0..4].copy_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        assert_eq!(macho_has_chained_fixups(&fat), None);
     }
 
     #[test]
