@@ -779,7 +779,7 @@ impl Analysis {
         self.reachable(entry, max_depth, petgraph::Direction::Incoming)
     }
 
-    /// Backward slice of `to` as `(addr, depth)` pairs.
+    /// Backward slice of `addr` as `(addr, depth)` pairs.
     ///
     /// Bounded reverse walk over xref edges (every [`XrefKind`]: code,
     /// data, string, and inferred-code) plus intra-function CFG
@@ -788,13 +788,13 @@ impl Analysis {
     /// predecessor block (see [`Function::predecessors`]) at block
     /// starts. Breadth-first out to `max_depth` hops, clipped to
     /// [`MAX_SLICE_DEPTH`], cycle-guarded with a visited set, never
-    /// reporting `to` itself even when a cycle reaches it. Pairs sort
+    /// reporting `addr` itself even when a cycle reaches it. Pairs sort
     /// by address for deterministic paging; a depth of zero yields an
     /// empty set. Any address is a valid root (data/string targets lie
     /// in no function and contribute only xref predecessors), so unlike
     /// the callgraph walks there is no unknown-entry case.
     #[must_use]
-    pub fn slice_to(&self, to: u64, max_depth: usize) -> Vec<(u64, usize)> {
+    pub fn slice_to(&self, addr: u64, max_depth: usize) -> Vec<(u64, usize)> {
         use std::collections::{HashMap, HashSet, VecDeque};
         let cap = max_depth.min(MAX_SLICE_DEPTH);
         if cap == 0 {
@@ -804,8 +804,8 @@ impl Analysis {
         for x in &self.xrefs {
             xref_preds.entry(x.to).or_default().push(x.from);
         }
-        let mut seen: HashSet<u64> = HashSet::from([to]);
-        let mut queue: VecDeque<(u64, usize)> = VecDeque::from([(to, 0)]);
+        let mut seen: HashSet<u64> = HashSet::from([addr]);
+        let mut queue: VecDeque<(u64, usize)> = VecDeque::from([(addr, 0)]);
         let mut out: Vec<(u64, usize)> = Vec::new();
         while let Some((cur, depth)) = queue.pop_front() {
             if depth >= cap {

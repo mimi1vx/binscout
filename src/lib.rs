@@ -1380,7 +1380,7 @@ impl Project {
         Ok(page_envelope(total, offset, limit, items))
     }
 
-    /// Backward slice of `to`: every instruction that can reach it, paged.
+    /// Backward slice of `addr`: every instruction that can reach it, paged.
     ///
     /// Bounded reverse walk over xref edges of every kind plus
     /// intra-function CFG predecessors (see
@@ -1398,7 +1398,7 @@ impl Project {
     /// [`Error::Invalid`] when `depth` exceeds the hop cap.
     pub fn slice_page(
         &self,
-        to: u64,
+        addr: u64,
         depth: usize,
         offset: usize,
         limit: usize,
@@ -1409,7 +1409,7 @@ impl Project {
                 crate::analysis::MAX_SLICE_DEPTH
             )));
         }
-        let reached = self.analysis.slice_to(to, depth);
+        let reached = self.analysis.slice_to(addr, depth);
         let total = reached.len();
         let items: Vec<SliceNode> = reached
             .into_iter()

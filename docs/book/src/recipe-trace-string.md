@@ -10,7 +10,7 @@ question is "what code touches this?".
 ## Chain
 
 `strings --pattern` → `xrefs --to --kind string` → `func` →
-`block-insns` / `disasm` → `slice --to` → `callers`.
+`block-insns` / `disasm` → `slice ADDR` → `callers`.
 
 Each step moves one hop: text, to reference site, to containing
 function, to backward reachability.
@@ -83,7 +83,7 @@ $ binscout slice fw.exe 0x401003 --depth 5
 $ binscout callers fw.exe 0x401000 --depth 5
 ```
 
-`slice` returns every instruction that can reach `TO` via xref edges
+`slice` returns every instruction that can reach `ADDR` via xref edges
 (any kind) plus intra-function CFG predecessors, out to `--depth`
 hops (direct predecessors are depth 1), ordered by address with
 shortest distance under the page envelope. Any address is a valid
@@ -92,7 +92,7 @@ from the sink function toward its callers out to `--depth` hops.
 Depth past the 64-hop cap is an `Invalid` error; zero yields an
 empty page.
 
-MCP: `slice` (`binary`, `to`, `depth?`), `callers` (`binary`,
+MCP: `slice` (`binary`, `addr`, `depth?`), `callers` (`binary`,
 `addr`, `depth?`).
 
 ## 5. Mark the sink

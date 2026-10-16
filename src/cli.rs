@@ -159,7 +159,7 @@ pub enum Cmd {
     /// valid root (data/string targets lie in no function).
     Slice {
         binary: PathBuf,
-        to: String,
+        addr: String,
         /// Max reverse hops from the root (direct predecessors are depth 1).
         #[arg(long, default_value_t = binscout::analysis::MAX_SLICE_DEPTH)]
         depth: usize,
@@ -391,11 +391,11 @@ impl Cli {
             } => callers(&binary, db, raw_opts, &addr, depth, offset, limit),
             Cmd::Slice {
                 binary,
-                to,
+                addr,
                 depth,
                 offset,
                 limit,
-            } => slice(&binary, db, raw_opts, &to, depth, offset, limit),
+            } => slice(&binary, db, raw_opts, &addr, depth, offset, limit),
             Cmd::Xrefs {
                 binary,
                 to,
@@ -728,13 +728,13 @@ fn slice(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
-    to: &str,
+    addr: &str,
     depth: usize,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
-    let page = p.slice_page(binscout::parse_addr(to)?, depth, offset, limit)?;
+    let page = p.slice_page(binscout::parse_addr(addr)?, depth, offset, limit)?;
     Ok(serde_json::to_value(page).expect("slice page serializes"))
 }
 

@@ -251,11 +251,11 @@ querying never writes a sidecar.
 ### `slice`
 
 ```sh
-binscout slice B TO [--depth N] [--offset N] [--limit N]
+binscout slice B ADDR [--depth N] [--offset N] [--limit N]
 ```
 
-MCP tool `slice` (`binary`, `db`?, `raw`?, `to`, `depth?`,
-`offset?`, `limit?`). `TO` is any address (data/string targets lie in
+MCP tool `slice` (`binary`, `db`?, `raw`?, `addr`, `depth?`,
+`offset?`, `limit?`). `ADDR` is any address (data/string targets lie in
 no function, which is a valid root, not an error); `depth` bounds the
 reverse walk over xref edges of every kind plus intra-function CFG
 predecessors to that many hops (direct predecessors are depth 1, zero

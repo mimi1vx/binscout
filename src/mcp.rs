@@ -359,7 +359,7 @@ pub struct SliceParams {
     /// Slice root: every returned instruction can reach this address
     /// (`0x`-hex or decimal string; any address is valid, including
     /// data/string targets in no function).
-    pub to: String,
+    pub addr: String,
     /// Max reverse hops from the root (direct predecessors are depth 1;
     /// defaults to the 64-hop cap).
     pub depth: Option<usize>,
@@ -671,9 +671,10 @@ impl BinscoutMcp {
         let _guard = self.guard();
         let p = all_params(p);
         let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
-        let to = parse_addr(&p.to).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.slice_page(
-            to,
+            addr,
             p.depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
             p.offset.unwrap_or(0),
             p.limit.unwrap_or(50),

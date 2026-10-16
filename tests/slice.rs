@@ -373,7 +373,7 @@ fn mcp_slice_parity_and_errors() {
     let v = tool_once(
         10,
         "slice",
-        json!({"binary": bin, "db": db, "to": marker_hex, "depth": 1}),
+        json!({"binary": bin, "db": db, "addr": marker_hex, "depth": 1}),
     );
     assert_eq!(v["protocol"], 1);
     assert_eq!(v["total"], 2);
@@ -384,7 +384,7 @@ fn mcp_slice_parity_and_errors() {
     let v = tool_once(
         11,
         "slice",
-        json!({"binary": bin, "db": db, "to": marker_hex, "depth": 5}),
+        json!({"binary": bin, "db": db, "addr": marker_hex, "depth": 5}),
     );
     assert_eq!(v["total"], 4);
     assert_eq!(v["items"][0]["addr"], BASIC_ENTRY_VA);
@@ -401,7 +401,7 @@ fn mcp_slice_parity_and_errors() {
     let from_mcp = tool_once(
         13,
         "slice",
-        json!({"binary": bin, "db": db, "to": marker_hex, "depth": 5}),
+        json!({"binary": bin, "db": db, "addr": marker_hex, "depth": 5}),
     );
     assert_eq!(from_cli, from_mcp, "CLI and MCP must agree");
 
@@ -417,20 +417,43 @@ fn mcp_slice_parity_and_errors() {
         call(
             20,
             "slice",
-            json!({"binary": bin, "db": db, "to": "zz", "depth": 5}),
+            json!({"binary": bin, "db": db, "addr": "zz", "depth": 5}),
         ),
         call(
             21,
             "slice",
-            json!({"binary": bin, "db": db, "to": marker_hex, "depth": MAX_SLICE_DEPTH + 1}),
+            json!({"binary": bin, "db": db, "addr": marker_hex, "depth": MAX_SLICE_DEPTH + 1}),
+        ),
+        call(
+            22,
+            "slice",
+            json!({"binary": bin, "db": db, "to": marker_hex, "depth": 5}),
         ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 3, "{resps:?}");
-    for resp in resps.iter().skip(1) {
+    assert_eq!(resps.len(), 4, "{resps:?}");
+    let by_id = |id: u64| {
+        resps
+            .iter()
+            .find(|r| r.get("id") == Some(&json!(id)))
+            .unwrap_or_else(|| panic!("no response for id {id}: {resps:?}"))
+    };
+    for id in [20, 21] {
+        let resp = by_id(id);
         assert!(resp.get("error").is_some(), "must error: {resp:?}");
         assert!(resp.get("result").is_none());
     }
+    // The removed `to` field is rejected: rmcp surfaces the missing-`addr`
+    // deserialization failure as a tool-level error result.
+    let removed = by_id(22);
+    let text = removed["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        removed["result"]["isError"] == true,
+        "must error: {removed:?}"
+    );
+    assert!(text.contains("addr"), "must name the new field: {text}");
     assert!(
         !std::path::Path::new(&db).exists(),
         "slice queries never create the sidecar"
