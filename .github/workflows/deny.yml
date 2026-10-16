@@ -1,0 +1,27 @@
+name: deny
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Weekly Monday 06:00 UTC, aligned with .github/dependabot.yml so the
+    # advisory DB is refreshed even without dependency churn.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # Pinned to the v2 tag tip (v2.1.1 as of 2026-10-16); dependabot's
+      # github-actions updates follow the inline version comment.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
