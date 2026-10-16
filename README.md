@@ -50,13 +50,18 @@ Every command prints exactly one JSON value to stdout. Runtime failures print
 errors for unknown flags/subcommands still go to stderr with exit 2.)
 
 ```sh
-binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] <command> <binary> [args]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] <command> <binary> [args]
 ```
 
-`--db` overrides the sidecar DB (default `<binary>.rsdbg.redb`). `--raw`
+`--db` overrides the sidecar DB (default `<binary>.rsdbg.redb`,
+appended to the full file name so `foo.exe` and `foo.dll` never share
+one). `--raw`
 selects explicit raw mapping for firmware/blob workflows (`arch` is one
 of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); without it,
-container auto-detection applies.
+container auto-detection applies. `--fat-arch` selects a slice of a
+fat Mach-O container (`x86_64`, `x86_32`, `aarch64`, `arm32`, plus
+`lipo` aliases like `arm64`, case-insensitive); it is required for fat
+inputs and exclusive with `--raw`.
 
 | Command | Example | Output |
 |---|---|---|
@@ -75,7 +80,7 @@ container auto-detection applies.
 | `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, paged under the page envelope |
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default); paged by `--start`/`--limit` |
-| `symbols` | `binscout symbols fw.elf` | imports and exports |
+| `symbols` | `binscout symbols fw.elf` | imports and exports; Mach-O imports carry the `address` of their `__stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir-coverage` | `binscout ir-coverage x86_64` | machine-readable lift coverage for one arch; with `BINARY ADDR LEN` adds decoded/lifted/unlifted counts from actual lifts |
@@ -85,7 +90,7 @@ container auto-detection applies.
 | `search-bytes` | `binscout search-bytes fw.elf "48 8B ??" --range 0x400000 0x401000` | paged `??`-wildcard byte-pattern matches with `--section`/`--range` filters |
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, SHA-256, size, mapping, sorted rows); read-only |
 | `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns `rows`/`changed`, default fails on conflicts |
-| `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar |
+| `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the global `--raw` mapping or `--fat-arch` selection (if any) applies to both, with per-side `--db-a`/`--db-b` instead of the global `--db` |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal strings.
 
@@ -101,7 +106,8 @@ omitting the flag leaves that field alone.
 `callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
 `sections`, `ir`, `ir_coverage`, `flirt_hints`, `rename`, `comment`, `search_bytes`,
 `annotations_export`, `annotations_import`, `diff`. Each takes `binary` plus
-optional `db` (and an optional `raw` mapping object on binary-taking
+optional `db` (and an optional `raw` mapping object or `fat_arch` slice
+selection on binary-taking
 tools) and returns one JSON document as text; failures are tool errors.
 
 ```json

@@ -6,7 +6,12 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
 
 - **Loader** (`loader`): sniffs ELF, PE, Mach-O, COFF, and LE, falling back to
   flat raw bytes when nothing matches: unrecognized input opens as
-  x86-64 at base 0, LE images analyze as 32-bit x86. Explicit
+  x86-64 at base 0, LE images analyze as 32-bit x86. Fat Mach-O
+  containers analyze one explicitly selected slice (`--fat-arch` /
+  `fat_arch`; slices never share snapshots). Mach-O `__stubs` /
+  `__auth_stubs` entries pair with imports in bind order under
+  all-or-none guards, so each mapped stub carries its import's
+  address. Explicit
   base/architecture mapping goes through `open_raw`, exposed as CLI
   `--raw --arch ARCH --base ADDR [--entry ADDR]` and the MCP `raw`
   object on every binary-taking tool. Produces
@@ -17,7 +22,10 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   32-bit ARM, and Thumb via yaxpeax-arm. Each instruction becomes an `Insn` with its bytes,
   mnemonic, operand strings, and resolved branch/data targets
   (including typed absolute-slot targets for single-slot indirect
-  jumps, which the resolver below consumes).
+  jumps, which the resolver below consumes). An AArch64 `adrp` decodes
+  to its 4K page base; an adjacent same-block `adrp` + `add`/`ldr`
+  pair resolves to the final address for xref recovery, IR, and
+  pseudo rendering.
 - **IR** (`ir`): lifts one instruction to one P-code-inspired `IrInsn`
   (`COPY`, `LOAD`, `BRANCH`, `CALL`, ...). Unknown mnemonics become `NOP`
   with a warning instead of failing, so analysis proceeds over partial
@@ -28,7 +36,8 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   actual lifts.
 - **Analysis** (`analysis`): recursive descent from the entry point and
   export addresses over decoded instructions, plus a prologue scan for
-  functions unreachable from those seeds. Builds per-function CFGs, a
+  functions unreachable from those seeds. Mach-O stub entries seed
+  their own functions under their import's name. Builds per-function CFGs, a
   callgraph, and code/data/string cross-references. Records discovery
   `reasons` per function (`entry`, `export`, `direct-call`,
   `prologue`), retains bounded diagnostics (unresolved indirect
@@ -38,7 +47,9 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   provenance-marked `inferred-code` edges and xrefs (one edge per
   single-slot site, 2–8 slots per table site, 100,000 per project;
   unprovable sites stay unresolved and
-  edgeless). Analysis revision 4; older snapshots re-analyze.
+  edgeless). Where an `adrp` + `add`/`ldr` pair resolves, the second
+  instruction also carries a `Data` xref at the final address alongside
+  the page-base row. Analysis revision 5; older snapshots re-analyze.
 - **Search** (`search`): bounded literal/`??`-wildcard scan over mapped
   file-backed bytes (pattern cap 4096 bytes, 256 MiB scan cap,
   1024-row pages; gaps never bridged, BSS never materialized).

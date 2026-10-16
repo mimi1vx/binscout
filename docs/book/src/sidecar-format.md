@@ -1,7 +1,8 @@
 # Sidecar format
 
 Analysis results and annotations persist in a `redb` database next to the
-binary: `<binary>.rsdbg.redb` by default, overridden per-invocation with
+binary: `.rsdbg.redb` appended to the full file name by default
+(`foo.exe` → `foo.exe.rsdbg.redb`), overridden per-invocation with
 `--db PATH` (CLI) or the `db` parameter (MCP tools). The analyzed binary
 itself is only ever read.
 
@@ -12,7 +13,7 @@ the binary re-analyzes. Annotations carry over by address when the
 mapping is unchanged. A sidecar holding annotations opened under an
 incompatible mapping fails with a separate-DB error instead of
 remapping them. A sidecar written by an older schema version (current
-version 5, analysis revision 4) behaves the same way: annotations
+version 5, analysis revision 5) behaves the same way: annotations
 carry over and the binary re-analyzes. Row values are JSON.
 
 | Table | Key | Value |

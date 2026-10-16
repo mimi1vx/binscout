@@ -25,7 +25,9 @@ $ binscout sections fw.exe
 ```
 
 `symbols` returns `{"imports": [...], "exports": [...]}`. Each
-import carries its `library` and `name`; ordinal-only imports carry
+import carries its `library` and `name` plus `address`/`address_hex`
+(the `__stubs`/`__auth_stubs` entry on Mach-O, null when unmapped);
+ordinal-only imports carry
 `ordinal` plus `unresolved: true`, and recognized C++ manglings
 additionally carry `demangled`. Exports name the callable surface
 the binary exposes to others. `sections` returns the section table
