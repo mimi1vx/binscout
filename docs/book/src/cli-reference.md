@@ -22,7 +22,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `blocks` | `binscout blocks fw.elf 0x400000 --offset 0 --limit 50` | block summaries (`id`, `start`/`start_hex`, `end`/`end_hex`, `insns` count, `succs`) of the containing function by block start, under the page envelope |
 | `block-insns` | `binscout block-insns fw.elf 0x400000 0x400000 --limit 50` | that block's instructions in address order, under the page envelope; the block must belong to the function |
 | `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); the valid prefix plus `error_at` for the first bad opcode, ranges cap at 1 MiB |
-| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only, same-function) |
+| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked indirect-jump resolutions (single-slot absolutes and guarded scaled-index tables; raw-only, same-function) |
 | `structure` | `binscout structure fw.elf 0x400000` | approximate control-flow structure: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning |
 | `pseudo` | `binscout pseudo fw.elf 0x400000` | approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning |
 | `callees` | `binscout callees fw.elf 0x400000 --depth 5` | transitive callees out to `--depth` hops (direct are depth 1), ordered by entry with shortest distance, under the page envelope |
@@ -36,6 +36,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
+| `flirt-hints` | `binscout flirt-hints fw.elf [--addr 0x400000]` | FLIRT-like library hints (read-only): corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `--addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, sha256, size, mapping, sorted rows); read-only, never creates a sidecar |

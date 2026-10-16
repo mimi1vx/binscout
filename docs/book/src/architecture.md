@@ -33,10 +33,12 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   `reasons` per function (`entry`, `export`, `direct-call`,
   `prologue`), retains bounded diagnostics (unresolved indirect
   sites, decode failures; 100,000-record cap with truncation counts),
-  and resolves single-slot absolute indirect jumps in raw mappings to
+  and resolves single-slot absolute indirect jumps and guarded
+  scaled-index tables in raw mappings to
   provenance-marked `inferred-code` edges and xrefs (one edge per
-  site, 100,000 per project; unprovable sites stay unresolved and
-  edgeless). Analysis revision 3; older snapshots re-analyze.
+  single-slot site, 2–8 slots per table site, 100,000 per project;
+  unprovable sites stay unresolved and
+  edgeless). Analysis revision 4; older snapshots re-analyze.
 - **Search** (`search`): bounded literal/`??`-wildcard scan over mapped
   file-backed bytes (pattern cap 4096 bytes, 256 MiB scan cap,
   1024-row pages; gaps never bridged, BSS never materialized).

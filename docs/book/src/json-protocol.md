@@ -9,7 +9,7 @@ Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
 $ binscout load tests/fixtures/raw-x64.bin
-{"analysis_revision":3,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.3.0","xrefs":0}
+{"analysis_revision":4,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.4.0","xrefs":0}
 ```
 
 `mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto
@@ -18,7 +18,7 @@ the engine revision that produced the snapshot. `diagnostics` counts
 retained provenance records (`diagnostics_truncated` plus
 `diagnostics_omitted` when the 100,000-record cap drops rows);
 `inferred_truncated`/`inferred_omitted` do the same for the
-single-slot resolver's edge budget.
+indirect-jump resolver's edge budget.
 
 ## Stability guarantees
 
@@ -157,7 +157,7 @@ Before — `func` today embeds every instruction of every block:
 
 After — `func` is a bounded summary. `blocks`/`insns` are counts,
 `calls` is a count (not the unbounded target array),
-`inferred_edges` counts provenance-marked single-slot resolutions in
+`inferred_edges` counts provenance-marked indirect-jump resolutions in
 that function, and `reasons` is the sorted, deduplicated discovery
 vocabulary (`entry`, `export`, `direct-call`, `prologue`). The
 redundant `containing_entry` twin is dropped; any interior address
@@ -207,7 +207,7 @@ Explicit raw mode never falls back to another mode on failure.
 
 ```sh
 $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/raw.redb
-{"analysis_revision":3,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.3.0","xrefs":0}
+{"analysis_revision":4,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.4.0","xrefs":0}
 ```
 
 Same bytes under a different mapping never reuse cached layouts: the
@@ -236,7 +236,7 @@ page, never with whole-function size.
 
 ```sh
 binscout callees B ADDR [--depth N] [--offset N] [--limit N]
-binscout callers B ADDR [--depth N] [--limit N]
+binscout callers B ADDR [--depth N] [--offset N] [--limit N]
 ```
 
 MCP tools `callees`/`callers` (`binary`, `db`?, `raw`?, `addr`,
@@ -429,15 +429,18 @@ them with `annotations::parse_type_hint` / `Project::type_hint_at`;
 ordinary comments without the prefix decode to "no hint", never an
 error. Free text may follow the hint's first line.
 
-### Inferred edges (single-slot resolver)
+### Inferred edges (indirect-jump resolver)
 
-One conservative indirect-jump pattern resolves to a real edge:
-a single-slot absolute indirect jump (x86-32 `jmp m32` through an
-absolute slot, x86-64 `jmp m64` through a RIP-relative slot) in an
-explicit raw mapping, with the slot value landing on executable
-mapped bytes in the same function. Everything else — indexed
-multi-entry tables, cross-function targets, truncated or unmapped
-slots, non-executable targets, container (non-raw) binaries — keeps
+Two conservative indirect-jump patterns resolve to real edges,
+both in explicit raw mappings with targets on executable mapped
+bytes in the same function: a single-slot absolute indirect jump
+(x86-32 `jmp m32` through an absolute slot, x86-64 `jmp m64`
+through a RIP-relative slot), and a guarded scaled-index table
+(`jmp [index*scale+base]`, x86-only: scale 4 on x86-32, scale 8
+on x86-64) behind a direct conditional bound-check guard within
+4 decoded predecessors. Everything else — unguarded indexes,
+cross-function targets, truncated or unmapped slots,
+non-executable targets, container (non-raw) binaries — keeps
 its `unresolved-indirect-jump` diagnostic and stays edgeless, e.g.:
 
 ```json
@@ -456,7 +459,11 @@ Resolved edges carry their provenance separately from direct flow:
   {"from": 4194304, "from_hex": "0x400000", "kind": "inferred-code", "to": 4194322, "to_hex": "0x400012"}]}
 ```
 
-Caps: one edge per site, 100,000 recovered edges per project. When
+Caps: one edge per single-slot site and 2–8 consecutive valid
+slots per table site (a singleton run is a stray pointer; a run
+still valid at 8 slots is open-ended, so the site stays
+unresolved rather than partially recovered); 100,000 recovered
+edges per project. When
 the project budget exhausts, the site stays unresolved with its
 diagnostic retained and the excess counted in `inferred_omitted`
 with `inferred_truncated` set — never silently clipped from the

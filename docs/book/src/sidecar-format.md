@@ -12,7 +12,7 @@ the binary re-analyzes. Annotations carry over by address when the
 mapping is unchanged. A sidecar holding annotations opened under an
 incompatible mapping fails with a separate-DB error instead of
 remapping them. A sidecar written by an older schema version (current
-version 5, analysis revision 3) behaves the same way: annotations
+version 5, analysis revision 4) behaves the same way: annotations
 carry over and the binary re-analyzes. Row values are JSON.
 
 | Table | Key | Value |

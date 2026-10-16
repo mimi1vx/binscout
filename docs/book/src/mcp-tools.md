@@ -21,7 +21,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `blocks` | binary, addr, offset?/limit? | Block summaries of the containing function by block start, under the page envelope |
 | `block_insns` | binary, addr, block, offset?/limit? | That block's instructions in address order, under the page envelope; `block` must belong to the function |
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
-| `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only, same-function) |
+| `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges; `inferred_edges` holds provenance-marked indirect-jump resolutions (single-slot absolutes and guarded scaled-index tables; raw-only, same-function) |
 | `structure` | binary, addr | Approximate control-flow structure of one function: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning; `addr` snaps to its containing function |
 | `pseudo` | binary, addr | Approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning; `addr` snaps to its containing function |
 | `callees` | binary, addr, depth?/offset?/limit? | Transitive callees out to `depth` hops (direct are depth 1), ordered by entry with shortest distance, under the page envelope; `addr` snaps to its containing function |
@@ -34,6 +34,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
+| `flirt_hints` | binary, addr?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears; structured struct-layout hints (`type-hint:{...}`, see [JSON protocol](json-protocol.md)) pass through opaquely |
@@ -56,9 +57,11 @@ Every binary-taking tool accepts an optional `raw` object
 `arch` and `base` are required in raw mode, and raw-only options
 without `raw` are errors. `func` returns the compact metadata shape;
 `cfg` separates direct `edges` from provenance-marked
-`inferred_edges`. Inferred edges come only from the single-slot
-absolute indirect-jump resolver: raw mappings only, same-function
-targets only. Anything the resolver cannot prove keeps its
-`unresolved-indirect-jump` diagnostic and stays edgeless. See
+`inferred_edges`. Inferred edges come from the indirect-jump
+resolver: single-slot absolute jumps plus guarded scaled-index
+tables (x86-only, 2–8 consecutive valid slots per table site),
+raw mappings only, same-function targets only. Anything the
+resolver cannot prove keeps its `unresolved-indirect-jump`
+diagnostic and stays edgeless. See
 [JSON protocol](json-protocol.md) for the full request/response
 definitions.

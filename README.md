@@ -67,7 +67,9 @@ container auto-detection applies.
 | `block-insns` | `binscout block-insns fw.elf 0x400000 0x400000` | one block's instructions in address order, paged |
 | `diagnostics` | `binscout diagnostics fw.elf --kind decode-failure` | provenance records (unresolved indirect sites, decode failures) filtered by `--kind`/`--func`, paged; never writes a sidecar |
 | `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); trailing bad bytes report in `error_at`, ranges cap at 1 MiB |
-| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only) |
+| `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked indirect-jump resolutions (single-slot absolutes and guarded scaled-index tables; raw-only, same-function) |
+| `structure` | `binscout structure fw.elf 0x400000` | approximate control-flow structure: syntactic loops and ifs over the CFG plus the IR lift, with an approximation warning |
+| `pseudo` | `binscout pseudo fw.elf 0x400000` | approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning |
 | `callees` | `binscout callees fw.elf 0x400000 --depth 5` | transitive callees out to `--depth` hops (direct are depth 1), ordered by entry with shortest distance, paged under the page envelope |
 | `callers` | `binscout callers fw.elf 0x400000 --depth 5` | transitive callers out to `--depth` hops, ordered by entry with shortest distance, paged under the page envelope |
 | `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, paged under the page envelope |
@@ -77,11 +79,13 @@ container auto-detection applies.
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir-coverage` | `binscout ir-coverage x86_64` | machine-readable lift coverage for one arch; with `BINARY ADDR LEN` adds decoded/lifted/unlifted counts from actual lifts |
+| `flirt-hints` | `binscout flirt-hints fw.elf --addr 0x400000` | FLIRT-like library hints (read-only): corpus signature matches over each function's leading bytes, paged under the page envelope; suggested names stay hints, querying never writes a sidecar |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 | `search-bytes` | `binscout search-bytes fw.elf "48 8B ??" --range 0x400000 0x401000` | paged `??`-wildcard byte-pattern matches with `--section`/`--range` filters |
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, SHA-256, size, mapping, sorted rows); read-only |
 | `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns `rows`/`changed`, default fails on conflicts |
+| `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal strings.
 
@@ -91,11 +95,12 @@ omitting the flag leaves that field alone.
 
 ## MCP server
 
-`binscout-mcp` serves 24 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 27 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `functions`, `func`, `blocks`, `block_insns`,
-`diagnostics`, `disasm`, `cfg`, `callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
+`diagnostics`, `disasm`, `cfg`, `structure`, `pseudo`,
+`callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
 `sections`, `ir`, `ir_coverage`, `flirt_hints`, `rename`, `comment`, `search_bytes`,
-`annotations_export`, `annotations_import`. Each takes `binary` plus
+`annotations_export`, `annotations_import`, `diff`. Each takes `binary` plus
 optional `db` (and an optional `raw` mapping object on binary-taking
 tools) and returns one JSON document as text; failures are tool errors.
 
