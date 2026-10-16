@@ -282,6 +282,22 @@ found by one deterministic DFS; ifs need a `CBranch` lift plus exactly
 two direct successors; inferred single-slot edges never participate.
 Read-only: querying never writes a sidecar.
 
+### `pseudo`
+
+```sh
+binscout pseudo B ADDR
+```
+
+MCP tool `pseudo` (`binary`, `db`?, `raw`?, `addr`). `ADDR` snaps to
+its containing function (`NotFound` when in no function). The result
+carries `entry`/`entry_hex` plus `pseudo`: one lossy C-like `lines` row
+per IR lift (`addr`/`addr_hex`, `text`, propagated `warning`) and the
+assembled `text` (`{addr:#x}: {text}` rows) with a top-level `warning`
+(`approximate ...; not a decompiler`). Data operations keep operand
+strings verbatim inside assignments or `OP(args)` calls; control renders
+as `goto`/`if`/`call`/`return` over direct targets (indirect sites keep
+operands). Read-only: querying never writes a sidecar.
+
 ### `diagnostics`
 
 ```sh

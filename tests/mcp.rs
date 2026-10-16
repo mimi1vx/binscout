@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 26 tools, and call every one against fixtures.
+//! list the 27 tools, and call every one against fixtures.
 
 mod common;
 
@@ -126,6 +126,7 @@ fn handshake_lists_twenty_three_tools() {
             "ir",
             "ir_coverage",
             "project_info",
+            "pseudo",
             "rename",
             "search_bytes",
             "sections",
@@ -136,7 +137,7 @@ fn handshake_lists_twenty_three_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 26 tools"
+        "exactly the 27 tools"
     );
     let search = tools
         .iter()
@@ -268,13 +269,18 @@ fn all_tools_return_json_over_stdio() {
             json!({"binary": b(), "db": d(), "addr": "0x0"}),
         ),
         call(
+            31,
+            "pseudo",
+            json!({"binary": b(), "db": d(), "addr": "0x0"}),
+        ),
+        call(
             29,
             "diff",
             json!({"binary_a": b(), "binary_b": b(), "db_a": d(), "db_b": d()}),
         ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 22, "{resps:?}");
+    assert_eq!(resps.len(), 23, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -341,6 +347,17 @@ fn all_tools_return_json_over_stdio() {
             .contains("approximate"),
         "{structure}"
     );
+
+    let pseudo: Value = serde_json::from_str(tool_text(by_id[&31])).expect("pseudo json");
+    assert_eq!(pseudo["entry"], 0);
+    assert!(
+        pseudo["pseudo"]["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("approximate"),
+        "{pseudo}"
+    );
+    assert_eq!(pseudo["pseudo"]["lines"][2]["text"], "return;");
 
     // Self-diff over one binary: the single function matches itself.
     let diff: Value = serde_json::from_str(tool_text(by_id[&29])).expect("diff json");

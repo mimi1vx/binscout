@@ -1,4 +1,4 @@
-//! binscout MCP server: 26 stateless tools over [`Project`].
+//! binscout MCP server: 27 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -598,6 +598,21 @@ impl BinscoutMcp {
         let addr =
             parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.structure_of(addr)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "pseudo",
+        description = "Approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning. Any address inside the function snaps to its containing entry"
+    )]
+    fn pseudo(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let proj = open(&p.binary, p.db.as_deref(), p.raw.as_ref())?;
+        let addr =
+            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.pseudo_of(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
     }

@@ -11,6 +11,7 @@ pub mod flirt;
 pub mod ir;
 pub mod loader;
 pub mod mcp;
+pub mod pseudo;
 pub mod search;
 
 use std::collections::BTreeMap;
@@ -1239,6 +1240,38 @@ impl Project {
             "entry": entry_json, "entry_hex": entry_hex,
             "containing_entry": entry, "containing_entry_hex": entry_hex,
             "structure": structure,
+        }))
+    }
+
+    /// Approximate pseudo-C of one function: one lossy C-like line per IR
+    /// row plus the assembled text, with the approximation warning.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::cfg_of`]. Each line
+    /// propagates its source IR warning (`None` for mapped rows); the
+    /// top-level `warning` is always
+    /// [`PSEUDO_WARNING`](crate::pseudo::PSEUDO_WARNING). Read-only: never
+    /// writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn pseudo_of(&self, addr: u64) -> Result<serde_json::Value> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let func = self
+            .analysis
+            .functions
+            .get(&entry)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let pseudo = crate::pseudo::render_function(self.binary.arch, func);
+        let pseudo = serde_json::to_value(pseudo).expect("pseudo serializes");
+        let (entry_json, entry_hex) = addr_pair(entry);
+        Ok(serde_json::json!({
+            "entry": entry_json, "entry_hex": entry_hex,
+            "containing_entry": entry, "containing_entry_hex": entry_hex,
+            "pseudo": pseudo,
         }))
     }
 

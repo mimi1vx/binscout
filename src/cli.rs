@@ -121,6 +121,10 @@ pub enum Cmd {
     /// warning. Any address inside the function snaps to its containing
     /// entry.
     Structure { binary: PathBuf, addr: String },
+    /// Approximate pseudo-C of one function: one lossy C-like line per IR
+    /// row plus assembled text, with an approximation warning. Any address
+    /// inside the function snaps to its containing entry.
+    Pseudo { binary: PathBuf, addr: String },
     /// Transitive callees of one function: every function reachable by
     /// following call edges out to `--depth` hops. Any address inside the
     /// function snaps to its containing entry.
@@ -370,6 +374,7 @@ impl Cli {
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
             Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, &addr),
+            Cmd::Pseudo { binary, addr } => pseudo(&binary, db, raw_opts, &addr),
             Cmd::Callees {
                 binary,
                 addr,
@@ -679,6 +684,16 @@ fn structure(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
     p.structure_of(binscout::parse_addr(addr)?)
+}
+
+fn pseudo(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    p.pseudo_of(binscout::parse_addr(addr)?)
 }
 
 fn callees(
