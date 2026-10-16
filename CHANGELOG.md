@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/mimi1vx/binscout/compare/v0.4.0...v0.5.0) - 2026-10-16
+
+### Added
+
+- add approximate pseudo-C rendering over IR
+- add approximate structured-view over IR (loops/ifs JSON)
+- add bounded jump-table recovery for guarded scaled-index switches
+- add type-hint comments for struct layout as structured comments
+- add bindiff-lite function-level diff between binaries
+- add backward slicing to to-addr
+- add FLIRT-like library-function hints (read-only)
+- add scoped flag/stack-pointer effects to IR
+- add COFF loader support via object FileKind
+- add read-only string decode view for XOR/add/rot
+- add depth-bounded transitive callgraph queries
+- expand IR coverage for FPU/SIMD/crypto/system mnemonics
+
+### Other
+
+- sync README and book with current tools, drop performance decision record
+- add headless agent cookbook (find-main, trace-string, audit-imports)
+- correct MCP tool count to 24 after slice and flirt-hints
+- Merge branch 'wip/ljy6-slicing'
+- Merge branch 'wip/ljy7-flirt'
+
 ## [0.4.0](https://github.com/mimi1vx/binscout/compare/v0.3.0...v0.4.0) - 2026-10-15
 
 ### Added
