@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/mimi1vx/binscout/compare/v0.5.1...v0.6.0) - 2026-10-16
+
+### Added
+
+- select fat Mach-O slices via --fat-arch
+- map macOS stubs to imports and name stub functions
+- [**breaking**] rename slice address field to->addr
+- resolve ARM64 adrp pairs in xrefs, IR and pseudo
+
+### Fixed
+
+- append-suffix sidecar naming
+
+### Other
+
+- reconcile docs with fat-slice, stub, adrp and sidecar changes
+- changelog for five-issue fixes
+
 ### Changed
 
 - BREAKING: `slice` address field renamed `to` -> `addr` (CLI positional `binscout slice B ADDR`, MCP `slice` param `addr`, `slice_page(addr)` / `slice_to(addr)`); no `to` alias is kept.
