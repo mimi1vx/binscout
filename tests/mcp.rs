@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 24 tools, and call every one against fixtures.
+//! list the 25 tools, and call every one against fixtures.
 
 mod common;
 
@@ -118,6 +118,7 @@ fn handshake_lists_twenty_three_tools() {
             "cfg",
             "comment",
             "diagnostics",
+            "diff",
             "disasm",
             "flirt_hints",
             "func",
@@ -134,7 +135,7 @@ fn handshake_lists_twenty_three_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 24 tools"
+        "exactly the 25 tools"
     );
     let search = tools
         .iter()
@@ -175,6 +176,16 @@ fn handshake_lists_twenty_three_tools() {
         .expect("input schema properties");
     for key in ["binary", "db", "raw"] {
         assert!(props.contains_key(key), "annotations_export exposes {key}");
+    }
+    let diff = tools
+        .iter()
+        .find(|t| t["name"] == "diff")
+        .expect("diff listed");
+    let props = diff["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in ["binary_a", "binary_b", "db_a", "db_b", "raw"] {
+        assert!(props.contains_key(key), "diff exposes {key}");
     }
 }
 
@@ -250,9 +261,14 @@ fn all_tools_return_json_over_stdio() {
         ),
         call(27, "diagnostics", json!({"binary": b(), "db": d()})),
         call(28, "flirt_hints", json!({"binary": b(), "db": d()})),
+        call(
+            29,
+            "diff",
+            json!({"binary_a": b(), "binary_b": b(), "db_a": d(), "db_b": d()}),
+        ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 20, "{resps:?}");
+    assert_eq!(resps.len(), 21, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -297,6 +313,14 @@ fn all_tools_return_json_over_stdio() {
     let flirt: Value = serde_json::from_str(tool_text(by_id[&28])).expect("flirt_hints json");
     assert_eq!(flirt["protocol"], 1);
     assert_eq!(flirt["total"], 0, "nop;nop;ret matches no signature");
+
+    // Self-diff over one binary: the single function matches itself.
+    let diff: Value = serde_json::from_str(tool_text(by_id[&29])).expect("diff json");
+    assert_eq!(diff["summary"]["matched"], 1);
+    assert_eq!(diff["summary"]["changed"], 0);
+    assert_eq!(diff["summary"]["added"], 0);
+    assert_eq!(diff["summary"]["removed"], 0);
+    assert_eq!(diff["summary"]["truncated"], false);
 
     let renamed: Value = serde_json::from_str(tool_text(by_id[&20])).expect("rename json");
     assert_eq!(renamed["name"], "main");

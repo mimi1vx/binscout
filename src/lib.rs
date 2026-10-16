@@ -4,6 +4,7 @@
 pub mod analysis;
 pub mod annotations;
 pub mod db;
+pub mod diff;
 pub mod disasm;
 pub mod error;
 pub mod flirt;

@@ -1,7 +1,8 @@
 # MCP tools
 
-`binscout-mcp` serves 24 tools over stdio (newline-delimited JSON-RPC).
-Each takes `binary` plus an optional `db` path and returns one JSON
+`binscout-mcp` serves 25 tools over stdio (newline-delimited JSON-RPC).
+Each takes `binary` plus an optional `db` path (`diff` takes
+`binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
 ```json
@@ -37,6 +38,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address; scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
+| `diff` | binary_a, binary_b, db_a?/db_b?, raw? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar |
 
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
 `code`, `data`, `string`, and `inferred-code` (case-insensitive);

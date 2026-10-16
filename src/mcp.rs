@@ -1,4 +1,4 @@
-//! binscout MCP server: 24 stateless tools over [`Project`].
+//! binscout MCP server: 25 stateless tools over [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -400,6 +400,22 @@ pub struct FlirtHintsParams {
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+}
+
+/// Parameters for the `diff` tool: function-level diff between two binaries.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DiffParams {
+    /// Path of the first (baseline) binary.
+    pub binary_a: String,
+    /// Path of the second (new) binary.
+    pub binary_b: String,
+    /// Explicit project DB path for side A.
+    pub db_a: Option<String>,
+    /// Explicit project DB path for side B.
+    pub db_b: Option<String>,
+    /// Optional explicit raw mapping, applied to both binaries (the
+    /// two-builds case shares one mapping).
+    pub raw: Option<RawParams>,
 }
 
 /// MCP server handler; serializes tool calls behind one lock.
@@ -891,5 +907,39 @@ impl BinscoutMcp {
         proj.query_flirt_hints(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("flirt hints page serializes")))
+    }
+
+    #[tool(
+        name = "diff",
+        description = "Function-level diff between two binaries: byte-identical pairs are matched, content-matched pairs are changed (with the match reason), the rest is added (only in B) / removed (only in A). Both projects open read-only, never creating or modifying a sidecar"
+    )]
+    fn diff(&self, p: Parameters<DiffParams>) -> Result<String, ErrorData> {
+        let _guard = self.guard();
+        let p = all_params(p);
+        let raw_opts = raw_options(p.raw.as_ref())?;
+        let db_a_path;
+        let db_a = match p.db_a.as_deref() {
+            Some(d) => {
+                db_a_path = Path::new(d).to_path_buf();
+                Some(db_a_path.as_path())
+            }
+            None => None,
+        };
+        let db_b_path;
+        let db_b = match p.db_b.as_deref() {
+            Some(d) => {
+                db_b_path = Path::new(d).to_path_buf();
+                Some(db_b_path.as_path())
+            }
+            None => None,
+        };
+        let map_err = |e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        };
+        let a = crate::open_mapped(Path::new(&p.binary_a), db_a, raw_opts).map_err(map_err)?;
+        let b = crate::open_mapped(Path::new(&p.binary_b), db_b, raw_opts).map_err(map_err)?;
+        let report = crate::diff::diff_projects(&a, &b);
+        ok(serde_json::to_value(report).expect("diff report serializes"))
     }
 }

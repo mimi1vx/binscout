@@ -286,6 +286,24 @@ pub enum Cmd {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Function-level diff between two binaries: byte-identical pairs are
+    /// `matched`, content-matched pairs are `changed` (with the match
+    /// reason), the rest is `added` (only in B) / `removed` (only in A).
+    /// Both projects open read-only: never creates or modifies a sidecar.
+    /// The global `--raw` mapping (if any) applies to both binaries;
+    /// use `--db-a`/`--db-b` instead of the global `--db`.
+    Diff {
+        /// First (baseline) binary.
+        binary_a: PathBuf,
+        /// Second (new) binary.
+        binary_b: PathBuf,
+        /// Explicit project DB path for side A (default: side-A sidecar).
+        #[arg(long)]
+        db_a: Option<PathBuf>,
+        /// Explicit project DB path for side B (default: side-B sidecar).
+        #[arg(long)]
+        db_b: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -482,6 +500,19 @@ impl Cli {
                 input,
                 overwrite,
             } => annotations_import(&binary, db, raw_opts, &input, overwrite),
+            Cmd::Diff {
+                binary_a,
+                binary_b,
+                db_a,
+                db_b,
+            } => bindiff(
+                &binary_a,
+                &binary_b,
+                db,
+                db_a.as_deref(),
+                db_b.as_deref(),
+                raw_opts,
+            ),
         };
         match result {
             Ok(value) => {
@@ -848,6 +879,33 @@ fn annotations_import(
     let mut p = open(binary, db, raw)?;
     let summary = p.import_annotations(&text, overwrite)?;
     Ok(serde_json::json!({"rows": summary.rows, "changed": summary.changed}))
+}
+
+/// Function-level diff between two binaries, read-only on both sides.
+///
+/// The global `--db` cannot serve two projects, so `diff` takes per-side
+/// `--db-a`/`--db-b` (each defaulting to its binary's sidecar) and rejects
+/// the global flag explicitly instead of sharing one sidecar path. The
+/// global `--raw` mapping (if any) applies to both binaries: the two-builds
+/// case shares one mapping. Neither project is saved, so no sidecar is
+/// ever created or modified.
+fn bindiff(
+    binary_a: &std::path::Path,
+    binary_b: &std::path::Path,
+    global_db: Option<&std::path::Path>,
+    db_a: Option<&std::path::Path>,
+    db_b: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+) -> binscout::error::Result<serde_json::Value> {
+    if global_db.is_some() {
+        return Err(binscout::error::Error::Invalid(
+            "diff takes --db-a/--db-b, not the global --db".to_string(),
+        ));
+    }
+    let a = binscout::open_mapped(binary_a, db_a, raw)?;
+    let b = binscout::open_mapped(binary_b, db_b, raw)?;
+    let report = binscout::diff::diff_projects(&a, &b);
+    Ok(serde_json::to_value(report).expect("diff report serializes"))
 }
 
 /// Read an interchange document with a hard pre-parse budget.
