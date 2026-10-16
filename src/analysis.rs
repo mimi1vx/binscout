@@ -44,7 +44,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 3;
+pub const ANALYSIS_REVISION: u32 = 4;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -54,11 +54,35 @@ pub const ANALYSIS_REVISION: u32 = 3;
 pub const MAX_DIAGNOSTICS: usize = 100_000;
 /// Cap on recovered single-slot indirect-jump edges per site.
 ///
-/// The approved pattern is a singleton by construction (one slot holds one
-/// target), so a site yields at most one edge; the constant states that
-/// structural bound against the investigation's 1024/site ceiling
-/// (`1 <= 1024`).
+/// The approved single-slot pattern is a singleton by construction (one slot
+/// holds one target), so a site yields at most one edge; the constant states
+/// that structural bound against the investigation's 1024/site ceiling
+/// (`1 <= 1024`). Multi-entry tables have their own per-site cap (see
+/// [`MAX_TABLE_ENTRIES_PER_SITE`]).
 pub const MAX_INFERRED_PER_SITE: usize = 1;
+/// Cap on recovered table entries per guarded scaled-index site.
+///
+/// The scan reads consecutive valid slots from the typed table base and
+/// stops at the first slot that fails validation (unmapped, truncated,
+/// non-executable, non-decoding, or cross-function). A run that is still
+/// valid at this length is not a bounded table but an open-ended index:
+/// the whole site stays unresolved rather than partially recovered
+/// (exact-or-reject). Runs shorter than [`MIN_TABLE_ENTRIES_PER_SITE`]
+/// are indistinguishable from stray pointers and stay unresolved too.
+pub const MAX_TABLE_ENTRIES_PER_SITE: usize = 8;
+/// Minimum consecutive valid slots for a table site to resolve.
+///
+/// Singleton runs fall back to the single-slot path (which owns the typed
+/// `mem_target` shapes); an indexed site with fewer valid slots than this
+/// keeps its diagnostic.
+pub const MIN_TABLE_ENTRIES_PER_SITE: usize = 2;
+/// How far back from a table site the index-guard search walks.
+///
+/// Counts decoded instructions in reverse address order within the site's
+/// function. A guarded switch checks its index just before indexing
+/// (`cmp` + a direct conditional branch to the default path); an unguarded
+/// scaled-index jump has an unbounded index and is unrecoverable.
+pub const MAX_TABLE_GUARD_BACKTRACK: usize = 4;
 /// Cap on recovered single-slot indirect-jump edges per [`analyze`] call.
 ///
 /// On exhaustion the site stays unresolved with its diagnostic retained and
@@ -93,7 +117,8 @@ pub enum XrefKind {
     /// Reference into an extracted string.
     String,
     /// Provenance-marked inferred code edge: a resolved single-slot
-    /// absolute indirect jump (`site -> target`). Direct edges stay
+    /// absolute indirect jump or a resolved guarded table entry
+    /// (`site -> target`). Direct edges stay
     /// [`XrefKind::Code`]; counts jointly against the `Code` per-kind
     /// budget so inferred rows cannot evade the cap by relabeling.
     /// Wire form is kebab-case (`inferred-code`); the direct kinds keep
@@ -367,7 +392,8 @@ pub struct Function {
     pub blocks: BTreeMap<u64, BasicBlock>,
     cfg: DiGraphMap<u64, ()>,
     /// Provenance-marked inferred block edges (`from_block -> to_block`)
-    /// from resolved single-slot indirect jumps. Direct edges stay in
+    /// from resolved single-slot indirect jumps and guarded table entries.
+    /// Direct edges stay in
     /// `cfg` (see [`Function::edges`]); inferred edges never become
     /// callgraph edges or new function entries.
     inferred: BTreeSet<(u64, u64)>,
@@ -421,9 +447,11 @@ impl Function {
 
     /// Inferred block edges as sorted `(from_block, to_block)` pairs.
     ///
-    /// Provenance-marked single-slot indirect-jump resolutions, at most one
-    /// per site (see [`MAX_INFERRED_PER_SITE`]). Same-function only: these
-    /// never become callgraph edges or new function entries.
+    /// Provenance-marked indirect-jump resolutions: at most one per site
+    /// for the single-slot shape (see [`MAX_INFERRED_PER_SITE`]), up to
+    /// [`MAX_TABLE_ENTRIES_PER_SITE`] for a guarded table site.
+    /// Same-function only: these never become callgraph edges or new
+    /// function entries.
     #[must_use]
     pub fn inferred_edges(&self) -> Vec<(u64, u64)> {
         self.inferred.iter().copied().collect()
@@ -753,7 +781,8 @@ pub struct BlockLayout {
     /// Successor block starts.
     pub succs: Vec<u64>,
     /// Inferred successor block starts from resolved single-slot indirect
-    /// jumps; direct successors stay in [`BlockLayout::succs`].
+    /// jumps and guarded table entries; direct successors stay in
+    /// [`BlockLayout::succs`].
     ///
     /// Defaults to empty so layouts written before inference still decode;
     /// such snapshots never hit the cache (their analysis revision
@@ -1903,11 +1932,18 @@ pub fn function_owner(entries: &[u64], va: u64) -> u64 {
     }
 }
 
-/// Recovered single-slot indirect-jump resolutions: `(site, target)` pairs
-/// in ascending site order plus explicit cap accounting.
+/// Recovered indirect-jump resolutions: `(site, target)` pairs in ascending
+/// site order plus explicit cap accounting.
+///
+/// Single-slot sites contribute one pair; guarded table sites contribute one
+/// pair per unique entry target (at most [`MAX_TABLE_ENTRIES_PER_SITE`]).
+/// `slots` holds the scanned `(site, slot)` table addresses backing the
+/// table pairs' `Data` evidence xrefs.
 struct InferredJumps {
-    /// Resolved `(site, target)` pairs, at most one per site.
+    /// Resolved `(site, target)` pairs, unique per tuple.
     pairs: Vec<(u64, u64)>,
+    /// Scanned `(site, slot)` table addresses for resolved table sites.
+    slots: Vec<(u64, u64)>,
     /// Whether the edge budget cut resolution short.
     truncated: bool,
     /// Sites skipped by the edge budget (each keeps its diagnostic).
@@ -1922,7 +1958,8 @@ struct InferredJumps {
 ///   immediate-reporting `mov`/`push`, calls, and predicated forms).
 /// - R2: `branch_target` is `None` (direct jumps never reach this set).
 /// - R3: `mem_target == Some(slot)` (excludes indexed/multi-entry and
-///   register-indirect shapes, which report no typed slot).
+///   register-indirect shapes, which report no typed slot; guarded
+///   scaled-index tables go through [`resolve_table_site`] instead).
 /// - R4: raw mappings only (container and LE slot values are not known
 ///   final: relocations are never applied to segment bytes).
 /// - R5: the arch-width slot bytes are fully file-backed in one segment
@@ -1983,15 +2020,155 @@ fn resolve_indirect_site(
     Some(target)
 }
 
-/// Resolve single-slot absolute indirect jumps over the walker's
-/// `UnresolvedIndirectJump` sites in ascending address order.
+/// Check one `UnresolvedIndirectJump` site against the guarded scaled-index
+/// table pattern, returning its unique entry targets in ascending order.
 ///
-/// Each site is checked once via [`resolve_indirect_site`]; a pass decodes
-/// the target's continuation with the existing [`Walker::run`] (so case
-/// bodies decode normally) and registers the target for block splitting.
-/// Continuation decoding can surface further indirect sites, which join the
-/// same ascending pass. At most one edge per site
-/// ([`MAX_INFERRED_PER_SITE`], singleton by construction); past
+/// All evidence is typed decoder facts, never operand text. Rejections:
+/// - T1: `insn.mnem == "jmp"` with a `Branch { None }` lift (same gate as
+///   the single-slot path: excludes calls and predicated forms).
+/// - T2: `branch_target` is `None` (direct jumps never reach this set).
+/// - T3: `table_base == Some(base)` (excludes the single-slot shapes, which
+///   report `mem_target` instead, and strided scales, which report `None`).
+/// - T4: raw mappings only (container slot values are not known final).
+/// - T5: a direct conditional branch (`CBranch { Some }`, the index bound
+///   check) within [`MAX_TABLE_GUARD_BACKTRACK`] decoded predecessors in
+///   the site's function. Unguarded indexes are unbounded: unrecoverable.
+/// - T6: the scan reads consecutive slots from `base` while every per-slot
+///   check passes (same file-backed/executable/decodable/same-function
+///   rules as the single-slot R5-R8, at the arch pointer width); the
+///   first failure ends the table.
+/// - T7: at least [`MIN_TABLE_ENTRIES_PER_SITE`] consecutive valid slots.
+///   Singleton runs are stray pointers, not tables.
+/// - T8: a run still valid at [`MAX_TABLE_ENTRIES_PER_SITE`] slots is
+///   open-ended, not bounded: the whole site stays unresolved rather than
+///   partially recovered (exact-or-reject).
+///
+/// Only x86 has an approved table shape (x86-32 scale 4, x86-64 scale 8);
+/// other arches are rejected outright, as are ARM `tbb`/`tbh` (no typed
+/// displacement) and single-entry fallbacks to the single-slot path.
+fn resolve_table_site(
+    arch: Arch,
+    format: BinaryFormat,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<TableResolution> {
+    let found = decoded.get(&site)?;
+    if found.insn.mnem != "jmp" {
+        return None;
+    }
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    if found.insn.branch_target.is_some() {
+        return None;
+    }
+    let base = found.insn.table_base?;
+    let width: usize = match arch {
+        Arch::X86_32 => 4,
+        Arch::X86_64 => 8,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+    };
+    if format != BinaryFormat::Raw {
+        return None;
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = function_owner(entries, site);
+    if !table_guard_present(decoded, entries, site, owner) {
+        return None;
+    }
+    let mut targets = BTreeSet::new();
+    let mut slots = Vec::new();
+    for i in 0..MAX_TABLE_ENTRIES_PER_SITE {
+        let slot = base.wrapping_add((i as u64).wrapping_mul(width as u64));
+        let Some(target) = table_slot_target(arch, space, entries, owner, slot, width) else {
+            break;
+        };
+        slots.push(slot);
+        targets.insert(target);
+    }
+    if slots.len() < MIN_TABLE_ENTRIES_PER_SITE {
+        return None;
+    }
+    let probe = base.wrapping_add((MAX_TABLE_ENTRIES_PER_SITE as u64).wrapping_mul(width as u64));
+    if table_slot_target(arch, space, entries, owner, probe, width).is_some() {
+        return None;
+    }
+    Some(TableResolution {
+        targets: targets.into_iter().collect(),
+        slots,
+    })
+}
+
+/// Unique entry targets plus scanned slot addresses of one table site.
+struct TableResolution {
+    /// Unique entry targets in ascending order.
+    targets: Vec<u64>,
+    /// Scanned slot addresses in table order (evidence for `Data` xrefs).
+    slots: Vec<u64>,
+}
+
+/// Whether a direct conditional branch (the index bound check) precedes
+/// `site` within [`MAX_TABLE_GUARD_BACKTRACK`] decoded predecessors in the
+/// same function. Typed lift facts only: a `CBranch` with a direct target.
+fn table_guard_present(
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+    owner: u64,
+) -> bool {
+    decoded
+        .range(..site)
+        .rev()
+        .take(MAX_TABLE_GUARD_BACKTRACK)
+        .take_while(|(va, _)| function_owner(entries, **va) == owner)
+        .any(|(_, d)| matches!(d.flow, Flow::CBranch { target: Some(_) }))
+}
+
+/// Validate one table slot: file-backed width bytes in a single segment,
+/// a little-endian value in executable file-backed bytes that decodes and
+/// attributes to the site's function. Mirrors the single-slot R5-R8 rules.
+fn table_slot_target(
+    arch: Arch,
+    space: &AddrSpace,
+    entries: &[u64],
+    owner: u64,
+    slot: u64,
+    width: usize,
+) -> Option<u64> {
+    let raw = space.file_bytes_at(slot, width)?;
+    let target = match width {
+        4 => u64::from(u32::from_le_bytes(raw.try_into().ok()?)),
+        _ => u64::from_le_bytes(raw.try_into().ok()?),
+    };
+    let target_bytes = space.code_bytes(target)?;
+    if !matches!(
+        crate::disasm::disasm_first(arch, target_bytes, target),
+        Ok(Some(_))
+    ) {
+        return None;
+    }
+    if function_owner(entries, target) != owner {
+        return None;
+    }
+    Some(target)
+}
+
+/// Resolve single-slot absolute indirect jumps and guarded scaled-index
+/// tables over the walker's `UnresolvedIndirectJump` sites in ascending
+/// address order.
+///
+/// Each site is checked once via [`resolve_indirect_site`], then via
+/// [`resolve_table_site`]; a pass decodes each target's continuation with
+/// the existing [`Walker::run`] (so case bodies decode normally) and
+/// registers the targets for block splitting. Continuation decoding can
+/// surface further indirect sites, which join the same ascending pass.
+/// Single-slot sites contribute at most one edge
+/// ([`MAX_INFERRED_PER_SITE`], singleton by construction); table sites
+/// contribute up to [`MAX_TABLE_ENTRIES_PER_SITE`] unique edges. Past
 /// `max_edges` (normally [`MAX_INFERRED_EDGES`]) sites stay unresolved
 /// with `truncated` set and each omission counted, never silently clipped.
 ///
@@ -2007,6 +2184,7 @@ fn resolve_indirect_jumps(
     max_edges: usize,
 ) -> Result<InferredJumps> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
+    let mut slots: Vec<(u64, u64)> = Vec::new();
     let mut processed: BTreeSet<u64> = BTreeSet::new();
     let mut truncated = false;
     let mut omitted: usize = 0;
@@ -2019,8 +2197,9 @@ fn resolve_indirect_jumps(
         .map(|d| d.addr)
         .next()
     {
-        // Each site contributes at most one pair: the check returns an
-        // `Option`, and the processed set keeps sites single-visit.
+        // Each site contributes at most one single-slot edge, or one table
+        // row set; the check returns at most one resolution per visit and
+        // the processed set keeps sites single-visit.
         let inserted = processed.insert(site);
         debug_assert!(inserted);
         if let Some(target) =
@@ -2034,19 +2213,32 @@ fn resolve_indirect_jumps(
             pairs.push((site, target));
             walk.run(vec![target])?;
             walk.jump_targets.insert(target);
+        } else if let Some(table) =
+            resolve_table_site(arch, format, space, &walk.decoded, entries, site)
+        {
+            let cost = table.targets.len();
+            if pairs.len().saturating_add(cost) > max_edges {
+                truncated = true;
+                omitted += cost;
+                continue;
+            }
+            for target in &table.targets {
+                pairs.push((site, *target));
+                walk.jump_targets.insert(*target);
+            }
+            for slot in &table.slots {
+                slots.push((site, *slot));
+            }
+            walk.run(table.targets)?;
         }
     }
-    // Singleton by construction: one `Option` per site, one visit per site.
-    debug_assert_eq!(
-        pairs
-            .iter()
-            .map(|(site, _)| site)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        pairs.len()
-    );
+    // Unique by construction: single-slot sites resolve once, table
+    // targets are a per-site set, and the two shapes own disjoint sites
+    // (`mem_target` and `table_base` never coincide).
+    debug_assert_eq!(pairs.iter().collect::<BTreeSet<_>>().len(), pairs.len());
     Ok(InferredJumps {
         pairs,
+        slots,
         truncated,
         omitted,
     })
@@ -2203,10 +2395,11 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     let entry_list: Vec<u64> = entries.iter().copied().collect();
     let owner = |va: u64| -> u64 { function_owner(&entry_list, va) };
 
-    // Pass A2: resolve single-slot absolute indirect jumps (raw x86 only).
-    // Entries are fixed above so the resolver can check same-function
-    // attribution without creating entries; resolved targets decode next
-    // via the walker's continuation and join block splitting below.
+    // Pass A2: resolve single-slot absolute indirect jumps and guarded
+    // scaled-index tables (raw x86 only). Entries are fixed above so the
+    // resolvers can check same-function attribution without creating
+    // entries; resolved targets decode next via the walker's continuation
+    // and join block splitting below.
     let jumps = resolve_indirect_jumps(
         &mut walk,
         arch,
@@ -2398,7 +2591,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // PC-relative accesses and x86-32 absolute immediates/displacements
     // into a segment, string refs where data lands in a recovered string.
     // Inferred edges add one provenance-marked `InferredCode` xref per
-    // resolved site; the site's `Data` slot xref above is retained.
+    // resolved site (single-slot) or per unique entry target (tables);
+    // the single-slot `Data` slot xref above is retained, and table sites
+    // add one `Data` xref per scanned slot.
     let mut xrefs: BTreeSet<(u64, XrefKind, u64)> = BTreeSet::new();
     for (&va, d) in &decoded {
         let target = match d.flow {
@@ -2417,6 +2612,11 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     for (site, target) in &jumps.pairs {
         if resolved_sites.contains(site) {
             xrefs.insert((*site, XrefKind::InferredCode, *target));
+        }
+    }
+    for (site, slot) in &jumps.slots {
+        if resolved_sites.contains(site) {
+            xrefs.insert((*site, XrefKind::Data, *slot));
         }
     }
     let mut strings: Vec<StringHit> = Vec::new();
@@ -2523,6 +2723,7 @@ mod tests {
             ops: Vec::new(),
             branch_target: None,
             mem_target: None,
+            table_base: None,
         };
         assert_eq!(classify(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
@@ -2533,6 +2734,7 @@ mod tests {
             ops: vec!["0x1005".to_string()],
             branch_target: Some(0x1005),
             mem_target: None,
+            table_base: None,
         };
         assert_eq!(
             classify(Arch::X86_64, &call),
@@ -2839,6 +3041,37 @@ mod tests {
         // A full budget resolves both with clean accounting.
         let (pairs, truncated, omitted, _) = run_inferred_cap(&bytes, MAX_INFERRED_EDGES);
         assert_eq!(pairs, [(0x1005, 0x100F), (0x1010, 0x101A)]);
+        assert!(!truncated);
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn table_cap_counts_unique_edges_against_shared_budget() {
+        // One guarded x86-32 table site (base 0x1000): two slots, two
+        // unique same-function ret targets, probe slot past the cap
+        // window holding nop bytes (unmapped value, exact end).
+        let mut bytes = vec![
+            0x83, 0xF8, 0x01, // 0x1000: cmp eax,1
+            0x73, 0x07, // 0x1003: jae 0x100c
+            0xFF, 0x24, 0x85, 0x12, 0x10, 0x00, 0x00, // 0x1005: jmp [eax*4+0x1012]
+            0xB8, 0x01, 0x00, 0x00, 0x00, // 0x100c: mov eax,1
+            0xC3, // 0x1011: ret
+            0x22, 0x10, 0x00, 0x00, // 0x1012: slot 0 -> 0x1022
+            0x23, 0x10, 0x00, 0x00, // 0x1016: slot 1 -> 0x1023
+        ];
+        bytes.extend([0x90; 8]); // 0x101a: probe window (value unmapped)
+        bytes.extend([0xC3, 0xC3]); // 0x1022/0x1023: bodies
+        assert_eq!(bytes.len(), 36);
+        // A budget below the unique-edge cost skips the whole site and
+        // counts every edge that would have resolved, never a prefix.
+        let (pairs, truncated, omitted, entries) = run_inferred_cap(&bytes, 1);
+        assert_eq!(entries, [0x1000]);
+        assert!(pairs.is_empty());
+        assert!(truncated);
+        assert_eq!(omitted, 2);
+        // A full budget resolves both edges with clean accounting.
+        let (pairs, truncated, omitted, _) = run_inferred_cap(&bytes, MAX_INFERRED_EDGES);
+        assert_eq!(pairs, [(0x1005, 0x1022), (0x1005, 0x1023)]);
         assert!(!truncated);
         assert_eq!(omitted, 0);
     }

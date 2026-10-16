@@ -81,6 +81,15 @@ pub struct Insn {
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
     /// reports its pointer slot here and `None` for `branch_target`.
     pub mem_target: Option<u64>,
+    /// Typed base of a scaled-index table load (`jmp [index*scale+base]`),
+    /// if any: x86 only, from the decoder's memory-operand fields (index
+    /// register present, no base register, scale equal to the slot width,
+    /// displacement as the table start). Never parsed from operand text;
+    /// indexed forms report `None` for [`Insn::mem_target`], and plain
+    /// absolute/RIP-relative slots report `None` here. ARM `tbb`/`tbh`
+    /// carry no displacement and are excluded.
+    #[serde(default)]
+    pub table_base: Option<u64>,
 }
 
 impl Serialize for Insn {
@@ -89,7 +98,7 @@ impl Serialize for Insn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("Insn", 10)?;
+        let mut st = serializer.serialize_struct("Insn", 12)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("size", &self.size)?;
@@ -103,6 +112,8 @@ impl Serialize for Insn {
         )?;
         st.serialize_field("mem_target", &self.mem_target)?;
         st.serialize_field("mem_target_hex", &self.mem_target.map(crate::addr_hex))?;
+        st.serialize_field("table_base", &self.table_base)?;
+        st.serialize_field("table_base_hex", &self.table_base.map(crate::addr_hex))?;
         st.end()
     }
 }
@@ -621,6 +632,7 @@ fn x86_insn(
         None if bitness == 32 => absolute_target32(insn),
         None => None,
     };
+    let table_base = table_base_for(bitness, insn);
     Insn {
         addr,
         size: insn.len() as u8,
@@ -629,6 +641,7 @@ fn x86_insn(
         ops,
         branch_target,
         mem_target,
+        table_base,
     }
 }
 
@@ -689,6 +702,38 @@ fn disasm_x86_partial(
         insns: out,
         error_at: None,
     })
+}
+
+/// Typed base of a scaled-index table load, if any.
+///
+/// Reports the displacement of an x86 memory operand with an index register,
+/// no base register, and a scale equal to the slot width (4 for 32-bit,
+/// 8 for 64-bit): the compiler switch shape `jmp [index*scale+table]`.
+/// RIP-relative forms (base `RIP`) and plain absolute slots (no index)
+/// report `None` here; those keep their [`Insn::mem_target`] path.
+/// Strided scales (e.g. `*2` in 32-bit mode) report `None`: the analysis
+/// scan assumes dense slots. 64-bit displacements use the decoder's
+/// sign-extended form.
+fn table_base_for(bitness: u32, insn: &Instruction) -> Option<u64> {
+    let width: u64 = match bitness {
+        32 => 4,
+        64 => 8,
+        _ => return None,
+    };
+    for op in 0..insn.op_count() {
+        if insn.op_kind(op) == OpKind::Memory
+            && insn.memory_base() == Register::None
+            && insn.memory_index() != Register::None
+            && u64::from(insn.memory_index_scale()) == width
+        {
+            let disp = match bitness {
+                32 => u64::from(insn.memory_displacement32()),
+                _ => insn.memory_displacement64(),
+            };
+            return Some(disp);
+        }
+    }
+    None
 }
 
 /// Absolute data address referenced by a 32-bit x86 instruction, if any.
@@ -771,6 +816,7 @@ fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruc
         ops,
         branch_target: arm_branch_target(inst, addr),
         mem_target: arm_data_target(inst, addr),
+        table_base: None,
     }
 }
 
@@ -967,6 +1013,7 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
         ops,
         branch_target: armv7_branch_target(inst, addr),
         mem_target: armv7_data_target(inst, addr),
+        table_base: None,
     }
 }
 
@@ -1253,5 +1300,57 @@ mod tests {
         // ldr r0, [pc, #16] at 0x20001: base is addr+4 rounded down to 4.
         let v = disasm_thumb(&[0x04, 0x48], 0x20001, 8).expect("ldr decodes");
         assert_eq!(v[0].mem_target, Some(((0x20001 + 4) & !3) + 16));
+    }
+
+    #[test]
+    fn x86_32_scaled_index_reports_typed_table_base() {
+        // jmp [eax*4+0x401012]: typed base, never a mem_target, never text.
+        let v = disasm_x86(&[0xFF, 0x24, 0x85, 0x12, 0x10, 0x40, 0x00], 0x401005, 8, 32)
+            .expect("indexed jmp decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mnem, "jmp");
+        assert_eq!(v[0].table_base, Some(0x401012));
+        assert_eq!(v[0].mem_target, None);
+        assert_eq!(v[0].branch_target, None);
+    }
+
+    #[test]
+    fn x86_64_scaled_index_reports_typed_table_base() {
+        // jmp [rax*8+0x400012]: the 64-bit switch shape.
+        let v = disasm_x86(
+            &[0x48, 0xFF, 0x24, 0xC5, 0x12, 0x00, 0x40, 0x00],
+            0x400005,
+            8,
+            64,
+        )
+        .expect("indexed jmp decodes");
+        assert_eq!(v[0].table_base, Some(0x400012));
+        assert_eq!(v[0].mem_target, None);
+        assert_eq!(v[0].branch_target, None);
+    }
+
+    #[test]
+    fn x86_index_wrong_scale_reports_no_table_base() {
+        // jmp [eax*2+0x401012] (scale 2, slot width 4): strided tables
+        // are unsupported, so no typed base is reported.
+        let v = disasm_x86(&[0xFF, 0x24, 0x45, 0x12, 0x10, 0x40, 0x00], 0x401005, 8, 32)
+            .expect("strided jmp decodes");
+        assert_eq!(v[0].table_base, None);
+        assert_eq!(v[0].mem_target, None);
+        assert_eq!(v[0].branch_target, None);
+    }
+
+    #[test]
+    fn x86_plain_slot_reports_no_table_base() {
+        // jmp [0x401006]: the single-slot shape keeps mem_target only.
+        let v = disasm_x86(&[0xFF, 0x25, 0x06, 0x10, 0x40, 0x00], 0x401000, 8, 32)
+            .expect("absolute jmp decodes");
+        assert_eq!(v[0].mem_target, Some(0x401006));
+        assert_eq!(v[0].table_base, None);
+        // RIP-relative slots stay on the mem_target path too.
+        let v = disasm_x86(&[0xFF, 0x25, 0x04, 0x00, 0x00, 0x00], 0x400000, 8, 64)
+            .expect("rip-relative jmp decodes");
+        assert_eq!(v[0].mem_target, Some(0x40000a));
+        assert_eq!(v[0].table_base, None);
     }
 }

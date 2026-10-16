@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use common::{builders, cleanup, open_test_project, tmpdir};
 
 /// Address fields and their required hex twins (`null` matches `null`).
-const PAIRS: [(&str, &str); 12] = [
+const PAIRS: [(&str, &str); 13] = [
     ("addr", "addr_hex"),
     ("from", "from_hex"),
     ("to", "to_hex"),
@@ -21,6 +21,7 @@ const PAIRS: [(&str, &str); 12] = [
     ("end", "end_hex"),
     ("branch_target", "branch_target_hex"),
     ("mem_target", "mem_target_hex"),
+    ("table_base", "table_base_hex"),
     ("target", "target_hex"),
     ("address", "address_hex"),
     ("vaddr", "vaddr_hex"),
@@ -254,15 +255,18 @@ fn golden_disasm_prefix() {
             {"addr": 4198400, "addr_hex": "0x401000", "size": 1, "bytes": [85],
              "mnem": "push", "ops": ["ebp"],
              "branch_target": null, "branch_target_hex": null,
-             "mem_target": null, "mem_target_hex": null},
+             "mem_target": null, "mem_target_hex": null,
+             "table_base": null, "table_base_hex": null},
             {"addr": 4198401, "addr_hex": "0x401001", "size": 2, "bytes": [137, 229],
              "mnem": "mov", "ops": ["ebp", "esp"],
              "branch_target": null, "branch_target_hex": null,
-             "mem_target": null, "mem_target_hex": null},
+             "mem_target": null, "mem_target_hex": null,
+             "table_base": null, "table_base_hex": null},
             {"addr": 4198403, "addr_hex": "0x401003", "size": 5, "bytes": [104, 0, 33, 64, 0],
              "mnem": "push", "ops": ["0x402100"],
              "branch_target": null, "branch_target_hex": null,
-             "mem_target": 4202752, "mem_target_hex": "0x402100"},
+             "mem_target": 4202752, "mem_target_hex": "0x402100",
+             "table_base": null, "table_base_hex": null},
         ],
     });
     assert_eq!(v, want);

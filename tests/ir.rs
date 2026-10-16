@@ -35,6 +35,7 @@ fn synth(mnem: &str, ops: &[&str]) -> binscout::disasm::Insn {
         ops: ops.iter().map(|s| (*s).to_string()).collect(),
         branch_target: None,
         mem_target: None,
+        table_base: None,
     }
 }
 

@@ -69,6 +69,7 @@ fn test_insn(addr: u64) -> Insn {
         ops: Vec::new(),
         branch_target: None,
         mem_target: None,
+        table_base: None,
     }
 }
 
