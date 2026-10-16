@@ -265,6 +265,23 @@ carrying `addr`/`addr_hex`, the containing function (`func`/`func_hex`,
 null when in no function) plus its rename-resolved `name`, paged under
 the envelope; querying never writes a sidecar.
 
+### `structure`
+
+```sh
+binscout structure B ADDR
+```
+
+MCP tool `structure` (`binary`, `db`?, `raw`?, `addr`). `ADDR` snaps to
+its containing function (`NotFound` when in no function). The result
+carries `entry`/`entry_hex` plus `structure`: syntactic `loops`
+(back-edge targets as `header`/`header_hex` with sorted `latches`) and
+`ifs` (two-successor `CBranch` sites with `cond` and taken/fallthrough
+`then_target`/`else_target` twins) with a top-level `warning`
+(`approximate ...; not a decompiler`). Loops are direct-CFG back edges
+found by one deterministic DFS; ifs need a `CBranch` lift plus exactly
+two direct successors; inferred single-slot edges never participate.
+Read-only: querying never writes a sidecar.
+
 ### `diagnostics`
 
 ```sh

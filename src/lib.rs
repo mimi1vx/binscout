@@ -1212,6 +1212,36 @@ impl Project {
         )
     }
 
+    /// Approximate control-flow structure of one function: syntactic loops
+    /// and ifs over the direct CFG plus the M3 lift, with the approximation
+    /// warning.
+    ///
+    /// `addr` may be any address inside the function; it snaps to the
+    /// containing entry exactly like [`Project::cfg_of`]. The result
+    /// carries `entry` (the canonical function entry) plus `structure`
+    /// (`loops`/`ifs` rows with `0x`-hex twins and the top-level
+    /// `warning`). Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `addr` lies in no function.
+    pub fn structure_of(&self, addr: u64) -> Result<serde_json::Value> {
+        let entry = self
+            .analysis
+            .containing_function(addr)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let structure = self
+            .analysis
+            .structure_of(entry)
+            .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let structure = serde_json::to_value(structure).expect("structure serializes");
+        let (entry_json, entry_hex) = addr_pair(entry);
+        Ok(serde_json::json!({
+            "entry": entry_json, "entry_hex": entry_hex,
+            "containing_entry": entry, "containing_entry_hex": entry_hex,
+            "structure": structure,
+        }))
+    }
+
     /// Lift `len` bytes at `va` to IR.
     ///
     /// Lifts the valid prefix (see [`Project::disasm_at`]) and reports the

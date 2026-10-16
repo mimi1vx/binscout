@@ -504,6 +504,196 @@ impl Function {
     }
 }
 
+/// Approximate per-function structural warning.
+///
+/// Loops and ifs are syntactic patterns over the direct CFG plus the M3
+/// lift (`Branch`/`CBranch` targets): a back edge is not a proven loop and
+/// a two-successor `CBranch` site is not a proven if. Agents must treat the
+/// rows as hints, never as decompiler output.
+pub const STRUCTURE_WARNING: &str = "approximate structure over CFG+IR: back edges and two-successor branch sites are syntactic hints, not verified loops/ifs; not a decompiler";
+
+/// One syntactic loop: CFG back edges into a shared header.
+///
+/// `header` is the back-edge target (the cycle entry); `latches` are the
+/// sorted sources of back edges into it. A self-edge (`header` in
+/// `latches`) is the tightest loop shape.
+///
+/// JSON pairs `header` with `header_hex`; `latches` stays a plain integer
+/// array.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LoopInfo {
+    /// Back-edge target: the loop header block start.
+    pub header: u64,
+    /// Sorted sources of back edges into `header`.
+    pub latches: Vec<u64>,
+}
+
+impl Serialize for LoopInfo {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("LoopInfo", 3)?;
+        st.serialize_field("header", &self.header)?;
+        st.serialize_field("header_hex", &crate::addr_hex(self.header))?;
+        st.serialize_field("latches", &self.latches)?;
+        st.end()
+    }
+}
+
+/// One syntactic if: a `CBranch`-terminated block with two successors.
+///
+/// `then_target` is the taken branch (the lift's direct target when it is
+/// one of the successors, else the lower successor); `else_target` is the
+/// other successor (usually fallthrough).
+///
+/// JSON pairs each address with its `0x`-hex twin (`cond`/`cond_hex`,
+/// `then_target`/`then_hex`, `else_target`/`else_hex`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IfInfo {
+    /// Start of the branching block.
+    pub cond: u64,
+    /// Taken-branch successor.
+    pub then_target: u64,
+    /// Fallthrough/other successor.
+    pub else_target: u64,
+}
+
+impl Serialize for IfInfo {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("IfInfo", 6)?;
+        st.serialize_field("cond", &self.cond)?;
+        st.serialize_field("cond_hex", &crate::addr_hex(self.cond))?;
+        st.serialize_field("then_target", &self.then_target)?;
+        st.serialize_field("then_hex", &crate::addr_hex(self.then_target))?;
+        st.serialize_field("else_target", &self.else_target)?;
+        st.serialize_field("else_hex", &crate::addr_hex(self.else_target))?;
+        st.end()
+    }
+}
+
+/// Approximate control-flow structure of one function.
+///
+/// `loops` sort by header, `ifs` by `cond`, so repeated queries agree.
+/// `warning` is always [`STRUCTURE_WARNING`]: the rows are syntactic
+/// hints over the CFG plus the M3 lift, never verified control flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuncStructure {
+    /// Syntactic loops ordered by header.
+    pub loops: Vec<LoopInfo>,
+    /// Syntactic ifs ordered by `cond`.
+    pub ifs: Vec<IfInfo>,
+    /// Always [`STRUCTURE_WARNING`].
+    pub warning: String,
+}
+
+impl Function {
+    /// Approximate control-flow structure: syntactic loops and ifs.
+    ///
+    /// Loops are direct-CFG back edges: one iterative depth-first walk over
+    /// ascending block starts (gray means on the DFS stack); an edge to a
+    /// gray node closes a cycle, grouped by header with sorted latches.
+    /// Ifs are blocks whose terminator lifts (see [`crate::ir::lift`]) to
+    /// [`IrOp::CBranch`] with exactly two direct-CFG successors. Pure
+    /// read-only pass over `blocks`/`cfg` plus the lift; inferred
+    /// single-slot edges never participate.
+    #[must_use]
+    pub fn structure(&self, arch: Arch) -> FuncStructure {
+        // Iterative DFS with sorted successors for deterministic output.
+        // `gray` holds the current stack path; an edge into it is a back
+        // edge (latch = source, header = target).
+        let mut gray: BTreeSet<u64> = BTreeSet::new();
+        let mut black: BTreeSet<u64> = BTreeSet::new();
+        let mut back_edges: Vec<(u64, u64)> = Vec::new();
+        for &root in self.blocks.keys() {
+            if gray.contains(&root) || black.contains(&root) {
+                continue;
+            }
+            gray.insert(root);
+            let mut stack: Vec<(u64, std::vec::IntoIter<u64>)> =
+                vec![(root, sorted_succs(self, root))];
+            while let Some((node, nexts)) = stack.last_mut() {
+                let node = *node;
+                match nexts.next() {
+                    Some(next) => {
+                        if gray.contains(&next) {
+                            back_edges.push((node, next));
+                        } else if !black.contains(&next) {
+                            gray.insert(next);
+                            stack.push((next, sorted_succs(self, next)));
+                        }
+                    }
+                    None => {
+                        let (done, _) = stack.pop().expect("nonempty stack pops");
+                        gray.remove(&done);
+                        black.insert(done);
+                    }
+                }
+            }
+        }
+        let mut by_header: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (latch, header) in back_edges {
+            by_header.entry(header).or_default().push(latch);
+        }
+        let loops = by_header
+            .into_iter()
+            .map(|(header, mut latches)| {
+                latches.sort_unstable();
+                latches.dedup();
+                LoopInfo { header, latches }
+            })
+            .collect();
+
+        let mut ifs: Vec<IfInfo> = Vec::new();
+        for (start, block) in &self.blocks {
+            let Some(last) = block.insns.last() else {
+                continue;
+            };
+            let lifted = crate::ir::lift(arch, last);
+            let is_cbranch = matches!(lifted.first(), Some(row) if row.op == IrOp::CBranch);
+            if !is_cbranch {
+                continue;
+            }
+            let mut succs = self.successors(*start);
+            if succs.len() != 2 {
+                continue;
+            }
+            succs.sort_unstable();
+            let target = lifted.first().and_then(|row| row.target);
+            let (then_target, else_target) = match target {
+                Some(t) if succs.contains(&t) => {
+                    (t, if succs[0] == t { succs[1] } else { succs[0] })
+                }
+                _ => (succs[0], succs[1]),
+            };
+            ifs.push(IfInfo {
+                cond: *start,
+                then_target,
+                else_target,
+            });
+        }
+        ifs.sort_by_key(|i| i.cond);
+
+        FuncStructure {
+            loops,
+            ifs,
+            warning: STRUCTURE_WARNING.to_string(),
+        }
+    }
+}
+
+/// Sorted direct-CFG successors of `block` for deterministic DFS order.
+fn sorted_succs(func: &Function, block: u64) -> std::vec::IntoIter<u64> {
+    let mut succs = func.successors(block);
+    succs.sort_unstable();
+    succs.into_iter()
+}
+
 /// Whole-binary analysis result.
 #[derive(Debug, Clone)]
 pub struct Analysis {
@@ -709,6 +899,18 @@ impl Analysis {
         }
         out.sort_unstable();
         out
+    }
+
+    /// Approximate control-flow structure of the function at `entry`, if known.
+    ///
+    /// Read-only [`Function::structure`] over the direct CFG plus the M3
+    /// lift: syntactic loops and ifs with the [`STRUCTURE_WARNING`]
+    /// marker. `None` for an unknown entry (callers snap addresses with
+    /// [`Analysis::containing_function`] first, as
+    /// [`crate::Project::structure_of`] does).
+    #[must_use]
+    pub fn structure_of(&self, entry: u64) -> Option<FuncStructure> {
+        self.functions.get(&entry).map(|f| f.structure(self.arch))
     }
 
     /// All callgraph edges as `(caller, callee)` pairs.

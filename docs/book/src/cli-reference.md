@@ -23,6 +23,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `block-insns` | `binscout block-insns fw.elf 0x400000 0x400000 --limit 50` | that block's instructions in address order, under the page envelope; the block must belong to the function |
 | `disasm` | `binscout disasm fw.elf 0x400000 32` | decoded instructions (`addr` = hex or decimal, then byte count); the valid prefix plus `error_at` for the first bad opcode, ranges cap at 1 MiB |
 | `cfg` | `binscout cfg fw.elf 0x400000` | block nodes plus `(from, to)` edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only, same-function) |
+| `structure` | `binscout structure fw.elf 0x400000` | approximate control-flow structure: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning |
 | `callees` | `binscout callees fw.elf 0x400000 --depth 5` | transitive callees out to `--depth` hops (direct are depth 1), ordered by entry with shortest distance, under the page envelope |
 | `callers` | `binscout callers fw.elf 0x400000 --depth 5` | transitive callers out to `--depth` hops, ordered by entry with shortest distance, under the page envelope |
 | `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, under the page envelope |

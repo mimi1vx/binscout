@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 25 tools, and call every one against fixtures.
+//! list the 26 tools, and call every one against fixtures.
 
 mod common;
 
@@ -132,10 +132,11 @@ fn handshake_lists_twenty_three_tools() {
             "slice",
             "stats",
             "strings",
+            "structure",
             "symbols",
             "xrefs",
         ],
-        "exactly the 25 tools"
+        "exactly the 26 tools"
     );
     let search = tools
         .iter()
@@ -262,13 +263,18 @@ fn all_tools_return_json_over_stdio() {
         call(27, "diagnostics", json!({"binary": b(), "db": d()})),
         call(28, "flirt_hints", json!({"binary": b(), "db": d()})),
         call(
+            30,
+            "structure",
+            json!({"binary": b(), "db": d(), "addr": "0x0"}),
+        ),
+        call(
             29,
             "diff",
             json!({"binary_a": b(), "binary_b": b(), "db_a": d(), "db_b": d()}),
         ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 21, "{resps:?}");
+    assert_eq!(resps.len(), 22, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -313,6 +319,28 @@ fn all_tools_return_json_over_stdio() {
     let flirt: Value = serde_json::from_str(tool_text(by_id[&28])).expect("flirt_hints json");
     assert_eq!(flirt["protocol"], 1);
     assert_eq!(flirt["total"], 0, "nop;nop;ret matches no signature");
+
+    let structure: Value = serde_json::from_str(tool_text(by_id[&30])).expect("structure json");
+    assert_eq!(structure["entry"], 0);
+    assert!(
+        structure["structure"]["loops"]
+            .as_array()
+            .expect("loops")
+            .is_empty()
+    );
+    assert!(
+        structure["structure"]["ifs"]
+            .as_array()
+            .expect("ifs")
+            .is_empty()
+    );
+    assert!(
+        structure["structure"]["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("approximate"),
+        "{structure}"
+    );
 
     // Self-diff over one binary: the single function matches itself.
     let diff: Value = serde_json::from_str(tool_text(by_id[&29])).expect("diff json");

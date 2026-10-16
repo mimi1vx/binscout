@@ -116,6 +116,11 @@ pub enum Cmd {
     /// Control-flow graph of one function. Any address inside the function
     /// snaps to its containing entry.
     Cfg { binary: PathBuf, addr: String },
+    /// Approximate control-flow structure of one function: syntactic loops
+    /// and ifs over the CFG plus the IR lift, with an approximation
+    /// warning. Any address inside the function snaps to its containing
+    /// entry.
+    Structure { binary: PathBuf, addr: String },
     /// Transitive callees of one function: every function reachable by
     /// following call edges out to `--depth` hops. Any address inside the
     /// function snaps to its containing entry.
@@ -364,6 +369,7 @@ impl Cli {
             ),
             Cmd::Disasm { binary, addr, len } => disasm(&binary, db, raw_opts, &addr, len),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, &addr),
+            Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, &addr),
             Cmd::Callees {
                 binary,
                 addr,
@@ -663,6 +669,16 @@ fn cfg(
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw)?;
     p.cfg_of(binscout::parse_addr(addr)?)
+}
+
+fn structure(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    addr: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw)?;
+    p.structure_of(binscout::parse_addr(addr)?)
 }
 
 fn callees(

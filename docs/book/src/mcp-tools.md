@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 25 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 26 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
@@ -22,6 +22,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `block_insns` | binary, addr, block, offset?/limit? | That block's instructions in address order, under the page envelope; `block` must belong to the function |
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges; `inferred_edges` holds provenance-marked single-slot resolutions (raw-only, same-function) |
+| `structure` | binary, addr | Approximate control-flow structure of one function: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning; `addr` snaps to its containing function |
 | `callees` | binary, addr, depth?/offset?/limit? | Transitive callees out to `depth` hops (direct are depth 1), ordered by entry with shortest distance, under the page envelope; `addr` snaps to its containing function |
 | `callers` | binary, addr, depth?/offset?/limit? | Transitive callers out to `depth` hops, ordered by entry with shortest distance, under the page envelope; `addr` snaps to its containing function |
 | `slice` | binary, to, depth?/offset?/limit? | Backward slice of `to`: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `depth` hops (direct are depth 1), ordered by address with shortest distance, under the page envelope; any address is a valid root |
