@@ -1,0 +1,77 @@
+# cargo-deny configuration for binscout (cargo-deny 0.20 format).
+# Policy: pragmatic license allow-list, fail on vulnerabilities and yanked
+# crates, deny duplicate crate versions, crates.io-only sources.
+
+[advisories]
+# In cargo-deny 0.20 the old vulnerability/unsound/notice lint levels were
+# removed: those advisories always fail. Unmaintained advisories default to
+# failing on any match. Only yanked remains configurable.
+yanked = "deny"
+
+[licenses]
+# Exact set reported by `cargo deny list`. Every license in the graph is
+# allowed; any new license fails the check and needs an explicit addition.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "LGPL-2.1-or-later",
+  "MIT",
+  "NCSA",
+  "Unlicense",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+# syn 2 vs 3 is a major-version ecosystem split, not fixable by `cargo update`
+# (verified 2026-10-16: `cargo update --dry-run` locks 0 packages; all parents
+# already at latest). syn 2.0.119 enters via tracing-attributes 0.1.31 <-
+# tracing 0.1.44 <- rmcp 3.5.1 (plus windows-implement/windows-interface <-
+# windows-core <- iana-time-zone <- chrono on Windows targets, which cargo-deny
+# checks on all platforms). syn 3.0.9 enters via clap_derive/darling/serde/
+# thiserror/tokio-macros. Upstream tracing has merged the syn 3 bump
+# (tokio-rs/tracing#3594) but it is unreleased (0.1.31 still latest on
+# crates.io), and the windows-core chain is outside our control.
+# Revisit the skips after `cargo update` moves syn 2 out of the graph
+# (cargo-deny warns on unused skip entries).
+# Upstream: https://github.com/dtolnay/syn
+[[bans.skip]]
+name = "syn"
+version = "2"
+reason = "major-version split: tracing-attributes 0.1.31 (via rmcp) and windows-core chain still pin syn 2 while the rest of the graph is on syn 3; unresolvable by cargo update, revisit after upstream releases"
+
+[[bans.skip]]
+name = "syn"
+version = "3"
+reason = "major-version split: clap_derive/darling/serde/thiserror/tokio-macros ecosystem has moved to syn 3 while tracing/windows chains still pin syn 2; unresolvable by cargo update, revisit after upstream releases"
+
+
+# hashbrown 0.15 vs 0.17 is pinned by upstream crates, not fixable by
+# `cargo update` (verified 2026-10-16: `cargo update` locks 0 packages; both
+# parents already at latest). hashbrown 0.15.5 enters directly via petgraph
+# 0.8.3 <- binscout; hashbrown 0.17.1 enters via indexmap 2.14.2 <- petgraph
+# 0.8.3 and <- rmcp 3.5.1 <- binscout. The split is internal to petgraph's own
+# dependency set (direct hashbrown pin vs indexmap range), so only a petgraph
+# release unifying its hashbrown usage can converge them. Scoped to the two
+# exact versions (0.x minors are semver-major, a "0" line spec would overmatch).
+# Revisit after `cargo update` moves one hashbrown out of the graph
+# (cargo-deny warns on unused skip entries).
+# Upstream: https://github.com/petgraph/petgraph
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.15.5"
+reason = "blocked on upstream: petgraph 0.8.3 pins hashbrown 0.15 directly while indexmap 2.14.2 (via petgraph/rmcp) pulls hashbrown 0.17; unresolvable by cargo update, revisit after petgraph unifies its hashbrown usage"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.17.1"
+reason = "blocked on upstream: indexmap 2.14.2 (via petgraph 0.8.3/rmcp 3.5.1) pulls hashbrown 0.17 while petgraph pins hashbrown 0.15 directly; unresolvable by cargo update, revisit after petgraph unifies its hashbrown usage"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
