@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- BREAKING: `slice` address field renamed `to` -> `addr` (CLI positional `binscout slice B ADDR`, MCP `slice` param `addr`, `slice_page(addr)` / `slice_to(addr)`); no `to` alias is kept.
+- sidecar database now appends instead of replacing the extension (`foo.exe` -> `foo.exe.rsdbg.redb`), so same-named binaries with different extensions no longer share a sidecar; there is no fallback to the old path.
+
+### Added
+
+- select fat Mach-O slices with global `--fat-arch ARCH` (CLI) / `fat_arch` (MCP); fat inputs without it error listing the available archs.
+- resolve Mach-O `__stubs`/`__auth_stubs` entries to imports: stub functions carry import names and `symbols` import rows carry `address`/`address_hex` (conservative — unmapped imports stay null, never misattributed).
+- resolve ARM64 `adrp`+`add`/`ldr` pairs to the final address in xrefs (`Data`/`String`), IR rows (`target`), and pseudo-C (`// => 0x...`); the page-base xref row is retained.
+
 ## [0.5.1](https://github.com/mimi1vx/binscout/compare/v0.5.0...v0.5.1) - 2026-10-16
 
 ### Other
