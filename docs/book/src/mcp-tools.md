@@ -34,7 +34,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
-| `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears |
+| `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears; structured struct-layout hints (`type-hint:{...}`, see [JSON protocol](json-protocol.md)) pass through opaquely |
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address; scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |

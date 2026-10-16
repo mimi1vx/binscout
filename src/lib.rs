@@ -776,7 +776,12 @@ impl Project {
     /// Any address is commentable (instructions, functions, strings, data).
     /// An empty `comment` clears the comment. Persists immediately via a
     /// single-row transaction when the cached snapshot matches, else a full
-    /// snapshot rewrite.
+    /// snapshot rewrite. Structured struct-layout/sizeof hints also travel
+    /// through this channel: format them with
+    /// [`crate::annotations::format_type_hint`] (or store them directly
+    /// with [`Project::set_type_hint`]) and read them back with
+    /// [`Project::type_hint_at`]; they are never validated against the
+    /// binary.
     ///
     /// # Errors
     /// [`Error::Limit`] when the comment exceeds 8 KiB, [`Error::Storage`]
@@ -795,6 +800,39 @@ impl Project {
             self.annotations.remove(&addr);
         }
         self.persist_annotation(addr)
+    }
+
+    /// Store a structured struct-layout/sizeof hint at `addr`.
+    ///
+    /// Formats `hint` with [`crate::annotations::format_type_hint`] and
+    /// stores it as an ordinary comment, so the any-address contract, the
+    /// 8 KiB cap, the immediate persistence, and the export/import
+    /// round-trip all behave exactly like [`Project::set_comment`]. There
+    /// is no type system: the layout is a hint for agents, never checked
+    /// against the binary.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on hint shape violations,
+    /// [`Error::Limit`] when the formatted hint exceeds 8 KiB,
+    /// [`Error::Storage`] when the annotation cannot be persisted.
+    pub fn set_type_hint(&mut self, addr: u64, hint: &crate::annotations::TypeHint) -> Result<()> {
+        let comment = crate::annotations::format_type_hint(hint)?;
+        self.set_comment(addr, &comment)
+    }
+
+    /// Read back the structured hint at `addr`, if the comment carries one.
+    ///
+    /// `Ok(None)` when there is no annotation, no comment, or a plain
+    /// free-text comment; a corrupt hint (prefix present but unparsable)
+    /// is [`Error::Invalid`], never silent.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on a corrupt type-hint comment.
+    pub fn type_hint_at(&self, addr: u64) -> Result<Option<crate::annotations::TypeHint>> {
+        match self.annotation(addr).and_then(|a| a.comment.as_deref()) {
+            None => Ok(None),
+            Some(text) => crate::annotations::parse_type_hint(text),
+        }
     }
 
     /// Export renames and comments as a portable JSON interchange document.

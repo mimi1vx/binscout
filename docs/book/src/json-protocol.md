@@ -382,6 +382,20 @@ last row leaves the DB unchanged. Import returns merge counts:
 {"rows": 1, "changed": 0}
 ```
 
+### Type-hint comments (hint only, no type system)
+
+Struct-layout/`sizeof` metadata travels in the comment channel as a
+`type-hint:`-prefixed JSON comment, e.g.
+`type-hint:{"kind":"struct","name":"Foo","size":24,
+"fields":[{"name":"a","offset":0,"size":8}]}`. Hints store via
+`annotate --comment` / `comment` / `set_type_hint` under the same
+any-address, 8 KiB-cap rules as any comment, survive export/import as
+opaque strings, and are never validated against the binary: a wrong
+hint misleads exactly like a wrong free-text comment. Readers parse
+them with `annotations::parse_type_hint` / `Project::type_hint_at`;
+ordinary comments without the prefix decode to "no hint", never an
+error. Free text may follow the hint's first line.
+
 ### Inferred edges (single-slot resolver)
 
 One conservative indirect-jump pattern resolves to a real edge:

@@ -47,6 +47,9 @@ additionally requires its block to be a block start belonging to that
 function. `annotate` without flags reads; `--rename ""` clears
 the rename, omitting `--comment` leaves the comment alone. `rename` only
 accepts known function entries; `comment` accepts any address.
+Structured struct-layout hints (`type-hint:{...}`, see [JSON
+protocol](json-protocol.md)) pass through `--comment` opaquely, e.g.
+`--comment 'type-hint:{"kind":"struct","name":"Foo","size":24,"fields":[]}'`.
 
 `sections` rows carry `name`, `vaddr` (the flat virtual address the loader
 mapped the section at), `size` (in-memory bytes), `file_off`/`file_size`

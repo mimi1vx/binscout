@@ -75,6 +75,232 @@ pub struct AnnotationDocument {
     pub annotations: Vec<AnnotationRow>,
 }
 
+/// Marker prefix of a structured type-hint comment (see [`TypeHint`]).
+///
+/// A comment starting with this prefix carries JSON struct-layout/sizeof
+/// metadata after it; any other comment is plain free text. The hint stays
+/// an ordinary comment everywhere else: it counts against the same 8 KiB
+/// text cap, exports/imports as an opaque string through
+/// [`build_document`]/[`validate_document`], and is never enforced against
+/// the binary.
+pub const TYPE_HINT_PREFIX: &str = "type-hint:";
+
+/// Wire `kind` tag of [`TypeHint`] JSON; the only kind defined today.
+const TYPE_HINT_STRUCT_KIND: &str = "struct";
+
+/// One struct field of a [`TypeHint`]: byte `offset` and `size` within the
+/// struct. Overlapping fields are allowed (unions); each field's end must
+/// still lie within the struct size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeField {
+    /// Field name (non-empty).
+    pub name: String,
+    /// Byte offset of the field within the struct.
+    pub offset: u64,
+    /// Field size in bytes (non-zero).
+    pub size: u64,
+}
+
+/// Structured struct-layout/sizeof hint stored as a comment.
+///
+/// There is no type system: this is documentation for agents, formatted by
+/// [`format_type_hint`] into the comment channel (`comment` accepts any
+/// address, [`Project::set_type_hint`](crate::Project::set_type_hint))
+/// and read back with [`parse_type_hint`]. Nothing validates the layout
+/// against the binary; a wrong hint misleads exactly like a wrong
+/// free-text comment.
+///
+/// # Example
+///
+/// ```
+/// use binscout::annotations::{
+///     TypeField, TypeHint, build_document, format_type_hint, parse_document,
+///     parse_type_hint, sha256_hex, validate_document,
+/// };
+/// use binscout::db::{Annotation, StoredMapping};
+/// use std::collections::BTreeMap;
+///
+/// let hint = TypeHint {
+///     name: "Foo".to_string(),
+///     size: 24,
+///     fields: vec![
+///         TypeField { name: "a".to_string(), offset: 0, size: 8 },
+///         TypeField { name: "b".to_string(), offset: 8, size: 4 },
+///     ],
+/// };
+/// let comment = format_type_hint(&hint).expect("valid hint");
+/// assert_eq!(parse_type_hint(&comment).expect("parses"), Some(hint.clone()));
+///
+/// // The hint rides the comment channel through export/import unchanged.
+/// let bytes = b"fake-binary";
+/// let sha = sha256_hex(bytes);
+/// let mut annotations = BTreeMap::new();
+/// annotations.insert(
+///     0x1000u64,
+///     Annotation { name: None, comment: Some(comment.clone()) },
+/// );
+/// let text =
+///     build_document(&sha, bytes.len() as u64, &StoredMapping::Auto, &annotations)
+///         .expect("export");
+/// let doc = parse_document(&text).expect("parse");
+/// let changes = validate_document(
+///     &doc,
+///     &sha,
+///     bytes.len() as u64,
+///     &StoredMapping::Auto,
+///     &|_| false,
+///     &BTreeMap::new(),
+///     false,
+/// )
+/// .expect("valid");
+/// assert_eq!(changes.len(), 1);
+/// let back = changes[&0x1000u64].clone().expect("row stored");
+/// assert_eq!(
+///     parse_type_hint(back.comment.as_deref().expect("comment")).expect("parses"),
+///     Some(hint)
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeHint {
+    /// Struct name (non-empty).
+    pub name: String,
+    /// `sizeof` the struct in bytes (non-zero).
+    pub size: u64,
+    /// Field layouts; may be empty for an opaque struct with known size.
+    pub fields: Vec<TypeField>,
+}
+
+/// Wire form of [`TypeHint`]: the same shape plus the `kind` tag, so
+/// future hint kinds fail closed on parse instead of misdecoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WireHint {
+    kind: String,
+    name: String,
+    size: u64,
+    #[serde(default)]
+    fields: Vec<TypeField>,
+}
+
+impl From<&TypeHint> for WireHint {
+    fn from(h: &TypeHint) -> Self {
+        Self {
+            kind: TYPE_HINT_STRUCT_KIND.to_string(),
+            name: h.name.clone(),
+            size: h.size,
+            fields: h.fields.clone(),
+        }
+    }
+}
+
+/// Check a hint's shape: names, sizes, and field bounds.
+///
+/// Overlapping fields are allowed (unions); each field's checked end must
+/// lie within the struct size. Shape only: never consults the binary.
+///
+/// # Errors
+/// [`Error::Invalid`] on empty names, zero sizes, integer overflow, or a
+/// field ending past the struct size.
+fn check_hint_shape(hint: &TypeHint) -> Result<()> {
+    if hint.name.trim().is_empty() {
+        return Err(Error::Invalid(
+            "type hint needs a non-empty struct name".to_string(),
+        ));
+    }
+    if hint.size == 0 {
+        return Err(Error::Invalid(
+            "type hint needs a non-zero struct size".to_string(),
+        ));
+    }
+    for f in &hint.fields {
+        if f.name.trim().is_empty() {
+            return Err(Error::Invalid(
+                "type hint needs a non-empty field name".to_string(),
+            ));
+        }
+        if f.size == 0 {
+            return Err(Error::Invalid(format!(
+                "type hint field {:?} needs a non-zero size",
+                f.name
+            )));
+        }
+        let end = f.offset.checked_add(f.size).ok_or_else(|| {
+            Error::Invalid(format!(
+                "type hint field {:?} offset {:#x} plus size {:#x} overflows",
+                f.name, f.offset, f.size
+            ))
+        })?;
+        if end > hint.size {
+            return Err(Error::Invalid(format!(
+                "type hint field {:?} ends at {end} past struct size {}",
+                f.name, hint.size
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Format `hint` as a comment-channel string: [`TYPE_HINT_PREFIX`] plus
+/// compact JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`).
+///
+/// The result stores via
+/// [`Project::set_comment`](crate::Project::set_comment) (or
+/// [`Project::set_type_hint`](crate::Project::set_type_hint)) under the
+/// same any-address, 8 KiB-cap rules as any comment.
+///
+/// # Errors
+/// [`Error::Invalid`] on shape violations (see [`TypeHint`]);
+/// [`Error::Limit`] when the formatted hint exceeds
+/// [`MAX_ANNOTATION_BYTES`](crate::db::MAX_ANNOTATION_BYTES);
+/// [`Error::Storage`] on encoding failure.
+pub fn format_type_hint(hint: &TypeHint) -> Result<String> {
+    check_hint_shape(hint)?;
+    let wire = WireHint::from(hint);
+    let json = serde_json::to_string(&wire)
+        .map_err(|e| Error::Storage(format!("encode type hint: {e}")))?;
+    let text = format!("{TYPE_HINT_PREFIX}{json}");
+    if text.len() > db::MAX_ANNOTATION_BYTES {
+        return Err(Error::Limit(format!(
+            "type hint of {} bytes exceeds {}",
+            text.len(),
+            db::MAX_ANNOTATION_BYTES
+        )));
+    }
+    Ok(text)
+}
+
+/// Parse a comment that may carry a [`TypeHint`].
+///
+/// `None` (no error) for ordinary comments without the
+/// [`TYPE_HINT_PREFIX`]; trailing free text after the hint's first line
+/// (e.g. `format` output plus `"\nnoted by …"`) is ignored, so a hint and
+/// a human note coexist at one address.
+///
+/// # Errors
+/// [`Error::Invalid`] when the prefix is present but the JSON or the
+/// shape is bad (wrong `kind`, malformed JSON, failed [`TypeHint`]
+/// validation): a corrupt hint errors instead of decoding silently.
+pub fn parse_type_hint(comment: &str) -> Result<Option<TypeHint>> {
+    let Some(rest) = comment.strip_prefix(TYPE_HINT_PREFIX) else {
+        return Ok(None);
+    };
+    let first = rest.lines().next().unwrap_or("").trim();
+    let wire: WireHint = serde_json::from_str(first)
+        .map_err(|e| Error::Invalid(format!("malformed type hint: {e}")))?;
+    if wire.kind != TYPE_HINT_STRUCT_KIND {
+        return Err(Error::Invalid(format!(
+            "unsupported type hint kind {:?} (expected {TYPE_HINT_STRUCT_KIND:?})",
+            wire.kind
+        )));
+    }
+    let hint = TypeHint {
+        name: wire.name,
+        size: wire.size,
+        fields: wire.fields,
+    };
+    check_hint_shape(&hint)?;
+    Ok(Some(hint))
+}
+
 /// Import outcome: document rows seen and stored addresses changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportSummary {
