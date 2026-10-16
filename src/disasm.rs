@@ -911,6 +911,80 @@ fn arm_branch_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> 
     })
 }
 
+/// Final address of an `adrp` + `add`/`ldr` pair, if any.
+///
+/// `adrp` materializes only the 4K page base (see [`Insn::mem_target`]);
+/// the page offset rides in the next instruction, so the referenced address
+/// spans two instructions. Returns the `adrp` page plus the second
+/// instruction's immediate when `first` is an `adrp` with a decoded page
+/// base and `second` consumes the same register:
+///
+/// - `add <dst>, <base>, #<imm>` with exactly three operands (`<base>`
+///   equals the `adrp` destination; shifted forms such as `lsl #12` add a
+///   fourth operand and are rejected) and
+/// - `ldr <dst>, [<base>, #<imm>]`, plus the zero-offset `ldr <dst>,
+///   [<base>]` form (final address is the page itself).
+///
+/// The `add`/`ldr` destination may differ from the `adrp` register (e.g.
+/// `ldr w0, [x0, #..]`); only the consumed base register must match.
+/// Anything else (wrong mnemonics, register mismatch, unparseable
+/// immediates, missing page base) returns `None`; the function never
+/// guesses. Pairing (adjacency, same block) is the caller's job.
+pub(crate) fn resolve_adrp_pair(first: &Insn, second: &Insn) -> Option<u64> {
+    if first.mnem != "adrp" {
+        return None;
+    }
+    let page = first.mem_target?;
+    let base = first.ops.first()?;
+    match second.mnem.as_str() {
+        "add" => {
+            if second.ops.len() != 3 || second.ops[1] != *base {
+                return None;
+            }
+            let off = parse_hash_imm(&second.ops[2])?;
+            Some(page.wrapping_add(off))
+        }
+        "ldr" => {
+            if second.ops.len() == 2 {
+                let reg = second.ops[1].strip_prefix('[')?.strip_suffix(']')?;
+                if reg != base.as_str() {
+                    return None;
+                }
+                return Some(page);
+            }
+            if second.ops.len() != 3 {
+                return None;
+            }
+            let reg = second.ops[1].strip_prefix('[')?;
+            if reg.contains(['[', ']']) || reg != base.as_str() {
+                return None;
+            }
+            let off = parse_hash_imm(second.ops[2].strip_suffix(']')?)?;
+            Some(page.wrapping_add(off))
+        }
+        _ => None,
+    }
+}
+
+/// Strict `#`-immediate (`#0x10`, `#16`): anything else is `None`.
+fn parse_hash_imm(op: &str) -> Option<u64> {
+    let digits = op.strip_prefix('#')?;
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u64>().ok()
+    }
+}
+
 /// Decode exactly one ARMv7 instruction from the start of `bytes`
 /// (`thumb` selects the decoder mode), with the same decoder and the same
 /// [`armv7_insn`] conversion as [`disasm_armv7_partial`].
@@ -1352,5 +1426,73 @@ mod tests {
             .expect("rip-relative jmp decodes");
         assert_eq!(v[0].mem_target, Some(0x40000a));
         assert_eq!(v[0].table_base, None);
+    }
+
+    fn adrp_pair(bytes: &[u8], va: u64) -> Vec<Insn> {
+        disasm_aarch64(bytes, va, 8).expect("adrp pair must decode")
+    }
+
+    #[test]
+    fn adrp_add_pair_resolves_final_address() {
+        // adrp x0, #0 at 0x4000 (page 0x4000); add x0, x0, #0x10.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x40, 0x00, 0x91], 0x4000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].mem_target, Some(0x4000));
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x4010));
+        // Nonzero page: adrp x2, +0x1000 (page 0x5000); add x2, x2, #0x123.
+        let v = adrp_pair(&[0x02, 0x00, 0x00, 0xB0, 0x42, 0x8c, 0x04, 0x91], 0x4000);
+        assert_eq!(v[0].mem_target, Some(0x5000));
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x5123));
+        // Cross-destination add still resolves: add x1, x0, #0x10.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x01, 0x40, 0x00, 0x91], 0x4000);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x4010));
+    }
+
+    #[test]
+    fn adrp_ldr_pair_resolves_final_address() {
+        // adrp x0, #0 at 0x4000; ldr x0, [x0, #0x8].
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x04, 0x40, 0xF9], 0x4000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x4008));
+        // Zero-offset form (ldr x0, [x0]) resolves to the page itself.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x40, 0xF9], 0x4000);
+        assert_eq!(v[1].ops, ["x0", "[x0]"]);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x4000));
+        // Narrow-destination load resolves too: ldr x1, [x0, #0x10].
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x01, 0x08, 0x40, 0xF9], 0x4000);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), Some(0x4010));
+    }
+
+    #[test]
+    fn adrp_pair_rejects_non_pairs() {
+        // Register mismatch: adrp x0 but add x0, x1, #0x10.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x20, 0x40, 0x00, 0x91], 0x4000);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), None);
+        // Wrong second mnemonic: sub x0, x0, #0x10.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x40, 0x00, 0xD1], 0x4000);
+        assert_eq!(v[1].mnem, "sub");
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), None);
+        // Shifted add (lsl #12) changes the offset encoding: rejected.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x04, 0x40, 0x91], 0x4000);
+        assert_eq!(v[1].ops.len(), 4);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), None);
+        // First instruction is not adrp.
+        let v = adrp_pair(&[0x00, 0x40, 0x00, 0x91, 0x00, 0x40, 0x00, 0x91], 0x4000);
+        assert_eq!(resolve_adrp_pair(&v[0], &v[1]), None);
+        // Missing page base never resolves.
+        let v = adrp_pair(&[0x00, 0x00, 0x00, 0x90, 0x00, 0x40, 0x00, 0x91], 0x4000);
+        let mut no_page = v[0].clone();
+        no_page.mem_target = None;
+        assert_eq!(resolve_adrp_pair(&no_page, &v[1]), None);
+        // Unparseable immediates never resolve, never panic.
+        let mut bad_imm = v[1].clone();
+        bad_imm.ops[2] = "#zz".to_string();
+        assert_eq!(resolve_adrp_pair(&v[0], &bad_imm), None);
+        bad_imm.ops[2] = "x1".to_string();
+        assert_eq!(resolve_adrp_pair(&v[0], &bad_imm), None);
+        let mut bad_ldr = v[1].clone();
+        bad_ldr.mnem = "ldr".to_string();
+        bad_ldr.ops = vec!["x0".to_string(), "[x1".to_string(), "#0x8]".to_string()];
+        assert_eq!(resolve_adrp_pair(&v[0], &bad_ldr), None);
     }
 }

@@ -862,3 +862,24 @@ fn thumb_extended_lifts() {
         assert_eq!(v[0].warning, None, "{bytes:02x?}");
     }
 }
+
+#[test]
+fn arm_adrp_add_pair_second_row_carries_final_address() {
+    // adrp x0, #0 at 0x4000 (page 0x4000); add x0, x0, #0x10 => 0x4010.
+    let bytes = [0x00, 0x00, 0x00, 0x90, 0x00, 0x40, 0x00, 0x91];
+    let insns = disasm_range(Arch::Aarch64, &bytes, 0x4000, 100).expect("pair decodes");
+    assert_eq!(insns.len(), 2);
+    let v = lift_range(Arch::Aarch64, &insns);
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0].op, IrOp::Copy);
+    assert_eq!(v[0].target, None);
+    assert_eq!(v[1].op, IrOp::Add);
+    assert_eq!(v[1].target, Some(0x4010));
+    assert_eq!(v[1].warning, None);
+    // Unresolvable pair keeps current behavior: mismatched base leaves no target.
+    let bad = [0x00, 0x00, 0x00, 0x90, 0x20, 0x40, 0x00, 0x91];
+    let insns = disasm_range(Arch::Aarch64, &bad, 0x4000, 100).expect("pair decodes");
+    let v = lift_range(Arch::Aarch64, &insns);
+    assert_eq!(v[1].op, IrOp::Add);
+    assert_eq!(v[1].target, None);
+}

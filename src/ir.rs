@@ -206,7 +206,7 @@
 //! (see [`crate::addr_hex`]).
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{Arch, Insn};
+use crate::disasm::{Arch, Insn, resolve_adrp_pair};
 
 /// Minimal P-code-inspired operation set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -402,9 +402,28 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
 }
 
 /// Lift a decoded range, preserving order.
+///
+/// AArch64 pairs thread the immediate predecessor so an `adrp`+`add`/`ldr`
+/// second row carries its resolved address (see
+/// [`lift_aarch64_with_prev`]); every other arch lifts each instruction
+/// independently.
 #[must_use]
 pub fn lift_range(arch: Arch, insns: &[Insn]) -> Vec<IrInsn> {
-    insns.iter().flat_map(|i| lift(arch, i)).collect()
+    if arch != Arch::Aarch64 {
+        return insns.iter().flat_map(|i| lift(arch, i)).collect();
+    }
+    let mut out = Vec::new();
+    for (idx, insn) in insns.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|p| insns.get(p));
+        let mut rows = lift_aarch64_with_prev(insn, prev);
+        if let [row] = rows.as_mut_slice()
+            && row.warning.is_none()
+        {
+            row.effects.sp_delta = sp_delta_for(arch, insn);
+        }
+        out.extend(rows);
+    }
+    out
 }
 
 /// Whether `mnem` has a lift mapping for `arch`.
@@ -992,8 +1011,20 @@ pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
 /// Lift one AArch64 instruction.
 #[must_use]
 pub fn lift_aarch64(insn: &Insn) -> Vec<IrInsn> {
+    lift_aarch64_with_prev(insn, None)
+}
+
+/// Lift one AArch64 instruction with its immediate predecessor, if any.
+///
+/// When `prev` ends where `insn` begins and the two form an
+/// adrp+add/ldr pair resolving to a final address, the second row's
+/// `target` carries that address; otherwise the row is identical to
+/// [`lift_aarch64`]. Nonadjacent or unresolvable pairs keep current
+/// behavior exactly.
+#[must_use]
+pub fn lift_aarch64_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
     let mnem = insn.mnem.as_str();
-    let (op, inputs, outputs, target) = match mnem {
+    let (op, inputs, outputs, mut target) = match mnem {
         s if is_arm_copy(s) => first_out_rest_in(insn, IrOp::Copy),
         s if is_arm_load(s) => first_out_rest_in(insn, IrOp::Load),
         s if is_arm_store(s) => (IrOp::Store, insn.ops.clone(), Vec::new(), None),
@@ -1020,6 +1051,13 @@ pub fn lift_aarch64(insn: &Insn) -> Vec<IrInsn> {
         s if is_arm_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
         _ => return unlifted(insn),
     };
+    if target.is_none()
+        && let Some(first) = prev
+        && first.addr.wrapping_add(u64::from(first.size)) == insn.addr
+        && let Some(resolved) = resolve_adrp_pair(first, insn)
+    {
+        target = Some(resolved);
+    }
     let sets_flags = matches!(op, IrOp::Add | IrOp::Sub | IrOp::Cmp) && arm_sets_flags(mnem);
     vec![IrInsn {
         addr: insn.addr,
@@ -2398,6 +2436,29 @@ mod tests {
         let v = lift_aarch64(&insn("mrs", &["x0", "tpidr_el0"]));
         assert_eq!(v[0].op, IrOp::Nop);
         assert!(v[0].warning.is_some());
+    }
+
+    #[test]
+    fn arm_adrp_add_pair_second_row_carries_final_address() {
+        let mut first = insn("adrp", &["x0", "#0x0"]);
+        first.addr = 0x4000;
+        first.size = 4;
+        first.mem_target = Some(0x4000);
+        let mut second = insn("add", &["x0", "x0", "#0x10"]);
+        second.addr = 0x4004;
+        second.size = 4;
+        let v = lift_aarch64_with_prev(&second, Some(&first));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].op, IrOp::Add);
+        assert_eq!(v[0].target, Some(0x4010));
+        // Single lift keeps current behavior exactly.
+        let v = lift_aarch64(&second);
+        assert_eq!(v[0].target, None);
+        // Nonadjacent pairs never resolve.
+        let mut gapped = second.clone();
+        gapped.addr = 0x4008;
+        let v = lift_aarch64_with_prev(&gapped, Some(&first));
+        assert_eq!(v[0].target, None);
     }
 
     #[test]

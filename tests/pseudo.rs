@@ -183,6 +183,63 @@ fn branch_fixture_renders_both_sides() {
 }
 
 #[test]
+fn adrp_add_pair_annotates_final_address() {
+    // adrp x0, #0 at 0x4000 (page 0x4000); add x0, x0, #0x10; ret.
+    let blob = vec![
+        0x00, 0x00, 0x00, 0x90, // adrp x0, #0
+        0x00, 0x40, 0x00, 0x91, // add x0, x0, #0x10
+        0xC0, 0x03, 0x5F, 0xD6, // ret
+    ];
+    let base = 0x4000;
+    let a = binscout::analysis::analyze_raw(&blob, base, Arch::Aarch64, Some(base))
+        .expect("adrp pair analyzes");
+    let func = a.functions.get(&base).expect("entry");
+    let rendered = render_function(Arch::Aarch64, func);
+    let add_line = rendered
+        .lines
+        .iter()
+        .find(|l| l.addr == base + 4)
+        .expect("add line");
+    assert!(
+        add_line.text.ends_with("// => 0x4010"),
+        "add line carries the final address: {}",
+        add_line.text
+    );
+    assert!(rendered.text.contains("// => 0x4010"), "{}", rendered.text);
+    let adrp_line = rendered
+        .lines
+        .iter()
+        .find(|l| l.addr == base)
+        .expect("adrp line");
+    assert!(
+        !adrp_line.text.contains("// =>"),
+        "adrp line itself is unannotated: {}",
+        adrp_line.text
+    );
+}
+
+#[test]
+fn nonadjacent_adrp_pair_renders_without_annotation() {
+    // Same pair with a nop between: adjacency is required, so no suffix.
+    let blob = vec![
+        0x00, 0x00, 0x00, 0x90, // adrp x0, #0
+        0x1F, 0x20, 0x03, 0xD5, // nop
+        0x00, 0x40, 0x00, 0x91, // add x0, x0, #0x10
+        0xC0, 0x03, 0x5F, 0xD6, // ret
+    ];
+    let base = 0x4000;
+    let a = binscout::analysis::analyze_raw(&blob, base, Arch::Aarch64, Some(base))
+        .expect("split pair analyzes");
+    let func = a.functions.get(&base).expect("entry");
+    let rendered = render_function(Arch::Aarch64, func);
+    assert!(
+        !rendered.text.contains("// =>"),
+        "unresolvable pairs render exactly as before: {}",
+        rendered.text
+    );
+}
+
+#[test]
 fn project_snaps_and_stays_read_only() {
     let dir = tmpdir("pseudo-pages");
     let bin = write_bin(&dir, "loop.bin", &loop_blob());

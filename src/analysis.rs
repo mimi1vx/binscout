@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{Arch, Insn};
+use crate::disasm::{Arch, Insn, resolve_adrp_pair};
 use crate::error::{Error, Result};
 use crate::ir::IrOp;
 use crate::loader::strings::{self, Encoding, StringHit};
@@ -2809,6 +2809,21 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             && space.contains(m)
         {
             xrefs.insert((va, XrefKind::Data, m));
+        }
+    }
+    // ARM64 `adrp` decodes to its 4K page base; the page offset rides in
+    // the next instruction (`add`/`ldr`). Where an adjacent same-block
+    // pair resolves, the second instruction references the final address
+    // too; the page-base row above is retained as the strict fallback.
+    for f in functions.values() {
+        for block in f.blocks.values() {
+            for pair in block.insns.windows(2) {
+                if let Some(final_addr) = resolve_adrp_pair(&pair[0], &pair[1])
+                    && space.contains(final_addr)
+                {
+                    xrefs.insert((pair[1].addr, XrefKind::Data, final_addr));
+                }
+            }
         }
     }
     for (site, target) in &jumps.pairs {

@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Function;
-use crate::disasm::Arch;
+use crate::disasm::{Arch, Insn, resolve_adrp_pair};
 use crate::ir::{IrInsn, IrOp};
 
 /// Approximate per-function pseudo-C warning.
@@ -148,16 +148,39 @@ pub fn render_rows(rows: &[IrInsn]) -> PseudoRender {
 /// Render one function's pseudo-C: blocks in ascending start order, each
 /// instruction lifted for `arch` (see [`crate::ir::lift`]) and rendered.
 ///
+/// An `add`/`ldr` immediately following its `adrp` in the same block keeps
+/// the pair's resolved final address as a `// => 0x...` suffix on its line;
+/// anything else renders unchanged.
+///
 /// Pure read-only pass; inferred single-slot edges never participate.
 #[must_use]
 pub fn render_function(arch: Arch, func: &Function) -> PseudoRender {
-    let mut rows = Vec::new();
+    let mut lines = Vec::new();
     for block in func.blocks.values() {
+        let mut prev: Option<&Insn> = None;
         for insn in &block.insns {
-            rows.extend(crate::ir::lift(arch, insn));
+            let resolved = prev.and_then(|p| resolve_adrp_pair(p, insn));
+            for row in crate::ir::lift(arch, insn) {
+                let mut line = render_one(&row);
+                if let Some(addr) = resolved {
+                    line.text
+                        .push_str(&format!(" // => {}", crate::addr_hex(addr)));
+                }
+                lines.push(line);
+            }
+            prev = Some(insn);
         }
     }
-    render_rows(&rows)
+    let text = lines
+        .iter()
+        .map(|l| format!("{:#x}: {}", l.addr, l.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    PseudoRender {
+        lines,
+        text,
+        warning: PSEUDO_WARNING.to_string(),
+    }
 }
 
 fn render_copy(row: &IrInsn) -> String {

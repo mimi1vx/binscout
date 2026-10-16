@@ -125,6 +125,44 @@ fn arm64_adr_reports_data_target() {
 }
 
 #[test]
+fn arm64_adrp_add_pair_links_string_at_final_address() {
+    // adrp x0, #0 at 0x4000 (page 0x4000); add x0, x0, #0x10; ret; nop;
+    // "hello!\0" at 0x4010. The pair resolves to the string start while
+    // the page-base row is retained.
+    let mut b = vec![
+        0x00, 0x00, 0x00, 0x90, // adrp x0, #0
+        0x00, 0x40, 0x00, 0x91, // add x0, x0, #0x10
+        0xC0, 0x03, 0x5F, 0xD6, // ret
+        0x1F, 0x20, 0x03, 0xD5, // nop (padding to 0x4010)
+    ];
+    b.extend(*b"hello!\0");
+    let va = 0x4000u64;
+    assert_eq!(va + b.len() as u64, 0x4017);
+    let a = analyze_raw(&b, va, Arch::Aarch64, Some(va)).expect("arm blob analyzes");
+    assert!(
+        a.strings
+            .iter()
+            .any(|h| h.value == "hello!" && h.vaddr == Some(0x4010)),
+        "string at the pair final address: {:?}",
+        a.strings
+    );
+    let data = a.xrefs_page(Some(XrefKind::Data), 0, 64);
+    assert!(
+        data.iter().any(|x| x.from == 0x4004 && x.to == 0x4010),
+        "pair final address from the add: {data:?}"
+    );
+    assert!(
+        data.iter().any(|x| x.from == 0x4000 && x.to == 0x4000),
+        "page-base row retained: {data:?}"
+    );
+    let srefs = a.xrefs_page(Some(XrefKind::String), 0, 64);
+    assert!(
+        srefs.iter().any(|x| x.from == 0x4004 && x.to == 0x4010),
+        "string ref follows the pair Data xref: {srefs:?}"
+    );
+}
+
+#[test]
 fn arm32_bl_discovers_callee() {
     // bl 0x5008 | bx lr | bx lr
     let b = vec![
