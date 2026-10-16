@@ -9,7 +9,7 @@ Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
 $ binscout load tests/fixtures/raw-x64.bin
-{"analysis_revision":4,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.4.0","xrefs":0}
+{"analysis_revision":4,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.4.0","xrefs":0}
 ```
 
 `mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto

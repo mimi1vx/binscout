@@ -94,12 +94,15 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Sidecar DB path for a binary: `foo.bin` -> `foo.rsdbg.redb`.
+/// Sidecar DB path for a binary: `foo.exe` -> `foo.exe.rsdbg.redb`.
+///
+/// Appends `.rsdbg.redb` to the full file name so `foo.exe` and `foo.dll`
+/// never share a sidecar. There is no fallback to the old colliding path.
 #[must_use]
 pub fn default_db_path(binary: &Path) -> PathBuf {
-    let mut p = binary.to_path_buf();
-    p.set_extension("rsdbg.redb");
-    p
+    let mut s = binary.as_os_str().to_owned();
+    s.push(".rsdbg.redb");
+    PathBuf::from(s)
 }
 
 /// Size of the project DB file in bytes.
@@ -1641,6 +1644,30 @@ mod tests {
                 comment: Some("c".to_string()),
             }
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn default_db_path_appends_suffix() {
+        assert_eq!(
+            default_db_path(Path::new("foo.exe")),
+            PathBuf::from("foo.exe.rsdbg.redb")
+        );
+        assert_eq!(
+            default_db_path(Path::new("foo.dll")),
+            PathBuf::from("foo.dll.rsdbg.redb")
+        );
+        assert_ne!(
+            default_db_path(Path::new("foo.exe")),
+            default_db_path(Path::new("foo.dll"))
+        );
+        assert_eq!(
+            default_db_path(Path::new("ls.arm64e")),
+            PathBuf::from("ls.arm64e.rsdbg.redb")
+        );
+        assert_eq!(
+            default_db_path(Path::new("prog")),
+            PathBuf::from("prog.rsdbg.redb")
         );
     }
 }
