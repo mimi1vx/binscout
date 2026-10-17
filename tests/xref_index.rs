@@ -30,6 +30,9 @@ fn test_insn(addr: u64) -> Insn {
         mem_target: None,
         table_base: None,
         import: None,
+        target_name: None,
+        comment: None,
+        string: None,
     }
 }
 
