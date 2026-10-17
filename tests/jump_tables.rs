@@ -918,3 +918,44 @@ fn fresh_save_and_reopen_agree_on_inferred_edges() {
     );
     common::cleanup(&dir);
 }
+
+#[test]
+fn many_register_indirect_sites_visit_once_each() {
+    // rsdbg-5tk.2: `jmp rax` carries no typed slot, so no site can resolve.
+    // Resolution must visit each site once (worklist), not rescan all
+    // diagnostics per site (O(J*D): 20k sites took 5.75 s release). Each
+    // `push rbp; mov rbp,rsp; jmp rax` frame seeds one function via the
+    // prologue scan, yielding one unresolved site per frame.
+    const SITES: usize = 20_000;
+    const BASE: u64 = 0x400000;
+    let mut bytes = Vec::with_capacity(SITES * 6);
+    for _ in 0..SITES {
+        bytes.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0xff, 0xe0]);
+    }
+    let start = std::time::Instant::now();
+    let a = x64(&bytes, BASE, Some(BASE));
+    let elapsed = start.elapsed();
+    assert_eq!(a.functions.len(), SITES);
+    assert_eq!(
+        diagnostics_of(&a)
+            .iter()
+            .filter(|(_, k)| *k == DiagnosticKind::UnresolvedIndirectJump)
+            .count(),
+        SITES
+    );
+    assert!(inferred_of(&a).is_empty());
+    assert!(!a.diagnostics.inferred_truncated);
+    assert_eq!(a.diagnostics.inferred_omitted, 0);
+    // Complexity guard, not a benchmark: debug builds run an order of
+    // magnitude slower, so each profile gets its own budget. Pre-fix this
+    // took 5.75 s release (18 s at 40k); post-fix it tracks the
+    // ret/call-rax control at ~0.2 s release.
+    #[cfg(debug_assertions)]
+    let budget = std::time::Duration::from_secs(30);
+    #[cfg(not(debug_assertions))]
+    let budget = std::time::Duration::from_secs(1);
+    assert!(
+        elapsed < budget,
+        "20k unresolvable sites took {elapsed:?} (budget {budget:?})"
+    );
+}

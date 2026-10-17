@@ -2052,8 +2052,14 @@ impl<'a> Walker<'a> {
     /// jump/call sites. Valid termination (`Return`) and fallthrough record
     /// nothing. Unmapped queued addresses record nothing: they end that
     /// path, they are not decode failures.
-    fn run(&mut self, seeds: Vec<u64>) -> Result<()> {
+    ///
+    /// Returns the newly recorded [`DiagnosticKind::UnresolvedIndirectJump`]
+    /// sites (re-inserts of already-known sites are not repeated), so
+    /// [`resolve_indirect_jumps`] can queue continuations without rescanning
+    /// the whole diagnostic set.
+    fn run(&mut self, seeds: Vec<u64>) -> Result<Vec<u64>> {
         let mut stack = seeds;
+        let mut fresh_jumps: Vec<u64> = Vec::new();
         while let Some(va) = stack.pop() {
             if self.decoded.contains_key(&va) {
                 continue;
@@ -2081,10 +2087,12 @@ impl<'a> Walker<'a> {
             let flow = classify(self.arch, &insn);
             match flow {
                 Flow::Branch { target: None } | Flow::CBranch { target: None } => {
-                    self.diagnostics.insert(Diagnostic {
+                    if self.diagnostics.insert(Diagnostic {
                         addr: va,
                         kind: DiagnosticKind::UnresolvedIndirectJump,
-                    });
+                    }) {
+                        fresh_jumps.push(va);
+                    }
                 }
                 Flow::Call { target: None } => {
                     self.diagnostics.insert(Diagnostic {
@@ -2124,7 +2132,7 @@ impl<'a> Walker<'a> {
             }
             self.decoded.insert(va, Decoded { insn, flow });
         }
-        Ok(())
+        Ok(fresh_jumps)
     }
 }
 
@@ -2163,6 +2171,28 @@ struct InferredJumps {
     truncated: bool,
     /// Sites skipped by the edge budget (each keeps its diagnostic).
     omitted: usize,
+}
+
+/// Slot width for indirect-jump resolution, or `None` when the resolvers
+/// cannot apply.
+///
+/// Single gate shared by [`resolve_indirect_site`], [`resolve_table_site`],
+/// and [`resolve_indirect_jumps`]: only raw x86 mappings have known-final
+/// slot values in an approved shape (x86-32 absolute slots are 4 bytes,
+/// x86-64 RIP-relative slots 8; other arches report no typed slot, and
+/// container slot values are not final until relocations apply, which never
+/// happens to segment bytes). The resolvers take the width from here and
+/// [`resolve_indirect_jumps`] skips its scan via `is_none`, so the gate
+/// cannot drift from the checks.
+fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
+    if format != BinaryFormat::Raw {
+        return None;
+    }
+    match arch {
+        Arch::X86_32 => Some(4),
+        Arch::X86_64 => Some(8),
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => None,
+    }
 }
 
 /// Check one `UnresolvedIndirectJump` site against the single-slot absolute
@@ -2206,14 +2236,7 @@ fn resolve_indirect_site(
         return None;
     }
     let slot = found.insn.mem_target?;
-    let width: usize = match arch {
-        Arch::X86_32 => 4,
-        Arch::X86_64 => 8,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
-    };
-    if format != BinaryFormat::Raw {
-        return None;
-    }
+    let width = indirect_slot_width(arch, format)?;
     let raw = space.file_bytes_at(slot, width)?;
     let target = match width {
         4 => u64::from(u32::from_le_bytes(raw.try_into().ok()?)),
@@ -2280,14 +2303,7 @@ fn resolve_table_site(
         return None;
     }
     let base = found.insn.table_base?;
-    let width: usize = match arch {
-        Arch::X86_32 => 4,
-        Arch::X86_64 => 8,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
-    };
-    if format != BinaryFormat::Raw {
-        return None;
-    }
+    let width = indirect_slot_width(arch, format)?;
     if entries.is_empty() {
         return None;
     }
@@ -2380,12 +2396,16 @@ fn table_slot_target(
 /// [`resolve_table_site`]; a pass decodes each target's continuation with
 /// the existing [`Walker::run`] (so case bodies decode normally) and
 /// registers the targets for block splitting. Continuation decoding can
-/// surface further indirect sites, which join the same ascending pass.
+/// surface further indirect sites, which join the same ascending worklist.
 /// Single-slot sites contribute at most one edge
 /// ([`MAX_INFERRED_PER_SITE`], singleton by construction); table sites
 /// contribute up to [`MAX_TABLE_ENTRIES_PER_SITE`] unique edges. Past
 /// `max_edges` (normally [`MAX_INFERRED_EDGES`]) sites stay unresolved
 /// with `truncated` set and each omission counted, never silently clipped.
+///
+/// Non-raw and non-x86 binaries return empty immediately via
+/// [`indirect_slot_width`]: no site could resolve, so the diagnostic scan is
+/// skipped entirely rather than visiting every site once per pass.
 ///
 /// # Errors
 /// [`Error::Limit`] when continuation decoding exceeds the analysis
@@ -2400,18 +2420,27 @@ fn resolve_indirect_jumps(
 ) -> Result<InferredJumps> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     let mut slots: Vec<(u64, u64)> = Vec::new();
+    if indirect_slot_width(arch, format).is_none() {
+        return Ok(InferredJumps {
+            pairs,
+            slots,
+            truncated: false,
+            omitted: 0,
+        });
+    }
     let mut processed: BTreeSet<u64> = BTreeSet::new();
-    let mut truncated = false;
-    let mut omitted: usize = 0;
-    while let Some(site) = walk
+    // Ascending worklist (the old scan's `next()` pick was the smallest
+    // unprocessed address): one initial pass over diagnostics, then only
+    // the newly surfaced sites each continuation `run` reports.
+    let mut pending: BTreeSet<u64> = walk
         .diagnostics
         .iter()
-        .filter(|d| {
-            d.kind == DiagnosticKind::UnresolvedIndirectJump && !processed.contains(&d.addr)
-        })
+        .filter(|d| d.kind == DiagnosticKind::UnresolvedIndirectJump)
         .map(|d| d.addr)
-        .next()
-    {
+        .collect();
+    let mut truncated = false;
+    let mut omitted: usize = 0;
+    while let Some(site) = pending.pop_first() {
         // Each site contributes at most one single-slot edge, or one table
         // row set; the check returns at most one resolution per visit and
         // the processed set keeps sites single-visit.
@@ -2426,7 +2455,11 @@ fn resolve_indirect_jumps(
                 continue;
             }
             pairs.push((site, target));
-            walk.run(vec![target])?;
+            for fresh in walk.run(vec![target])? {
+                if !processed.contains(&fresh) {
+                    pending.insert(fresh);
+                }
+            }
             walk.jump_targets.insert(target);
         } else if let Some(table) =
             resolve_table_site(arch, format, space, &walk.decoded, entries, site)
@@ -2444,7 +2477,11 @@ fn resolve_indirect_jumps(
             for slot in &table.slots {
                 slots.push((site, *slot));
             }
-            walk.run(table.targets)?;
+            for fresh in walk.run(table.targets)? {
+                if !processed.contains(&fresh) {
+                    pending.insert(fresh);
+                }
+            }
         }
     }
     // Unique by construction: single-slot sites resolve once, table
