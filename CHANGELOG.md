@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/mimi1vx/binscout/compare/v0.6.0...v0.7.0) - 2026-10-17
+
+### Added
+
+- name ELF PLT and PE IAT import call sites with import xrefs
+- seed and name functions from object symbol tables
+
+### Fixed
+
+- document FuncRow.name as rename-resolved
+- scope arch-less FLIRT signatures to x86
+- handle EPIPE on stdout without panicking
+- ARM32 Load/Store IR I/O split and bracket-aware split_asm
+- count diff summary before truncation
+- make annotate rename+comment atomic
+- repair merge resolutions for MCP cache and ARM seed work
+- ARM32 pc-writes, Thumb IT blocks, Thumb-bit seeds
+- mask ARM Thumb interworking bit on entry and export seeds
+- predicate Thumb terminators inside IT blocks
+- treat ARM32 writes to pc as control flow
+- resolve indirect jumps from a worklist with a shared gate
+- reject --db paths resolving to the analyzed binary
+- scale ARM blx immediates as halfwords and align Thumb PC
+- lift AArch64 pointer-auth branches and returns
+- strip CET/MPX/HLE prefix words so x86 branches lift correctly
+
+### Other
+
+- cache MCP project opens in a 4-entry LRU with per-sidecar locks
+- cache MCP project opens in a 4-entry LRU with per-sidecar locks
+- apply cargo fmt to ARM control-flow fixes
+
 ## [0.6.0](https://github.com/mimi1vx/binscout/compare/v0.5.1...v0.6.0) - 2026-10-16
 
 ### Added
