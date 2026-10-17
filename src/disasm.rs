@@ -83,8 +83,10 @@ pub struct Insn {
     /// Absolute target for direct branches/calls, if any.
     pub branch_target: Option<u64>,
     /// Absolute address of a data access, if any: x86 RIP-relative memory
-    /// operands, x86-32 absolute immediates and displacements
-    /// (`push 0x402100`, `mov eax, [0x403000]`), AArch64
+    /// operands, x86 absolute immediates and displacements (32-bit
+    /// `push 0x402100`, `mov eax, [0x403000]`; 64-bit non-PIE
+    /// `mov edi, <str>` = `bf imm32`, `mov eax, [abs32]`, `lea` with
+    /// disp32), AArch64
     /// `adr`/`adrp`/literal loads, and ARM32/Thumb PC-relative literal
     /// loads (`ldr r0, [pc, ...]`).
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
@@ -693,8 +695,7 @@ fn x86_insn(
         .then(|| insn.ip_rel_memory_address());
     let mem_target = match mem_target {
         Some(_) => mem_target,
-        None if bitness == 32 => absolute_target32(insn),
-        None => None,
+        None => absolute_target(bitness, insn),
     };
     let table_base = table_base_for(bitness, insn);
     Insn {
@@ -801,26 +802,35 @@ fn table_base_for(bitness: u32, insn: &Instruction) -> Option<u64> {
     None
 }
 
-/// Absolute data address referenced by a 32-bit x86 instruction, if any.
+/// Absolute data address referenced by an x86 instruction, if any.
 ///
 /// 32-bit code addresses data absolutely (`push 0x402100`,
-/// `mov eax, 0x403000`, `mov eax, [0x403000]`); 64-bit code uses
-/// RIP-relative operands instead (handled by the caller), so 64-bit
-/// immediates are never reported here. Absolute memory operands win over
+/// `mov eax, 0x403000`, `mov eax, [0x403000]`); 64-bit non-PIE code does
+/// the same (`mov edi, <str>` = `bf imm32`, `mov eax, [abs32]`, `lea`
+/// with disp32) while PIE code uses RIP-relative operands instead
+/// (handled by the caller). Absolute memory operands win over
 /// immediates: in `mov [0x403000], 0x1` the store slot is the reference,
-/// not the stored constant.
-fn absolute_target32(insn: &Instruction) -> Option<u64> {
+/// not the stored constant. Small constants report here too (e.g.
+/// `mov eax, 0` reports `Some(0)`); the analysis layer filters
+/// unmapped targets, so only mapped addresses become data/string xrefs.
+fn absolute_target(bitness: u32, insn: &Instruction) -> Option<u64> {
     for op in 0..insn.op_count() {
         if insn.op_kind(op) == OpKind::Memory
             && insn.memory_base() == Register::None
             && insn.memory_index() == Register::None
         {
-            return Some(u64::from(insn.memory_displacement32()));
+            return Some(match bitness {
+                32 => u64::from(insn.memory_displacement32()),
+                _ => insn.memory_displacement64(),
+            });
         }
     }
     for op in 0..insn.op_count() {
         if insn.op_kind(op) == OpKind::Immediate32 {
             return Some(u64::from(insn.immediate32()));
+        }
+        if insn.op_kind(op) == OpKind::Immediate32to64 {
+            return u64::try_from(insn.immediate32to64()).ok();
         }
     }
     None
@@ -1398,11 +1408,43 @@ mod tests {
     }
 
     #[test]
-    fn x86_64_push_imm32_is_not_a_data_ref() {
-        // Same bytes in 64-bit mode: a sign-extended constant, not an address.
+    fn x86_64_push_imm32_reports_mem_target() {
+        // Same bytes in 64-bit non-PIE mode: an absolute address.
+        // Unmapped small constants are filtered downstream by the
+        // analysis mapped check, not here.
         let v = disasm_x86(&[0x68, 0x00, 0x21, 0x40, 0x00], 0x401003, 8, 64).expect("push decodes");
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].mem_target, None);
+        assert_eq!(v[0].mem_target, Some(0x402100));
+    }
+
+    #[test]
+    fn x86_64_mov_edi_imm32_reports_mem_target() {
+        // mov edi, 0x402000 at 0x400000: the non-PIE string-arg shape.
+        let v = disasm_x86(&[0xBF, 0x00, 0x20, 0x40, 0x00], 0x400000, 8, 64)
+            .expect("mov imm32 decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mnem, "mov");
+        assert_eq!(v[0].mem_target, Some(0x402000));
+        assert_eq!(v[0].branch_target, None);
+    }
+
+    #[test]
+    fn x86_64_mov_abs_mem_reports_mem_target() {
+        // mov edi, [0x402000] at 0x400000: SIB disp32 absolute load.
+        let v = disasm_x86(&[0x8B, 0x3C, 0x25, 0x00, 0x20, 0x40, 0x00], 0x400000, 8, 64)
+            .expect("abs load decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mem_target, Some(0x402000));
+    }
+
+    #[test]
+    fn x86_64_lea_disp32_reports_mem_target() {
+        // lea edi, [0x402000] at 0x400000: SIB disp32 absolute address.
+        let v = disasm_x86(&[0x8D, 0x3C, 0x25, 0x00, 0x20, 0x40, 0x00], 0x400000, 8, 64)
+            .expect("lea decodes");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mnem, "lea");
+        assert_eq!(v[0].mem_target, Some(0x402000));
     }
 
     #[test]
