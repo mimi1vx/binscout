@@ -6,7 +6,7 @@
 //! mnemonic carries a condition suffix). Otherwise the walker falls through
 //! into literal pools and jump tables, decoding data as code.
 
-use binscout::analysis::{analyze_raw, DiagnosticKind};
+use binscout::analysis::{DiagnosticKind, analyze_raw};
 use binscout::disasm::Arch;
 
 fn arm32(bytes: &[u8], base: u64) -> binscout::analysis::Analysis {

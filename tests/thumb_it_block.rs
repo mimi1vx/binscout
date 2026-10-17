@@ -4,7 +4,7 @@
 //! predicated (conditional return), so the tail stays reachable. A stateless
 //! decode sees an unconditional `bx lr` and truncates the function.
 
-use binscout::analysis::{analyze_raw, DiagnosticKind};
+use binscout::analysis::{DiagnosticKind, analyze_raw};
 use binscout::disasm::Arch;
 
 #[test]

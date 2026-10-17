@@ -2417,8 +2417,10 @@ fn is_arm32_call(s: &str) -> bool {
 /// Whether `s` is an ARM32 branch mnemonic handled by [`lift_arm32`]'s
 /// explicit control-flow arms (never a `pc`-writing data instruction).
 fn is_arm32_branch(s: &str) -> bool {
-    matches!(s, "b" | "bl" | "blx" | "bx" | "cbz" | "cbnz" | "tbb" | "tbh")
-        || is_arm32_call(s)
+    matches!(
+        s,
+        "b" | "bl" | "blx" | "bx" | "cbz" | "cbnz" | "tbb" | "tbh"
+    ) || is_arm32_call(s)
 }
 
 /// Whether `s` is a load-multiple covered by the `pop`/`ldm`-with-`pc`

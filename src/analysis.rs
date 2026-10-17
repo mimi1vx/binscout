@@ -1765,12 +1765,7 @@ fn normalize_arm_seed(arch: Arch, addr: u64) -> (u64, bool) {
 
 /// Push one seed address, masking the ARM Thumb bit (see
 /// [`normalize_arm_seed`]) and recording the odd address when masked.
-fn push_seed(
-    seeds: &mut Vec<u64>,
-    diags: &mut Vec<Diagnostic>,
-    arch: Arch,
-    addr: u64,
-) {
+fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr: u64) {
     let (addr, masked) = normalize_arm_seed(arch, addr);
     if masked {
         diags.push(Diagnostic {
