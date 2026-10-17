@@ -1667,7 +1667,7 @@ impl Project {
             insns: f.insn_count(),
             calls: self.analysis.calls_count(entry),
             reasons: f.reason_list(),
-            inferred_edges: f.inferred_edges().len(),
+            inferred_edges: f.inferred_len(),
         })
     }
 

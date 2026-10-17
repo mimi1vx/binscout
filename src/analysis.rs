@@ -469,6 +469,27 @@ impl Function {
         self.inferred.iter().copied().collect()
     }
 
+    /// Targets inferred from `block`, in address order.
+    ///
+    /// The same rows [`Function::inferred_edges`] reports, restricted to one
+    /// source block without materializing the whole set.
+    #[must_use]
+    pub fn inferred_succs(&self, block: u64) -> Vec<u64> {
+        self.inferred
+            .range((block, 0)..=(block, u64::MAX))
+            .map(|(_, t)| *t)
+            .collect()
+    }
+
+    /// Count of inferred block edges (see [`Function::inferred_edges`]).
+    ///
+    /// The same count `inferred_edges().len()` reports, without allocating
+    /// the pair vector.
+    #[must_use]
+    pub fn inferred_len(&self) -> usize {
+        self.inferred.len()
+    }
+
     /// Sorted, deduplicated discovery reasons.
     #[must_use]
     pub fn reason_list(&self) -> Vec<DiscoveryReason> {
@@ -736,9 +757,10 @@ impl Analysis {
     pub fn containing_function(&self, va: u64) -> Option<u64> {
         let (&entry, func) = self.functions.range(..=va).next_back()?;
         func.blocks
-            .values()
-            .any(|b| va >= b.start && va < b.end())
-            .then_some(entry)
+            .range(..=va)
+            .next_back()
+            .filter(|(_, b)| va < b.end())
+            .map(|_| entry)
     }
 
     /// Direct callees of `entry` (function entries only).
@@ -1064,13 +1086,7 @@ pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
                             size: i.size,
                         })
                         .collect();
-                    let mut inferred_succs: Vec<u64> = f
-                        .inferred_edges()
-                        .into_iter()
-                        .filter(|(a, _)| *a == b.start)
-                        .map(|(_, t)| t)
-                        .collect();
-                    inferred_succs.sort_unstable();
+                    let inferred_succs: Vec<u64> = f.inferred_succs(b.start);
                     BlockLayout {
                         start: b.start,
                         end: b.end(),
@@ -1718,15 +1734,17 @@ struct AddrSpace<'a> {
 
 impl<'a> AddrSpace<'a> {
     fn new(bin: &'a LoadedBinary) -> Self {
-        Self {
-            exec: bin.segments.iter().filter(|s| s.executable).collect(),
-            all: bin.segments.iter().collect(),
-        }
+        let mut exec: Vec<&Segment> = bin.segments.iter().filter(|s| s.executable).collect();
+        exec.sort_by_key(|s| s.vaddr);
+        let mut all: Vec<&Segment> = bin.segments.iter().collect();
+        all.sort_by_key(|s| s.vaddr);
+        Self { exec, all }
     }
 
     fn seg_at(segs: &[&'a Segment], va: u64) -> Option<&'a Segment> {
-        segs.iter()
-            .find(|s| va >= s.vaddr && va.wrapping_sub(s.vaddr) < s.mem_size)
+        let idx = segs.partition_point(|s| s.vaddr <= va);
+        segs.get(idx.checked_sub(1)?)
+            .filter(|s| va.wrapping_sub(s.vaddr) < s.mem_size)
             .copied()
     }
 
@@ -1897,7 +1915,11 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<
 /// collect-all pass produced. x86 inputs past the budget previously stopped
 /// in collection order; they now stop in the same sorted order as
 /// below-budget inputs.
-fn prologue_seeds(arch: Arch, space: &AddrSpace, reached: &BTreeSet<u64>) -> Result<Vec<u64>> {
+fn prologue_seeds(
+    arch: Arch,
+    space: &AddrSpace,
+    is_reached: impl Fn(u64) -> bool,
+) -> Result<Vec<u64>> {
     let mut streams: Vec<CandStream<'_>> = space
         .exec
         .iter()
@@ -1922,7 +1944,7 @@ fn prologue_seeds(arch: Arch, space: &AddrSpace, reached: &BTreeSet<u64>) -> Res
             continue;
         }
         last = Some(va);
-        if !reached.contains(&va) && decode_one(arch, space, va)?.is_some() {
+        if !is_reached(va) && decode_one(arch, space, va)?.is_some() {
             seeds.push(va);
         }
     }
@@ -2795,8 +2817,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     let (seeds1, seed_diags) = authoritative_seeds(&space, bin);
     walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
-    let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
-    let seeds2 = prologue_seeds(arch, &space, &round1)?;
+    let seeds2 = prologue_seeds(arch, &space, |va| walk.decoded.contains_key(&va))?;
     walk.run(seeds2.clone())?;
 
     if walk.decoded.is_empty() {
@@ -3054,16 +3075,20 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     for (site, target) in &jumps.pairs {
         // Blocks partition decoded addresses across functions, so the site
         // sits in exactly one block; the target is a block start by
-        // construction (it joined `jump_targets` before Pass B).
-        let mut hit: Option<(u64, u64)> = None;
-        for (entry, f) in &functions {
-            if let Some((&start, b)) = f.blocks.range(..=*site).next_back()
-                && *site < b.end()
-            {
-                hit = Some((*entry, start));
-                break;
-            }
-        }
+        // construction (it joined `jump_targets` before Pass B). Two ordered
+        // lookups (function entry, then block start) replace the old scan
+        // over every function.
+        let hit: Option<(u64, u64)> =
+            functions
+                .range(..=*site)
+                .next_back()
+                .and_then(|(&entry, f)| {
+                    f.blocks
+                        .range(..=*site)
+                        .next_back()
+                        .filter(|(_, b)| *site < b.end())
+                        .map(|(&start, _)| (entry, start))
+                });
         match (hit, block_func.get(target)) {
             (Some((func, site_block)), Some(target_func)) if func == *target_func => {
                 if let Some(f) = functions.get_mut(&func) {
@@ -3529,7 +3554,8 @@ mod tests {
             let reached: BTreeSet<u64> = [0x5000, 0x5001, 0x5002, 0x5003, 0x4FF0, u64::MAX, 1]
                 .into_iter()
                 .collect();
-            let got = prologue_seeds(arch, &space, &reached).expect("streaming seeds");
+            let got =
+                prologue_seeds(arch, &space, |va| reached.contains(&va)).expect("streaming seeds");
             let want = oracle_seeds(arch, &space, &reached).expect("oracle seeds");
             assert_eq!(got, want, "seed mismatch for {arch:?}");
             assert!(
@@ -3550,7 +3576,7 @@ mod tests {
         let bin = seed_test_binary(Arch::X86_64, None, vec![(vaddr, data)]);
         let space = AddrSpace::new(&bin);
         let reached = BTreeSet::new();
-        let got = prologue_seeds(Arch::X86_64, &space, &reached).expect("seeds");
+        let got = prologue_seeds(Arch::X86_64, &space, |va| reached.contains(&va)).expect("seeds");
         // `vaddr + 8` wraps to `3`, which is unmapped (`seg_at` uses plain
         // comparison), so it is offered first and rejected; the stashed
         // `u64::MAX` still sorts after the high run.
@@ -3578,8 +3604,8 @@ mod tests {
         let mut walk = Walker::new(Arch::X86_32, &space);
         let seeds = authoritative_seeds(&space, &bin).0;
         walk.run(seeds.clone()).expect("round one walks");
-        let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
-        let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");
+        let seeds2 = prologue_seeds(Arch::X86_32, &space, |va| walk.decoded.contains_key(&va))
+            .expect("prologue scans");
         walk.run(seeds2.clone()).expect("round two walks");
         let mut entries: BTreeSet<u64> = BTreeSet::new();
         for s in seeds.iter().chain(seeds2.iter()) {
@@ -3688,7 +3714,8 @@ mod tests {
             let bin = seed_test_binary(arch, None, vec![(base, data)]);
             let space = AddrSpace::new(&bin);
             let reached: BTreeSet<u64> = (0..12_000).map(|i| base + i * period).collect();
-            let got = prologue_seeds(arch, &space, &reached).expect("streaming seeds");
+            let got =
+                prologue_seeds(arch, &space, |va| reached.contains(&va)).expect("streaming seeds");
             let want = oracle_seeds(arch, &space, &reached).expect("oracle seeds");
             assert_eq!(got.len(), MAX_SEEDS, "budget must fill for {arch:?}");
             assert_eq!(got, want, "truncated prefix mismatch for {arch:?}");
