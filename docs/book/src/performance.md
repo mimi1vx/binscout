@@ -80,13 +80,14 @@ scenario (asserted by the harness); only host paths differ.
 
 Read plainly: at these scales the whole pass costs single milliseconds.
 On the small fixture everything is near timer resolution — the only
-sound reading is "negligible". On the large fixture the workflow pass
+sound reading is "negligible", and it covers only these ≤3.9 KB
+fixtures. On the large fixture the workflow pass
 (~2.9 ms serializing ~368 KB: 1201 block rows, 1024 instruction rows,
 1200 xrefs) exceeds either open path (~1.4–1.5 ms), and saved-sidecar
 reopen costs about the same as cold analysis — layout replay is not
-observably cheaper than reanalysis for a 3.9 KB input. Whether any of
-this matters for real-world binaries (megabytes, not kilobytes) is
-resolved by the MCP cache measurement below, not by this table.
+observably cheaper than reanalysis for a 3.9 KB input. Real-world
+binaries (megabytes, not kilobytes) behave differently: see the
+real-size spot check below, not this table.
 
 ## MCP server cache
 
@@ -117,17 +118,35 @@ size while the hit path does not touch the binary at all (a companion
 test keeps the binary `chmod 000` after the first call and the cached
 call still succeeds byte-identically).
 
+## Real-size spot check
+
+A 6.5 MB Mach-O binary shows where the fixture table stops applying.
+One representative release run, peak RSS via `/usr/bin/time -l`;
+no assertion depends on these numbers and they are not a CI gate:
+
+| Scenario | Wall time | Peak RSS |
+|---|---|---|
+| fresh load (no sidecar: file read, hash, full analysis) | 1.31 s | 760 MB |
+| cache hit (sidecar replay, no analysis) | 0.42 s | 403 MB |
+
+At real sizes the open dominates and costs seconds plus hundreds of
+megabytes resident, with replay about 3x faster than fresh analysis
+but still far from free. The "negligible" reading above covers only
+the ≤3.9 KB fixtures; size MCP timeouts, sidecar-warming strategy,
+and memory headroom from this spot check instead.
+
 ## Limitations
 
 - **No in-process peak RSS.** The harness has no platform memory API
   without a new dependency, so resident size is an external step, e.g.
   `/usr/bin/time -l target/release/binscout <args>` (macOS reports
-  `maximum resident set size`). No RSS numbers are recorded here.
+  `maximum resident set size`). The harness records no RSS; the only
+  RSS numbers here are the external spot-check readings above.
 - **Warm page cache.** Reps run back-to-back on one machine, so "cold"
   means no-sidecar, not cold-boot I/O. File read/hash costs are
   best-case.
 - **Timer resolution.** Small-fixture cells sit at tens of microseconds;
   treat the distribution as order-of-magnitude only.
-- **No generalization.** Two synthetic fixtures do not predict real
-  binaries. Do not cite these numbers as guarantees, do not encode them
+- **No generalization.** Two synthetic fixtures plus one single-run spot
+  check do not predict real binaries. Do not cite these numbers as guarantees, do not encode them
   as CI timing assertions, and do not claim any speedup from them.

@@ -332,7 +332,7 @@ pub struct FunctionsParams {
     pub limit: Option<usize>,
 }
 
-/// Parameters for single-address tools (`func`, `cfg`, `blocks`, `comment`).
+/// Parameters for single-address tools (`func`, `cfg`, `structure`, `pseudo`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddrParams {
     /// Path to the analyzed binary.

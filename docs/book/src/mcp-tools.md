@@ -15,7 +15,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 
 | Tool | Parameters | Does |
 |---|---|---|
-| `project_info` | binary | Open a binary and report arch, format, entry, mapping (`mode`, `base`), diagnostic totals, and `analysis_revision` |
+| `project_info` | binary | Open a binary and report arch, format, entry, mapping (`mode`, `base`), diagnostic totals, and `analysis_revision`; read-only, never saves the snapshot — call `load` once to persist the sidecar so later opens replay it instead of re-analyzing |
 | `load` | binary | Persist the analysis snapshot to the project DB (binary untouched); CLI `load` parity, warms the sidecar so later opens replay it instead of re-analyzing |
 | `functions` | binary, query/caller/callee/range_lo/range_hi, offset/limit | List functions with rename-resolved names, filtered (`query` case-insensitive substring; `caller`/`callee` addresses resolving to call-graph neighbors; `range_lo` + `range_hi` bounding entries) and paged |
 | `func` | binary, addr | Compact metadata of one function: entry, name, block/insn/call counts, discovery `reasons` |
@@ -30,7 +30,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `slice` | binary, addr, depth?/offset?/limit? | Backward slice of `addr`: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `depth` hops (direct are depth 1), ordered by address with shortest distance, under the page envelope; any address is a valid root |
 | `diagnostics` | binary, kind?, func?, offset/limit | Provenance records (unresolved indirect sites, decode failures) ordered by (`kind`, `addr`) under the page envelope, filtered by `kind` and containing-function `func`; queries never write a sidecar |
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind (`code`, `data`, `string`, `import`, `inferred-code`), paged behind a `total` match count |
-| `strings` | binary, pattern/min-len/section/include_code, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`); `decode` (`xor:<byte>`, `add:<byte>`, `rot:<0-7>`) re-extracts over a read-only in-memory transform with original offsets |
+| `strings` | binary, pattern/min_len/section/include_code/decode, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`); `decode` (`xor:<byte>`, `add:<byte>`, `rot:<0-7>`) re-extracts over a read-only in-memory transform with original offsets |
 | `symbols` | binary | Imports, exports, and symbol-table code addresses of the binary (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below exports and above stubs |
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
@@ -42,7 +42,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address; scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
-| `diff` | binary_a, binary_b, db_a?/db_b?, raw? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar |
+| `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |
 
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
 `code`, `data`, `string`, `import`, and `inferred-code`
