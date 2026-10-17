@@ -2276,20 +2276,20 @@ impl<'a> Walker<'a> {
 
 /// Owner entry for an address: greatest entry at or below `va`.
 ///
-/// `entries` must be sorted ascending and non-empty (as built in
-/// [`analyze`]); addresses below the first entry fall back to it, matching
-/// the old reverse scan. Binary search, so block/edge attribution is
-/// `O(log F)` per lookup instead of `O(F)`.
-///
-/// # Panics
-/// Panics on an empty `entries` slice.
+/// `entries` must be sorted ascending (as built in [`analyze`]).
+/// Addresses below the first entry — and every address when `entries`
+/// is empty — have no owner (`None`), matching
+/// [`Analysis::containing_function`], which reports `None` there so
+/// block ownership and `func`/`blocks` lookups agree. Binary search,
+/// so block/edge attribution is `O(log F)` per lookup instead of
+/// `O(F)`.
 #[must_use]
-pub fn function_owner(entries: &[u64], va: u64) -> u64 {
+pub fn function_owner(entries: &[u64], va: u64) -> Option<u64> {
     let idx = entries.partition_point(|e| *e <= va);
     if idx == 0 {
-        entries[0]
+        None
     } else {
-        entries[idx - 1]
+        Some(entries[idx - 1])
     }
 }
 
@@ -2390,8 +2390,12 @@ fn resolve_indirect_site(
     if entries.is_empty() {
         return None;
     }
-    if function_owner(entries, target) != function_owner(entries, site) {
-        return None;
+    match (
+        function_owner(entries, target),
+        function_owner(entries, site),
+    ) {
+        (Some(t), Some(s)) if t == s => {}
+        _ => return None,
     }
     Some(target)
 }
@@ -2445,7 +2449,7 @@ fn resolve_table_site(
     if entries.is_empty() {
         return None;
     }
-    let owner = function_owner(entries, site);
+    let owner = function_owner(entries, site)?;
     if !table_guard_present(decoded, entries, site, owner) {
         return None;
     }
@@ -2493,7 +2497,7 @@ fn table_guard_present(
         .range(..site)
         .rev()
         .take(MAX_TABLE_GUARD_BACKTRACK)
-        .take_while(|(va, _)| function_owner(entries, **va) == owner)
+        .take_while(|(va, _)| function_owner(entries, **va) == Some(owner))
         .any(|(_, d)| matches!(d.flow, Flow::CBranch { target: Some(_) }))
 }
 
@@ -2520,7 +2524,7 @@ fn table_slot_target(
     ) {
         return None;
     }
-    if function_owner(entries, target) != owner {
+    if function_owner(entries, target) != Some(owner) {
         return None;
     }
     Some(target)
@@ -2874,7 +2878,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         reasons.insert(*e, r);
     }
     let entry_list: Vec<u64> = entries.iter().copied().collect();
-    let owner = |va: u64| -> u64 { function_owner(&entry_list, va) };
+    let owner = |va: u64| -> Option<u64> { function_owner(&entry_list, va) };
 
     // Pass A2: resolve single-slot absolute indirect jumps and guarded
     // scaled-index tables (raw x86 only). Entries are fixed above so the
@@ -3025,7 +3029,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         );
     }
     for (start, block) in blocks {
-        let o = owner(start);
+        let Some(o) = owner(start) else {
+            continue;
+        };
         if let Some(f) = functions.get_mut(&o) {
             f.cfg.add_node(start);
             f.blocks.insert(start, block);
@@ -3097,8 +3103,10 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
                 Flow::Branch { target: Some(t) } => {
                     if f.blocks.contains_key(&t) {
                         cfg_edges.push((entry, *start, t));
-                    } else if decoded.contains_key(&t) {
-                        cg_edges.push((entry, owner(t)));
+                    } else if decoded.contains_key(&t)
+                        && let Some(o) = owner(t)
+                    {
+                        cg_edges.push((entry, o));
                     }
                 }
                 Flow::Branch { target: None } => {}
@@ -3115,8 +3123,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
                 Flow::Call { target } => {
                     if let Some(t) = target
                         && decoded.contains_key(&t)
+                        && let Some(o) = owner(t)
                     {
-                        cg_edges.push((entry, owner(t)));
+                        cg_edges.push((entry, o));
                     }
                     if f.blocks.contains_key(&end) {
                         cfg_edges.push((entry, *start, end));

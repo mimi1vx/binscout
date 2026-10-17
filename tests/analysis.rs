@@ -336,36 +336,36 @@ fn garbage_fixture_yields_no_string_xrefs() {
     common::cleanup(&dir);
 }
 
-// Reference linear scan the old `owner` closure used.
-fn linear_owner(entries: &[u64], va: u64) -> u64 {
-    match entries.iter().rfind(|e| **e <= va) {
-        Some(e) => *e,
-        None => entries[0],
-    }
+// Reference linear scan without the below-first fallback: unowned below.
+fn linear_owner(entries: &[u64], va: u64) -> Option<u64> {
+    entries.iter().rfind(|e| **e <= va).copied()
 }
 
 #[test]
 fn function_owner_boundary_cases() {
     let entries = vec![0x1000, 0x1010, 0x1030];
-    // Below first falls back to first.
-    assert_eq!(function_owner(&entries, 0x0FFF), 0x1000);
-    assert_eq!(function_owner(&entries, 0x0000), 0x1000);
+    // Below first is unowned, matching `containing_function`.
+    assert_eq!(function_owner(&entries, 0x0FFF), None);
+    assert_eq!(function_owner(&entries, 0x0000), None);
     // Exactly at entries.
-    assert_eq!(function_owner(&entries, 0x1000), 0x1000);
-    assert_eq!(function_owner(&entries, 0x1010), 0x1010);
-    assert_eq!(function_owner(&entries, 0x1030), 0x1030);
+    assert_eq!(function_owner(&entries, 0x1000), Some(0x1000));
+    assert_eq!(function_owner(&entries, 0x1010), Some(0x1010));
+    assert_eq!(function_owner(&entries, 0x1030), Some(0x1030));
     // In gaps snaps to greatest entry below.
-    assert_eq!(function_owner(&entries, 0x1005), 0x1000);
-    assert_eq!(function_owner(&entries, 0x101F), 0x1010);
-    assert_eq!(function_owner(&entries, 0x102F), 0x1010);
+    assert_eq!(function_owner(&entries, 0x1005), Some(0x1000));
+    assert_eq!(function_owner(&entries, 0x101F), Some(0x1010));
+    assert_eq!(function_owner(&entries, 0x102F), Some(0x1010));
     // Above last snaps to last.
-    assert_eq!(function_owner(&entries, 0x1031), 0x1030);
-    assert_eq!(function_owner(&entries, 0xFFFF), 0x1030);
-    // Single entry always wins.
+    assert_eq!(function_owner(&entries, 0x1031), Some(0x1030));
+    assert_eq!(function_owner(&entries, 0xFFFF), Some(0x1030));
+    // Empty entries own nothing.
+    let empty: Vec<u64> = vec![];
+    assert_eq!(function_owner(&empty, 0x1000), None);
+    // Single entry owns itself and above, nothing below.
     let single = vec![0x2000];
-    assert_eq!(function_owner(&single, 0x1FFF), 0x2000);
-    assert_eq!(function_owner(&single, 0x2000), 0x2000);
-    assert_eq!(function_owner(&single, 0x2001), 0x2000);
+    assert_eq!(function_owner(&single, 0x1FFF), None);
+    assert_eq!(function_owner(&single, 0x2000), Some(0x2000));
+    assert_eq!(function_owner(&single, 0x2001), Some(0x2000));
 }
 
 #[test]
@@ -393,6 +393,57 @@ fn function_owner_matches_linear_scan_on_generated_set() {
             "owner mismatch at {va:#x}"
         );
     }
+}
+
+#[test]
+fn backward_jump_below_first_entry_stays_unowned() {
+    // Seed at 0x1010 jumps back below the lowest entry; the target decodes
+    // but must stay unowned so block ownership, `func` lookups, and slice
+    // `func` fields agree (all null below the first entry).
+    // 0x1000: call 0x1010 | 0x1005: ret | 0x1006..0x100F: nop * 10 |
+    // 0x1010: jmp 0x1000.
+    let mut b = vec![0xE8, 0x0B, 0x00, 0x00, 0x00, 0xC3];
+    b.extend([0x90; 10]);
+    b.extend([0xE9, 0xEB, 0xFF, 0xFF, 0xFF]);
+    assert_eq!(b.len(), 0x15);
+    let a = x64(&b, 0x1000, Some(0x1010));
+    assert_eq!(function_owner(&[0x1010], 0x1000), None);
+    assert_eq!(function_owner(&[0x1010], 0x1010), Some(0x1010));
+    assert_eq!(a.containing_function(0x1000), None);
+    assert_eq!(a.containing_function(0x1005), None);
+    assert_eq!(a.containing_function(0x1010), Some(0x1010));
+    for f in a.functions.values() {
+        for block in f.blocks.values() {
+            assert!(
+                0x1000 < block.start || 0x1000 >= block.end(),
+                "unowned addr in block {:#x}",
+                block.start
+            );
+        }
+    }
+    let dir = common::tmpdir("owner-below-first");
+    let bin = common::write_bin(&dir, "below.bin", &b);
+    let db = common::temp_db(&dir, "below");
+    let opts = binscout::loader::RawOptions {
+        base: 0x1000,
+        arch: binscout::disasm::Arch::X86_64,
+        entry: Some(0x1010),
+    };
+    let p = binscout::Project::open_raw(&bin, &db, opts).expect("raw open");
+    assert_eq!(p.analysis().containing_function(0x1000), None);
+    assert!(p.func_detail(0x1000).is_err());
+    let page = p.slice_page(0x1010, 5, 0, 64).expect("slice pages");
+    let row = page
+        .items
+        .iter()
+        .find(|n| n.addr == 0x1000)
+        .expect("call xref reaches below-entry addr");
+    assert_eq!(row.func, None);
+    assert_eq!(row.func, p.analysis().containing_function(row.addr));
+    for n in &page.items {
+        assert_eq!(n.func, p.analysis().containing_function(n.addr));
+    }
+    common::cleanup(&dir);
 }
 
 // One 11-byte frame function: push rbp; mov rbp,rsp; mov eax,1; pop rbp; ret.
@@ -436,8 +487,8 @@ fn many_function_ownership_matches_reference_and_golden() {
     // Every block start attributes to the reference linear owner.
     for (entry, f) in &a.functions {
         for start in f.blocks.keys() {
-            assert_eq!(function_owner(&entries, *start), *entry);
-            assert_eq!(linear_owner(&entries, *start), *entry);
+            assert_eq!(function_owner(&entries, *start), Some(*entry));
+            assert_eq!(linear_owner(&entries, *start), Some(*entry));
         }
     }
     // Generated sweep across the whole span agrees differentially.
