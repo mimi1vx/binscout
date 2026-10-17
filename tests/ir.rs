@@ -196,6 +196,66 @@ fn arm32_bx_lr_lifts_return() {
 }
 
 #[test]
+fn arm32_ldr_address_stays_one_input() {
+    // ldr r0, [r1, #4]: the bracketed address is a single input, the
+    // destination the only output.
+    let v = arm32(&[0x04, 0x00, 0x91, 0xe5], 0x10000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Load);
+    assert_eq!(v[0].outputs, ["r0"]);
+    assert_eq!(v[0].inputs, ["[r1, 0x4]"]);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
+fn arm32_ldr_pc_stays_branch_with_one_address_operand() {
+    // ldr pc, [pc, #-4]: a pc destination is control flow, and the
+    // bracketed address still arrives as one operand.
+    let v = arm32(&[0x04, 0xf0, 0x1f, 0xe5], 0x10000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Branch);
+    assert!(v[0].outputs.is_empty());
+    assert_eq!(v[0].inputs, ["pc", "[pc, -0x4]"]);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
+fn arm32_ldm_writeback_splits_base_and_list() {
+    // ldm r0!, {r1, r2}: the base is read, the list is written, and the
+    // write-back base is written too.
+    let v = arm32(&[0x06, 0x00, 0xb0, 0xe8], 0x10000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Load);
+    assert_eq!(v[0].inputs, ["r0"]);
+    assert_eq!(v[0].outputs, ["r1", "r2", "r0"]);
+    assert_eq!(v[0].warning, None);
+    // Without write-back the base is read-only.
+    let v = arm32(&[0x06, 0x00, 0x90, 0xe8], 0x10000);
+    assert_eq!(v[0].op, IrOp::Load);
+    assert_eq!(v[0].inputs, ["r0"]);
+    assert_eq!(v[0].outputs, ["r1", "r2"]);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
+fn arm32_store_mirrors_load() {
+    // str r0, [r1, #4]: stored value and address are both inputs.
+    let v = arm32(&[0x04, 0x00, 0x81, 0xe5], 0x10000);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Store);
+    assert_eq!(v[0].inputs, ["r0", "[r1, 0x4]"]);
+    assert!(v[0].outputs.is_empty());
+    assert_eq!(v[0].warning, None);
+    // stm r0!, {r1, r2}: base plus list are inputs, the write-back
+    // base is also an output.
+    let v = arm32(&[0x06, 0x00, 0xa0, 0xe8], 0x10000);
+    assert_eq!(v[0].op, IrOp::Store);
+    assert_eq!(v[0].inputs, ["r0", "r1", "r2"]);
+    assert_eq!(v[0].outputs, ["r0"]);
+    assert_eq!(v[0].warning, None);
+}
+
+#[test]
 fn thumb_cbz_lifts_cbranch() {
     // cbz r0, #4 at 0x20000 targets 0x20008.
     let v = thumb(&[0x08, 0xb1], 0x20000);
@@ -799,11 +859,11 @@ fn arm32_extended_lifts() {
         assert!(is_mapped(Arch::Arm32, m), "{m}");
         assert!(is_mapped(Arch::Thumb, m), "{m}");
     }
-    let v = lift(Arch::Arm32, &synth("ldmia", &["{r4", "pc}"]));
+    let v = lift(Arch::Arm32, &synth("ldmia", &["{r4, pc}"]));
     assert_eq!(v[0].op, IrOp::Return);
-    let v = lift(Arch::Arm32, &synth("ldmiaeq", &["{r4", "pc}"]));
+    let v = lift(Arch::Arm32, &synth("ldmiaeq", &["{r4, pc}"]));
     assert_eq!(v[0].op, IrOp::CBranch);
-    let v = lift(Arch::Arm32, &synth("stmdb", &["sp!", "{r4", "lr}"]));
+    let v = lift(Arch::Arm32, &synth("stmdb", &["sp!", "{r4, lr}"]));
     assert_eq!(v[0].op, IrOp::Store);
     for (m, want) in [
         ("ldrt", IrOp::Load),

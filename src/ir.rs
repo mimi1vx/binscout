@@ -1100,6 +1100,95 @@ fn first_out_rest_in(insn: &Insn, op: IrOp) -> (IrOp, Vec<String>, Vec<String>, 
     }
 }
 
+/// Input/output split for an ARM32 load.
+///
+/// Single loads (`ldr` family) write the first operand and read the rest.
+/// Load-multiples (`ldm` family, `pop`) read the base register and write
+/// the listed registers; a write-back `!` base is read and written.
+fn arm32_load_parts(base: &str, insn: &Insn) -> (Vec<String>, Vec<String>) {
+    if !is_arm32_ldm(base) {
+        return match insn.ops.as_slice() {
+            [] => (Vec::new(), Vec::new()),
+            [dst, rest @ ..] => (rest.to_vec(), vec![dst.clone()]),
+        };
+    }
+    match insn.ops.as_slice() {
+        [] => (Vec::new(), Vec::new()),
+        [single] => match arm32_reglist(single) {
+            Some(regs) => (Vec::new(), regs),
+            None => (Vec::new(), vec![single.clone()]),
+        },
+        [first, rest @ ..] => {
+            let (base_reg, writeback) = arm32_strip_bang(first);
+            let mut outputs = Vec::new();
+            for op in rest {
+                match arm32_reglist(op) {
+                    Some(regs) => outputs.extend(regs),
+                    None => outputs.push(op.clone()),
+                }
+            }
+            if writeback && !outputs.iter().any(|o| o == base_reg) {
+                outputs.push(base_reg.to_string());
+            }
+            (vec![base_reg.to_string()], outputs)
+        }
+    }
+}
+
+/// Input/output split for an ARM32 store, mirroring [`arm32_load_parts`].
+///
+/// Single stores (`str` family) read every operand (stored value plus
+/// address). Store-multiples (`stm` family, `push`) read the base register
+/// and the listed registers; a write-back `!` base is also written.
+fn arm32_store_parts(base: &str, insn: &Insn) -> (Vec<String>, Vec<String>) {
+    if !is_arm32_stm(base) {
+        return (insn.ops.clone(), Vec::new());
+    }
+    match insn.ops.as_slice() {
+        [] => (Vec::new(), Vec::new()),
+        [single] => match arm32_reglist(single) {
+            Some(regs) => (regs, Vec::new()),
+            None => (vec![single.clone()], Vec::new()),
+        },
+        [first, rest @ ..] => {
+            let (base_reg, writeback) = arm32_strip_bang(first);
+            let mut inputs = vec![base_reg.to_string()];
+            for op in rest {
+                match arm32_reglist(op) {
+                    Some(regs) => inputs.extend(regs),
+                    None => inputs.push(op.clone()),
+                }
+            }
+            let outputs = if writeback {
+                vec![base_reg.to_string()]
+            } else {
+                Vec::new()
+            };
+            (inputs, outputs)
+        }
+    }
+}
+
+/// Expand a `{r1, r2}` register-list operand into its registers.
+///
+/// Returns `None` when `op` is not a single brace-enclosed list, so
+/// callers can fall back to treating the operand verbatim.
+fn arm32_reglist(op: &str) -> Option<Vec<String>> {
+    let inner = op.strip_prefix('{')?.strip_suffix('}')?;
+    let regs: Vec<String> = inner
+        .split(',')
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if regs.is_empty() { None } else { Some(regs) }
+}
+
+/// Split a write-back `!` base (`r0!` into `("r0", true)`).
+fn arm32_strip_bang(op: &str) -> (&str, bool) {
+    op.strip_suffix('!')
+        .map_or((op, false), |base| (base, true))
+}
+
 /// Lift one ARM32/Thumb instruction.
 ///
 /// ARMv7 Display bakes the condition code and flag suffix into the mnemonic
@@ -1139,10 +1228,14 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
                     (IrOp::Return, Vec::new(), Vec::new(), None)
                 }
             } else {
-                (IrOp::Load, Vec::new(), insn.ops.clone(), None)
+                let (inputs, outputs) = arm32_load_parts(s, insn);
+                (IrOp::Load, inputs, outputs, None)
             }
         }
-        s if is_arm32_store(s) => (IrOp::Store, insn.ops.clone(), Vec::new(), None),
+        s if is_arm32_store(s) => {
+            let (inputs, outputs) = arm32_store_parts(s, insn);
+            (IrOp::Store, inputs, outputs, None)
+        }
         s if is_arm32_alu(s, IrOp::Add) => first_out_rest_in(insn, IrOp::Add),
         s if is_arm32_alu(s, IrOp::Sub) => first_out_rest_in(insn, IrOp::Sub),
         s if is_arm32_alu(s, IrOp::Mul) => first_out_rest_in(insn, IrOp::Mul),
@@ -2429,6 +2522,13 @@ fn is_arm32_ldm(s: &str) -> bool {
     s == "pop" || s == "ldm" || s == "ldmia" || s == "ldmdb" || s == "ldmda"
 }
 
+/// Whether `s` is a store-multiple covered by the register-list store
+/// rule (`stm` and its `ia`/`db`/`da` addressing-mode spellings, plus
+/// the `push` alias for `stmdb sp!`).
+fn is_arm32_stm(s: &str) -> bool {
+    s == "push" || s == "stm" || s == "stmia" || s == "stmdb" || s == "stmda"
+}
+
 fn is_arm32_nop(s: &str) -> bool {
     ARM32_NOP.contains(&s)
 }
@@ -2577,11 +2677,11 @@ mod tests {
 
     #[test]
     fn arm32_pop_pc_is_return() {
-        let i = insn("pop", &["{r4", "pc}"]);
+        let i = insn("pop", &["{r4, pc}"]);
         assert_eq!(lift_arm32(&i)[0].op, IrOp::Return);
-        let i = insn("pop", &["{r4", "r5}"]);
+        let i = insn("pop", &["{r4, r5}"]);
         assert_eq!(lift_arm32(&i)[0].op, IrOp::Load);
-        let i = insn("push", &["{r4", "lr}"]);
+        let i = insn("push", &["{r4, lr}"]);
         assert_eq!(lift_arm32(&i)[0].op, IrOp::Store);
     }
 

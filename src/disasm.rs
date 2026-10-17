@@ -482,6 +482,9 @@ const X86_PREFIXES: &[&str] = &[
 /// disassembly listing and the IR lift see the real operation; operand
 /// immediates leave iced-x86 in MASM suffix form (`402100h`), so each
 /// operand goes through [`masm_to_hex`] so agents only ever see `0x` form.
+///
+/// Commas inside `[...]`/`{...}` never split: `ldr pc, [pc, #-4]` keeps
+/// `[pc, #-4]` as one operand and `ldm r0, {r1, r2}` keeps `{r1, r2}`.
 fn split_asm(text: &str) -> (String, Vec<String>) {
     let text = text.trim();
     let (mut head, mut tail) = match text.find(char::is_whitespace) {
@@ -509,9 +512,44 @@ fn split_asm(text: &str) -> (String, Vec<String>) {
     let ops = if tail.is_empty() {
         Vec::new()
     } else {
-        tail.split(',').map(|s| masm_to_hex(s.trim())).collect()
+        split_operands(tail)
+            .into_iter()
+            .map(|s| masm_to_hex(s.trim()))
+            .collect()
     };
     (head.to_lowercase(), ops)
+}
+
+/// Split an operand tail on commas at bracket/brace depth 0.
+///
+/// `[`/`{` nest one level deeper, `]`/`}` come back out (saturating at 0
+/// so a stray closer cannot swallow the rest of the line); commas at
+/// depth 0 separate operands, anything nested is operand-internal
+/// (`[pc, #-4]`, `{r1, r2}`).
+fn split_operands(tail: &str) -> Vec<&str> {
+    let mut depth: u32 = 0;
+    let mut start = 0;
+    let bytes = tail.as_bytes();
+    let mut ends: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'{' => depth = depth.saturating_add(1),
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                ends.push(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut splits: Vec<&str> = Vec::with_capacity(ends.len() + 1);
+    for end in ends {
+        splits.push(&tail[start..end]);
+        start = end + 1;
+    }
+    splits.push(&tail[start..]);
+    splits
 }
 
 /// Rewrite MASM-suffixed hex inside one operand as canonical `0x`-hex.
@@ -950,12 +988,36 @@ pub(crate) fn resolve_adrp_pair(first: &Insn, second: &Insn) -> Option<u64> {
         }
         "ldr" => {
             if second.ops.len() == 2 {
-                let reg = second.ops[1].strip_prefix('[')?.strip_suffix(']')?;
-                if reg != base.as_str() {
-                    return None;
+                // Single-operand shape from depth-aware splitting:
+                // `[<base>]` (final address is the page) or
+                // `[<base>, #<imm>]` (page plus offset).
+                if let Some(inner) = second.ops[1]
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                {
+                    let mut parts = inner.split(',');
+                    let reg = parts.next()?.trim();
+                    if reg != base.as_str() {
+                        return None;
+                    }
+                    return match parts.next() {
+                        None => Some(page),
+                        Some(imm) => {
+                            if parts.next().is_some() {
+                                return None;
+                            }
+                            let off = parse_hash_imm(imm.trim())?;
+                            Some(page.wrapping_add(off))
+                        }
+                    };
                 }
-                return Some(page);
+                // Not a bracketed memory operand: fall through to the
+                // legacy three-operand shape below, which rejects len 2.
+                return None;
             }
+            // Legacy three-operand shape (`[<base>`, `#<imm>]`) from
+            // comma-oblivious splitting; kept so hand-built rows still
+            // resolve.
             if second.ops.len() != 3 {
                 return None;
             }

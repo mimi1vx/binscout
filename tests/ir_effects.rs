@@ -191,7 +191,7 @@ fn arm32_flag_writers() {
         }
         // Multi-register push/pop need register-list decoding: none.
         for m in ["push", "pop"] {
-            let v = lift(arch, &synth(m, &["{r4", "lr}"]));
+            let v = lift(arch, &synth(m, &["{r4, lr}"]));
             assert_eq!(v[0].effects.sp_delta, None, "{arch:?} {m}");
             assert!(!v[0].effects.sets_flags, "{arch:?} {m}");
         }
