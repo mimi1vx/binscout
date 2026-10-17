@@ -367,8 +367,10 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
 
 /// Parse any supported binary, selecting a fat Mach-O slice by arch name.
 ///
-/// Identical to [`load`] for thin containers: `fat_arch` is ignored unless
-/// the input is a fat (universal) Mach-O container. For fat input the slice
+/// For thin containers `fat_arch` must be `None`: supplying a selection
+/// for thin (non-fat) input errors with [`Error::Invalid`] instead of
+/// silently ignoring the flag, so a misspelled workflow fails loudly
+/// rather than opening under an unintended mapping. For fat input the slice
 /// is required — a missing, unknown, or ambiguous selection errors with
 /// [`Error::Invalid`] listing the available slice archs, so the failure
 /// names what to retry with instead of surfacing an `object` parse error.
@@ -382,9 +384,9 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
 /// through unchanged.
 ///
 /// # Errors
-/// Same as [`load`], plus [`Error::Invalid`] when fat input has no usable
-/// selection (missing, unknown, or ambiguous) or the selected slice range
-/// is unreadable.
+/// Same as [`load`], plus [`Error::Invalid`] when a selection is supplied
+/// for thin input, when fat input has no usable selection (missing,
+/// unknown, or ambiguous), or when the selected slice range is unreadable.
 pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty input".to_string()));
@@ -393,10 +395,27 @@ pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBin
         return Err(Error::Limit("input exceeds 512 MiB".to_string()));
     }
     if le::is_le(bytes) {
+        if fat_arch.is_some() {
+            return Err(Error::Invalid(
+                "--fat-arch selects a fat Mach-O slice, but the input is not a fat container"
+                    .to_string(),
+            ));
+        }
         return Ok(convert_le(le::parse_le(bytes)?));
     }
-    let kind = FileKind::parse(bytes)
-        .map_err(|e| Error::Invalid(format!("unrecognized binary format: {e}")))?;
+    let kind = FileKind::parse(bytes).map_err(|e| {
+        if fat_arch.is_some() {
+            Error::Invalid(format!("--fat-arch requires a fat Mach-O container: {e}"))
+        } else {
+            Error::Invalid(format!("unrecognized binary format: {e}"))
+        }
+    })?;
+    if !matches!(kind, FileKind::MachOFat32 | FileKind::MachOFat64) && fat_arch.is_some() {
+        return Err(Error::Invalid(
+            "--fat-arch selects a fat Mach-O slice, but the input is not a fat container"
+                .to_string(),
+        ));
+    }
     match kind {
         FileKind::Elf32 | FileKind::Elf64 => load_object(bytes, BinaryFormat::Elf),
         FileKind::Pe32 | FileKind::Pe64 => load_object(bytes, BinaryFormat::Pe),
@@ -814,7 +833,7 @@ fn canonical_fat_name(arch: object::Architecture) -> Option<&'static str> {
 ///
 /// Accepts the canonical names plus `lipo`-style aliases; anything else
 /// is unknown (never guessed to a slice).
-fn normalize_fat_selector(s: &str) -> Option<&'static str> {
+pub fn normalize_fat_selector(s: &str) -> Option<&'static str> {
     match s.to_lowercase().as_str() {
         "x86_64" | "x86-64" => Some("x86_64"),
         "x86_32" | "i386" | "x86" => Some("x86_32"),

@@ -227,7 +227,11 @@ Fat Mach-O containers need `--fat-arch ARCH` (CLI) or `fat_arch`
 (MCP, on every binary-taking tool): `x86_64`, `x86_32`, `aarch64`,
 `arm32`, plus `lipo` aliases like `arm64`, case-insensitive.
 Without it a fat input errors listing the available archs; `--raw`
-and `--fat-arch` are exclusive. `project_info` reports `mode`
+and `--fat-arch` are exclusive. Supplying `--fat-arch`/`fat_arch`
+for thin (non-fat) input is an `Invalid` error, never silently
+ignored. Slice spellings canonicalize (`arm64` ≡ `aarch64`,
+`x86-64` ≡ `x86_64`, case-insensitive), so either spelling shares
+one snapshot. `project_info` reports `mode`
 `"fat"` with a null base, and slices never share snapshots.
 
 ### `blocks` / `block_insns`

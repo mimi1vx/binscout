@@ -16,7 +16,8 @@ failure.
 `--fat-arch` selects a slice of a fat Mach-O container: `x86_64`,
 `x86_32`, `aarch64`, `arm32` (plus `lipo` aliases like `arm64`,
 case-insensitive); it is required for fat inputs, which error
-listing the available archs without it. `--raw` and `--fat-arch`
+listing the available archs without it, and rejected for thin
+(non-fat) inputs. `--raw` and `--fat-arch`
 are exclusive. Different slices never share cached snapshots.
 See [JSON protocol](json-protocol.md) for the output contract.
 | Command | Example | Output |

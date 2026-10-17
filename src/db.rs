@@ -245,13 +245,17 @@ impl StoredMapping {
     ///
     /// `arch` is the caller-supplied slice selector (the CLI `--fat-arch` /
     /// MCP `fat_arch` value the follow-up plumbing passes through
-    /// unchanged); it is lowercased so `X86_64` and `x86_64` share one
-    /// snapshot. Prefer the canonical names (`x86_64`, `x86_32`,
-    /// `aarch64`, `arm32`); aliases resolve at load time, not here.
+    /// unchanged); it canonicalizes through
+    /// [`crate::loader::normalize_fat_selector`] so aliases share one
+    /// snapshot (`arm64` ≡ `aarch64`, `x86-64` ≡ `x86_64`,
+    /// case-insensitively). Unknown spellings lowercase as before; the
+    /// loader rejects them at open, so they never persist a snapshot.
     #[must_use]
     pub fn for_fat_slice(arch: &str) -> Self {
         Self::Fat {
-            arch: arch.to_lowercase(),
+            arch: crate::loader::normalize_fat_selector(arch)
+                .map(str::to_string)
+                .unwrap_or_else(|| arch.to_lowercase()),
         }
     }
 
