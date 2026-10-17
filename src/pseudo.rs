@@ -29,7 +29,9 @@ pub const PSEUDO_WARNING: &str = "approximate pseudo-C over thin IR: lossy rende
 /// One approximate pseudo-C line for a single IR row.
 ///
 /// JSON pairs `addr` with `addr_hex`; `warning` propagates the source
-/// [`IrInsn`] warning verbatim (`None` for mapped rows).
+/// [`IrInsn`] warning verbatim (`None` for mapped rows). `import` carries
+/// the resolved import name when the source instruction calls through an
+/// import slot or stub, and is absent otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PseudoLine {
     /// Address of the source machine instruction.
@@ -38,6 +40,9 @@ pub struct PseudoLine {
     pub text: String,
     /// Propagated lift warning, if the source row was unmapped.
     pub warning: Option<String>,
+    /// Name of the import the source instruction calls through, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
 }
 
 impl Serialize for PseudoLine {
@@ -46,11 +51,17 @@ impl Serialize for PseudoLine {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("PseudoLine", 4)?;
+        let mut st =
+            serializer.serialize_struct("PseudoLine", if self.import.is_some() { 5 } else { 4 })?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("text", &self.text)?;
         st.serialize_field("warning", &self.warning)?;
+        if self.import.is_some() {
+            st.serialize_field("import", &self.import)?;
+        } else {
+            st.skip_field("import")?;
+        }
         st.end()
     }
 }
@@ -126,6 +137,7 @@ pub fn render_one(row: &IrInsn) -> PseudoLine {
         addr: row.addr,
         text,
         warning,
+        import: None,
     }
 }
 

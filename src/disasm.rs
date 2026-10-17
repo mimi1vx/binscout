@@ -99,6 +99,13 @@ pub struct Insn {
     /// carry no displacement and are excluded.
     #[serde(default)]
     pub table_base: Option<u64>,
+    /// Name of the import this instruction calls through, if any:
+    /// indirect `call`/`jmp` sites whose slot resolves to an import, and
+    /// direct `call`/`jmp` sites targeting a PLT stub or import thunk.
+    /// Pure agent-pivot annotation; never affects decoding. Old rows
+    /// without the key still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
 }
 
 impl Serialize for Insn {
@@ -107,7 +114,8 @@ impl Serialize for Insn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("Insn", 12)?;
+        let mut st =
+            serializer.serialize_struct("Insn", if self.import.is_some() { 13 } else { 12 })?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("size", &self.size)?;
@@ -123,6 +131,11 @@ impl Serialize for Insn {
         st.serialize_field("mem_target_hex", &self.mem_target.map(crate::addr_hex))?;
         st.serialize_field("table_base", &self.table_base)?;
         st.serialize_field("table_base_hex", &self.table_base.map(crate::addr_hex))?;
+        if self.import.is_some() {
+            st.serialize_field("import", &self.import)?;
+        } else {
+            st.skip_field("import")?;
+        }
         st.end()
     }
 }
@@ -693,6 +706,7 @@ fn x86_insn(
         branch_target,
         mem_target,
         table_base,
+        import: None,
     }
 }
 
@@ -868,6 +882,7 @@ fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruc
         branch_target: arm_branch_target(inst, addr),
         mem_target: arm_data_target(inst, addr),
         table_base: None,
+        import: None,
     }
 }
 
@@ -1163,6 +1178,7 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
         branch_target: armv7_branch_target(inst, addr),
         mem_target: armv7_data_target(inst, addr),
         table_base: None,
+        import: None,
     }
 }
 

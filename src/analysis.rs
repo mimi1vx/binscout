@@ -6,7 +6,7 @@
 //! prologue scan for functions unreachable from those seeds. Decoded code is
 //! split into basic blocks, each function gets a CFG and the whole binary a
 //! callgraph (both `petgraph` maps), and cross-references are split into
-//! code, data, and string refs.
+//! code, data, string, and import refs.
 //!
 //! Control flow reuses the M3 lift ([`lift`](crate::ir::lift)): `Branch`/`CBranch`/`Call`
 //! carry their direct target, `Return` ends a path, everything else
@@ -44,7 +44,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 6;
+pub const ANALYSIS_REVISION: u32 = 7;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -116,6 +116,13 @@ pub enum XrefKind {
     Data,
     /// Reference into an extracted string.
     String,
+    /// Import call-site reference: an indirect `call`/`jmp` through a PE
+    /// IAT or ELF GOT slot, or a direct `call`/`jmp` to a PLT stub or
+    /// import thunk. `to` is the import's slot address (see
+    /// [`ImportRef::address`](crate::loader::ImportRef::address)); the
+    /// `Data` slot row (indirect sites) and the `Code` stub row (direct
+    /// sites) are retained alongside, so import rows are purely additive.
+    Import,
     /// Provenance-marked inferred code edge: a resolved single-slot
     /// absolute indirect jump or a resolved guarded table entry
     /// (`site -> target`). Direct edges stay
@@ -390,7 +397,8 @@ impl BasicBlock {
 pub struct Function {
     /// Function entry address; the stable key.
     pub entry: u64,
-    /// Export or stub-import name when one resolves to `entry`.
+    /// Export, symbol, stub-import, PLT (`sym@plt`), or thunk name when
+    /// one resolves to `entry`.
     pub name: Option<String>,
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
@@ -706,8 +714,11 @@ pub struct Analysis {
     /// Discovered functions keyed by entry address.
     pub functions: BTreeMap<u64, Function>,
     callgraph: DiGraphMap<u64, ()>,
-    /// Code, data, and string xrefs sorted by `(from, kind, to)`.
+    /// Code, data, string, and import xrefs sorted by `(from, kind, to)`.
     pub xrefs: Vec<Xref>,
+    /// PLT-stub/import-thunk sites: `jmp [slot]` address to `imports`
+    /// index (x86 PE/ELF only; see [`import_slots`]).
+    pub import_stubs: BTreeMap<u64, usize>,
     /// Extracted strings sorted by address.
     pub strings: Vec<StringHit>,
     /// Bounded discovery evidence: unresolved sites and decode failures.
@@ -960,6 +971,7 @@ impl Analysis {
             functions,
             callgraph,
             xrefs,
+            import_stubs: BTreeMap::new(),
             strings,
             diagnostics,
         }
@@ -1152,14 +1164,49 @@ pub fn rebuild(
             ),
         );
     }
-    Ok(Analysis::from_parts(
-        arch,
-        rebuilt,
-        call_edges,
-        xrefs,
-        strings,
-        diagnostics,
-    ))
+    Ok({
+        let mut analysis =
+            Analysis::from_parts(arch, rebuilt, call_edges, xrefs, strings, diagnostics);
+        // Snapshots persist layouts, not rendered rows: re-decoded
+        // instructions need the same import tags and stub map `analyze`
+        // applies, so cached opens answer identically to fresh ones.
+        let slots = import_slots(bin);
+        let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+            collect_stubs(
+                analysis
+                    .functions
+                    .values()
+                    .flat_map(|f| f.blocks.values())
+                    .flat_map(|b| b.insns.iter())
+                    .map(|insn| {
+                        (
+                            insn.addr,
+                            classify(arch, insn),
+                            insn.mem_target,
+                            insn.mnem.as_str(),
+                            insn.size,
+                        )
+                    }),
+                &slots,
+            )
+        } else {
+            BTreeMap::new()
+        };
+        for f in analysis.functions.values_mut() {
+            for b in f.blocks.values_mut() {
+                for insn in &mut b.insns {
+                    if let Some(i) =
+                        import_index(&slots, &stubs, insn.branch_target, insn.mem_target)
+                        && let Some(imp) = bin.imports.get(i)
+                    {
+                        insn.import = Some(imp.name.clone());
+                    }
+                }
+            }
+        }
+        analysis.import_stubs = stubs;
+        analysis
+    })
 }
 
 /// Re-decode one persisted block instruction by instruction.
@@ -1815,13 +1862,16 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<
     // Mach-O stub entries carry their import's address (see
     // `LoadedBinary.imports`): seeding them makes each stub its own
     // function even when no call targets it. Unmapped imports
-    // (`address: None`) contribute nothing.
-    for imp in &bin.imports {
-        if let Some(addr) = imp.address
-            && seeds.len() < MAX_SEEDS
-            && space.code_bytes(addr).is_some()
-        {
-            seeds.push(addr);
+    // (`address: None`) contribute nothing. PE/ELF addresses are data
+    // slots, never code, so they must not seed.
+    if bin.format == BinaryFormat::MachO {
+        for imp in &bin.imports {
+            if let Some(addr) = imp.address
+                && seeds.len() < MAX_SEEDS
+                && space.code_bytes(addr).is_some()
+            {
+                seeds.push(addr);
+            }
         }
     }
     if seeds.is_empty()
@@ -2648,6 +2698,83 @@ impl StringSpanIndex {
     }
 }
 
+/// Import slot map: slot VA to `imports` index for PE/ELF binaries.
+///
+/// Slots are the loader-resolved call pointers (PE IAT, ELF GOT; see
+/// [`ImportRef::address`](crate::loader::ImportRef::address)). Mach-O
+/// addresses are code stubs rather than slots, so they stay out: a data
+/// reference can never legitimately target them.
+#[must_use]
+pub fn import_slots(bin: &LoadedBinary) -> BTreeMap<u64, usize> {
+    if !matches!(bin.format, BinaryFormat::Pe | BinaryFormat::Elf) {
+        return BTreeMap::new();
+    }
+    let mut map = BTreeMap::new();
+    for (i, imp) in bin.imports.iter().enumerate() {
+        if let Some(slot) = imp.address {
+            map.entry(slot).or_insert(i);
+        }
+    }
+    map
+}
+
+/// Import index serving one call site, if any.
+///
+/// Indirect sites match by slot (`mem_target`); direct sites match by
+/// PLT-stub/thunk target (`branch_target` against `stubs`). The slot rule
+/// runs first so a site carrying both resolves to the slot.
+#[must_use]
+pub fn import_index(
+    slots: &BTreeMap<u64, usize>,
+    stubs: &BTreeMap<u64, usize>,
+    branch_target: Option<u64>,
+    mem_target: Option<u64>,
+) -> Option<usize> {
+    if let Some(m) = mem_target
+        && let Some(&i) = slots.get(&m)
+    {
+        return Some(i);
+    }
+    if let Some(t) = branch_target
+        && let Some(&i) = stubs.get(&t)
+    {
+        return Some(i);
+    }
+    None
+}
+
+/// PLT-stub/import-thunk sites from decoded rows: `jmp [slot]` address
+/// to `imports` index (x86 only; snapshot rebuilds run the same
+/// predicate over re-decoded rows).
+///
+/// A bare `jmp` with no direct target whose slot resolves is a stub;
+/// calls through slots are callers, not stubs. A CET `endbr32`/`endbr64`
+/// immediately before the jump (`.plt.sec` entries) maps too, so direct
+/// calls landing on the `endbr` resolve to the same import.
+fn collect_stubs<'a>(
+    rows: impl Iterator<Item = (u64, Flow, Option<u64>, &'a str, u8)>,
+    slots: &BTreeMap<u64, usize>,
+) -> BTreeMap<u64, usize> {
+    let mut stubs = BTreeMap::new();
+    let mut prev: Option<(u64, &'a str, u8)> = None;
+    for (addr, flow, mem, mnem, size) in rows {
+        if matches!(flow, Flow::Branch { target: None })
+            && let Some(m) = mem
+            && let Some(&i) = slots.get(&m)
+        {
+            stubs.insert(addr, i);
+            if let Some((pa, pm, ps)) = prev
+                && (pm == "endbr64" || pm == "endbr32")
+                && pa.wrapping_add(ps as u64) == addr
+            {
+                stubs.insert(pa, i);
+            }
+        }
+        prev = Some((addr, mnem, size));
+    }
+    stubs
+}
+
 /// Run recursive descent and build functions, CFGs, callgraph, and xrefs.
 ///
 /// # Errors
@@ -2675,6 +2802,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             functions: BTreeMap::new(),
             callgraph: DiGraphMap::new(),
             xrefs: Vec::new(),
+            import_stubs: BTreeMap::new(),
             strings: Vec::new(),
             diagnostics,
         });
@@ -2762,12 +2890,42 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         MAX_INFERRED_EDGES,
     )?;
     let Walker {
-        decoded,
+        mut decoded,
         jump_targets,
         fallthroughs,
         diagnostics: mut diagnostic_set,
         ..
     } = walk;
+
+    // Import call sites: the slot map comes from loader-resolved
+    // addresses (PE IAT / ELF GOT); stub sites come from decoded
+    // `jmp [slot]` shapes, CET `endbr` preludes included (see
+    // `collect_stubs`). Calls through slots are callers, not stubs.
+    let slots = import_slots(bin);
+    let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+        collect_stubs(
+            decoded.iter().map(|(&va, d)| {
+                (
+                    va,
+                    d.flow,
+                    d.insn.mem_target,
+                    d.insn.mnem.as_str(),
+                    d.insn.size,
+                )
+            }),
+            &slots,
+        )
+    } else {
+        BTreeMap::new()
+    };
+    // Tag decoded rows with the import each site calls through.
+    for d in decoded.values_mut() {
+        if let Some(i) = import_index(&slots, &stubs, d.insn.branch_target, d.insn.mem_target)
+            && let Some(imp) = bin.imports.get(i)
+        {
+            d.insn.import = Some(imp.name.clone());
+        }
+    }
 
     // Pass B: split decoded runs into blocks at seeds, targets, fallthroughs.
     let mut starts: BTreeSet<u64> = BTreeSet::new();
@@ -2805,11 +2963,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries, then symbol-table names, then Mach-O
-    // stub import names. Precedence per address: export > symbol > stub;
-    // annotation renames win over all three at display time (see
-    // `Project::function_name`). Export addresses normalize like seeds
-    // so an odd ARM export still names its function.
+    // Export names for entries, then symbol-table names, then import
+    // addresses (Mach-O stubs; PE slots are data and never collide).
+    // ELF stubs take `sym@plt` from the stub map below. Precedence per
+    // address: export > symbol > import; annotation renames win over all
+    // three at display time (see `Project::function_name`). Export
+    // addresses normalize like seeds so an odd ARM export still names
+    // its function.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
@@ -2822,9 +2982,31 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         names.entry(sym.address).or_insert_with(|| sym.name.clone());
     }
     for imp in &bin.imports {
+        // ELF slots are data addresses that never collide with entries;
+        // ELF stubs take `sym@plt` from the stub map below instead.
+        if bin.format == BinaryFormat::Elf {
+            continue;
+        }
         if let Some(addr) = imp.address {
             names.entry(addr).or_insert_with(|| imp.name.clone());
         }
+    }
+    // PLT/import-thunk stubs: a `jmp [slot]` site that starts a function
+    // serves that import. ELF stubs read `sym@plt`; PE thunks carry the
+    // bare import name. `or_insert` keeps the export > symbol > import
+    // precedence of the loops above.
+    for (&site, &i) in &stubs {
+        if !entries.contains(&site) {
+            continue;
+        }
+        let Some(imp) = bin.imports.get(i) else {
+            continue;
+        };
+        let name = match bin.format {
+            BinaryFormat::Elf => format!("{}@plt", imp.name),
+            _ => imp.name.clone(),
+        };
+        names.entry(site).or_insert(name);
     }
 
     // Pass C: assign blocks to functions, build CFGs and the callgraph.
@@ -2981,6 +3163,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         {
             xrefs.insert((va, XrefKind::Data, m));
         }
+        // Import rows: indirect slot references and direct stub/thunk
+        // targets both resolve to the import's slot address.
+        if let Some(i) = import_index(&slots, &stubs, target, d.insn.mem_target)
+            && let Some(slot) = bin.imports.get(i).and_then(|imp| imp.address)
+        {
+            xrefs.insert((va, XrefKind::Import, slot));
+        }
     }
     // ARM64 `adrp` decodes to its 4K page base; the page offset rides in
     // the next instruction (`add`/`ldr`). Where an adjacent same-block
@@ -3061,7 +3250,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             XrefKind::Code
         )));
     }
-    for kind in [XrefKind::Data, XrefKind::String] {
+    for kind in [XrefKind::Data, XrefKind::String, XrefKind::Import] {
         if xrefs.iter().filter(|x| x.kind == kind).count() > MAX_XREFS_PER_KIND {
             return Err(Error::Limit(format!(
                 "more than {MAX_XREFS_PER_KIND} {kind:?} xrefs"
@@ -3086,6 +3275,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         functions,
         callgraph,
         xrefs,
+        import_stubs: stubs,
         strings,
         diagnostics,
     })
@@ -3112,6 +3302,7 @@ mod tests {
             branch_target: None,
             mem_target: None,
             table_base: None,
+            import: None,
         };
         assert_eq!(classify(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
@@ -3123,6 +3314,7 @@ mod tests {
             branch_target: Some(0x1005),
             mem_target: None,
             table_base: None,
+            import: None,
         };
         assert_eq!(
             classify(Arch::X86_64, &call),

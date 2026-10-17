@@ -144,10 +144,12 @@ pub struct Section {
 /// importing image; named imports carry `ordinal: None` and
 /// `unresolved: false`. C++ names (MSVC `?...` and Itanium `_Z...`)
 /// additionally carry `demangled: Some(...)` when the demangler succeeds.
-/// Mach-O imports resolved to a `__stubs`/`__auth_stubs` entry carry its
-/// address; every other import carries `address: None`. JSON pairs
-/// `address` with `address_hex` (`null` on both sides for address-less
-/// imports).
+/// Resolved imports carry the pointer they are called through in
+/// `address`: the `__stubs`/`__auth_stubs` entry on Mach-O, the IAT slot
+/// on PE, the GOT slot named by `.rela.plt`/`.rel.plt` `R_*_JUMP_SLOT`
+/// relocations on ELF. Unresolved imports carry `address: None`. JSON
+/// pairs `address` with `address_hex` (`null` on both sides for
+/// address-less imports).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImportRef {
     /// Providing module (`""` when the format names none).
@@ -163,8 +165,8 @@ pub struct ImportRef {
     /// Demangled C++ name, when `name` is a recognized mangling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
-    /// `__stubs`/`__auth_stubs` entry address (`None` for non-Mach-O and
-    /// unmapped Mach-O imports; see `load` stub mapping).
+    /// `__stubs`/`__auth_stubs` entry address on Mach-O, IAT slot on PE,
+    /// GOT slot on ELF (`None` for unmapped imports; see `load`).
     #[serde(default)]
     pub address: Option<u64>,
 }
@@ -624,6 +626,18 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         }
     }
 
+    if format == BinaryFormat::Pe
+        && let Some(slots) = pe_iat_slots(bytes, imports.len())
+    {
+        for (imp, slot) in imports.iter_mut().zip(slots) {
+            imp.address = Some(slot);
+        }
+    }
+
+    if format == BinaryFormat::Elf {
+        elf_got_slots(&file, bytes, arch, &mut imports);
+    }
+
     let mut exports = Vec::new();
     for exp in file
         .exports()
@@ -732,6 +746,172 @@ fn macho_stub_addresses<'a>(
         return None;
     }
     Some(addrs)
+}
+
+/// IAT slot virtual addresses in import order, or `None` on any doubt.
+///
+/// Walks the regular import descriptors (`FirstThunk` tables) counting one
+/// slot per thunk; the count must equal `import_count` exactly, otherwise
+/// nothing maps rather than misattributing a slot (delay-load imports,
+/// which the generic import walk reports after the regular ones, trip
+/// this guard). Slot math is checked against the image base.
+fn pe_iat_slots(bytes: &[u8], import_count: usize) -> Option<Vec<u64>> {
+    use object::read::pe::{PeFile32, PeFile64};
+    if import_count == 0 || import_count > MAX_IMPORTS {
+        return None;
+    }
+    match FileKind::parse(bytes) {
+        Ok(FileKind::Pe32) => PeFile32::parse(bytes)
+            .ok()
+            .and_then(|pe| pe_slots(&pe, import_count, 4)),
+        Ok(FileKind::Pe64) => PeFile64::parse(bytes)
+            .ok()
+            .and_then(|pe| pe_slots(&pe, import_count, 8)),
+        _ => None,
+    }
+}
+
+fn pe_slots<Pe>(
+    pe: &object::read::pe::PeFile<'_, Pe>,
+    import_count: usize,
+    stride: u64,
+) -> Option<Vec<u64>>
+where
+    Pe: object::read::pe::ImageNtHeaders,
+{
+    use object::LittleEndian as LE;
+    let table = pe.import_table().ok()??;
+    let base = pe.relative_address_base();
+    let mut descs = table.descriptors().ok()?;
+    let mut slots = Vec::new();
+    while let Some(desc) = descs.next().ok()? {
+        let first_thunk = desc.first_thunk.get(LE);
+        let mut thunks = table.thunks(first_thunk).ok()?;
+        let mut idx: u64 = 0;
+        while thunks.next::<Pe>().ok()?.is_some() {
+            if slots.len() >= MAX_IMPORTS {
+                return None;
+            }
+            let rva = u64::from(first_thunk).checked_add(idx.checked_mul(stride)?)?;
+            slots.push(base.checked_add(rva)?);
+            idx += 1;
+        }
+    }
+    if slots.len() != import_count {
+        return None;
+    }
+    Some(slots)
+}
+
+/// Assign GOT slot addresses to ELF imports from `R_*_JUMP_SLOT` relocs.
+///
+/// Parses `.rela.plt`/`.rel.plt` entries directly (`object` maps these
+/// types to `RelocationKind::Unknown`, so the unified relocation view
+/// cannot see them): each entry's `r_offset` is already the slot's
+/// virtual address, and its symbol resolves through the dynamic symbol
+/// table to an import matched by name. Unknown types, unreadable
+/// sections, and nameless imports are skipped, never guessed; the first
+/// slot wins on repeats.
+fn elf_got_slots<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    bytes: &[u8],
+    arch: Arch,
+    imports: &mut [ImportRef],
+) {
+    if imports.is_empty() {
+        return;
+    }
+    let jump_slot: u32 = match arch {
+        Arch::X86_64 | Arch::X86_32 => 7,
+        Arch::Arm32 | Arch::Thumb => 22,
+        Arch::Aarch64 => 1026,
+    };
+    let is64 = bytes.get(4).is_some_and(|&c| c == 2);
+    let le = file.endianness() == object::Endianness::Little;
+    // Index-aligned with `r_info` symbol numbers: the dynamic-symbol
+    // iterator starts past the null symbol, so index 0 stays empty here.
+    let mut dynsyms: Vec<Vec<u8>> = vec![Vec::new()];
+    dynsyms.extend(
+        file.dynamic_symbols()
+            .map(|s| s.name_bytes().unwrap_or_default().to_vec()),
+    );
+    if dynsyms.len() < 2 {
+        return;
+    }
+    let mut assigned = 0usize;
+    for sec in file.sections() {
+        if assigned >= imports.len() || assigned >= MAX_IMPORTS {
+            break;
+        }
+        let is_rela = match sec.name() {
+            Ok(".rela.plt") => true,
+            Ok(".rel.plt") => false,
+            _ => continue,
+        };
+        let data = match sec.data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let entry = if is64 {
+            if is_rela { 24 } else { 16 }
+        } else if is_rela {
+            12
+        } else {
+            8
+        };
+        if data.is_empty() || data.len() % entry != 0 {
+            continue;
+        }
+        let get32 = |off: usize| -> Option<u32> {
+            let b: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+            Some(if le {
+                u32::from_le_bytes(b)
+            } else {
+                u32::from_be_bytes(b)
+            })
+        };
+        let get64 = |off: usize| -> Option<u64> {
+            let b: [u8; 8] = data.get(off..off + 8)?.try_into().ok()?;
+            Some(if le {
+                u64::from_le_bytes(b)
+            } else {
+                u64::from_be_bytes(b)
+            })
+        };
+        let mut off = 0;
+        while off + entry <= data.len() {
+            if assigned >= MAX_IMPORTS {
+                break;
+            }
+            let (slot, sym, rtype) = if is64 {
+                let (Some(r_offset), Some(r_info)) = (get64(off), get64(off + 8)) else {
+                    break;
+                };
+                (r_offset, (r_info >> 32) as usize, r_info as u32)
+            } else {
+                let (Some(r_offset), Some(r_info)) = (get32(off), get32(off + 4)) else {
+                    break;
+                };
+                (u64::from(r_offset), (r_info >> 8) as usize, r_info & 0xff)
+            };
+            off += entry;
+            if rtype != jump_slot || slot == 0 {
+                continue;
+            }
+            let sym_name = match dynsyms.get(sym) {
+                Some(n) if !n.is_empty() => n,
+                _ => continue,
+            };
+            let want = String::from_utf8_lossy(sym_name);
+            if let Some(imp) = imports
+                .iter_mut()
+                .find(|i| i.address.is_none() && i.name.as_str() == want.as_ref())
+            {
+                imp.address = Some(slot);
+                assigned += 1;
+            }
+        }
+    }
 }
 
 /// True for thin little-endian Mach-O images (32- or 64-bit).

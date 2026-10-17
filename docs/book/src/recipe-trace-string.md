@@ -46,7 +46,7 @@ $ binscout xrefs fw.exe --to 0x402100 --kind string
 ```
 
 `xrefs` filters by `--to` / `--from` / `--kind` (`code`, `data`,
-`string`, `inferred-code`, case-insensitive) and pages behind a
+`string`, `import`, `inferred-code`, case-insensitive) and pages behind a
 `{"total", "xrefs"}` envelope. Rows carry `from` / `from_hex`,
 `to` / `to_hex`, and `kind`. A string typically has `string`-kind
 rows from the referencing instructions (the `pe32-basic.exe`

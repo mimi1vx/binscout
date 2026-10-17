@@ -9,7 +9,7 @@ Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
 $ binscout load tests/fixtures/raw-x64.bin
-{"analysis_revision":6,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":7,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
 ```
 
 `mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto
@@ -173,9 +173,14 @@ Explicitly unchanged in this contract (no style churn): the bare-array
 `functions` list with `--offset`/`--limit`; the `{"total", "xrefs"}`
 `xrefs` envelope; the bare-array `strings` list with
 `--start`/`--limit` (`--offset` stays a deprecated alias that warns);
-`symbols` exports keep their shape while imports gain additive
-`address`/`address_hex` (the Mach-O `__stubs` entry address, null when
-unmapped); a third additive array, `symbols`, carries one
+`symbols` exports keep their shape while imports carry additive
+`address`/`address_hex` (the call pointer: the Mach-O `__stubs` entry,
+the PE IAT slot, the ELF GOT slot named by `.rela.plt`/`.rel.plt`
+`R_*_JUMP_SLOT` relocations; null when unmapped), `disasm`/`ir` rows
+carry an additive `import` name when the instruction calls through an
+import slot or stub, and `pseudo` lines carry the same additive `import`
+name; `xrefs` gains the additive `import` kind for call sites through
+an import slot or stub (alongside the retained `data`/`code` rows); a third additive array, `symbols`, carries one
 `name`/`address`/`address_hex` row per defined text symbol from the
 object symbol tables (locals included, deduplicated by address, Thumb
 bit cleared on ARM). Symbol addresses seed analysis as
@@ -215,7 +220,7 @@ Explicit raw mode never falls back to another mode on failure.
 
 ```sh
 $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/raw.redb
-{"analysis_revision":6,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":7,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
 ```
 
 Same bytes under a different mapping never reuse cached layouts: the
@@ -483,6 +488,28 @@ the project budget exhausts, the site stays unresolved with its
 diagnostic retained and the excess counted in `inferred_omitted`
 with `inferred_truncated` set — never silently clipped from the
 inferred graph.
+
+### Import call sites
+
+Indirect calls through a PE IAT or ELF GOT slot (`call [slot]`,
+`jmp [slot]`, including `bnd`-prefixed and CET-`endbr` PLT shapes)
+and direct calls to ELF PLT stubs (`sym@plt` functions) or PE import
+thunks resolve to `import`-kind xrefs whose `to` is the import's slot
+address — the same address the `symbols` import row carries:
+
+```json
+{"total": 2, "xrefs": [
+  {"from": 4198400, "from_hex": "0x401000", "kind": "Data", "to": 4202496, "to_hex": "0x402100"},
+  {"from": 4198400, "from_hex": "0x401000", "kind": "Import", "to": 4202496, "to_hex": "0x402100"}]}
+```
+
+The `data` row (indirect sites) and the `code` row (direct stub
+calls) are retained alongside, so `import` rows are purely additive;
+`xrefs --to <slot> --kind import` lists exactly the import's
+callers. `disasm`/`block-insns` rows and `pseudo` lines at such
+sites carry the additive `import` name. Import rows share the
+1,000,000-per-kind xref budget with their own cap. Uncalled PLT
+stubs seed no function: with no caller there is nothing to xref.
 
 ## Errors and validation
 

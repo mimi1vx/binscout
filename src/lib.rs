@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
     Analysis, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref, XrefKind, analyze,
-    diagnostic_detail,
+    diagnostic_detail, import_index, import_slots,
 };
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn, PartialDisasm};
@@ -837,7 +837,8 @@ impl Project {
     }
 
     /// Display name of a function: annotation rename wins over the
-    /// analysis name (export > symbol-table > stub import).
+    /// analysis name (export > symbol-table > stub import, with ELF PLT
+    /// stubs as `sym@plt` and PE import thunks under the bare name).
     #[must_use]
     pub fn function_name(&self, entry: u64) -> Option<String> {
         if let Some(n) = self
@@ -1133,16 +1134,33 @@ impl Project {
     ///
     /// Returns the valid prefix plus `error_at` for the first bad opcode
     /// (`None` when the whole range decodes); cap overruns are still
-    /// errors. Serializes as `{"insns": [...], "error_at": null|{...}}`.
+    /// errors. Rows carry the resolved import name when the instruction
+    /// calls through an import slot or stub (see
+    /// [`crate::analysis::XrefKind::Import`]). Serializes as
+    /// `{"insns": [...], "error_at": null|{...}}`.
     ///
     /// # Errors
     /// Same as [`Project::bytes_at`], plus [`Error::Limit`] on cap overrun.
     pub fn disasm_at(&self, addr: u64, len: usize) -> Result<PartialDisasm> {
         let bytes = self.bytes_at(addr, len)?;
-        self.binary
+        let mut partial = self
+            .binary
             .arch
             .disassembler()
-            .disasm_range_partial(&bytes, addr)
+            .disasm_range_partial(&bytes, addr)?;
+        let slots = import_slots(&self.binary);
+        for insn in &mut partial.insns {
+            if let Some(i) = import_index(
+                &slots,
+                &self.analysis.import_stubs,
+                insn.branch_target,
+                insn.mem_target,
+            ) && let Some(imp) = self.binary.imports.get(i)
+            {
+                insn.import = Some(imp.name.clone());
+            }
+        }
+        Ok(partial)
     }
 
     /// Function rows with annotation renames resolved, ordered by entry.
@@ -1430,8 +1448,9 @@ impl Project {
     ///
     /// `addr` may be any address inside the function; it snaps to the
     /// containing entry exactly like [`Project::cfg_of`]. Each line
-    /// propagates its source IR warning (`None` for mapped rows); the
-    /// top-level `warning` is always
+    /// propagates its source IR warning (`None` for mapped rows) and the
+    /// resolved import name when the source instruction calls through an
+    /// import slot or stub; the top-level `warning` is always
     /// [`PSEUDO_WARNING`](crate::pseudo::PSEUDO_WARNING). Read-only: never
     /// writes the binary or the sidecar.
     ///
@@ -1447,7 +1466,18 @@ impl Project {
             .functions
             .get(&entry)
             .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
-        let pseudo = crate::pseudo::render_function(self.binary.arch, func);
+        let mut pseudo = crate::pseudo::render_function(self.binary.arch, func);
+        let by_addr: BTreeMap<u64, &String> = func
+            .blocks
+            .values()
+            .flat_map(|b| &b.insns)
+            .filter_map(|i| i.import.as_ref().map(|name| (i.addr, name)))
+            .collect();
+        for line in &mut pseudo.lines {
+            if let Some(name) = by_addr.get(&line.addr) {
+                line.import = Some((*name).clone());
+            }
+        }
         let pseudo = serde_json::to_value(pseudo).expect("pseudo serializes");
         let (entry_json, entry_hex) = addr_pair(entry);
         Ok(serde_json::json!({
@@ -1723,9 +1753,10 @@ impl Project {
     ///
     /// Ordinal-only imports carry `ordinal` plus `unresolved: true`;
     /// C++ imports/exports/symbols carry `demangled` when [`crate::loader::demangle_cpp`]
-    /// recognizes the mangling. Mach-O imports resolved to a
-    /// `__stubs`/`__auth_stubs` entry carry its `address`/`address_hex`;
-    /// every other import row carries null on both sides. `symbols` holds
+    /// recognizes the mangling. Resolved imports carry the call pointer in
+    /// `address`/`address_hex`: the `__stubs`/`__auth_stubs` entry on
+    /// Mach-O, the IAT slot on PE, the GOT slot on ELF; every other import
+    /// row carries null on both sides. `symbols` holds
     /// one `{name, address, address_hex}` row per defined text symbol
     /// (locals included), deduplicated by address; empty for raw blobs
     /// and LE images, which have no symbol tables.
@@ -1984,8 +2015,9 @@ pub fn parse_addr(s: &str) -> Result<u64> {
     v.map_err(|_| Error::Invalid(format!("bad address: {s:?}")))
 }
 
-/// Parse an xref kind filter: `code`, `data`, `string`, or
-/// `inferred-code` (provenance-marked single-slot resolutions).
+/// Parse an xref kind filter: `code`, `data`, `string`, `import`
+/// (call sites through an import slot or stub), or `inferred-code`
+/// (provenance-marked single-slot resolutions).
 ///
 /// # Errors
 /// [`Error::Invalid`] for anything else.
@@ -1994,6 +2026,7 @@ pub fn parse_xref_kind(s: &str) -> Result<XrefKind> {
         "code" => Ok(XrefKind::Code),
         "data" => Ok(XrefKind::Data),
         "string" => Ok(XrefKind::String),
+        "import" => Ok(XrefKind::Import),
         "inferred-code" => Ok(XrefKind::InferredCode),
         _ => Err(Error::Invalid(format!("bad xref kind: {s:?}"))),
     }
@@ -2135,6 +2168,8 @@ mod tests {
             ("code", XrefKind::Code),
             ("Data", XrefKind::Data),
             ("STRING", XrefKind::String),
+            ("import", XrefKind::Import),
+            ("Import", XrefKind::Import),
             ("inferred-code", XrefKind::InferredCode),
             ("Inferred-Code", XrefKind::InferredCode),
         ] {

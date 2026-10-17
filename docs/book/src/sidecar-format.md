@@ -22,7 +22,7 @@ carry over and the binary re-analyzes. Row values are JSON.
 | `binaries` | `0` | snapshot metadata |
 | `functions` | entry address | function row (name, callees, discovery reasons, inferred successors) |
 | `blocks` | block key | block row (address range, successors, inferred successors) |
-| `xrefs` | xref key | cross-reference row (direct and `inferred-code` kinds) |
+| `xrefs` | xref key | cross-reference row (direct, `import`, and `inferred-code` kinds) |
 | `strings` | row index | extracted-string row |
 | `diagnostics` | record key | provenance row (unresolved indirect sites, decode failures) |
 | `annotations` | address | rename and/or comment |

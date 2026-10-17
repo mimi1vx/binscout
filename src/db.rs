@@ -654,6 +654,7 @@ fn xref_kind_name(kind: crate::analysis::XrefKind) -> &'static str {
         crate::analysis::XrefKind::Code => "code",
         crate::analysis::XrefKind::Data => "data",
         crate::analysis::XrefKind::String => "string",
+        crate::analysis::XrefKind::Import => "import",
         crate::analysis::XrefKind::InferredCode => "inferred-code",
     }
 }

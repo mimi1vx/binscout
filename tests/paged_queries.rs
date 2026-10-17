@@ -70,6 +70,7 @@ fn test_insn(addr: u64) -> Insn {
         branch_target: None,
         mem_target: None,
         table_base: None,
+        import: None,
     }
 }
 
