@@ -137,6 +137,45 @@ fn run(args: &[&str]) -> (bool, Value) {
 }
 
 #[test]
+fn lib_diff_func_rows_carry_renames_without_affecting_pairing() {
+    let dir = tmpdir("diff-rename");
+    let a = write_bin(&dir, "a.bin", &blob_a());
+    let b = write_bin(&dir, "b.bin", &blob_b());
+    let mut pa = binscout::Project::open_with_db(&a, &temp_db(&dir, "a")).expect("open a");
+    let mut pb = binscout::Project::open_with_db(&b, &temp_db(&dir, "b")).expect("open b");
+
+    // Raw blobs carry no symbol names. Renames are per-side display
+    // labels: they must surface in the one-sided rows yet never affect
+    // content pairing.
+    pa.rename_function(0x1F, "old_gone")
+        .expect("rename removed");
+    pb.rename_function(0x1F, "new_here").expect("rename added");
+    pa.rename_function(0x14, "alpha").expect("rename changed A");
+    pb.rename_function(0x14, "beta").expect("rename changed B");
+
+    let r = binscout::diff::diff_projects(&pa, &pb);
+    assert_eq!(r.summary.matched, 1);
+    assert_eq!(r.summary.changed, 1);
+    assert_eq!(r.summary.added, 1);
+    assert_eq!(r.summary.removed, 1);
+
+    // One-sided rows carry the rename-resolved display name.
+    assert_eq!(r.removed.len(), 1);
+    assert_eq!(r.removed[0].entry, 0x1F);
+    assert_eq!(r.removed[0].name.as_deref(), Some("old_gone"));
+    assert_eq!(r.added.len(), 1);
+    assert_eq!(r.added[0].entry, 0x1F);
+    assert_eq!(r.added[0].name.as_deref(), Some("new_here"));
+
+    // Differing renames do not break content pairing.
+    assert_eq!(r.changed.len(), 1);
+    let c = &r.changed[0];
+    assert_eq!((c.entry_a, c.entry_b), (0x14, 0x14));
+    assert_eq!(c.reason, binscout::diff::MatchReason::IrMatch);
+    cleanup(&dir);
+}
+
+#[test]
 fn cli_diff_reports_added_removed_changed_and_writes_nothing() {
     let dir = tmpdir("diff-cli");
     let a = write_bin(&dir, "a.bin", &blob_a()).display().to_string();

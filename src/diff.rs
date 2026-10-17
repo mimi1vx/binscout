@@ -83,7 +83,10 @@ pub enum MatchReason {
 pub struct FuncRow {
     /// Function entry address on its own side.
     pub entry: u64,
-    /// Raw export/symbol name, if any (never a rename).
+    /// Rename-resolved display name, if any: the per-side annotation
+    /// rename when present, else the raw export/symbol name. Matching
+    /// still keys on the raw names (see [`MatchReason::NameMatch`]), so
+    /// renames never affect pairing.
     pub name: Option<String>,
     /// SHA-256 over raw instruction bytes in address order.
     pub bytes_hash: String,
