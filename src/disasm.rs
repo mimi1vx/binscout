@@ -464,11 +464,15 @@ fn limit_err(max_insns: usize) -> Error {
     Error::Limit(format!("more than {max_insns} instructions in range"))
 }
 
-/// Legacy x86 prefixes folded into iced-x86's formatted text. [`split_asm`]
+/// Legacy x86 prefixes (plus the CET/MPX/HLE prefix words iced-x86 folds
+/// into formatted text: `notrack`, `bnd`, `xacquire`, `xrelease`).
+/// [`split_asm`]
 /// strips these so the mnemonic is the real operation (`rep movsb` becomes
 /// `movsb`, `lock add ..` becomes `add`); no ARM backend prints these words
 /// as a mnemonic head, so the strip is x86-only in effect.
-const X86_PREFIXES: &[&str] = &["rep", "repe", "repne", "lock"];
+const X86_PREFIXES: &[&str] = &[
+    "rep", "repe", "repne", "lock", "notrack", "bnd", "xacquire", "xrelease",
+];
 
 /// Split `mnem op1, op2` into a lowercase mnemonic and operand strings.
 ///
