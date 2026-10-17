@@ -888,8 +888,7 @@ fn xrefs(
     let p = open(binary, db, raw, fat_arch)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
-    let total = p.count_xrefs(to, from, kind);
-    let rows = p.query_xrefs(to, from, kind, offset, limit);
+    let (total, rows) = p.query_xrefs_page(to, from, kind, offset, limit);
     Ok(serde_json::json!({ "total": total, "xrefs": rows }))
 }
 

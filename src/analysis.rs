@@ -21,6 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::OnceLock;
 
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
@@ -716,6 +717,11 @@ pub struct Analysis {
     callgraph: DiGraphMap<u64, ()>,
     /// Code, data, string, and import xrefs sorted by `(from, kind, to)`.
     pub xrefs: Vec<Xref>,
+    /// Lazily built secondary index: positions into [`xrefs`](Self::xrefs)
+    /// sorted by (`to`, `from`, `kind`), so `to` queries binary-search
+    /// instead of scanning. Built once on first use; never persisted (the
+    /// sidecar stores rows in `from` order and the index rebuilds on open).
+    to_index: OnceLock<Vec<u32>>,
     /// PLT-stub/import-thunk sites: `jmp [slot]` address to `imports`
     /// index (x86 PE/ELF only; see [`import_slots`]).
     pub import_stubs: BTreeMap<u64, usize>,
@@ -810,15 +816,12 @@ impl Analysis {
     /// the callgraph walks there is no unknown-entry case.
     #[must_use]
     pub fn slice_to(&self, addr: u64, max_depth: usize) -> Vec<(u64, usize)> {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use std::collections::{HashSet, VecDeque};
         let cap = max_depth.min(MAX_SLICE_DEPTH);
         if cap == 0 {
             return Vec::new();
         }
-        let mut xref_preds: HashMap<u64, Vec<u64>> = HashMap::new();
-        for x in &self.xrefs {
-            xref_preds.entry(x.to).or_default().push(x.from);
-        }
+        let idx = self.to_index();
         let mut seen: HashSet<u64> = HashSet::from([addr]);
         let mut queue: VecDeque<(u64, usize)> = VecDeque::from([(addr, 0)]);
         let mut out: Vec<(u64, usize)> = Vec::new();
@@ -827,9 +830,8 @@ impl Analysis {
                 continue;
             }
             let mut next: Vec<u64> = Vec::new();
-            if let Some(v) = xref_preds.get(&cur) {
-                next.extend(v.iter().copied());
-            }
+            let (lo, hi) = self.span_to(idx, cur);
+            next.extend(idx[lo..hi].iter().map(|&i| self.xrefs[i as usize].from));
             next.extend(self.insn_preds(cur));
             next.sort_unstable();
             next.dedup();
@@ -865,9 +867,8 @@ impl Analysis {
         else {
             return Vec::new();
         };
-        let addrs: Vec<u64> = block.insns.iter().map(|i| i.addr).collect();
-        match addrs.iter().position(|&a| a == cur) {
-            Some(i) if i > 0 => vec![addrs[i - 1]],
+        match block.insns.iter().position(|i| i.addr == cur) {
+            Some(i) if i > 0 => vec![block.insns[i - 1].addr],
             Some(_) => {
                 let mut preds = f.predecessors(start);
                 preds.sort_unstable();
@@ -938,7 +939,10 @@ impl Analysis {
     ///
     /// Drops call edges pointing at unknown functions, mirroring [`analyze`].
     /// `diagnostics` records are sorted, deduplicated, and capped at
-    /// [`MAX_DIAGNOSTICS`] via [`Diagnostics::collect`].
+    /// [`MAX_DIAGNOSTICS`] via [`Diagnostics::collect`]. `xrefs` are sorted
+    /// into `(from, kind, to)` order when the caller passes them unsorted
+    /// (snapshot rows already arrive sorted, so the check is one linear
+    /// pass); the binary-search queries require that order.
     #[must_use]
     pub fn from_parts(
         arch: Arch,
@@ -948,6 +952,10 @@ impl Analysis {
         strings: Vec<StringHit>,
         diagnostics: Diagnostics,
     ) -> Self {
+        let mut xrefs = xrefs;
+        if !xrefs.is_sorted_by_key(|x| (x.from, x.kind, x.to)) {
+            xrefs.sort_by_key(|x| (x.from, x.kind, x.to));
+        }
         let mut callgraph = DiGraphMap::<u64, ()>::new();
         for e in functions.keys() {
             callgraph.add_node(*e);
@@ -971,6 +979,7 @@ impl Analysis {
             functions,
             callgraph,
             xrefs,
+            to_index: OnceLock::new(),
             import_stubs: BTreeMap::new(),
             strings,
             diagnostics,
@@ -1397,6 +1406,25 @@ fn page_slice<T: Clone>(items: &[T], offset: usize, limit: usize) -> Vec<T> {
         .collect()
 }
 
+/// Count a match stream while collecting one page: one pass, no intermediate
+/// vector. `offset` skips that many matches, `cap` is the already-clipped
+/// page size, so `limit == 0` still reports the exact count.
+fn count_and_page(
+    matches: impl Iterator<Item = Xref>,
+    offset: usize,
+    cap: usize,
+) -> (usize, Vec<Xref>) {
+    let mut total = 0usize;
+    let mut page = Vec::new();
+    for x in matches {
+        if total >= offset && page.len() < cap {
+            page.push(x);
+        }
+        total += 1;
+    }
+    (total, page)
+}
+
 impl Analysis {
     /// Counters over the whole result.
     #[must_use]
@@ -1483,24 +1511,127 @@ impl Analysis {
         }
     }
 
-    /// Xrefs pointing at `addr`.
+    /// Positions into [`xrefs`](Self::xrefs) sorted by (`to`, `from`,
+    /// `kind`), built once on first use.
+    ///
+    /// Repeated `to` queries and slices share this one build plus a binary
+    /// search each instead of paying a linear scan per request.
+    fn to_index(&self) -> &[u32] {
+        self.to_index.get_or_init(|| {
+            let mut idx: Vec<u32> = (0..self.xrefs.len()).map(|i| i as u32).collect();
+            idx.sort_by_key(|&i| {
+                let x = &self.xrefs[i as usize];
+                (x.to, x.from, x.kind)
+            });
+            idx
+        })
+    }
+
+    /// Half-open span of [`xrefs`](Self::xrefs) with `from == addr`, via
+    /// binary search (rows are sorted `(from, kind, to)`).
+    fn span_from(&self, addr: u64) -> (usize, usize) {
+        let lo = self.xrefs.partition_point(|x| x.from < addr);
+        let hi = self.xrefs.partition_point(|x| x.from <= addr);
+        (lo, hi)
+    }
+
+    /// Half-open span of `idx` (see [`to_index`](Self::to_index)) whose rows
+    /// point at `addr`.
+    fn span_to(&self, idx: &[u32], addr: u64) -> (usize, usize) {
+        let lo = idx.partition_point(|&i| self.xrefs[i as usize].to < addr);
+        let hi = idx.partition_point(|&i| self.xrefs[i as usize].to <= addr);
+        (lo, hi)
+    }
+
+    /// Xrefs pointing at `addr`, in `(from, kind)` order.
+    ///
+    /// Binary-searches the `to_index` span instead of
+    /// scanning: for a fixed `to` the index order is `(from, kind)`, the
+    /// same rows the old linear filter returned.
     #[must_use]
     pub fn xrefs_to(&self, addr: u64) -> Vec<Xref> {
-        self.xrefs
+        let idx = self.to_index();
+        let (lo, hi) = self.span_to(idx, addr);
+        idx[lo..hi]
             .iter()
-            .copied()
-            .filter(|x| x.to == addr)
+            .map(|&i| self.xrefs[i as usize])
             .collect()
     }
 
-    /// Xrefs originating at `addr`.
+    /// Xrefs originating at `addr`, in `(kind, to)` order.
+    ///
+    /// Binary-searches the `(from, kind, to)`-sorted rows instead of
+    /// scanning; the span keeps storage order, as before.
     #[must_use]
     pub fn xrefs_from(&self, addr: u64) -> Vec<Xref> {
-        self.xrefs
-            .iter()
-            .copied()
-            .filter(|x| x.from == addr)
-            .collect()
+        let (lo, hi) = self.span_from(addr);
+        self.xrefs[lo..hi].to_vec()
+    }
+
+    /// Xrefs matching the endpoint/kind filters with the pre-page count, in
+    /// one pass.
+    ///
+    /// Rows come in storage order, as the old filter-then-page path
+    /// reported: a `from` filter narrows to one binary-searched span, the
+    /// unfiltered case scans, and a `to`-only filter walks the `to_index`
+    /// span when it is already built (same row
+    /// order for a fixed `to`) but falls back to one linear scan while it
+    /// is cold — a single request does one lookup, which a scan answers
+    /// faster than building the index, while slices and repeated lookups
+    /// amortize the build. `limit` clips to [`MAX_PAGE`]; an `offset` past
+    /// the end yields an empty page with the exact count.
+    #[must_use]
+    pub fn xrefs_matching_page(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+        offset: usize,
+        limit: usize,
+    ) -> (usize, Vec<Xref>) {
+        let cap = truncate_limit(limit);
+        if let Some(f) = from {
+            let (lo, hi) = self.span_from(f);
+            return count_and_page(
+                self.xrefs[lo..hi]
+                    .iter()
+                    .copied()
+                    .filter(move |x| to.is_none_or(|t| x.to == t))
+                    .filter(move |x| kind.is_none_or(|k| x.kind == k)),
+                offset,
+                cap,
+            );
+        }
+        if let Some(t) = to {
+            if let Some(idx) = self.to_index.get() {
+                let (lo, hi) = self.span_to(idx, t);
+                return count_and_page(
+                    idx[lo..hi]
+                        .iter()
+                        .map(|&i| self.xrefs[i as usize])
+                        .filter(move |x| kind.is_none_or(|k| x.kind == k)),
+                    offset,
+                    cap,
+                );
+            }
+            return count_and_page(
+                self.xrefs
+                    .iter()
+                    .copied()
+                    .filter(|x| x.to == t)
+                    .filter(move |x| kind.is_none_or(|k| x.kind == k)),
+                offset,
+                cap,
+            );
+        }
+        count_and_page(
+            self.xrefs
+                .iter()
+                .copied()
+                .filter(move |x| kind.is_none_or(|k| x.kind == k)),
+            offset,
+            cap,
+        )
     }
 
     /// Diagnostics filtered by kind and containing function, ordered by
@@ -2806,6 +2937,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             functions: BTreeMap::new(),
             callgraph: DiGraphMap::new(),
             xrefs: Vec::new(),
+            to_index: OnceLock::new(),
             import_stubs: BTreeMap::new(),
             strings: Vec::new(),
             diagnostics,
@@ -3284,6 +3416,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         functions,
         callgraph,
         xrefs,
+        to_index: OnceLock::new(),
         import_stubs: stubs,
         strings,
         diagnostics,

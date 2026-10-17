@@ -1170,8 +1170,8 @@ impl BinscoutMcp {
             .transpose()
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
-        let total = proj.count_xrefs(to, from, kind);
-        let rows = proj.query_xrefs(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
+        let (total, rows) =
+            proj.query_xrefs_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
         ok(serde_json::json!({ "total": total, "xrefs": rows }))
     }
 

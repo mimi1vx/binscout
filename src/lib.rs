@@ -2080,6 +2080,25 @@ impl Project {
         Ok(value)
     }
 
+    /// Xrefs filtered by endpoint/kind with the pre-page count, in one pass.
+    ///
+    /// The single call behind the CLI/MCP `xrefs` envelope: `total` is the
+    /// exact match count and `items` the requested page, computed in one
+    /// index-narrowed pass instead of separate count and page scans. `limit`
+    /// clips to `MAX_ROWS`, as in [`Project::query_xrefs`].
+    #[must_use]
+    pub fn query_xrefs_page(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+        offset: usize,
+        limit: usize,
+    ) -> (usize, Vec<Xref>) {
+        self.analysis
+            .xrefs_matching_page(to, from, kind, offset, limit.min(MAX_ROWS))
+    }
+
     /// Xrefs filtered by endpoint/kind, paged.
     #[must_use]
     pub fn query_xrefs(
@@ -2090,10 +2109,7 @@ impl Project {
         offset: usize,
         limit: usize,
     ) -> Vec<Xref> {
-        self.xrefs_matching(to, from, kind)
-            .skip(offset)
-            .take(limit.min(MAX_ROWS))
-            .collect()
+        self.query_xrefs_page(to, from, kind, offset, limit).1
     }
 
     /// Count of xrefs matching the [`Project::query_xrefs`] filters, before
@@ -2101,23 +2117,7 @@ impl Project {
     /// large result sets page without scanning blind.
     #[must_use]
     pub fn count_xrefs(&self, to: Option<u64>, from: Option<u64>, kind: Option<XrefKind>) -> usize {
-        self.xrefs_matching(to, from, kind).count()
-    }
-
-    /// Xrefs matching the endpoint/kind filters, in storage order.
-    fn xrefs_matching(
-        &self,
-        to: Option<u64>,
-        from: Option<u64>,
-        kind: Option<XrefKind>,
-    ) -> impl Iterator<Item = Xref> + '_ {
-        self.analysis
-            .xrefs
-            .iter()
-            .copied()
-            .filter(move |x| to.is_none_or(|t| x.to == t))
-            .filter(move |x| from.is_none_or(|f| x.from == f))
-            .filter(move |x| kind.is_none_or(|k| x.kind == k))
+        self.query_xrefs_page(to, from, kind, 0, 0).0
     }
 
     /// Imports plus exports plus symbol-table code addresses for symbol views.
