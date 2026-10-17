@@ -3312,6 +3312,9 @@ mod tests {
             mem_target: None,
             table_base: None,
             import: None,
+            target_name: None,
+            comment: None,
+            string: None,
         };
         assert_eq!(classify(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
@@ -3324,6 +3327,9 @@ mod tests {
             mem_target: None,
             table_base: None,
             import: None,
+            target_name: None,
+            comment: None,
+            string: None,
         };
         assert_eq!(
             classify(Arch::X86_64, &call),

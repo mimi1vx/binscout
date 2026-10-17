@@ -118,6 +118,9 @@ fn unmapped_rows_keep_warning_verbatim() {
             mem_target: None,
             table_base: None,
             import: None,
+            target_name: None,
+            comment: None,
+            string: None,
         },
     );
     assert_eq!(lifted.len(), 1);

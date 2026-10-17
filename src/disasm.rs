@@ -69,6 +69,12 @@ impl Arch {
 /// `mem_target`) plus its canonical `0x`-hex twin (`addr_hex`, ...), via
 /// [`crate::addr_hex`]. Old rows without the twins still deserialize (the
 /// twins are recomputed on serialize, never stored).
+///
+/// Render-time enrichment (never stored, filled by
+/// [`crate::Project`] read paths): `target_name` names the branch target
+/// (or data target when there is no branch), `comment` carries the
+/// annotation at `addr`, and `string` previews the referenced string.
+/// Old rows without these keys still deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Insn {
     /// Virtual address of the first byte.
@@ -109,6 +115,56 @@ pub struct Insn {
     /// without the key still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import: Option<String>,
+    /// Render-time display name of the branch target, or of the data
+    /// target when there is no branch: rename wins over symbol-table and
+    /// import names, with a `func@0x...` fallback for code targets.
+    /// Pure listing annotation; never affects decoding. Old rows without
+    /// the key still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    /// Render-time copy of the annotation comment at [`Insn::addr`], if
+    /// any. Pure listing annotation; old rows without the key still
+    /// deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Render-time preview of the string referenced by the data target
+    /// (escaped, clipped to [`STRING_PREVIEW_MAX_CHARS`] characters), if
+    /// the target lands in a recovered string. Pure listing annotation;
+    /// old rows without the key still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub string: Option<String>,
+}
+
+/// Max characters in an [`Insn::string`] preview (counted after escaping).
+pub const STRING_PREVIEW_MAX_CHARS: usize = 64;
+
+/// Escape `value` for one-line display, clipped to
+/// [`STRING_PREVIEW_MAX_CHARS`] characters.
+///
+/// Backslash and double quote are backslash-escaped, newline/carriage
+/// return/tab become `\\n`/`\\r`/`\\t`, and any other control character
+/// becomes `\\u{...}`; printable text passes through untouched. Clipping
+/// counts escaped characters, so the result is always one line of at most
+/// [`STRING_PREVIEW_MAX_CHARS`] characters.
+#[must_use]
+pub fn string_preview(value: &str) -> String {
+    let mut out = String::new();
+    for c in value.chars() {
+        let escaped = match c {
+            '\\' => "\\\\".to_string(),
+            '"' => "\\\"".to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            c if c.is_control() => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        };
+        if out.chars().count() + escaped.chars().count() > STRING_PREVIEW_MAX_CHARS {
+            break;
+        }
+        out.push_str(&escaped);
+    }
+    out
 }
 
 impl Serialize for Insn {
@@ -117,8 +173,18 @@ impl Serialize for Insn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st =
-            serializer.serialize_struct("Insn", if self.import.is_some() { 13 } else { 12 })?;
+        let mut len = 12;
+        for present in [
+            self.import.is_some(),
+            self.target_name.is_some(),
+            self.comment.is_some(),
+            self.string.is_some(),
+        ] {
+            if present {
+                len += 1;
+            }
+        }
+        let mut st = serializer.serialize_struct("Insn", len)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("size", &self.size)?;
@@ -138,6 +204,21 @@ impl Serialize for Insn {
             st.serialize_field("import", &self.import)?;
         } else {
             st.skip_field("import")?;
+        }
+        if self.target_name.is_some() {
+            st.serialize_field("target_name", &self.target_name)?;
+        } else {
+            st.skip_field("target_name")?;
+        }
+        if self.comment.is_some() {
+            st.serialize_field("comment", &self.comment)?;
+        } else {
+            st.skip_field("comment")?;
+        }
+        if self.string.is_some() {
+            st.serialize_field("string", &self.string)?;
+        } else {
+            st.skip_field("string")?;
         }
         st.end()
     }
@@ -724,6 +805,9 @@ fn x86_insn(
         mem_target,
         table_base,
         import: None,
+        target_name: None,
+        comment: None,
+        string: None,
     }
 }
 
@@ -909,6 +993,9 @@ fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruc
         mem_target: arm_data_target(inst, addr),
         table_base: None,
         import: None,
+        target_name: None,
+        comment: None,
+        string: None,
     }
 }
 
@@ -1205,6 +1292,9 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
         mem_target: armv7_data_target(inst, addr),
         table_base: None,
         import: None,
+        target_name: None,
+        comment: None,
+        string: None,
     }
 }
 
@@ -1404,6 +1494,31 @@ fn armv7_data_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_preview_passes_plain_text_through() {
+        assert_eq!(string_preview("Hello"), "Hello");
+        assert_eq!(string_preview(""), "");
+    }
+
+    #[test]
+    fn string_preview_escapes_quote_backslash_and_controls() {
+        assert_eq!(string_preview("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(string_preview("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(string_preview("a\x07b"), "a\\u{7}b");
+    }
+
+    #[test]
+    fn string_preview_clips_to_64_escaped_chars() {
+        let long = "x".repeat(100);
+        let preview = string_preview(&long);
+        assert_eq!(preview.chars().count(), STRING_PREVIEW_MAX_CHARS);
+        assert_eq!(preview, "x".repeat(64));
+        // A leading quote costs two escaped characters of budget.
+        let preview = string_preview(&format!("\"{long}"));
+        assert_eq!(preview.chars().count(), STRING_PREVIEW_MAX_CHARS);
+        assert!(preview.starts_with("\\\""));
+    }
 
     #[test]
     fn x86_32_push_imm32_reports_mem_target() {
