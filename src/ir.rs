@@ -1110,6 +1110,26 @@ fn first_out_rest_in(insn: &Insn, op: IrOp) -> (IrOp, Vec<String>, Vec<String>, 
 pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
     let (base, cond) = split_arm_mnem(&insn.mnem);
     let (op, inputs, outputs, target) = match base {
+        // Any write to `pc` is control flow, not data movement. An
+        // unconditional `mov pc, lr` returns; everything else with a `pc`
+        // destination (`ldr pc, ...` veneers, `add pc, ...` table dispatch,
+        // predicated `mov pc, ...`) is an indirect branch. Load-multiples
+        // keep their own `pc`-in-list rule below (`pop {pc}` reads the whole
+        // list from `ops`, not `ops[0]`), and the branch/call arms never take
+        // this path (their first operand is not a destination).
+        s if !is_arm32_store(s)
+            && !is_arm32_branch(s)
+            && !is_arm32_ldm(s)
+            && arm32_dest_is_pc(insn) =>
+        {
+            if s == "mov" && !cond {
+                (IrOp::Return, Vec::new(), Vec::new(), None)
+            } else if cond {
+                (IrOp::CBranch, insn.ops.clone(), Vec::new(), None)
+            } else {
+                direct_or_indirect(insn, IrOp::Branch)
+            }
+        }
         s if is_arm32_copy(s) => first_out_rest_in(insn, IrOp::Copy),
         s if is_arm32_load(s) => {
             if is_arm32_ldm(s) && ops_contain_pc(insn) {
@@ -1231,6 +1251,20 @@ fn ops_contain_pc(insn: &Insn) -> bool {
     insn.ops
         .iter()
         .any(|o| o.split(|c: char| !c.is_alphanumeric()).any(|w| w == "pc"))
+}
+
+/// Whether the first operand names `pc` as the written destination.
+///
+/// Operands split on commas, so `ldr pc, [pc, #-4]` arrives with `ops[0]`
+/// exactly `pc`; the match is on the first alphanumeric word for stray
+/// writeback/bracket punctuation. Only the destination position counts: a
+/// `pc` base in a later operand (`ldr r0, [pc, #4]`) is a literal load.
+fn arm32_dest_is_pc(insn: &Insn) -> bool {
+    insn.ops.first().is_some_and(|o| {
+        o.split(|c: char| !c.is_alphanumeric())
+            .find(|w| !w.is_empty())
+            == Some("pc")
+    })
 }
 
 /// Direct branch/call keeps only `target`; indirect keeps the operands.
@@ -2378,6 +2412,13 @@ fn is_arm32_alu(s: &str, op: IrOp) -> bool {
 
 fn is_arm32_call(s: &str) -> bool {
     ARM32_CALL.contains(&s)
+}
+
+/// Whether `s` is an ARM32 branch mnemonic handled by [`lift_arm32`]'s
+/// explicit control-flow arms (never a `pc`-writing data instruction).
+fn is_arm32_branch(s: &str) -> bool {
+    matches!(s, "b" | "bl" | "blx" | "bx" | "cbz" | "cbnz" | "tbb" | "tbh")
+        || is_arm32_call(s)
 }
 
 /// Whether `s` is a load-multiple covered by the `pop`/`ldm`-with-`pc`
