@@ -924,12 +924,7 @@ fn annotate(
 ) -> binscout::error::Result<serde_json::Value> {
     let mut p = open(binary, db, raw, fat_arch)?;
     let addr = binscout::parse_addr(addr)?;
-    if let Some(name) = rename {
-        p.rename_function(addr, name)?;
-    }
-    if let Some(text) = comment {
-        p.set_comment(addr, text)?;
-    }
+    p.annotate(addr, rename, comment)?;
     Ok(p.annotation_json(addr))
 }
 

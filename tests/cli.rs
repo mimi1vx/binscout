@@ -316,6 +316,39 @@ fn annotate_round_trip_and_binary_untouched() {
 }
 
 #[test]
+fn annotate_rename_and_comment_are_atomic() {
+    let dir = tmpdir("annotate-atomic");
+    let before = std::fs::read("tests/fixtures/raw-x64.bin").expect("fixture");
+    let bin = write_bin(&dir, "a.bin", &before);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "a").display().to_string();
+
+    let big = "x".repeat(9000);
+    let (ok, v) = run(&[
+        "--db",
+        &db,
+        "annotate",
+        &bin_s,
+        "0x0",
+        "--rename",
+        "foo",
+        "--comment",
+        big.as_str(),
+    ]);
+    assert!(!ok, "oversize comment must fail: {v}");
+    assert!(v.get("error").is_some(), "{v}");
+
+    let (ok, v) = run(&["--db", &db, "annotate", &bin_s, "0x0"]);
+    assert!(ok, "{v}");
+    assert!(
+        v.get("name").is_none() || v["name"].is_null(),
+        "rename must not persist after failed annotate: {v}"
+    );
+    assert!(v.get("comment").is_none() || v["comment"].is_null(), "{v}");
+    cleanup(&dir);
+}
+
+#[test]
 fn func_and_cfg_snap_to_containing_function() {
     let (bin, db, _dir, dir) = raw_case("snap");
     let d = db.as_str();

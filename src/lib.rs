@@ -911,6 +911,80 @@ impl Project {
         self.persist_annotation(addr)
     }
 
+    /// Atomically rename and/or comment the annotation at `addr`.
+    ///
+    /// Validates both inputs before touching memory or disk, then persists
+    /// the merged row in one transaction (single-row fast path or full
+    /// snapshot rewrite, like [`Project::import_annotations`]). A failing
+    /// comment never leaves a rename behind and vice versa. `None` leaves
+    /// the field untouched; an empty string clears it. Both `None` is a
+    /// no-op that never touches the sidecar, so `annotate` without flags
+    /// stays read-only.
+    ///
+    /// Rename targets must be known function entries; comments accept any
+    /// address. The binary is never modified.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for unknown rename targets, [`Error::Limit`]
+    /// when either field exceeds 8 KiB, [`Error::Storage`] when the
+    /// annotation cannot be persisted.
+    pub fn annotate(
+        &mut self,
+        addr: u64,
+        rename: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        if rename.is_some() && !self.analysis.functions.contains_key(&addr) {
+            return Err(Error::NotFound(format!("function {addr:#x}")));
+        }
+        if let Some(name) = rename
+            && name.len() > crate::db::MAX_ANNOTATION_BYTES
+        {
+            return Err(Error::Limit(format!(
+                "rename of {} bytes exceeds {}",
+                name.len(),
+                crate::db::MAX_ANNOTATION_BYTES
+            )));
+        }
+        if let Some(text) = comment
+            && text.len() > crate::db::MAX_ANNOTATION_BYTES
+        {
+            return Err(Error::Limit(format!(
+                "comment of {} bytes exceeds {}",
+                text.len(),
+                crate::db::MAX_ANNOTATION_BYTES
+            )));
+        }
+        if rename.is_none() && comment.is_none() {
+            return Ok(());
+        }
+        let current = self.annotations.get(&addr).cloned();
+        let mut merged = current.clone().unwrap_or_default();
+        if let Some(name) = rename {
+            merged.name = (!name.is_empty()).then(|| name.to_string());
+        }
+        if let Some(text) = comment {
+            merged.comment = (!text.is_empty()).then(|| text.to_string());
+        }
+        let next = (!merged.is_empty()).then_some(merged);
+        if next == current {
+            return Ok(());
+        }
+        let mut changes = BTreeMap::new();
+        changes.insert(addr, next);
+        let db = db::open_db(&self.db_path)?;
+        match db::save_annotation_batch(&db, &self.meta(), &changes)? {
+            db::AnnotationSave::Fast => {}
+            db::AnnotationSave::NeedsFull => {
+                let mut full = self.annotations.clone();
+                crate::annotations::apply_changes(&mut full, &changes);
+                db::save(&db, &self.meta(), &self.analysis, &full)?;
+            }
+        }
+        crate::annotations::apply_changes(&mut self.annotations, &changes);
+        Ok(())
+    }
+
     /// Store a structured struct-layout/sizeof hint at `addr`.
     ///
     /// Formats `hint` with [`crate::annotations::format_type_hint`] and
