@@ -1095,6 +1095,21 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
     }
 }
 
+/// Length of the Thumb IT block opened by `mnem` (1-4), else `None`.
+///
+/// yaxpeax-arm prints the IT mask in the mnemonic (`it`, `ite`, `itt`,
+/// `itet`, ...), so the predicated count is the mask length plus one; the
+/// base condition rides in the first operand. Only the `e`/`t` mask guard
+/// keeps non-IT mnemonics sharing the prefix out. Thumb-only: ARM mode has
+/// no IT instruction, so callers gate on [`Arch::Thumb`].
+pub(crate) fn it_block_len(mnem: &str) -> Option<u8> {
+    let mask = mnem.strip_prefix("it")?;
+    if mask.len() > 3 || !mask.bytes().all(|b| b == b'e' || b == b't') {
+        return None;
+    }
+    Some(mask.len() as u8 + 1)
+}
+
 fn disasm_arm32(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> {
     let partial = disasm_arm32_partial(bytes, va, max_insns)?;
     match partial.error_at {

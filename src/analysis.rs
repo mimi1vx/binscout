@@ -2029,6 +2029,14 @@ struct Walker<'a> {
     fallthroughs: BTreeSet<u64>,
     call_targets: BTreeSet<u64>,
     diagnostics: BTreeSet<Diagnostic>,
+    /// Remaining predicated slots in the open Thumb IT block, with the
+    /// address expecting the next one. The single-instruction decoder is
+    /// stateless, so the worklist carries the IT state instead; the address
+    /// check keeps stale state from predicating unrelated decodes when the
+    /// worklist visits out of linear order (a branch into an IT block then
+    /// fails open to the old stateless decode).
+    it_remaining: u8,
+    it_next: Option<u64>,
 }
 
 impl<'a> Walker<'a> {
@@ -2041,6 +2049,8 @@ impl<'a> Walker<'a> {
             fallthroughs: BTreeSet::new(),
             call_targets: BTreeSet::new(),
             diagnostics: BTreeSet::new(),
+            it_remaining: 0,
+            it_next: None,
         }
     }
 
@@ -2085,6 +2095,37 @@ impl<'a> Walker<'a> {
                 Err(e) => return Err(e),
             };
             let flow = classify(self.arch, &insn);
+            // Thumb IT predication: the decoder prints no condition suffix
+            // inside an IT block, so a predicated `bx lr` (or `pop {.., pc}`)
+            // lifts as an unconditional return. Downgrade predicated
+            // terminators to conditional branches: the site keeps its
+            // indirect-jump diagnostic and the fallthrough stays reachable.
+            // The stored `Insn` keeps its faithful decode; only the flow is
+            // predicated (edge building reuses it below).
+            let opens_it = if self.arch == Arch::Thumb {
+                crate::disasm::it_block_len(&insn.mnem)
+            } else {
+                None
+            };
+            let predicated =
+                opens_it.is_none() && self.it_remaining > 0 && self.it_next == Some(va);
+            if predicated {
+                self.it_remaining -= 1;
+                self.it_next = Some(va.wrapping_add(u64::from(insn.size)));
+            }
+            if let Some(n) = opens_it {
+                self.it_remaining = n;
+                self.it_next = Some(va.wrapping_add(u64::from(insn.size)));
+            }
+            let flow = if predicated {
+                match flow {
+                    Flow::Ret => Flow::CBranch { target: None },
+                    Flow::Branch { target } => Flow::CBranch { target },
+                    other => other,
+                }
+            } else {
+                flow
+            };
             match flow {
                 Flow::Branch { target: None } | Flow::CBranch { target: None } => {
                     if self.diagnostics.insert(Diagnostic {
@@ -2794,7 +2835,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             let Some(last) = block.insns.last() else {
                 continue;
             };
-            let flow = classify(arch, last);
+            // Stored walker flow, never a fresh classify: Thumb instructions
+            // inside an IT block decode without a condition suffix, so only
+            // the walker's predicated flow keeps the fallthrough edge.
+            let flow = decoded
+                .get(&last.addr)
+                .map(|d| d.flow)
+                .unwrap_or_else(|| classify(arch, last));
             let end = block.end();
             match flow {
                 Flow::Branch { target: Some(t) } => {
