@@ -1200,10 +1200,10 @@ fn disasm_armv7_partial(
 /// Absolute target for direct ARMv7 branches, else `None`.
 ///
 /// `BranchOffset` (ARM `b`/`bl`) counts words from the instruction address:
-/// the decoder already folded the architectural PC+8 bias in. Thumb
-/// `BranchThumbOffset` counts halfwords from PC (`addr + 4`); the ARM
-/// immediate `blx` instead carries a byte offset from PC (`addr + 8`),
-/// told apart by the decoded mode.
+/// the decoder already folded the architectural PC+8 bias in.
+/// `BranchThumbOffset` counts halfwords (`off * 2`) from PC: `addr + 4` in
+/// Thumb, `addr + 8` in ARM. Thumb `blx` switches to ARM state, so its PC
+/// is aligned (`(addr + 4) & !3`) before adding the offset.
 fn armv7_branch_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
     if !matches!(
         inst.opcode,
@@ -1213,13 +1213,18 @@ fn armv7_branch_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
     }
     inst.operands.iter().find_map(|op| match op {
         ArmV7Operand::BranchOffset(off) => Some(addr.wrapping_add_signed(i64::from(*off) * 4)),
-        ArmV7Operand::BranchThumbOffset(off) if inst.thumb() => Some(
-            addr.wrapping_add(4)
+        ArmV7Operand::BranchThumbOffset(off) if inst.thumb() => {
+            let base = if matches!(inst.opcode, ArmV7Opcode::BLX) {
+                addr.wrapping_add(4) & !3
+            } else {
+                addr.wrapping_add(4)
+            };
+            Some(base.wrapping_add_signed(i64::from(*off) * 2))
+        }
+        ArmV7Operand::BranchThumbOffset(off) => Some(
+            addr.wrapping_add(8)
                 .wrapping_add_signed(i64::from(*off) * 2),
         ),
-        ArmV7Operand::BranchThumbOffset(off) => {
-            Some(addr.wrapping_add(8).wrapping_add_signed(i64::from(*off)))
-        }
         _ => None,
     })
 }

@@ -337,6 +337,18 @@ fn arm32_b_bl_branch_targets() {
 }
 
 #[test]
+fn arm32_blx_imm_halfword_offset() {
+    // ARM blx #imm counts halfwords from PC (addr+8): FB000000 @ 0x10004.
+    let v = arm32(&[0x00, 0x00, 0x00, 0xfb], 0x10004);
+    assert_eq!(v[0].mnem, "blx");
+    assert_eq!(v[0].branch_target, Some(0x1000e));
+    // FAFFFFFF @ 0x10008 targets addr+8-4.
+    let v = arm32(&[0xff, 0xff, 0xff, 0xfa], 0x10008);
+    assert_eq!(v[0].mnem, "blx");
+    assert_eq!(v[0].branch_target, Some(0x1000c));
+}
+
+#[test]
 fn arm32_invalid_opcode_errors() {
     let err = disasm_range(Arch::Arm32, &[0xff, 0xff, 0xff, 0xff], 0x10000, 100).unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
@@ -387,6 +399,15 @@ fn thumb_b_and_cbz_branch_targets() {
     let v = thumb(&[0x08, 0xb1], 0x20000);
     assert_eq!(v[0].mnem, "cbz");
     assert_eq!(v[0].branch_target, Some(0x20008));
+}
+
+#[test]
+fn thumb_blx_imm_aligns_pc() {
+    // Thumb blx switches to ARM: target is Align(PC,4)+imm, not PC+imm.
+    // F000 E800 @ 0x20002 targets 0x20004.
+    let v = thumb(&[0x00, 0xf0, 0x00, 0xe8], 0x20002);
+    assert_eq!(v[0].mnem, "blx.w");
+    assert_eq!(v[0].branch_target, Some(0x20004));
 }
 
 #[test]
