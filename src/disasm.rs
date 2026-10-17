@@ -12,6 +12,7 @@ use iced_x86::{
     Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use yaxpeax_arch::Decoder as ArmDecoder;
 use yaxpeax_arm::armv7::{
     InstDecoder as ArmV7Decoder, Instruction as ArmV7Instruction, Opcode as ArmV7Opcode,
@@ -624,6 +625,17 @@ fn disasm_x86(bytes: &[u8], va: u64, max_insns: usize, bitness: u32) -> Result<V
     }
 }
 
+thread_local! {
+    /// Reused x86 format scratch for single-instruction decodes.
+    ///
+    /// [`disasm_first`] runs once per decoded instruction during the Pass-A
+    /// walk, so a fresh [`IntelFormatter`] plus text buffer per call is pure
+    /// churn; the range decoders already reuse one instance per call.
+    /// Thread-local because decoding may run on any thread.
+    static FIRST_FORMATTER: RefCell<IntelFormatter> = RefCell::new(IntelFormatter::new());
+    static FIRST_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
 /// Decode only the first x86 instruction in `bytes` (loaded at `va`).
 ///
 /// Uses the same [`Decoder`] options (`DecoderOptions::NONE`, IP `va`) and
@@ -657,16 +669,20 @@ fn disasm_first_x86(bytes: &[u8], va: u64, bitness: u32) -> Result<Option<Insn>>
             "x86 invalid opcode at {addr:#x} ({bitness}-bit)"
         )));
     };
-    let mut formatter = IntelFormatter::new();
-    let mut text = String::new();
-    Ok(Some(x86_insn(
-        &insn,
-        addr,
-        raw,
-        bitness,
-        &mut formatter,
-        &mut text,
-    )))
+    FIRST_FORMATTER.with(|formatter| {
+        FIRST_TEXT.with(|text| {
+            let mut formatter = formatter.borrow_mut();
+            let mut text = text.borrow_mut();
+            Ok(Some(x86_insn(
+                &insn,
+                addr,
+                raw,
+                bitness,
+                &mut formatter,
+                &mut text,
+            )))
+        })
+    })
 }
 
 /// Convert one decoded iced-x86 instruction to [`Insn`].
