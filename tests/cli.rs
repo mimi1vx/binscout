@@ -1693,3 +1693,57 @@ fn db_alias_of_binary_is_rejected_and_binary_untouched() {
     );
     cleanup(&dir);
 }
+
+// rsdbg-zvm.11 (unix only): a closed stdout pipe must not panic (exit
+// 101) via `println!`. Spawn with piped stdout, drop the read end before
+// the child writes, then assert a quiet exit and no panic on stderr.
+// Success keeps exit 0, the error envelope keeps exit 1.
+#[cfg(unix)]
+#[test]
+fn closed_stdout_pipe_exits_quietly_without_panic() {
+    use std::process::Stdio;
+    let dir = tmpdir("epipe");
+    let bin = write_bin(&dir, "r.bin", &[0x90, 0x90, 0xC3]);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "e").display().to_string();
+    let raw = [
+        "--db",
+        db.as_str(),
+        "--raw",
+        "--arch",
+        "x86_64",
+        "--base",
+        "0x1000",
+    ];
+
+    // Success path: `functions` analysis succeeds, stdout is gone.
+    let mut success_args: Vec<&str> = raw.to_vec();
+    success_args.extend(["functions", bin_s.as_str()]);
+    let mut child = Command::new(binscout_bin())
+        .args(&success_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binscout");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(0), "closed-pipe success exits 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "no panic on stderr: {stderr}");
+
+    // Error path: bad address fails, error envelope goes nowhere.
+    let mut error_args: Vec<&str> = raw.to_vec();
+    error_args.extend(["func", bin_s.as_str(), "zz"]);
+    let mut child = Command::new(binscout_bin())
+        .args(&error_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binscout");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(out.status.code(), Some(1), "closed-pipe failure exits 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "no panic on stderr: {stderr}");
+    cleanup(&dir);
+}

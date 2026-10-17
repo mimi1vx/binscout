@@ -330,8 +330,7 @@ impl Cli {
         ) {
             Ok(o) => o,
             Err(e) => {
-                println!("{}", serde_json::json!({ "error": e.to_string() }));
-                std::process::exit(1);
+                emit(&serde_json::json!({ "error": e.to_string() }), 1);
             }
         };
         let db = self.db.as_deref();
@@ -438,7 +437,7 @@ impl Cli {
                 decode,
             } => {
                 if offset.is_some() {
-                    eprintln!("warning: --offset is deprecated, use --start");
+                    warn("warning: --offset is deprecated, use --start");
                 }
                 let decode = match decode
                     .map(|s| binscout::loader::strings::parse_decode_spec(&s))
@@ -446,8 +445,7 @@ impl Cli {
                 {
                     Ok(d) => d,
                     Err(e) => {
-                        println!("{}", serde_json::json!({ "error": e.to_string() }));
-                        std::process::exit(1);
+                        emit(&serde_json::json!({ "error": e.to_string() }), 1);
                     }
                 };
                 strings(
@@ -555,15 +553,40 @@ impl Cli {
         };
         match result {
             Ok(value) => {
-                println!("{value}");
-                std::process::exit(0);
+                emit(&value, 0);
             }
             Err(e) => {
-                println!("{}", serde_json::json!({ "error": e.to_string() }));
-                std::process::exit(1);
+                emit(&serde_json::json!({ "error": e.to_string() }), 1);
             }
         }
     }
+}
+
+/// Write one JSON line to stdout without panicking on a closed pipe.
+///
+/// `println!` panics with exit 101 when stdout is a closed pipe (EPIPE),
+/// which violates the CLI contract (success exits 0, runtime failure
+/// prints `{"error": ...}` and exits 1). A closed pipe means the consumer
+/// went away, so exit quietly with the intended code instead: success
+/// stays 0 (conventional SIGPIPE-quiet), failure stays 1.
+fn emit(value: &serde_json::Value, code: i32) -> ! {
+    use std::io::Write as _;
+    let text = value.to_string();
+    let mut out = std::io::stdout().lock();
+    match writeln!(out, "{text}") {
+        Ok(()) => std::process::exit(code),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(code),
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "failed to write stdout: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Best-effort stderr note that never panics, even on a closed stderr.
+fn warn(msg: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{msg}");
 }
 
 fn open(
