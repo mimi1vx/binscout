@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/mimi1vx/binscout/compare/v0.7.0...v0.8.0) - 2026-10-17
+
+### Added
+
+- bytes/hexdump command with typed views and VA<->file offset
+- x86-64 absolute imm32/disp32 operands as data refs (non-PIE)
+
+### Fixed
+
+- Mach-O stub addresses resolve via indirect symbol table by name
+- ownership of blocks below first entry consistent (function_owner vs containing_function)
+- snapshot identity — carry sha256/len, gate stale annotations, exclude binary_path from meta equality
+- canonicalize fat-slice cache identity and reject fat-arch on thin binaries
+
+### Other
+
+- reuse x86 formatter scratch across single-instruction decodes
+- fix strings/decode, fat_arch, AddrParams, and performance drift
+
 ## [0.7.0](https://github.com/mimi1vx/binscout/compare/v0.6.0...v0.7.0) - 2026-10-17
 
 ### Added
