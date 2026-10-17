@@ -676,6 +676,7 @@ fn save_rejects_oversize_annotations_before_writing() {
         version: binscout::db::SCHEMA_VERSION,
         binary_path: bin.display().to_string(),
         content_hash: proj.content_hash(),
+        content_sha256: proj.content_sha256().to_string(),
         size: 1,
         arch: "x86_32".to_string(),
         format: "pe".to_string(),

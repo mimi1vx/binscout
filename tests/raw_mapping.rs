@@ -32,16 +32,16 @@ fn write_raw(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
     common::write_bin(dir, name, bytes)
 }
 
-/// Open `bin` with `o`, save a full snapshot, and return the content hash.
-fn bootstrap_raw(bin: &Path, db: &Path, o: RawOptions) -> u64 {
+/// Open `bin` with `o`, save a full snapshot, and return the content identity.
+fn bootstrap_raw(bin: &Path, db: &Path, o: RawOptions) -> (u64, String, u64) {
     let p = Project::open_raw(bin, db, o).expect("raw open");
     p.save().expect("bootstrap save");
-    p.content_hash()
+    (p.content_hash(), p.content_sha256().to_string(), p.size())
 }
 
-fn cached_with(db: &Path, hash: u64, m: &StoredMapping) -> db::Snapshot {
+fn cached_with(db: &Path, hash: u64, sha256: &str, size: u64, m: &StoredMapping) -> db::Snapshot {
     let handle = db::open_db(db).expect("open db");
-    db::load_cached(&handle, hash, m).expect("load_cached")
+    db::load_cached(&handle, hash, sha256, size, m).expect("load_cached")
 }
 
 fn assert_stale(snap: db::Snapshot) {
@@ -59,8 +59,8 @@ fn same_explicit_mapping_hits() {
     let db = common::temp_db(&dir, "r");
     let o = opts(Arch::X86_64, 0x1000, None);
 
-    let hash = bootstrap_raw(&bin, &db, o);
-    match cached_with(&db, hash, &mapping_of(o)) {
+    let (hash, sha256, size) = bootstrap_raw(&bin, &db, o);
+    match cached_with(&db, hash, &sha256, size, &mapping_of(o)) {
         db::Snapshot::Hit(hit) => {
             assert_eq!(hit.meta.content_hash, hash);
             assert_eq!(hit.meta.mapping, Some(mapping_of(o)));
@@ -81,8 +81,8 @@ fn arch_change_is_stale_not_hit() {
     let a = opts(Arch::X86_64, 0x1000, None);
     let b = opts(Arch::X86_32, 0x1000, None);
 
-    let hash = bootstrap_raw(&bin, &db, a);
-    assert_stale(cached_with(&db, hash, &mapping_of(b)));
+    let (hash, sha256, size) = bootstrap_raw(&bin, &db, a);
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(b)));
 
     // Same bytes, no annotations: the other arch rebuilds instead of
     // reusing layouts, and records its own arch.
@@ -101,8 +101,8 @@ fn base_change_is_stale_not_hit() {
     let a = opts(Arch::X86_64, 0x1000, None);
     let b = opts(Arch::X86_64, 0x2000, None);
 
-    let hash = bootstrap_raw(&bin, &db, a);
-    assert_stale(cached_with(&db, hash, &mapping_of(b)));
+    let (hash, sha256, size) = bootstrap_raw(&bin, &db, a);
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(b)));
 
     let q = Project::open_raw(&bin, &db, b).expect("other base rebuilds");
     assert!(q.analysis().functions.contains_key(&0x2000));
@@ -119,8 +119,8 @@ fn entry_change_is_stale_not_hit() {
     let a = opts(Arch::X86_64, 0x5000, None);
     let b = opts(Arch::X86_64, 0x5000, Some(0x5000));
 
-    let hash = bootstrap_raw(&bin, &db, a);
-    assert_stale(cached_with(&db, hash, &mapping_of(b)));
+    let (hash, sha256, size) = bootstrap_raw(&bin, &db, a);
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(b)));
     common::cleanup(&dir);
 }
 
@@ -136,12 +136,14 @@ fn auto_and_explicit_never_alias() {
     assert_eq!(auto.binary().arch, Arch::X86_64);
     auto.save().expect("save auto snapshot");
     let hash = auto.content_hash();
+    let sha256 = auto.content_sha256().to_string();
+    let size = auto.size();
     drop(auto);
 
     // The identical effective mapping requested explicitly still misses:
     // mode is part of the identity.
     let explicit = opts(Arch::X86_64, 0, None);
-    assert_stale(cached_with(&db, hash, &mapping_of(explicit)));
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(explicit)));
 
     // And the reverse: an explicit snapshot never serves an auto open.
     let db2 = common::temp_db(&dir, "r2");
@@ -149,7 +151,8 @@ fn auto_and_explicit_never_alias() {
     let handle = db::open_db(&db2).expect("open db");
     assert!(
         matches!(
-            db::load_cached(&handle, hash, &StoredMapping::Auto).expect("load_cached"),
+            db::load_cached(&handle, hash, &sha256, size, &StoredMapping::Auto)
+                .expect("load_cached"),
             db::Snapshot::Stale { .. }
         ),
         "auto open must not hit an explicit snapshot"
@@ -247,6 +250,7 @@ fn mapping_conflict_with_annotations_errors_without_writes() {
         version: db::SCHEMA_VERSION,
         binary_path: bin.display().to_string(),
         content_hash: q.content_hash(),
+        content_sha256: q.content_sha256().to_string(),
         size: bytes.len() as u64,
         arch: db::arch_name(q.binary().arch).to_string(),
         format: db::format_name(q.binary().format).to_string(),
@@ -321,7 +325,9 @@ fn legacy_empty_rebuilds_not_trusted() {
 
     // Same bytes, same mapping, empty annotations: rebuilt, never a hit.
     let hash = db::content_hash(&bytes);
-    assert_stale(cached_with(&db, hash, &mapping_of(o)));
+    let sha256 = binscout::annotations::sha256_hex(&bytes);
+    let size = bytes.len() as u64;
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(o)));
     let q = Project::open_raw(&bin, &db, o).expect("legacy rebuilds");
     assert!(q.analysis().functions.contains_key(&0x1000));
     common::cleanup(&dir);
@@ -344,9 +350,11 @@ fn legacy_annotated_requires_separate_db() {
     // The mapping can no longer be established, so populated legacy
     // annotations are never trusted under any mapping.
     let hash = db::content_hash(&bytes);
+    let sha256 = binscout::annotations::sha256_hex(&bytes);
+    let size = bytes.len() as u64;
     {
         let handle = db::open_db_read_only(&db).expect("open db");
-        let err = db::load_cached(&handle, hash, &mapping_of(o)).unwrap_err();
+        let err = db::load_cached(&handle, hash, &sha256, size, &mapping_of(o)).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("separate --db") && msg.contains("legacy"),
@@ -379,6 +387,8 @@ fn analysis_rev_mismatch_reanalyzes_same_mapping() {
     p.rename_function(0x1000, "entry").expect("rename");
     drop(p);
     let hash = db::content_hash(&bytes);
+    let sha256 = binscout::annotations::sha256_hex(&bytes);
+    let size = bytes.len() as u64;
 
     {
         let dbh = db::open_db(&db).expect("open db");
@@ -394,7 +404,7 @@ fn analysis_rev_mismatch_reanalyzes_same_mapping() {
     }
 
     // Same mapping and bytes, stale revision: re-analyze, annotations survive.
-    assert_stale(cached_with(&db, hash, &mapping_of(o)));
+    assert_stale(cached_with(&db, hash, &sha256, size, &mapping_of(o)));
     let q = Project::open_raw(&bin, &db, o).expect("rev-mismatched open");
     assert_eq!(q.function_name(0x1000).as_deref(), Some("entry"));
     assert!(q.analysis().functions.contains_key(&0x1000));

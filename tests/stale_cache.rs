@@ -43,6 +43,15 @@ fn patched(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Cache identity for `bytes`: FNV-1a plus SHA-256 and size.
+fn ident(bytes: &[u8]) -> (u64, String, u64) {
+    (
+        db::content_hash(bytes),
+        binscout::annotations::sha256_hex(bytes),
+        bytes.len() as u64,
+    )
+}
+
 /// Open `bin` with `db`, add a rename plus a comment (persists a full
 /// snapshot on the fresh sidecar), and return the binary bytes.
 fn bootstrap_with_annotations(bin: &Path, db: &Path) -> Vec<u8> {
@@ -134,12 +143,17 @@ fn hit_loads_cached_snapshot() {
     let before_edges = p.analysis().call_edges();
     drop(p);
 
-    let hash = db::content_hash(&std::fs::read(&bin).expect("read"));
+    let raw_for_hit = std::fs::read(&bin).expect("read");
+    let (hash, sha256, size) = ident(&raw_for_hit);
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, hash, &db::StoredMapping::Auto).expect("load_cached") {
+        match db::load_cached(&handle, hash, &sha256, size, &db::StoredMapping::Auto)
+            .expect("load_cached")
+        {
             db::Snapshot::Hit(hit) => {
                 assert_eq!(hit.meta.content_hash, hash);
+                assert_eq!(hit.meta.content_sha256, sha256);
+                assert_eq!(hit.meta.size, size);
                 let raw = std::fs::read(&bin).expect("read");
                 let loaded = binscout::loader::load(&raw).expect("reload");
                 let cached = binscout::analysis::rebuild(
@@ -184,7 +198,8 @@ fn miss_on_fresh_db() {
     let handle = db::open_db(&db).expect("create db");
     assert!(
         matches!(
-            db::load_cached(&handle, 1234, &db::StoredMapping::Auto).expect("load_cached"),
+            db::load_cached(&handle, 1234, "deadbeef", 0, &db::StoredMapping::Auto)
+                .expect("load_cached"),
             db::Snapshot::Miss
         ),
         "fresh sidecar has no snapshot"
@@ -212,7 +227,7 @@ fn meta_without_binaries_row_errors() {
             let _ = wtxn.open_table(BINARIES).expect("create binaries");
         }
         wtxn.commit().expect("commit");
-        let err = db::load_cached(&handle, 0, &db::StoredMapping::Auto).unwrap_err();
+        let err = db::load_cached(&handle, 0, "", 0, &db::StoredMapping::Auto).unwrap_err();
         assert!(
             err.to_string().contains("no binary row"),
             "unexpected: {err:?}"
@@ -236,7 +251,7 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
     let p = Project::open_with_db(&bin, &db).expect("open");
     p.save().expect("save full snapshot");
     drop(p);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, old_sha256, old_size) = ident(&bytes);
 
     {
         let handle = db::open_db(&db).expect("open db");
@@ -248,7 +263,14 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
     // Matching hash: the snapshot is corrupt, still an error.
     {
         let handle = db::open_db(&db).expect("open db");
-        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            old_hash,
+            &old_sha256,
+            old_size,
+            &db::StoredMapping::Auto,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("open functions"),
             "unexpected: {err:?}"
@@ -260,11 +282,14 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
+        let (new_hash, new_sha256, new_size) = ident(&new_bytes);
         assert!(
             matches!(
                 db::load_cached(
                     &handle,
-                    db::content_hash(&new_bytes),
+                    new_hash,
+                    &new_sha256,
+                    new_size,
                     &db::StoredMapping::Auto
                 )
                 .expect("load_cached"),
@@ -286,14 +311,22 @@ fn version_mismatch_is_stale_but_carries_annotations() {
     let db = common::temp_db(&dir, "v");
 
     bootstrap_with_annotations(&bin, &db);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, old_sha256, old_size) = ident(&bytes);
     set_stored_version(&db, 999);
 
     // Matching hash with an unknown schema version: stale, not an error —
     // annotations carry over and the binary re-analyzes on open.
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).expect("load_cached") {
+        match db::load_cached(
+            &handle,
+            old_hash,
+            &old_sha256,
+            old_size,
+            &db::StoredMapping::Auto,
+        )
+        .expect("load_cached")
+        {
             db::Snapshot::Stale { meta, annotations } => {
                 assert_eq!(meta.version, 999);
                 assert_eq!(
@@ -314,9 +347,12 @@ fn version_mismatch_is_stale_but_carries_annotations() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
+        let (new_hash, new_sha256, new_size) = ident(&new_bytes);
         match db::load_cached(
             &handle,
-            db::content_hash(&new_bytes),
+            new_hash,
+            &new_sha256,
+            new_size,
             &db::StoredMapping::Auto,
         )
         .expect("load_cached")
@@ -345,7 +381,7 @@ fn healthy_stale_carries_annotations_matches_fresh_and_never_saves() {
     let db = common::temp_db(&dir, "h");
 
     bootstrap_with_annotations(&bin, &db);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, _old_sha256, _old_size) = ident(&bytes);
     // Stored snapshot before the stale read (meta, analysis, annotations).
     let (stored_meta, stored_summary, stored_edges, stored_xrefs, stored_strings, stored_ann) = {
         let handle = db::open_db(&db).expect("open db");
@@ -428,7 +464,7 @@ fn stale_corrupt_derived_rows_are_discarded() {
     let db = common::temp_db(&dir, "c");
 
     bootstrap_with_annotations(&bin, &db);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, old_sha256, old_size) = ident(&bytes);
 
     // Poison one row per derived table. A full decode must choke on these.
     poison_u64_row(&db, FUNCTIONS, u64::MAX);
@@ -442,7 +478,14 @@ fn stale_corrupt_derived_rows_are_discarded() {
             err.to_string().contains("decode row"),
             "full load must still validate: {err:?}"
         );
-        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            old_hash,
+            &old_sha256,
+            old_size,
+            &db::StoredMapping::Auto,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("decode row"),
             "hit path must still validate: {err:?}"
@@ -454,11 +497,14 @@ fn stale_corrupt_derived_rows_are_discarded() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
+        let (new_hash, new_sha256, new_size) = ident(&new_bytes);
         assert!(
             matches!(
                 db::load_cached(
                     &handle,
-                    db::content_hash(&new_bytes),
+                    new_hash,
+                    &new_sha256,
+                    new_size,
                     &db::StoredMapping::Auto
                 )
                 .expect("load_cached"),
@@ -494,9 +540,12 @@ fn stale_corrupt_annotations_still_error() {
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
     {
         let handle = db::open_db(&db).expect("open db");
+        let (new_hash, new_sha256, new_size) = ident(&new_bytes);
         let err = db::load_cached(
             &handle,
-            db::content_hash(&new_bytes),
+            new_hash,
+            &new_sha256,
+            new_size,
             &db::StoredMapping::Auto,
         )
         .unwrap_err();
@@ -564,15 +613,21 @@ fn stale_snapshot_reads_one_coherent_sidecar_generation() {
     proj_b.save().expect("overwrite sidecar with b");
     drop(proj_b);
 
-    let hash_a = db::content_hash(&std::fs::read(&bin_a).expect("read a"));
-    let hash_b = db::content_hash(&std::fs::read(&bin_b).expect("read b"));
-    assert_ne!(hash_a, hash_b);
+    let bytes_a = std::fs::read(&bin_a).expect("read a");
+    let bytes_b = std::fs::read(&bin_b).expect("read b");
+    let (hash_a, sha_a, size_a) = ident(&bytes_a);
+    let (hash_b, sha_b, size_b) = ident(&bytes_b);
+    assert_ne!((hash_a, &sha_a), (hash_b, &sha_b));
     let handle = db::open_db(&db).expect("open db");
     let expected = db::load(&handle)
         .expect("load")
         .expect("generation b snapshot");
     assert_eq!(expected.meta.content_hash, hash_b);
-    match db::load_cached(&handle, hash_a, &db::StoredMapping::Auto).expect("load_cached") {
+    assert_eq!(expected.meta.content_sha256, sha_b);
+    assert_eq!(expected.meta.size, size_b);
+    match db::load_cached(&handle, hash_a, &sha_a, size_a, &db::StoredMapping::Auto)
+        .expect("load_cached")
+    {
         db::Snapshot::Stale { meta, annotations } => {
             assert_eq!(meta, expected.meta, "stale meta is generation b");
             assert_eq!(
@@ -630,7 +685,7 @@ fn corrupt_unknown_arch_still_errors_on_hit_but_stale_skips() {
     let db = common::temp_db(&dir, "r");
 
     bootstrap_with_annotations(&bin, &db);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, old_sha256, old_size) = ident(&bytes);
     {
         let handle = db::open_db(&db).expect("open db");
         let wtxn = handle.begin_write().expect("begin write");
@@ -642,7 +697,14 @@ fn corrupt_unknown_arch_still_errors_on_hit_but_stale_skips() {
             t.insert(0u64, v.to_string()).expect("rewrite meta");
         }
         wtxn.commit().expect("commit");
-        let err = db::load_cached(&handle, old_hash, &db::StoredMapping::Auto).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            old_hash,
+            &old_sha256,
+            old_size,
+            &db::StoredMapping::Auto,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("unknown arch"),
             "hit path must validate arch: {err:?}"
@@ -746,13 +808,13 @@ fn auto_snapshot_explicit_open_rebuilds_when_empty() {
     p.save().expect("save auto snapshot");
     drop(p);
 
-    let hash = db::content_hash(&bytes);
+    let (hash, sha256, size) = ident(&bytes);
     let explicit = db::StoredMapping::for_request(Some(elf_as_raw()));
     {
         let handle = db::open_db_read_only(&db).expect("open db");
         assert!(
             matches!(
-                db::load_cached(&handle, hash, &explicit).expect("load_cached"),
+                db::load_cached(&handle, hash, &sha256, size, &explicit).expect("load_cached"),
                 db::Snapshot::Stale { .. }
             ),
             "explicit open must not hit an auto snapshot"
@@ -785,7 +847,8 @@ fn auto_snapshot_explicit_open_conflicts_when_annotated() {
     let explicit = db::StoredMapping::for_request(Some(elf_as_raw()));
     {
         let handle = db::open_db_read_only(&db).expect("open db");
-        let err = db::load_cached(&handle, db::content_hash(&bytes), &explicit).unwrap_err();
+        let (b_hash, b_sha256, b_size) = ident(&bytes);
+        let err = db::load_cached(&handle, b_hash, &b_sha256, b_size, &explicit).unwrap_err();
         assert!(
             err.to_string().contains("separate --db"),
             "mode mismatch must name a separate DB: {err:?}"
@@ -819,7 +882,7 @@ fn same_mapping_stale_patch_never_saves() {
     let db = common::temp_db(&dir, "s");
 
     bootstrap_with_annotations(&bin, &db);
-    let old_hash = db::content_hash(&bytes);
+    let (old_hash, old_sha256, old_size) = ident(&bytes);
     let (old_meta, old_ann) = {
         let handle = db::open_db(&db).expect("open db");
         let stored = db::load(&handle).expect("load").expect("snapshot exists");
@@ -839,7 +902,152 @@ fn same_mapping_stale_patch_never_saves() {
             .expect("old snapshot intact");
         assert_eq!(stored.meta, old_meta);
         assert_eq!(stored.meta.content_hash, old_hash);
+        assert_eq!(stored.meta.content_sha256, old_sha256);
+        assert_eq!(stored.meta.size, old_size);
         assert_eq!(stored.annotations, old_ann);
     }
+    common::cleanup(&dir);
+}
+
+#[test]
+fn sha256_mismatch_is_stale_not_hit() {
+    // Same FNV hash but different SHA-256 must not hit: the wide hash gates
+    // the cache alongside FNV plus size, so a constructed FNV collision
+    // cannot replay another binary's layouts.
+    let dir = common::tmpdir("stale-sha256");
+    let bytes = small_elf();
+    let bin = common::write_bin(&dir, "h.bin", &bytes);
+    let db = common::temp_db(&dir, "h");
+
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    p.save().expect("save snapshot");
+    drop(p);
+
+    let (hash, _, size) = ident(&bytes);
+    let handle = db::open_db(&db).expect("open db");
+    let wrong_sha = "00".repeat(32);
+    match db::load_cached(&handle, hash, &wrong_sha, size, &db::StoredMapping::Auto)
+        .expect("load_cached")
+    {
+        db::Snapshot::Stale { .. } => {}
+        other => panic!("SHA-256 mismatch must be stale, got {other:?}"),
+    }
+    // Wrong size is likewise stale even with matching hashes.
+    let (hash, sha256, _) = ident(&bytes);
+    match db::load_cached(
+        &handle,
+        hash,
+        &sha256,
+        size.wrapping_add(1),
+        &db::StoredMapping::Auto,
+    )
+    .expect("load_cached")
+    {
+        db::Snapshot::Stale { .. } => {}
+        other => panic!("size mismatch must be stale, got {other:?}"),
+    }
+    common::cleanup(&dir);
+}
+
+#[test]
+fn unrelated_binary_drops_annotations_with_warning() {
+    // Reusing one `--db` path for an unrelated binary must not import its
+    // renames: different path and different arch/format/entry drops the
+    // rows and reports a stale warning instead of carrying by address.
+    let dir = common::tmpdir("stale-unrelated");
+    let bin_a = common::write_bin(&dir, "a.bin", &small_elf());
+    let other = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let bin_b = dir.join("b.exe");
+    std::fs::copy(&other, &bin_b).expect("copy");
+    let _ = std::fs::remove_file(&other);
+    let db = common::temp_db(&dir, "shared");
+
+    let mut proj_a = Project::open_with_db(&bin_a, &db).expect("open a");
+    proj_a.rename_function(0x400000, "aaa").expect("rename a");
+    drop(proj_a);
+
+    let q = Project::open_with_db(&bin_b, &db).expect("open unrelated b");
+    assert!(
+        q.annotations().is_empty(),
+        "unrelated open must drop carried rows, got {:?}",
+        q.annotations()
+    );
+    assert_eq!(
+        q.function_name(0x400000),
+        None,
+        "foreign rename must not resolve"
+    );
+    assert_eq!(q.stale_annotations_dropped(), 1);
+    let warning = q.stale_warning().expect("unrelated drop must warn");
+    assert!(
+        warning.contains("dropped 1"),
+        "warning must count dropped rows, got {warning:?}"
+    );
+    let stats = q.stats_json().expect("stats");
+    assert_eq!(stats["annotations_dropped"], 1);
+    assert!(stats["stale_warning"].is_string(), "stats must warn");
+
+    // The next write persists only the new binary's rows: the foreign
+    // rename stays dropped instead of being resurrected by the full save.
+    let mut r = q;
+    let entry_b = common::builders::BASIC_ENTRY_VA;
+    r.set_comment(entry_b, "bee").expect("comment b");
+    drop(r);
+    let s = Project::open_with_db(&bin_b, &db).expect("reopen b");
+    assert_eq!(
+        s.annotation(entry_b).and_then(|a| a.comment.as_deref()),
+        Some("bee")
+    );
+    assert!(s.annotations().get(&0x400000).is_none());
+    common::cleanup(&dir);
+}
+
+#[test]
+fn relative_vs_absolute_path_takes_fast_path() {
+    // Same file via different path spellings (`a.bin` vs `./a.bin`) has
+    // different `binary_path` strings but identical content identity:
+    // annotation writes must take the single-row fast path, not a full
+    // snapshot rewrite. The fast path leaves the stored `meta` row alone,
+    // so the persisted `binary_path` stays at the bootstrap spelling.
+    let dir = common::tmpdir("stale-dot-path");
+    let bytes = small_elf();
+    let abs_bin = common::write_bin(&dir, "a.bin", &bytes);
+    let db = common::temp_db(&dir, "shared");
+
+    let p = Project::open_with_db(&abs_bin, &db).expect("open abs");
+    p.save().expect("bootstrap snapshot");
+    drop(p);
+
+    let dot_bin = dir.join("./a.bin");
+    let mut q = Project::open_with_db(&dot_bin, &db).expect("open dot path");
+    assert_ne!(
+        q.path().display().to_string(),
+        abs_bin.display().to_string(),
+        "test needs distinct path spellings"
+    );
+    q.rename_function(0x400000, "via-dot").expect("rename");
+
+    let handle = db::open_db(&db).expect("open db");
+    let stored = db::load(&handle).expect("load").expect("snapshot exists");
+    assert_eq!(
+        stored.meta.binary_path,
+        abs_bin.display().to_string(),
+        "fast path must not rewrite meta for a path-only difference"
+    );
+    assert_eq!(
+        stored
+            .annotations
+            .get(&0x400000)
+            .and_then(|a| a.name.as_deref()),
+        Some("via-dot")
+    );
+    drop(handle);
+
+    let r = Project::open_with_db(&abs_bin, &db).expect("reopen abs");
+    assert_eq!(
+        r.function_name(0x400000).as_deref(),
+        Some("via-dot"),
+        "dot-path rename must be visible via the abs spelling"
+    );
     common::cleanup(&dir);
 }

@@ -364,23 +364,25 @@ fn thin_input_rejects_fat_arch() {
     common::cleanup(&dir);
 }
 
-/// Save a snapshot for one fat slice and return the container hash.
+/// Save a snapshot for one fat slice and return the container identity.
 fn bootstrap_slice(
     dir: &std::path::Path,
     name: &str,
     fat: &[u8],
     selector: &str,
     annotations: std::collections::BTreeMap<u64, db::Annotation>,
-) -> (std::path::PathBuf, u64) {
+) -> (std::path::PathBuf, u64, String) {
     let loaded = load_with_slice(fat, Some(selector)).expect("slice must load");
     let analysis = binscout::analysis::analyze(&loaded).expect("slice must analyze");
     let hash = db::content_hash(fat);
+    let sha256 = binscout::annotations::sha256_hex(fat);
     let db_path = common::temp_db(dir, name);
     let handle = db::open_db(&db_path).expect("open db");
     let meta = db::BinaryMeta {
         version: db::SCHEMA_VERSION,
         binary_path: name.to_string(),
         content_hash: hash,
+        content_sha256: sha256.clone(),
         size: fat.len() as u64,
         arch: db::arch_name(loaded.arch).to_string(),
         format: db::format_name(loaded.format).to_string(),
@@ -395,7 +397,7 @@ fn bootstrap_slice(
         inferred_omitted: analysis.diagnostics.inferred_omitted,
     };
     db::save(&handle, &meta, &analysis, &annotations).expect("save slice snapshot");
-    (db_path, hash)
+    (db_path, hash, sha256)
 }
 
 #[test]
@@ -636,12 +638,18 @@ fn fat_slices_do_not_share_snapshots() {
     let dir = common::tmpdir("fat-slices");
     let fat = two_slice_fat32();
 
-    let (db_path, hash) = bootstrap_slice(&dir, "x86", &fat, "x86_64", Default::default());
+    let (db_path, hash, sha256) = bootstrap_slice(&dir, "x86", &fat, "x86_64", Default::default());
     let handle = db::open_db(&db_path).expect("open db");
 
     // Same slice replays; the other slice and auto rebuild instead.
-    match db::load_cached(&handle, hash, &StoredMapping::for_fat_slice("x86_64"))
-        .expect("load_cached")
+    match db::load_cached(
+        &handle,
+        hash,
+        &sha256,
+        fat.len() as u64,
+        &StoredMapping::for_fat_slice("x86_64"),
+    )
+    .expect("load_cached")
     {
         db::Snapshot::Hit(hit) => {
             assert_eq!(
@@ -653,15 +661,28 @@ fn fat_slices_do_not_share_snapshots() {
     }
     assert!(
         matches!(
-            db::load_cached(&handle, hash, &StoredMapping::for_fat_slice("aarch64"))
-                .expect("load_cached"),
+            db::load_cached(
+                &handle,
+                hash,
+                &sha256,
+                fat.len() as u64,
+                &StoredMapping::for_fat_slice("aarch64")
+            )
+            .expect("load_cached"),
             db::Snapshot::Stale { .. }
         ),
         "other slice must not hit"
     );
     assert!(
         matches!(
-            db::load_cached(&handle, hash, &StoredMapping::Auto).expect("load_cached"),
+            db::load_cached(
+                &handle,
+                hash,
+                &sha256,
+                fat.len() as u64,
+                &StoredMapping::Auto
+            )
+            .expect("load_cached"),
             db::Snapshot::Stale { .. }
         ),
         "auto must not hit a slice snapshot"
@@ -669,7 +690,7 @@ fn fat_slices_do_not_share_snapshots() {
 
     // A populated slice sidecar under the other slice errors with a
     // separate-DB message instead of reusing layouts or annotations.
-    let (db_ann, hash_ann) = bootstrap_slice(
+    let (db_ann, hash_ann, sha256_ann) = bootstrap_slice(
         &dir,
         "ann",
         &fat,
@@ -685,8 +706,14 @@ fn fat_slices_do_not_share_snapshots() {
         .collect(),
     );
     let hog = db::open_db(&db_ann).expect("open db");
-    let err =
-        db::load_cached(&hog, hash_ann, &StoredMapping::for_fat_slice("aarch64")).unwrap_err();
+    let err = db::load_cached(
+        &hog,
+        hash_ann,
+        &sha256_ann,
+        fat.len() as u64,
+        &StoredMapping::for_fat_slice("aarch64"),
+    )
+    .unwrap_err();
     assert!(
         err.to_string().contains("separate --db"),
         "cross-slice annotations must require a separate DB: {err:?}"

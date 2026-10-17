@@ -14,16 +14,18 @@
 //! [`save`] rewrites every table in one transaction; [`load`] rebuilds the
 //! skeleton [`Loaded`] snapshot and the caller re-decodes instructions via
 //! [`Analysis::rebuild`](crate::analysis::rebuild), returning stored
-//! annotations untouched. [`load_cached`] filters by content hash, loader
+//! annotations untouched. [`load_cached`] filters by content hash plus
+//! SHA-256 and size, loader
 //! mapping, and analysis revision in one read transaction: matching
-//! snapshots load the skeleton fully, stale ones (different hash, mapping,
+//! snapshots load the skeleton fully, stale ones (different content, mapping,
 //! revision, or an older schema version) return metadata plus annotations
 //! without decoding the discarded derived rows (see its stale-cache
 //! policy). A mapping mismatch over a populated annotation sidecar errors
 //! with a separate-DB message instead of reusing layouts or remapping
 //! annotations. Callers detect a changed binary by comparing
 //! [`content_hash`] against [`BinaryMeta::content_hash`]: re-analysis runs,
-//! same-mapping annotations carry over by address, and only an explicit
+//! same-mapping annotations carry over by address when
+//! [`stale_carry_plausible`] holds, and only an explicit
 //! [`save`] writes — the analyzed binary itself is only ever read.
 
 use std::collections::BTreeMap;
@@ -40,11 +42,11 @@ use crate::loader::strings::StringHit;
 
 /// Schema version stored under `meta["version"]`.
 ///
-/// Version 5 records inferred single-slot indirect-jump edges alongside
-/// the mapping-aware v4 snapshot, so same bytes opened under different
+/// Version 6 strengthens cache identity with SHA-256 plus size alongside
+/// the FNV-1a hash, so same bytes opened under different
 /// raw options never share cached layouts and old snapshots re-analyze
 /// rather than synthesizing clean diagnostics.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -307,6 +309,15 @@ pub struct BinaryMeta {
     pub binary_path: String,
     /// Hash of the file contents.
     pub content_hash: u64,
+    /// Hex SHA-256 of the file contents.
+    ///
+    /// Strengthens [`BinaryMeta::content_hash`] (FNV-1a-64) against
+    /// collisions: cache identity compares both plus [`BinaryMeta::size`].
+    /// Defaults to empty so pre-v6 snapshots without the field still
+    /// decode; such snapshots never hit the cache (empty never equals a
+    /// real digest) and re-analyze instead.
+    #[serde(default)]
+    pub content_sha256: String,
     /// File size in bytes.
     pub size: u64,
     /// Architecture string.
@@ -369,6 +380,54 @@ pub struct BinaryMeta {
 
 fn default_supported() -> bool {
     true
+}
+
+impl BinaryMeta {
+    /// Equality for fast annotation writes: all content identity except host path.
+    ///
+    /// [`BinaryMeta::binary_path`] is display-only: opening the same file as
+    /// `./a` versus `/abs/a` must take the single-row fast path, not force a
+    /// full-snapshot fallback. Every other field (hash, SHA-256, size, arch,
+    /// format, entry, mapping, revisions, truncation flags) still gates the
+    /// fast path.
+    #[must_use]
+    pub fn fast_write_eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.content_hash == other.content_hash
+            && self.content_sha256 == other.content_sha256
+            && self.size == other.size
+            && self.arch == other.arch
+            && self.format == other.format
+            && self.entry == other.entry
+            && self.supported == other.supported
+            && self.reason == other.reason
+            && self.mapping == other.mapping
+            && self.analysis_rev == other.analysis_rev
+            && self.diagnostics_truncated == other.diagnostics_truncated
+            && self.diagnostics_omitted == other.diagnostics_omitted
+            && self.inferred_truncated == other.inferred_truncated
+            && self.inferred_omitted == other.inferred_omitted
+    }
+}
+
+/// Whether stale annotations plausibly belong to the current binary.
+///
+/// True when the stored snapshot names the same host path, or when the
+/// stored arch, format, and entry all match the freshly loaded binary.
+/// Otherwise the sidecar was reused for an unrelated binary and its
+/// renames/comments must be dropped rather than carried by address.
+#[must_use]
+pub fn stale_carry_plausible(
+    stored: &BinaryMeta,
+    current_path: &str,
+    current_arch: &str,
+    current_format: &str,
+    current_entry: Option<u64>,
+) -> bool {
+    if stored.binary_path == current_path {
+        return true;
+    }
+    stored.arch == current_arch && stored.format == current_format && stored.entry == current_entry
 }
 
 /// One function row: export name plus sorted direct callees.
@@ -812,7 +871,10 @@ pub enum AnnotationSave {
 /// on a snapshot written for different bytes by another process. On match,
 /// inserts (`Some` non-empty) or deletes (`None`/empty) only that row and
 /// commits; the `functions`/`blocks`/`xrefs`/`strings` tables are never
-/// opened for writing. On a fresh DB or any content/revision mismatch under
+/// opened for writing. Identity ignores [`BinaryMeta::binary_path`]
+/// (see [`BinaryMeta::fast_write_eq`]): opening the same file via
+/// different relative/absolute spellings still takes the fast path.
+/// On a fresh DB or any content/revision mismatch under
 /// the same mapping, aborts without writing and returns
 /// [`AnnotationSave::NeedsFull`]. A populated sidecar under an incompatible
 /// mapping (or an ambiguous legacy mapping) errors instead of returning
@@ -875,7 +937,7 @@ pub fn save_annotation(
             }
             return Ok(AnnotationSave::NeedsFull);
         }
-        if persisted != *meta {
+        if !persisted.fast_write_eq(meta) {
             return Ok(AnnotationSave::NeedsFull);
         }
     }
@@ -904,7 +966,9 @@ pub fn save_annotation(
 /// Same guards as [`save_annotation`], applied once for the whole batch:
 /// reads the persisted `meta`/`binaries` rows inside the write transaction
 /// that applies every change, so rows never land on a snapshot written for
-/// different bytes by another process. On match, upserts (`Some` non-empty)
+/// different bytes by another process. Identity ignores
+/// [`BinaryMeta::binary_path`] (see [`BinaryMeta::fast_write_eq`]).
+/// On match, upserts (`Some` non-empty)
 /// or deletes (`None`) every entry of `changes` and commits once; the
 /// `functions`/`blocks`/`xrefs`/`strings` tables are never opened for
 /// writing. An empty `changes` map commits nothing and returns
@@ -969,7 +1033,7 @@ pub fn save_annotation_batch(
             }
             return Ok(AnnotationSave::NeedsFull);
         }
-        if persisted != *meta {
+        if !persisted.fast_write_eq(meta) {
             return Ok(AnnotationSave::NeedsFull);
         }
     }
@@ -1089,6 +1153,8 @@ pub fn save(
         t.insert("binary_path", meta.binary_path.clone())
             .map_err(|e| Error::Storage(format!("write meta: {e}")))?;
         t.insert("content_hash", meta.content_hash.to_string())
+            .map_err(|e| Error::Storage(format!("write meta: {e}")))?;
+        t.insert("content_sha256", meta.content_sha256.clone())
             .map_err(|e| Error::Storage(format!("write meta: {e}")))?;
         t.insert("size", meta.size.to_string())
             .map_err(|e| Error::Storage(format!("write meta: {e}")))?;
@@ -1216,6 +1282,29 @@ fn read_meta_row(rtxn: &redb::ReadTransaction) -> Result<Option<BinaryMeta>> {
         .map_err(|e| Error::Storage(format!("read binaries: {e}")))?
         .ok_or_else(|| Error::Storage("project db has meta but no binary row".to_string()))?;
     Ok(Some(decode(&row.value())?))
+}
+
+/// Current snapshot identity plus annotations, without decoding layouts.
+///
+/// Used by annotation-write fallbacks to merge one batch on top of rows
+/// another process wrote in between: returns `None` on a fresh DB.
+/// A missing annotations table reads as empty; corrupt rows still error so
+/// user data is never silently dropped.
+///
+/// # Errors
+/// [`Error::Storage`] on unreadable metadata or corrupt annotation rows.
+/// [`Error::Limit`] when annotation budgets are exceeded.
+pub fn load_meta_and_annotations(
+    db: &Database,
+) -> Result<Option<(BinaryMeta, BTreeMap<u64, Annotation>)>> {
+    let rtxn = db
+        .begin_read()
+        .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
+    let Some(meta) = read_meta_row(&rtxn)? else {
+        return Ok(None);
+    };
+    let annotations = read_annotations_or_empty(&rtxn)?;
+    Ok(Some((meta, annotations)))
 }
 
 /// Persisted derived rows (`functions`/block layouts, call edges, xrefs,
@@ -1467,23 +1556,27 @@ pub enum Snapshot {
     Miss,
 }
 
-/// Load the snapshot for one binary hash and loader mapping in a single read
-/// transaction.
+/// Load the snapshot for one binary identity and loader mapping in a single
+/// read transaction.
 ///
 /// Accepts any readable handle ([`Database`] or [`redb::ReadOnlyDatabase`]);
 /// read opens pass a read-only handle from [`open_db_read_only`].
 ///
-/// Cache identity covers the binary content (`expected_hash`), the
+/// Cache identity covers the binary content (`expected_hash` plus
+/// `expected_sha256` and `expected_size`), the
 /// loader mapping — auto, explicit raw arch/base/entry, or fat slice arch
 /// (`expected_mapping`) — and the analysis revision: layouts replay only when
-/// all three agree with the stored snapshot on the current
-/// [`SCHEMA_VERSION`]. A mapping mismatch never reuses layouts, even when
-/// the bytes are identical; auto and explicit opens never alias.
+/// all agree with the stored snapshot on the current
+/// [`SCHEMA_VERSION`]. The 64-bit FNV-1a hash is a fast pre-check; the
+/// SHA-256 plus size is the collision-resistant gate, so a constructed
+/// FNV collision cannot replay another binary's layouts. A mapping mismatch
+/// never reuses layouts, even when the bytes are identical; auto and
+/// explicit opens never alias.
 ///
 /// Reads and validates the `meta`/`binaries` rows first. On any identity
 /// mismatch the derived tables are never opened, so opening a small binary
 /// against a sidecar written for a large one costs no decoding proportional
-/// to the discarded rows. A version, hash, or revision mismatch under the
+/// to the discarded rows. A version, content, or revision mismatch under the
 /// same mapping returns [`Snapshot::Stale`] with the stored annotations and
 /// the binary re-analyzes. A legacy snapshot whose mapping cannot be
 /// established is rebuilt, never trusted. A mapping mismatch (or an
@@ -1503,9 +1596,15 @@ pub enum Snapshot {
 /// the `meta` version marker, the `binaries` row (missing/undecodable rows
 /// error, as without metadata no hash comparison is possible), and every
 /// annotation row (a corrupt annotation errors because annotations carry
-/// over into the re-analysis; a missing annotations table reads as empty).
+/// over into the re-analysis when [`stale_carry_plausible`] holds; a missing
+/// annotations table reads as empty).
 /// A full identity match keeps the exact [`load`] validation:
 /// unknown arch/format, and any corrupt or missing table error.
+///
+/// Callers filter stale annotations with [`stale_carry_plausible`]:
+/// [`load_cached`] itself returns the stored rows so one read transaction
+/// stays coherent (see its coherence test); [`Project::open`](crate::Project::open)
+/// drops implausible rows and reports them via its stale warning.
 ///
 /// # Errors
 /// [`Error::Storage`] on unreadable metadata, on corrupt annotations, on
@@ -1516,6 +1615,8 @@ pub enum Snapshot {
 pub fn load_cached(
     db: &impl ReadableDatabase,
     expected_hash: u64,
+    expected_sha256: &str,
+    expected_size: u64,
     expected_mapping: &StoredMapping,
 ) -> Result<Snapshot> {
     let rtxn = db
@@ -1558,7 +1659,11 @@ pub fn load_cached(
         }
         return Ok(Snapshot::Stale { meta, annotations });
     }
-    if meta.content_hash != expected_hash || meta.analysis_rev != Some(ANALYSIS_REVISION) {
+    if meta.content_hash != expected_hash
+        || meta.content_sha256 != expected_sha256
+        || meta.size != expected_size
+        || meta.analysis_rev != Some(ANALYSIS_REVISION)
+    {
         let annotations = read_annotations_or_empty(&rtxn)?;
         return Ok(Snapshot::Stale { meta, annotations });
     }

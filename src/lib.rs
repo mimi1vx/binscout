@@ -412,6 +412,8 @@ pub struct Project {
     analysis: Analysis,
     annotations: BTreeMap<u64, Annotation>,
     mapping: db::StoredMapping,
+    stale_annotations_dropped: usize,
+    stale_warning: Option<String>,
 }
 
 impl Project {
@@ -433,9 +435,14 @@ impl Project {
     /// through [`Project::open_raw`]. Unrecognized bytes fall back to raw
     /// x86-64 at base 0 so fixture blobs and shellcode open without options;
     /// explicit bases/arches go through [`Project::open_raw`]. Reads the
-    /// sidecar when present: a matching content hash, loader mapping, and
+    /// sidecar when present: a matching content hash plus SHA-256 and size,
+    /// loader mapping, and
     /// analysis revision loads the cached snapshot, a mismatch re-analyzes
-    /// while keeping same-mapping stored annotations. A populated sidecar
+    /// while keeping stored annotations only when
+    /// [`db::stale_carry_plausible`] holds
+    /// (same path or same arch/format/entry). An unrelated sidecar's rows
+    /// are dropped and reported via [`Project::stale_warning`]. A populated
+    /// sidecar
     /// under an incompatible mapping errors with a separate-DB message
     /// instead of reusing layouts. A stale sidecar's derived rows are never
     /// decoded (only its metadata and annotations are read), so a large
@@ -508,17 +515,19 @@ impl Project {
         // accumulation, so a growing file cannot slip past a stat cap.
         let bytes = read_input_bytes(binary)?;
         let hash = db::content_hash(&bytes);
+        let sha256 = crate::annotations::sha256_hex(&bytes);
         let size = bytes.len() as u64;
         let mapping = mapping_for(raw, fat_arch)?;
 
         // Metadata-first snapshot read over a read-only handle: cache
-        // identity covers content, loader mapping, and analysis revision
-        // before any layout replay (see `db::load_cached`), and the
-        // read-only open itself costs nothing proportional to the file.
-        // Reads never save and never create the sidecar.
+        // identity covers content hash plus SHA-256 and size, loader mapping,
+        // and analysis revision before any layout replay (see
+        // `db::load_cached`), and the read-only open itself costs nothing
+        // proportional to the file. Reads never save and never create the
+        // sidecar.
         let cached = if db_path.exists() {
             match db::open_db_read_only(db_path) {
-                Ok(db) => Some(db::load_cached(&db, hash, &mapping)?),
+                Ok(db) => Some(db::load_cached(&db, hash, &sha256, size, &mapping)?),
                 // Raced with a concurrent sidecar deletion: read as absent.
                 Err(_) if !db_path.exists() => None,
                 Err(e) => return Err(e),
@@ -559,22 +568,29 @@ impl Project {
                     path: binary.to_path_buf(),
                     db_path: db_path.to_path_buf(),
                     content_hash: hash,
-                    content_sha256: crate::annotations::sha256_hex(&bytes),
+                    content_sha256: sha256,
                     size,
                     binary: loaded,
                     analysis,
                     annotations,
                     mapping,
+                    stale_annotations_dropped: 0,
+                    stale_warning: None,
                 })
             }
-            Some(db::Snapshot::Stale { annotations, .. }) => Self::reanalyze(
+            Some(db::Snapshot::Stale {
+                meta: stale_meta,
+                annotations,
+            }) => Self::reanalyze(
                 binary,
                 db_path,
                 bytes,
                 raw,
                 fat_arch,
                 hash,
+                sha256,
                 size,
+                Some(stale_meta),
                 annotations,
             ),
             Some(db::Snapshot::Miss) | None => Self::reanalyze(
@@ -584,18 +600,23 @@ impl Project {
                 raw,
                 fat_arch,
                 hash,
+                sha256,
                 size,
+                None,
                 BTreeMap::new(),
             ),
         }
     }
 
-    /// Re-analyze `bytes` from scratch, carrying `annotations` forward.
+    /// Re-analyze `bytes` from scratch, carrying `annotations` forward when plausible.
     ///
-    /// Stale sidecars keep user renames and comments by address under the
-    /// same mapping; the derived analysis always comes from the current
-    /// bytes, never from storage. A mapping mismatch over populated
-    /// annotations never reaches this path: [`db::load_cached`] errors first.
+    /// Stale sidecars keep user renames and comments by address only when
+    /// [`db::stale_carry_plausible`] holds (same path or same
+    /// arch/format/entry); otherwise the rows belong to an unrelated binary
+    /// and are dropped with a stale warning. The derived analysis always
+    /// comes from the current bytes, never from storage. A mapping mismatch
+    /// over populated annotations never reaches this path:
+    /// [`db::load_cached`] errors first.
     #[allow(
         clippy::too_many_arguments,
         reason = "open plumbing: paths plus raw/fat mapping, content, and annotations"
@@ -607,7 +628,9 @@ impl Project {
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
         hash: u64,
+        sha256: String,
         size: u64,
+        stale_meta: Option<db::BinaryMeta>,
         annotations: BTreeMap<u64, Annotation>,
     ) -> Result<Self> {
         let mapping = mapping_for(raw, fat_arch)?;
@@ -616,16 +639,44 @@ impl Project {
             None => load_or_raw(&bytes, fat_arch)?,
         };
         let analysis = analyze(&loaded)?;
+        let current_path = binary.display().to_string();
+        let current_arch = db::arch_name(loaded.arch).to_string();
+        let current_format = db::format_name(loaded.format).to_string();
+        let current_entry = loaded.entry;
+        let (annotations, stale_annotations_dropped, stale_warning) = match stale_meta {
+            Some(stored)
+                if !db::stale_carry_plausible(
+                    &stored,
+                    &current_path,
+                    &current_arch,
+                    &current_format,
+                    current_entry,
+                ) =>
+            {
+                let n = annotations.len();
+                let warning = if n > 0 {
+                    Some(format!(
+                        "dropped {n} stale annotation(s): sidecar was written for unrelated binary (path/arch/format/entry mismatch); not carried"
+                    ))
+                } else {
+                    None
+                };
+                (BTreeMap::new(), n, warning)
+            }
+            _ => (annotations, 0, None),
+        };
         Ok(Self {
             path: binary.to_path_buf(),
             db_path: db_path.to_path_buf(),
             content_hash: hash,
-            content_sha256: crate::annotations::sha256_hex(&bytes),
+            content_sha256: sha256,
             size,
             binary: loaded,
             analysis,
             annotations,
             mapping,
+            stale_annotations_dropped,
+            stale_warning,
         })
     }
 
@@ -646,6 +697,7 @@ impl Project {
             version: db::SCHEMA_VERSION,
             binary_path: self.path.display().to_string(),
             content_hash: self.content_hash,
+            content_sha256: self.content_sha256.clone(),
             size: self.size,
             arch: db::arch_name(self.binary.arch).to_string(),
             format: db::format_name(self.binary.format).to_string(),
@@ -675,8 +727,12 @@ impl Project {
     /// Tries [`db::save_annotation`](crate::db::save_annotation) first: when
     /// the sidecar holds a snapshot for this binary and mapping, only the
     /// `annotations` row changes. Otherwise (fresh DB or same-mapping
-    /// content mismatch) rewrites the full snapshot via [`Project::save`].
-    /// A populated sidecar under an incompatible mapping errors instead of
+    /// content mismatch) rewrites the full snapshot. The fallback merges
+    /// the single changed row onto the sidecar's current annotations when
+    /// the stored lineage is plausible (see [`db::stale_carry_plausible`),
+    /// so rows another process wrote in between are kept; an unrelated
+    /// sidecar is replaced with the in-memory state instead. A populated
+    /// sidecar under an incompatible mapping errors instead of
     /// overwriting.
     fn persist_annotation(&self, addr: u64) -> Result<()> {
         let db = db::open_db(&self.db_path)?;
@@ -684,10 +740,52 @@ impl Project {
         match db::save_annotation(&db, &self.meta(), addr, ann)? {
             db::AnnotationSave::Fast => Ok(()),
             db::AnnotationSave::NeedsFull => {
-                db::save(&db, &self.meta(), &self.analysis, &self.annotations)?;
+                let merged = self.merged_fallback_annotations(&db, [(addr, ann.cloned())])?;
+                db::save(&db, &self.meta(), &self.analysis, &merged)?;
                 Ok(())
             }
         }
+    }
+
+    /// Merge fallback annotations for a full-snapshot rewrite.
+    ///
+    /// Reads the sidecar's current annotations and, when the stored lineage
+    /// is plausible for this project, applies `changes` (`None` deletes) on
+    /// top so concurrent rows survive. Otherwise (fresh DB or unrelated
+    /// sidecar) falls back to the in-memory annotations with `changes`
+    /// applied. Single-row and batch write paths share this helper.
+    fn merged_fallback_annotations(
+        &self,
+        db: &redb::Database,
+        changes: impl IntoIterator<Item = (u64, Option<Annotation>)>,
+    ) -> Result<BTreeMap<u64, Annotation>> {
+        let changes: BTreeMap<u64, Option<Annotation>> = changes.into_iter().collect();
+        let Some((persisted_meta, mut current)) = db::load_meta_and_annotations(db)? else {
+            let mut full = self.annotations.clone();
+            crate::annotations::apply_changes(&mut full, &changes);
+            return Ok(full);
+        };
+        if persisted_meta.mapping != self.meta().mapping {
+            let mut full = self.annotations.clone();
+            crate::annotations::apply_changes(&mut full, &changes);
+            return Ok(full);
+        }
+        let ours = self.meta();
+        let plausible = persisted_meta.fast_write_eq(&ours)
+            || db::stale_carry_plausible(
+                &persisted_meta,
+                &ours.binary_path,
+                &ours.arch,
+                &ours.format,
+                ours.entry,
+            );
+        if !plausible {
+            let mut full = self.annotations.clone();
+            crate::annotations::apply_changes(&mut full, &changes);
+            return Ok(full);
+        }
+        crate::annotations::apply_changes(&mut current, &changes);
+        Ok(current)
     }
 
     /// Agent-facing summary; always JSON-serializable.
@@ -734,6 +832,8 @@ impl Project {
     /// Opens without saving like the other read paths; `db_size` is `0`
     /// when no sidecar exists yet. The `stats` CLI/MCP surface reports
     /// this verbatim so operators see the cost of a cached snapshot.
+    /// Includes the SHA-256 content identity plus the stale-annotation
+    /// drop count and warning (see [`Project::stale_warning`]).
     ///
     /// # Errors
     /// [`Error::Storage`] when the sidecar exists but cannot be statted.
@@ -761,6 +861,7 @@ impl Project {
             "entry": entry,
             "entry_hex": entry_hex,
             "content_hash": self.content_hash,
+            "content_sha256": self.content_sha256,
             "size": self.size,
             "db_size": db_size,
             "functions": s.functions,
@@ -769,6 +870,8 @@ impl Project {
             "xrefs": s.xrefs,
             "strings": s.strings,
             "annotations": self.annotations.values().filter(|a| !a.is_empty()).count(),
+            "annotations_dropped": self.stale_annotations_dropped,
+            "stale_warning": self.stale_warning,
             "diagnostics": self.analysis.diagnostics.records.len(),
             "diagnostics_truncated": self.analysis.diagnostics.truncated,
             "diagnostics_omitted": self.analysis.diagnostics.omitted,
@@ -801,9 +904,34 @@ impl Project {
     /// Cryptographic identity for portable annotation interchange (see
     /// [`Project::export_annotations`]); the 64-bit
     /// [`Project::content_hash`] only detects "binary changed, re-analyze".
+    /// Together with [`Project::size`] it gates the snapshot cache in
+    /// [`db::load_cached`], so an FNV-1a collision cannot replay another
+    /// binary's layouts.
     #[must_use]
     pub fn content_sha256(&self) -> &str {
         &self.content_sha256
+    }
+
+    /// Stale annotations dropped for an unrelated sidecar on open.
+    ///
+    /// Counts rows discarded because [`db::stale_carry_plausible`] failed
+    /// (different path and different arch/format/entry): reusing one `--db`
+    /// path for an unrelated binary no longer imports its renames. Zero on
+    /// cache hits and on plausible stale opens.
+    #[must_use]
+    pub fn stale_annotations_dropped(&self) -> usize {
+        self.stale_annotations_dropped
+    }
+
+    /// Why stale annotations were dropped, if any.
+    ///
+    /// `Some` exactly when [`Project::stale_annotations_dropped`] is
+    /// non-zero: names the unrelated sidecar lineage that was ignored.
+    /// Agents surfacing `stats` should include this alongside the drop
+    /// count instead of silently carrying foreign renames.
+    #[must_use]
+    pub fn stale_warning(&self) -> Option<&str> {
+        self.stale_warning.as_deref()
     }
 
     /// Binary size in bytes the analysis was taken over.
@@ -977,8 +1105,9 @@ impl Project {
         match db::save_annotation_batch(&db, &self.meta(), &changes)? {
             db::AnnotationSave::Fast => {}
             db::AnnotationSave::NeedsFull => {
-                let mut full = self.annotations.clone();
-                crate::annotations::apply_changes(&mut full, &changes);
+                let owned: BTreeMap<u64, Option<Annotation>> =
+                    changes.iter().map(|(&k, v)| (k, v.clone())).collect();
+                let full = self.merged_fallback_annotations(&db, owned)?;
                 db::save(&db, &self.meta(), &self.analysis, &full)?;
             }
         }
@@ -1084,8 +1213,9 @@ impl Project {
             match db::save_annotation_batch(&db, &self.meta(), &changes)? {
                 db::AnnotationSave::Fast => {}
                 db::AnnotationSave::NeedsFull => {
-                    let mut merged = self.annotations.clone();
-                    crate::annotations::apply_changes(&mut merged, &changes);
+                    let owned: BTreeMap<u64, Option<Annotation>> =
+                        changes.iter().map(|(&k, v)| (k, v.clone())).collect();
+                    let merged = self.merged_fallback_annotations(&db, owned)?;
                     db::save(&db, &self.meta(), &self.analysis, &merged)?;
                 }
             }

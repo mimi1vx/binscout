@@ -236,6 +236,7 @@ fn fresh_db_bootstraps_full_snapshot() {
             version: db::SCHEMA_VERSION,
             binary_path: probe.path().display().to_string(),
             content_hash: probe.content_hash(),
+            content_sha256: probe.content_sha256().to_string(),
             size: info.size,
             arch: info.arch.clone(),
             format: info.format.clone(),

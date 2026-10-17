@@ -547,6 +547,7 @@ fn oversized_export_fails_explicitly() {
         version: db::SCHEMA_VERSION,
         binary_path: p.path().display().to_string(),
         content_hash: p.content_hash(),
+        content_sha256: p.content_sha256().to_string(),
         size: info.size,
         arch: info.arch.clone(),
         format: info.format.clone(),
