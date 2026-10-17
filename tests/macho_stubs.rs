@@ -218,6 +218,7 @@ fn stub_binary(stub_addrs: [Option<u64>; 2]) -> LoadedBinary {
         sections: Vec::new(),
         imports,
         exports: Vec::new(),
+        symbols: Vec::new(),
     }
 }
 

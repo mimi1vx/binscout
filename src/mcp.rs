@@ -880,7 +880,10 @@ impl BinscoutMcp {
         ok(serde_json::to_value(rows).expect("strings serialize"))
     }
 
-    #[tool(name = "symbols", description = "Imports and exports of the binary")]
+    #[tool(
+        name = "symbols",
+        description = "Imports, exports, and symbol-table code addresses of the binary"
+    )]
     fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let _guard = self.guard();
         let p = all_params(p);

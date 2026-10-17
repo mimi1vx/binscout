@@ -9,7 +9,7 @@ Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
 $ binscout load tests/fixtures/raw-x64.bin
-{"analysis_revision":5,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":6,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
 ```
 
 `mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto
@@ -159,8 +159,8 @@ After — `func` is a bounded summary. `blocks`/`insns` are counts,
 `calls` is a count (not the unbounded target array),
 `inferred_edges` counts provenance-marked indirect-jump resolutions in
 that function, and `reasons` is the sorted, deduplicated discovery
-vocabulary (`entry`, `export`, `direct-call`, `prologue`). The
-redundant `containing_entry` twin is dropped; any interior address
+vocabulary (`entry`, `export`, `symbol`, `direct-call`, `prologue`).
+The redundant `containing_entry` twin is dropped; any interior address
 still snaps to the canonical `entry`:
 
 ```json
@@ -175,7 +175,13 @@ Explicitly unchanged in this contract (no style churn): the bare-array
 `--start`/`--limit` (`--offset` stays a deprecated alias that warns);
 `symbols` exports keep their shape while imports gain additive
 `address`/`address_hex` (the Mach-O `__stubs` entry address, null when
-unmapped); `sections`, `disasm`/`ir` with `error_at` and the 1 MiB
+unmapped); a third additive array, `symbols`, carries one
+`name`/`address`/`address_hex` row per defined text symbol from the
+object symbol tables (locals included, deduplicated by address, Thumb
+bit cleared on ARM). Symbol addresses seed analysis as
+`symbol`-reasoned functions; per-address naming resolves export >
+symbol > stub import, with annotation renames winning over all three
+at display time. `sections`, `disasm`/`ir` with `error_at` and the 1 MiB
 range cap; `cfg` node/edge shape; `annotate` read/write semantics
 (`rename` only on known function entries, `comment` on any address,
 empty string clears, 8 KiB text cap); all exit codes and error
@@ -209,7 +215,7 @@ Explicit raw mode never falls back to another mode on failure.
 
 ```sh
 $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/raw.redb
-{"analysis_revision":5,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":6,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
 ```
 
 Same bytes under a different mapping never reuse cached layouts: the

@@ -876,7 +876,10 @@ fn diagnostics_envelope_filters_and_errors() {
     assert_eq!(v["diagnostics"], 3);
     assert_eq!(v["diagnostics_truncated"], false);
     assert_eq!(v["diagnostics_omitted"], 0);
-    assert_eq!(v["analysis_revision"], 5);
+    assert_eq!(
+        v["analysis_revision"],
+        binscout::analysis::ANALYSIS_REVISION
+    );
 
     // Only `load` caches the snapshot.
     assert!(Path::new(d).exists(), "load caches the snapshot");

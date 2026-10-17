@@ -419,6 +419,7 @@ mod tests {
             sections: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            symbols: Vec::new(),
         };
         let spanning = BytePattern::parse("AA AA BB BB").expect("parse");
         let (total, _) = run(&bin, &spanning, None, None, 0, 100).expect("scan");
@@ -463,6 +464,7 @@ mod tests {
             sections: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            symbols: Vec::new(),
         };
         let (total, _) = run(
             &bin,
@@ -502,6 +504,7 @@ mod tests {
             }],
             imports: Vec::new(),
             exports: Vec::new(),
+            symbols: Vec::new(),
         };
         let pat = BytePattern::parse("90").expect("parse");
         let (total, _) = run(&bin, &pat, Some(".bss"), None, 0, 10).expect("bss filter");

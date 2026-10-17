@@ -836,7 +836,8 @@ impl Project {
         self.annotations.get(&addr).filter(|a| !a.is_empty())
     }
 
-    /// Display name of a function: annotation rename wins over export name.
+    /// Display name of a function: annotation rename wins over the
+    /// analysis name (export > symbol-table > stub import).
     #[must_use]
     pub fn function_name(&self, entry: u64) -> Option<String> {
         if let Some(n) = self
@@ -1644,16 +1645,19 @@ impl Project {
             .filter(move |x| kind.is_none_or(|k| x.kind == k))
     }
 
-    /// Imports plus exports for symbol views.
+    /// Imports plus exports plus symbol-table code addresses for symbol views.
     ///
     /// Ordinal-only imports carry `ordinal` plus `unresolved: true`;
-    /// C++ imports/exports carry `demangled` when [`crate::loader::demangle_cpp`]
+    /// C++ imports/exports/symbols carry `demangled` when [`crate::loader::demangle_cpp`]
     /// recognizes the mangling. Mach-O imports resolved to a
     /// `__stubs`/`__auth_stubs` entry carry its `address`/`address_hex`;
-    /// every other row carries null on both sides.
+    /// every other import row carries null on both sides. `symbols` holds
+    /// one `{name, address, address_hex}` row per defined text symbol
+    /// (locals included), deduplicated by address; empty for raw blobs
+    /// and LE images, which have no symbol tables.
     #[must_use]
     pub fn symbols_json(&self) -> serde_json::Value {
-        serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports })
+        serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports, "symbols": self.binary.symbols })
     }
 
     /// Section table in file order: name, virtual address, in-memory size,

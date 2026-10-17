@@ -44,7 +44,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 5;
+pub const ANALYSIS_REVISION: u32 = 6;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -164,7 +164,7 @@ impl Serialize for Xref {
 /// binary entry point, an export, a direct-call target, and a prologue
 /// hit at once. Stored sorted and deduplicated.
 ///
-/// Wire form is kebab-case (`entry`, `export`, `direct-call`,
+/// Wire form is kebab-case (`entry`, `export`, `symbol`, `direct-call`,
 /// `prologue`); pre-provenance rows in the historical CamelCase spelling
 /// still decode via aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -177,6 +177,10 @@ pub enum DiscoveryReason {
     /// Export address resolving to executable code.
     #[serde(alias = "Export")]
     Export,
+    /// Symbol-table address (locals included) resolving to executable
+    /// code.
+    #[serde(alias = "Symbol")]
+    Symbol,
     /// Direct call target followed during recursive descent.
     #[serde(alias = "DirectCall")]
     DirectCall,
@@ -1746,10 +1750,10 @@ struct Decoded {
     flow: Flow,
 }
 
-/// Seed addresses from the entry point, exports, and Mach-O stub entries
-/// resolving to executable code. When none exists (raw blobs, stripped
-/// objects), the first executable byte seeds analysis so some function is
-/// always found.
+/// Seed addresses from the entry point, exports, symbol-table entries,
+/// and Mach-O stub entries resolving to executable code. When none exists
+/// (raw blobs, stripped objects), the first executable byte seeds analysis
+/// so some function is always found.
 fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
     let mut seeds: Vec<u64> = Vec::new();
     if let Some(entry) = bin.entry
@@ -1763,6 +1767,14 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
             && space.code_bytes(addr).is_some()
         {
             seeds.push(addr);
+        }
+    }
+    // Symbol-table code addresses (locals included): the only seed path
+    // for static functions nothing calls. Loader-canonical already
+    // (Thumb bit cleared), so they seed exactly as stored.
+    for sym in &bin.symbols {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(sym.address).is_some() {
+            seeds.push(sym.address);
         }
     }
     // Mach-O stub entries carry their import's address (see
@@ -2614,13 +2626,15 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         return Err(Error::Limit(format!("more than {MAX_FUNCTIONS} functions")));
     }
     // Discovery provenance: every seed path that reached an entry.
-    // `seeds1` holds the entry point, exports, or the fallback base;
-    // `seeds2` holds prologue hits; `call_targets` holds direct calls.
-    // A fallback base that is neither entry nor export still counts as
-    // `Entry`: it seeded analysis as the entry point.
+    // `seeds1` holds the entry point, exports, symbol-table addresses,
+    // or the fallback base; `seeds2` holds prologue hits; `call_targets`
+    // holds direct calls. A fallback base that is neither entry nor
+    // export still counts as `Entry`: it seeded analysis as the entry
+    // point.
     let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
     let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
     let export_addrs: BTreeSet<u64> = bin.exports.iter().filter_map(|e| e.address).collect();
+    let symbol_addrs: BTreeSet<u64> = bin.symbols.iter().map(|s| s.address).collect();
     let mut reasons: BTreeMap<u64, BTreeSet<DiscoveryReason>> = BTreeMap::new();
     for e in &entries {
         let mut r = BTreeSet::new();
@@ -2629,6 +2643,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
         if export_addrs.contains(e) {
             r.insert(DiscoveryReason::Export);
+        }
+        if symbol_addrs.contains(e) {
+            r.insert(DiscoveryReason::Symbol);
         }
         if walk.call_targets.contains(e) {
             r.insert(DiscoveryReason::DirectCall);
@@ -2704,13 +2721,18 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries; Mach-O stub entries take their import's
-    // name when no export claims the address.
+    // Export names for entries, then symbol-table names, then Mach-O
+    // stub import names. Precedence per address: export > symbol > stub;
+    // annotation renames win over all three at display time (see
+    // `Project::function_name`).
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
             names.entry(addr).or_insert_with(|| exp.name.clone());
         }
+    }
+    for sym in &bin.symbols {
+        names.entry(sym.address).or_insert_with(|| sym.name.clone());
     }
     for imp in &bin.imports {
         if let Some(addr) = imp.address {
@@ -3129,6 +3151,7 @@ mod tests {
             sections: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            symbols: Vec::new(),
         }
     }
 

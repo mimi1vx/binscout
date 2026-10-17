@@ -114,6 +114,7 @@ fn export_and_direct_call_reasons_coexist_sorted() {
             ordinal: None,
             demangled: None,
         }],
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("raw with export must analyze");
     assert_eq!(reasons_of(&a, 0x1000), [DiscoveryReason::Entry]);

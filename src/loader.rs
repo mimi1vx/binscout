@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use object::{FileKind, Object, ObjectSection, ObjectSegment};
+use object::{FileKind, Object, ObjectSection, ObjectSegment, ObjectSymbol};
 
 use crate::disasm::Arch;
 use crate::error::{Error, Result};
@@ -30,6 +30,13 @@ pub const MAX_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_IMPORTS: usize = 100_000;
 /// Cap on exports per binary.
 pub const MAX_EXPORTS: usize = 100_000;
+/// Cap on defined text symbols (locals and globals) per binary.
+///
+/// Matches [`MAX_IMPORTS`]/[`MAX_EXPORTS`]: 100k short names fit the
+/// [`MAX_METADATA_BYTES`] budget with headroom, and the per-symbol work
+/// is one binary search over the executable ranges plus one budgeted
+/// name copy.
+pub const MAX_SYMBOLS: usize = 100_000;
 /// Cap on total input bytes read before parsing (all formats).
 ///
 /// Twice [`MAX_MAPPED_BYTES`] so containers with large unmapped
@@ -252,6 +259,48 @@ impl Serialize for ExportRef {
     }
 }
 
+/// One defined code symbol from the object symbol table.
+///
+/// Unlike [`ExportRef`], this covers locals: static functions, section-
+/// relative labels, and any other `SymbolKind::Text` definition in an
+/// executable section, whether or not it is exported. C++ names carry
+/// `demangled: Some(...)` when the demangler succeeds. JSON pairs
+/// `address` with `address_hex`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SymbolRef {
+    /// Symbol name as recorded in the table.
+    pub name: String,
+    /// Canonical code address (Thumb bit cleared on ARM, see
+    /// [`canonical_code_addr`]).
+    pub address: u64,
+    /// Demangled C++ name, when `name` is a recognized mangling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demangled: Option<String>,
+}
+
+impl Serialize for SymbolRef {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut len = 3;
+        if self.demangled.is_some() {
+            len += 1;
+        }
+        let mut st = serializer.serialize_struct("SymbolRef", len)?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("address", &self.address)?;
+        st.serialize_field("address_hex", &crate::addr_hex(self.address))?;
+        if self.demangled.is_some() {
+            st.serialize_field("demangled", &self.demangled)?;
+        } else {
+            st.skip_field("demangled")?;
+        }
+        st.end()
+    }
+}
+
 /// A parsed binary ready for disassembly and analysis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedBinary {
@@ -269,6 +318,10 @@ pub struct LoadedBinary {
     pub imports: Vec<ImportRef>,
     /// Exported symbols in table order.
     pub exports: Vec<ExportRef>,
+    /// Defined code symbols in table order, deduplicated by address.
+    ///
+    /// Empty for raw blobs and LE images, which have no symbol tables.
+    pub symbols: Vec<SymbolRef>,
 }
 
 /// Options for [`load_raw`].
@@ -384,7 +437,8 @@ pub fn raw_entry_alignment(arch: Arch) -> u64 {
 /// Map a raw blob to a single `RWX` segment at `opts.base`.
 ///
 /// Permissions are unknown for raw input; the segment is marked `RWX` as the
-/// neutral stand-in. Sections/imports/exports are empty: raw has no tables.
+/// neutral stand-in. Sections/imports/exports/symbols are empty: raw has
+/// no tables.
 ///
 /// # Errors
 /// [`Error::Invalid`] on empty input, base-plus-length overflow, an entry
@@ -434,6 +488,7 @@ pub fn load_raw(bytes: &[u8], opts: RawOptions) -> Result<LoadedBinary> {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     })
 }
 
@@ -452,6 +507,21 @@ pub fn arch_from_object(arch: object::Architecture) -> Result<Arch> {
         A::Aarch64 | A::Aarch64_Ilp32 => Ok(Arch::Aarch64),
         A::Arm => Ok(Arch::Arm32),
         other => Err(Error::Unsupported(format!("architecture {other:?}"))),
+    }
+}
+
+/// Canonical code address for `addr` under `arch`.
+///
+/// 32-bit ARM containers link Thumb functions with bit 0 set; the
+/// address the decoder (and every seed/name/table row) uses clears it.
+/// Every other architecture passes through unchanged. Apply at the
+/// producer (loader tables), never at each consumer, so seeds, names,
+/// and `symbols` output agree on one address per function.
+#[must_use]
+pub fn canonical_code_addr(arch: Arch, addr: u64) -> u64 {
+    match arch {
+        Arch::Arm32 => addr & !1,
+        _ => addr,
     }
 }
 
@@ -574,6 +644,15 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         )?);
     }
 
+    let symbols = collect_symbols(
+        &file,
+        arch,
+        &sections,
+        &segments,
+        &mut meta_bytes,
+        &mut demangle_cache,
+    )?;
+
     Ok(LoadedBinary {
         format,
         arch,
@@ -582,6 +661,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         sections,
         imports,
         exports,
+        symbols,
     })
 }
 
@@ -917,6 +997,7 @@ fn demangle_bounded(
 /// retains decoded names without offsets. Exports resolve entry bundles to
 /// flat addresses, skipping bundles whose object index is out of range.
 /// Sections mirror objects as `objN` sharing each segment's bytes.
+/// `symbols` is empty: LE images carry no symbol table.
 /// LE owned names are budgeted at [`le::parse_le`] time (shared 16 MiB
 /// aggregate); this mapping only clones that bounded set plus small
 /// generated names (`objN`, `#n`, `@0x…`, `mod#N`, each under a dozen bytes
@@ -1017,6 +1098,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         sections,
         imports,
         exports,
+        symbols: Vec::new(),
     }
 }
 
@@ -1091,6 +1173,101 @@ fn export_from_object(
             })
         }
     }
+}
+
+/// Collect defined code symbols from the regular and dynamic tables.
+///
+/// Keeps `SymbolKind::Text` definitions sectioned in executable memory
+/// (locals included: statics, non-exported globals), canonicalized via
+/// [`canonical_code_addr`] and deduplicated by address with the first
+/// table row winning. Names and demangled copies count against the
+/// shared metadata budget; unique rows are capped at [`MAX_SYMBOLS`].
+///
+/// The executable-range check runs over the loader's own mapped
+/// sections (segments as fallback) so `Text`-kind rows pointing at
+/// data never seed or name functions.
+fn collect_symbols<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    arch: Arch,
+    sections: &[Section],
+    segments: &[Segment],
+    meta: &mut u64,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Result<Vec<SymbolRef>> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for s in sections {
+        if s.executable && s.size > 0 {
+            ranges.push((s.vaddr, s.vaddr.saturating_add(s.size)));
+        }
+    }
+    if ranges.is_empty() {
+        for s in segments {
+            if s.executable && s.mem_size > 0 {
+                ranges.push((s.vaddr, s.vaddr.saturating_add(s.mem_size)));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    // Merge overlaps so the binary search below cannot miss a hit
+    // hiding behind a neighboring range in a hostile section table.
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        if let Some((_, last_hi)) = merged.last_mut()
+            && lo <= *last_hi
+        {
+            *last_hi = (*last_hi).max(hi);
+            continue;
+        }
+        merged.push((lo, hi));
+    }
+    let ranges = merged;
+    let in_exec = |addr: u64| -> bool {
+        ranges
+            .binary_search_by(|(lo, hi)| {
+                if addr < *lo {
+                    std::cmp::Ordering::Greater
+                } else if addr >= *hi {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    };
+
+    let mut out: Vec<SymbolRef> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    // Chaining is lazy: dynamic rows only decode when the regular table
+    // is exhausted, and every row below is filtered before any copy.
+    for sym in file.symbols().chain(file.dynamic_symbols()) {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        if !matches!(sym.section(), object::SymbolSection::Section(_)) {
+            continue;
+        }
+        let address = canonical_code_addr(arch, sym.address());
+        if !in_exec(address) {
+            continue;
+        }
+        let raw = match sym.name_bytes() {
+            Ok(b) if !b.is_empty() => decode_owned_name(b, meta)?,
+            _ => continue,
+        };
+        if !seen.insert(address) {
+            continue;
+        }
+        if out.len() >= MAX_SYMBOLS {
+            return Err(Error::Limit("symbols exceed cap".to_string()));
+        }
+        let demangled = demangle_bounded(&raw, meta, cache)?;
+        out.push(SymbolRef {
+            name: raw,
+            address,
+            demangled,
+        });
+    }
+    Ok(out)
 }
 
 /// Demangle a C++ symbol to a human-readable form.

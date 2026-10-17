@@ -240,6 +240,7 @@ fn non_executable_target_stays_unresolved() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -534,6 +535,7 @@ fn non_executable_table_entry_stays_unresolved() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -617,6 +619,7 @@ fn cross_function_table_entry_stays_unresolved() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -708,6 +711,7 @@ fn container_table_stays_unresolved_by_design() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(
@@ -764,6 +768,7 @@ fn container_format_stays_unresolved_by_design() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(
