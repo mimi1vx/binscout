@@ -31,7 +31,12 @@ pub const PSEUDO_WARNING: &str = "approximate pseudo-C over thin IR: lossy rende
 /// JSON pairs `addr` with `addr_hex`; `warning` propagates the source
 /// [`IrInsn`] warning verbatim (`None` for mapped rows). `import` carries
 /// the resolved import name when the source instruction calls through an
-/// import slot or stub, and is absent otherwise.
+/// import slot or stub, and is absent otherwise. `target_name`, `comment`,
+/// and `string` are render-time listing annotations (see
+/// [`crate::disasm::Insn`]) filled by [`crate::Project::pseudo_of`):
+/// the direct target's display name, the annotation at `addr`, and the
+/// referenced string preview. Old rows without these keys still
+/// deserialize.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PseudoLine {
     /// Address of the source machine instruction.
@@ -43,6 +48,21 @@ pub struct PseudoLine {
     /// Name of the import the source instruction calls through, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import: Option<String>,
+    /// Render-time display name of the direct call/branch target, if any:
+    /// rename wins over symbol-table and import names, with a
+    /// `func@0x...` fallback for code targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    /// Render-time copy of the annotation comment at [`PseudoLine::addr`],
+    /// if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Render-time preview of the string referenced by the source
+    /// instruction's data target (escaped, clipped to
+    /// [`crate::disasm::STRING_PREVIEW_MAX_CHARS`] characters), if the
+    /// target lands in a recovered string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub string: Option<String>,
 }
 
 impl Serialize for PseudoLine {
@@ -51,8 +71,18 @@ impl Serialize for PseudoLine {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st =
-            serializer.serialize_struct("PseudoLine", if self.import.is_some() { 5 } else { 4 })?;
+        let mut len = 4;
+        for present in [
+            self.import.is_some(),
+            self.target_name.is_some(),
+            self.comment.is_some(),
+            self.string.is_some(),
+        ] {
+            if present {
+                len += 1;
+            }
+        }
+        let mut st = serializer.serialize_struct("PseudoLine", len)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("text", &self.text)?;
@@ -61,6 +91,21 @@ impl Serialize for PseudoLine {
             st.serialize_field("import", &self.import)?;
         } else {
             st.skip_field("import")?;
+        }
+        if self.target_name.is_some() {
+            st.serialize_field("target_name", &self.target_name)?;
+        } else {
+            st.skip_field("target_name")?;
+        }
+        if self.comment.is_some() {
+            st.serialize_field("comment", &self.comment)?;
+        } else {
+            st.skip_field("comment")?;
+        }
+        if self.string.is_some() {
+            st.serialize_field("string", &self.string)?;
+        } else {
+            st.skip_field("string")?;
         }
         st.end()
     }
@@ -138,6 +183,9 @@ pub fn render_one(row: &IrInsn) -> PseudoLine {
         text,
         warning,
         import: None,
+        target_name: None,
+        comment: None,
+        string: None,
     }
 }
 
@@ -163,6 +211,10 @@ pub fn render_rows(rows: &[IrInsn]) -> PseudoRender {
 /// An `add`/`ldr` immediately following its `adrp` in the same block keeps
 /// the pair's resolved final address as a `// => 0x...` suffix on its line;
 /// anything else renders unchanged.
+///
+/// [`crate::Project::pseudo_of`] enriches these rows further at render
+/// time (target names in call/goto text, string-literal and comment
+/// suffixes, plus the additive `target_name`/`comment`/`string` fields).
 ///
 /// Pure read-only pass; inferred single-slot edges never participate.
 #[must_use]

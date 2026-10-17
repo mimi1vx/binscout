@@ -2630,6 +2630,9 @@ mod tests {
             mem_target: None,
             table_base: None,
             import: None,
+            target_name: None,
+            comment: None,
+            string: None,
         }
     }
 

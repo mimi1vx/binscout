@@ -24,10 +24,10 @@ use crate::analysis::{
     diagnostic_detail, import_index, import_slots,
 };
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
-use crate::disasm::{Disassembler, Insn, PartialDisasm};
+use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
 use crate::error::{Error, Result};
 use crate::flirt::FlirtHint;
-use crate::loader::strings::StringHit;
+use crate::loader::strings::{Encoding, StringHit};
 use crate::loader::{LoadedBinary, RawOptions, load_raw, load_with_slice};
 use crate::search::{ByteMatch, BytePattern};
 
@@ -486,6 +486,22 @@ fn page_envelope<T>(total: usize, offset: usize, limit: usize, items: Vec<T>) ->
         next_offset,
         items,
     }
+}
+
+/// Render-time listing context: name and string indexes built once per
+/// read so per-row enrichment stays cheap.
+///
+/// A pure derived view over the project: building it writes nothing, and
+/// the rows it annotates are never persisted.
+struct EnrichCtx<'a> {
+    /// First symbol-table name per code address.
+    symbols: BTreeMap<u64, &'a str>,
+    /// First import name per resolved call-pointer address.
+    imports: BTreeMap<u64, &'a str>,
+    /// Import slot map (see [`import_slots`](crate::analysis::import_slots)).
+    slots: BTreeMap<u64, usize>,
+    /// Recovered string spans as `(start, end, value)`, in address order.
+    spans: Vec<(u64, u64, &'a str)>,
 }
 
 /// Opened analysis project: binary plus its cached analysis and annotations.
@@ -1072,6 +1088,114 @@ impl Project {
         self.analysis.functions.get(&entry)?.name.clone()
     }
 
+    /// Build the render-time listing context for one read.
+    ///
+    /// Pure derived view; building it never writes the binary or the
+    /// sidecar.
+    fn enrich_ctx(&self) -> EnrichCtx<'_> {
+        let mut symbols: BTreeMap<u64, &str> = BTreeMap::new();
+        for s in &self.binary.symbols {
+            symbols.entry(s.address).or_insert(s.name.as_str());
+        }
+        let mut imports: BTreeMap<u64, &str> = BTreeMap::new();
+        for imp in &self.binary.imports {
+            if let Some(slot) = imp.address {
+                imports.entry(slot).or_insert(imp.name.as_str());
+            }
+        }
+        let mut spans: Vec<(u64, u64, &str)> = Vec::new();
+        for h in &self.analysis.strings {
+            let Some(start) = h.vaddr else {
+                continue;
+            };
+            let len = match h.encoding {
+                Encoding::Ascii => h.value.len() as u64,
+                Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
+            };
+            spans.push((start, start.wrapping_add(len), h.value.as_str()));
+        }
+        spans.sort();
+        EnrichCtx {
+            symbols,
+            imports,
+            slots: import_slots(&self.binary),
+            spans,
+        }
+    }
+
+    /// Display name of a branch or data target: rename-resolved function
+    /// name wins, then the symbol table, then the import name. Code
+    /// targets (and known function entries) degrade to `func@0x...`;
+    /// unresolvable data targets report `None` rather than inventing a
+    /// name. Pure read-only lookup for listings.
+    fn target_name_in(&self, ctx: &EnrichCtx, target: u64, is_code: bool) -> Option<String> {
+        if let Some(name) = self.function_name(target) {
+            return Some(name);
+        }
+        if let Some(name) = ctx.symbols.get(&target) {
+            return Some((*name).to_string());
+        }
+        if let Some(name) = ctx.imports.get(&target) {
+            return Some((*name).to_string());
+        }
+        if is_code || self.analysis.functions.contains_key(&target) {
+            return Some(format!("func@{target:#x}"));
+        }
+        None
+    }
+
+    /// Preview of the recovered string containing `addr`, if any.
+    ///
+    /// Matches the analysis string-xref rule: the address may point
+    /// anywhere inside the span, not just at its start. Pure read-only
+    /// lookup for listings.
+    fn string_preview_in(&self, ctx: &EnrichCtx, addr: u64) -> Option<String> {
+        let idx = ctx.spans.partition_point(|(start, _, _)| *start <= addr);
+        ctx.spans[..idx]
+            .iter()
+            .rev()
+            .find(|(start, end, _)| addr >= *start && addr < *end)
+            .map(|(_, _, value)| crate::disasm::string_preview(value))
+    }
+
+    /// Fill a listing row's additive annotation fields in place.
+    ///
+    /// `prev` is the address-ordered predecessor for `adrp` pair
+    /// resolution (`None` at a page start degrades to the row's own
+    /// `mem_target`). Only absent fields are filled, so stored rows keep
+    /// their decoded values and repeated reads agree. Never persists.
+    fn enrich_insn(&self, ctx: &EnrichCtx, insn: &mut Insn, prev: Option<&Insn>) {
+        if insn.import.is_none()
+            && let Some(i) = import_index(
+                &ctx.slots,
+                &self.analysis.import_stubs,
+                insn.branch_target,
+                insn.mem_target,
+            )
+            && let Some(imp) = self.binary.imports.get(i)
+        {
+            insn.import = Some(imp.name.clone());
+        }
+        let resolved_mem = prev
+            .and_then(|p| resolve_adrp_pair(p, insn))
+            .or(insn.mem_target);
+        if insn.target_name.is_none() {
+            if let Some(t) = insn.branch_target {
+                insn.target_name = self.target_name_in(ctx, t, true);
+            } else if let Some(m) = resolved_mem {
+                insn.target_name = self.target_name_in(ctx, m, false);
+            }
+        }
+        if insn.comment.is_none() {
+            insn.comment = self.annotation(insn.addr).and_then(|a| a.comment.clone());
+        }
+        if insn.string.is_none()
+            && let Some(m) = resolved_mem
+        {
+            insn.string = self.string_preview_in(ctx, m);
+        }
+    }
+
     /// Rename a function in the DB only; the binary is never modified.
     ///
     /// An empty `name` clears the rename. Persists immediately via a
@@ -1507,7 +1631,9 @@ impl Project {
     /// (`None` when the whole range decodes); cap overruns are still
     /// errors. Rows carry the resolved import name when the instruction
     /// calls through an import slot or stub (see
-    /// [`crate::analysis::XrefKind::Import`]). Serializes as
+    /// [`crate::analysis::XrefKind::Import`]), plus the render-time
+    /// `target_name`/`comment`/`string` listing annotations (see
+    /// [`Insn`]). Serializes as
     /// `{"insns": [...], "error_at": null|{...}}`.
     ///
     /// # Errors
@@ -1519,17 +1645,11 @@ impl Project {
             .arch
             .disassembler()
             .disasm_range_partial(&bytes, addr)?;
-        let slots = import_slots(&self.binary);
+        let ctx = self.enrich_ctx();
+        let mut prev: Option<Insn> = None;
         for insn in &mut partial.insns {
-            if let Some(i) = import_index(
-                &slots,
-                &self.analysis.import_stubs,
-                insn.branch_target,
-                insn.mem_target,
-            ) && let Some(imp) = self.binary.imports.get(i)
-            {
-                insn.import = Some(imp.name.clone());
-            }
+            self.enrich_insn(&ctx, insn, prev.as_ref());
+            prev = Some(insn.clone());
         }
         Ok(partial)
     }
@@ -1602,6 +1722,8 @@ impl Project {
     /// `addr` may be any address inside the function; it snaps to the
     /// containing entry. The result carries both `entry` (the canonical
     /// function entry) and `containing_entry` (the entry containing `addr`).
+    /// Instruction rows carry the render-time `target_name`/`comment`/
+    /// `string` listing annotations (see [`Insn`]).
     ///
     /// # Errors
     /// [`Error::NotFound`] when `addr` lies in no function.
@@ -1615,16 +1737,23 @@ impl Project {
             .functions
             .get(&entry)
             .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
+        let ctx = self.enrich_ctx();
         let blocks: Vec<serde_json::Value> = f
             .blocks
             .values()
             .map(|b| {
                 let (start, start_hex) = addr_pair(b.start);
                 let (end, end_hex) = addr_pair(b.end());
+                let mut prev: Option<Insn> = None;
+                let mut insns = b.insns.clone();
+                for insn in &mut insns {
+                    self.enrich_insn(&ctx, insn, prev.as_ref());
+                    prev = Some(insn.clone());
+                }
                 serde_json::json!({
                     "id": b.id(entry), "start": start, "start_hex": start_hex,
                     "end": end, "end_hex": end_hex,
-                    "insns": b.insns, "succs": f.successors(b.start),
+                    "insns": insns, "succs": f.successors(b.start),
                 })
             })
             .collect();
@@ -1714,7 +1843,10 @@ impl Project {
     /// cross-function read. Rows come from
     /// [`Analysis::block_insns`](crate::analysis::Analysis::block_insns),
     /// so only the selected page is cloned; `total` is the instruction
-    /// count read without cloning rows.
+    /// count read without cloning rows. Each row carries the render-time
+    /// `target_name`/`comment`/`string` listing annotations (see
+    /// [`Insn`]); `adrp` pairs split by a page boundary resolve from the
+    /// page's own rows only.
     ///
     /// # Errors
     /// [`Error::NotFound`] when `addr` lies in no function, or when
@@ -1740,10 +1872,16 @@ impl Project {
             .ok_or_else(|| Error::NotFound(format!("block {block:#x} in function {entry:#x}")))?
             .insns
             .len();
-        let items = self
+        let mut items = self
             .analysis
             .block_insns(entry, block, offset, limit)
             .ok_or_else(|| Error::NotFound(format!("block {block:#x} in function {entry:#x}")))?;
+        let ctx = self.enrich_ctx();
+        let mut prev: Option<Insn> = None;
+        for insn in &mut items {
+            self.enrich_insn(&ctx, insn, prev.as_ref());
+            prev = Some(insn.clone());
+        }
         Ok(page_envelope(total, offset, limit, items))
     }
 
@@ -1821,7 +1959,12 @@ impl Project {
     /// containing entry exactly like [`Project::cfg_of`]. Each line
     /// propagates its source IR warning (`None` for mapped rows) and the
     /// resolved import name when the source instruction calls through an
-    /// import slot or stub; the top-level `warning` is always
+    /// import slot or stub; direct call/branch targets render under their
+    /// display name (rename wins over symbol-table and import names, with
+    /// a `func@0x...` fallback), data references append their string
+    /// preview as `// "..."`, and annotations append as `// ...`. Lines
+    /// also carry the additive `target_name`/`comment`/`string` fields.
+    /// The top-level `warning` is always
     /// [`PSEUDO_WARNING`](crate::pseudo::PSEUDO_WARNING). Read-only: never
     /// writes the binary or the sidecar.
     ///
@@ -1847,6 +1990,75 @@ impl Project {
         for line in &mut pseudo.lines {
             if let Some(name) = by_addr.get(&line.addr) {
                 line.import = Some((*name).clone());
+            }
+        }
+        let ctx = self.enrich_ctx();
+        let mut rows: BTreeMap<u64, (&Insn, Option<&Insn>)> = BTreeMap::new();
+        for block in func.blocks.values() {
+            let mut prev: Option<&Insn> = None;
+            for insn in &block.insns {
+                rows.insert(insn.addr, (insn, prev));
+                prev = Some(insn);
+            }
+        }
+        for line in &mut pseudo.lines {
+            let Some((insn, prev)) = rows.get(&line.addr) else {
+                continue;
+            };
+            let resolved_mem = prev
+                .and_then(|p| resolve_adrp_pair(p, insn))
+                .or(insn.mem_target);
+            let ctrl = crate::ir::lift(self.binary.arch, insn)
+                .into_iter()
+                .find(|r| r.op.is_control())
+                .map(|r| (r.op, r.target));
+            match ctrl {
+                Some((crate::ir::IrOp::Call, Some(t))) => {
+                    if let Some(name) = self.target_name_in(&ctx, t, true) {
+                        line.text = format!("call {name}();");
+                        line.target_name = Some(name);
+                    }
+                }
+                Some((crate::ir::IrOp::Call, None)) => {
+                    if let Some(name) = line.import.clone() {
+                        line.text = format!("call {name}();");
+                    }
+                }
+                Some((crate::ir::IrOp::Branch, Some(t))) => {
+                    if let Some(name) = self.target_name_in(&ctx, t, true) {
+                        line.text = format!("goto {name};");
+                        line.target_name = Some(name);
+                    }
+                }
+                Some((crate::ir::IrOp::CBranch, Some(t))) => {
+                    if let Some(name) = self.target_name_in(&ctx, t, true) {
+                        if let Some(pos) = line.text.find("goto 0x")
+                            && let Some(rel) = line.text[pos + 5..].find(';')
+                        {
+                            line.text.replace_range(pos + 5..pos + 5 + rel, &name);
+                        }
+                        line.target_name = Some(name);
+                    }
+                }
+                _ => {}
+            }
+            if line.string.is_none()
+                && let Some(m) = resolved_mem
+            {
+                line.string = self.string_preview_in(&ctx, m);
+            }
+            if line.comment.is_none() {
+                line.comment = self.annotation(line.addr).and_then(|a| a.comment.clone());
+            }
+            if let Some(preview) = line.string.clone() {
+                line.text.push_str(&format!(" // \"{preview}\""));
+            }
+            if let Some(comment) = line.comment.clone() {
+                let flat: String = comment
+                    .chars()
+                    .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect();
+                line.text.push_str(&format!(" // {flat}"));
             }
         }
         let pseudo = serde_json::to_value(pseudo).expect("pseudo serializes");

@@ -176,10 +176,14 @@ Explicitly unchanged in this contract (no style churn): the bare-array
 `symbols` exports keep their shape while imports carry additive
 `address`/`address_hex` (the call pointer: the Mach-O `__stubs` entry,
 the PE IAT slot, the ELF GOT slot named by `.rela.plt`/`.rel.plt`
-`R_*_JUMP_SLOT` relocations; null when unmapped), `disasm`/`ir` rows
-carry an additive `import` name when the instruction calls through an
-import slot or stub, and `pseudo` lines carry the same additive `import`
-name; `xrefs` gains the additive `import` kind for call sites through
+`R_*_JUMP_SLOT` relocations; null when unmapped), `disasm`/`block-insns`
+rows carry an additive `import` name when the instruction calls through an
+import slot or stub plus the additive `target_name`/`comment`/`string`
+listing annotations (target display name with a `func@0x...` fallback
+for code targets, the annotation at the row address, and the referenced
+string preview), and `pseudo` lines carry the same additive `import`
+name plus the same `target_name`/`comment`/`string` fields, with callee
+names and string literals rendered into the line text; `xrefs` gains the additive `import` kind for call sites through
 an import slot or stub (alongside the retained `data`/`code` rows); a third additive array, `symbols`, carries one
 `name`/`address`/`address_hex` row per defined text symbol from the
 object symbol tables (locals included, deduplicated by address, Thumb
@@ -254,7 +258,14 @@ function); `BLOCK` must be a block start belonging to that function
 (`id`, `start`/`start_hex`, `end`/`end_hex`, `insns` count, `succs`)
 by start; `block_insns` pages that block's instructions in address
 order. Both use the page envelope; per-page work scales with the
-page, never with whole-function size.
+page, never with whole-function size. Every instruction row carries
+the render-time listing annotations (never stored, omitted when
+absent): `target_name` (branch target's display name, else the data
+target's; rename wins over symbol-table and import names, code targets
+fall back to `func@0x...`), `comment` (the annotation at the row
+address), and `string` (the referenced string preview, escaped and
+clipped to 64 characters). An `adrp` pair split by a page boundary
+resolves from the page's own rows only.
 
 ### `callees` / `callers`
 
@@ -320,7 +331,14 @@ assembled `text` (`{addr:#x}: {text}` rows) with a top-level `warning`
 (`approximate ...; not a decompiler`). Data operations keep operand
 strings verbatim inside assignments or `OP(args)` calls; control renders
 as `goto`/`if`/`call`/`return` over direct targets (indirect sites keep
-operands). Read-only: querying never writes a sidecar.
+operands, except indirect calls through a known import, which render
+under the import name). Direct call/branch targets render under their
+display name (`call strcpy();`, rename wins over symbol-table and
+import names, code targets fall back to `func@0x...`); data references
+append their string preview as `// "..."` and annotations append as
+`// ...`. Lines also carry the additive `target_name`/`comment`/
+`string` fields (omitted when absent). Read-only: querying never writes
+a sidecar.
 
 ### `diagnostics`
 

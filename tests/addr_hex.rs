@@ -266,7 +266,8 @@ fn golden_disasm_prefix() {
              "mnem": "push", "ops": ["0x402100"],
              "branch_target": null, "branch_target_hex": null,
              "mem_target": 4202752, "mem_target_hex": "0x402100",
-             "table_base": null, "table_base_hex": null},
+             "table_base": null, "table_base_hex": null,
+             "string": "SAVE%d.GAM is invalid"},
         ],
     });
     assert_eq!(v, want);
