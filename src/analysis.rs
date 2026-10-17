@@ -1746,23 +1746,63 @@ struct Decoded {
     flow: Flow,
 }
 
+/// Normalize a seed address for `arch`, clearing the ARM Thumb
+/// interworking bit.
+///
+/// On ARM ELF, `e_entry` and `STT_FUNC` values carry bit 0 set for Thumb
+/// functions, but ARM containers decode as [`Arch::Arm32`]: an odd seed
+/// would read misaligned garbage. Returns the (possibly masked) address
+/// plus whether the bit was set; callers record a diagnostic for masked
+/// seeds. Structured for later interworking support: the flag marks the
+/// seeds a Thumb-capable walker would decode as Thumb instead of masking.
+fn normalize_arm_seed(arch: Arch, addr: u64) -> (u64, bool) {
+    if arch == Arch::Arm32 && addr & 1 == 1 {
+        (addr & !1, true)
+    } else {
+        (addr, false)
+    }
+}
+
+/// Push one seed address, masking the ARM Thumb bit (see
+/// [`normalize_arm_seed`]) and recording the odd address when masked.
+fn push_seed(
+    seeds: &mut Vec<u64>,
+    diags: &mut Vec<Diagnostic>,
+    arch: Arch,
+    addr: u64,
+) {
+    let (addr, masked) = normalize_arm_seed(arch, addr);
+    if masked {
+        diags.push(Diagnostic {
+            addr: addr | 1,
+            kind: DiagnosticKind::DecodeFailure,
+        });
+    }
+    seeds.push(addr);
+}
+
 /// Seed addresses from the entry point, exports, and Mach-O stub entries
 /// resolving to executable code. When none exists (raw blobs, stripped
 /// objects), the first executable byte seeds analysis so some function is
 /// always found.
-fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
+///
+/// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
+/// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
+/// the odd address (a queued discovery address never decoded as given).
+fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<Diagnostic>) {
     let mut seeds: Vec<u64> = Vec::new();
+    let mut diags: Vec<Diagnostic> = Vec::new();
     if let Some(entry) = bin.entry
         && space.code_bytes(entry).is_some()
     {
-        seeds.push(entry);
+        push_seed(&mut seeds, &mut diags, bin.arch, entry);
     }
     for exp in &bin.exports {
         if let Some(addr) = exp.address
             && seeds.len() < MAX_SEEDS
             && space.code_bytes(addr).is_some()
         {
-            seeds.push(addr);
+            push_seed(&mut seeds, &mut diags, bin.arch, addr);
         }
     }
     // Mach-O stub entries carry their import's address (see
@@ -1784,7 +1824,7 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
     }
     seeds.sort_unstable();
     seeds.dedup();
-    seeds
+    (seeds, diags)
 }
 
 /// Prologue-scan hits outside `reached` that decode. These seed the second
@@ -2614,7 +2654,8 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // hits in code round one never reached. Both rounds' seeds become
     // entries; incidental pattern matches inside reached code do not.
     let mut walk = Walker::new(arch, &space);
-    let seeds1 = authoritative_seeds(&space, bin);
+    let (seeds1, seed_diags) = authoritative_seeds(&space, bin);
+    walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
     let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
     let seeds2 = prologue_seeds(arch, &space, &round1)?;
@@ -2661,11 +2702,18 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // `Entry`: it seeded analysis as the entry point.
     let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
     let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
-    let export_addrs: BTreeSet<u64> = bin.exports.iter().filter_map(|e| e.address).collect();
+    // Normalized like the seeds: an odd ARM export address and its masked
+    // seed are the same function.
+    let export_addrs: BTreeSet<u64> = bin
+        .exports
+        .iter()
+        .filter_map(|e| e.address.map(|a| normalize_arm_seed(arch, a).0))
+        .collect();
+    let entry_norm = bin.entry.map(|e| normalize_arm_seed(arch, e).0);
     let mut reasons: BTreeMap<u64, BTreeSet<DiscoveryReason>> = BTreeMap::new();
     for e in &entries {
         let mut r = BTreeSet::new();
-        if Some(*e) == bin.entry {
+        if Some(*e) == entry_norm {
             r.insert(DiscoveryReason::Entry);
         }
         if export_addrs.contains(e) {
@@ -2746,11 +2794,14 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     flush(&mut cur_start, &mut cur, &mut blocks);
 
     // Export names for entries; Mach-O stub entries take their import's
-    // name when no export claims the address.
+    // name when no export claims the address. Export addresses normalize
+    // like seeds so an odd ARM export still names its function.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
-            names.entry(addr).or_insert_with(|| exp.name.clone());
+            names
+                .entry(normalize_arm_seed(arch, addr).0)
+                .or_insert_with(|| exp.name.clone());
         }
     }
     for imp in &bin.imports {
@@ -3306,7 +3357,7 @@ mod tests {
         .expect("raw loads");
         let space = AddrSpace::new(&bin);
         let mut walk = Walker::new(Arch::X86_32, &space);
-        let seeds = authoritative_seeds(&space, &bin);
+        let seeds = authoritative_seeds(&space, &bin).0;
         walk.run(seeds.clone()).expect("round one walks");
         let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
         let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");
