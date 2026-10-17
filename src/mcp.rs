@@ -1,4 +1,4 @@
-//! binscout MCP server: 28 tools over a cached [`Project`].
+//! binscout MCP server: 29 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -432,6 +432,28 @@ pub struct RangeParams {
     pub addr: String,
     /// Bytes to decode.
     pub len: usize,
+}
+
+/// Parameters for the `bytes` tool: raw byte range with typed views.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BytesParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Virtual address (`0x`-hex or decimal string).
+    pub addr: String,
+    /// Bytes to read (capped at 1 MiB).
+    pub len: usize,
+    /// Typed view: `u8`, `u16`, `u32`, `u64`, `ptr`, `cstr`, `utf16` (default `u8`).
+    pub r#as: Option<String>,
+    /// Byte order for multi-byte views: `le` or `be` (default `le`).
+    pub endian: Option<String>,
 }
 
 /// Parameters for the `xrefs` tool.
@@ -970,6 +992,41 @@ impl BinscoutMcp {
         proj.disasm_at(addr, len)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|v| ok(serde_json::to_value(v).expect("partial disasm serializes")))
+    }
+
+    #[tool(
+        name = "bytes",
+        description = "Read len bytes at addr with typed views and VA/file provenance; returns addr twins, file_off (null for zero-fill), section, bytes_hex, and decoded values (ranges cap at 1 MiB)"
+    )]
+    async fn bytes(&self, p: Parameters<BytesParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (addr_s, len, as_s, endian_s) =
+            (p.addr.clone(), p.len, p.r#as.clone(), p.endian.clone());
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let as_ = as_s
+            .as_deref()
+            .map(crate::parse_bytes_as)
+            .transpose()
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?
+            .unwrap_or(crate::BytesAs::U8);
+        let endian = endian_s
+            .as_deref()
+            .map(crate::parse_bytes_endian)
+            .transpose()
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?
+            .unwrap_or(crate::BytesEndian::Le);
+        proj.bytes_view(addr, len, as_, endian)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|v| ok(serde_json::to_value(v).expect("bytes view serializes")))
     }
 
     #[tool(

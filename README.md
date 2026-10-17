@@ -100,9 +100,9 @@ omitting the flag leaves that field alone.
 
 ## MCP server
 
-`binscout-mcp` serves 28 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 29 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `load`, `functions`, `func`, `blocks`, `block_insns`,
-`diagnostics`, `disasm`, `cfg`, `structure`, `pseudo`,
+`diagnostics`, `disasm`, `bytes`, `cfg`, `structure`, `pseudo`,
 `callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
 `sections`, `ir`, `ir_coverage`, `flirt_hints`, `rename`, `comment`, `search_bytes`,
 `annotations_export`, `annotations_import`, `diff`. Each takes `binary` plus

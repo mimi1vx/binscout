@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 28 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 29 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
@@ -22,6 +22,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `blocks` | binary, addr, offset?/limit? | Block summaries of the containing function by block start, under the page envelope |
 | `block_insns` | binary, addr, block, offset?/limit? | That block's instructions in address order, under the page envelope; `block` must belong to the function |
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
+| `bytes` | binary, addr, len, as?/endian? | Raw bytes at `addr` (`len` caps at 1 MiB, BSS tails read as zeros) with VA/file provenance (`file_off` null for zero-fill, `section` null when section-less) plus `bytes_hex` and typed `values` (`u8`/`u16`/`u32`/`u64`/`ptr`/`cstr`/`utf16`, `le`/`be` byte order) |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges; `inferred_edges` holds provenance-marked indirect-jump resolutions (single-slot absolutes and guarded scaled-index tables; raw-only, same-function) |
 | `structure` | binary, addr | Approximate control-flow structure of one function: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning; `addr` snaps to its containing function |
 | `pseudo` | binary, addr | Approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning; `addr` snaps to its containing function |

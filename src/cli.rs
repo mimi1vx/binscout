@@ -118,6 +118,20 @@ pub enum Cmd {
         addr: String,
         len: usize,
     },
+    /// Read `len` bytes at `addr` with typed views and VA/file provenance.
+    Bytes {
+        binary: PathBuf,
+        addr: String,
+        /// Bytes to read (capped at 1 MiB).
+        #[arg(long)]
+        len: usize,
+        /// Typed view: `u8`, `u16`, `u32`, `u64`, `ptr`, `cstr`, `utf16`.
+        #[arg(long = "as", default_value = "u8")]
+        as_view: String,
+        /// Byte order for multi-byte views: `le` or `be`.
+        #[arg(long, default_value = "le")]
+        endian: String,
+    },
     /// Control-flow graph of one function. Any address inside the function
     /// snaps to its containing entry.
     Cfg { binary: PathBuf, addr: String },
@@ -383,6 +397,15 @@ impl Cli {
             Cmd::Disasm { binary, addr, len } => {
                 disasm(&binary, db, raw_opts, fat_arch, &addr, len)
             }
+            Cmd::Bytes {
+                binary,
+                addr,
+                len,
+                as_view,
+                endian,
+            } => bytes(
+                &binary, db, raw_opts, fat_arch, &addr, len, &as_view, &endian,
+            ),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Pseudo { binary, addr } => pseudo(&binary, db, raw_opts, fat_arch, &addr),
@@ -731,6 +754,30 @@ fn disasm(
     let p = open(binary, db, raw, fat_arch)?;
     let addr = binscout::parse_addr(addr)?;
     Ok(serde_json::to_value(p.disasm_at(addr, len)?).expect("partial disasm serializes"))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
+fn bytes(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    addr: &str,
+    len: usize,
+    as_view: &str,
+    endian: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw, fat_arch)?;
+    let view = p.bytes_view(
+        binscout::parse_addr(addr)?,
+        len,
+        binscout::parse_bytes_as(as_view)?,
+        binscout::parse_bytes_endian(endian)?,
+    )?;
+    Ok(serde_json::to_value(view).expect("bytes view serializes"))
 }
 
 fn cfg(
