@@ -1564,3 +1564,96 @@ fn annotations_import_conflicts_mismatches_and_atomicity() {
     );
     cleanup(&dir);
 }
+
+// rsdbg-zvm.17: `--db` resolving to the analyzed binary must fail before
+// any write, leaving the input byte-identical. The victim holds a valid
+// sidecar's bytes so the pre-fix path (raw fallback + `save` rewrite)
+// would actually have overwritten it.
+#[test]
+fn db_same_as_binary_is_rejected_and_binary_untouched() {
+    let dir = tmpdir("db-is-binary");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "seed").display().to_string();
+    let (ok, _) = run(&["--db", &db, "load", &bin_s]);
+    assert!(ok, "seed load must succeed");
+    // Victim file carrying a valid redb's bytes: the exact trigger shape.
+    let victim = dir.join("victim.redb");
+    std::fs::copy(&db, &victim).expect("seed victim");
+    let victim_s = victim.display().to_string();
+    let before = std::fs::read(&victim).expect("read victim");
+
+    let out = Command::new(binscout_bin())
+        .args(["--db", &victim_s, "load", &victim_s])
+        .output()
+        .expect("spawn binscout");
+    assert_eq!(out.status.code(), Some(1), "runtime failure exits 1");
+    let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+    let v: Value = serde_json::from_str(text.trim_end())
+        .unwrap_or_else(|_| panic!("stdout must be one JSON value, got: {text:?}"));
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("--db must not be the analyzed binary")),
+        "guard message: {v}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).expect("reread"),
+        before,
+        "binary byte-identical"
+    );
+
+    // Read-only commands reject it too: the guard lives in open, not save.
+    let (ok, v) = run(&["--db", &victim_s, "functions", &victim_s]);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(
+        std::fs::read(&victim).expect("reread"),
+        before,
+        "binary byte-identical"
+    );
+    cleanup(&dir);
+}
+
+// rsdbg-zvm.17: symlink and hard-link aliases of the binary reach the
+// same guard.
+#[cfg(unix)]
+#[test]
+fn db_alias_of_binary_is_rejected_and_binary_untouched() {
+    let dir = tmpdir("db-alias-binary");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let before = std::fs::read(&bin).expect("read fixture");
+    let bin_s = bin.display().to_string();
+    let link = dir.join("link-to-bin");
+    std::os::unix::fs::symlink(&bin, &link).expect("symlink");
+    let link_s = link.display().to_string();
+    let hard = dir.join("hard-to-bin");
+    std::fs::hard_link(&bin, &hard).expect("hard link");
+    let hard_s = hard.display().to_string();
+
+    for alias in [&link_s, &hard_s] {
+        let out = Command::new(binscout_bin())
+            .args(["--db", alias, "load", &bin_s])
+            .output()
+            .expect("spawn binscout");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{alias}: runtime failure exits 1"
+        );
+        let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+        let v: Value = serde_json::from_str(text.trim_end())
+            .unwrap_or_else(|_| panic!("stdout must be one JSON value, got: {text:?}"));
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("--db must not be the analyzed binary")),
+            "{alias}: guard message: {v}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&bin).expect("reread"),
+        before,
+        "binary byte-identical"
+    );
+    cleanup(&dir);
+}

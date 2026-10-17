@@ -115,7 +115,8 @@ pub fn parse_raw_options(
 /// # Errors
 /// Same as [`Project::open`] plus raw-mapping validation from
 /// [`crate::loader::load_raw`], plus [`Error::Invalid`] when raw and fat
-/// selections are combined.
+/// selections are combined, plus [`Error::Invalid`] when the DB path
+/// resolves to the analyzed binary.
 pub fn open_mapped(
     binary: &Path,
     db: Option<&Path>,
@@ -152,6 +153,40 @@ fn mapping_for(raw: Option<RawOptions>, fat_arch: Option<&str>) -> Result<db::St
         (None, Some(arch)) => Ok(db::StoredMapping::for_fat_slice(arch)),
         (None, None) => Ok(db::StoredMapping::for_request(None)),
     }
+}
+
+/// Reject a `--db` path that resolves to the analyzed binary.
+///
+/// The sidecar is rewritten by [`Project::save`], so opening with the
+/// binary as its own DB would overwrite the input. Symlinks resolve via
+/// `canonicalize`; hard links share `(dev, ino)` on unix. Best-effort:
+/// unresolvable paths simply do not match.
+fn reject_db_is_binary(binary: &Path, db_path: &Path) -> Result<()> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    if let (Ok(can_bin), Ok(can_db)) = (
+        std::fs::canonicalize(binary),
+        std::fs::canonicalize(db_path),
+    ) && can_bin == can_db
+    {
+        return Err(Error::Invalid(
+            "--db must not be the analyzed binary".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(bin_meta), Ok(db_meta)) = (std::fs::metadata(binary), std::fs::metadata(db_path))
+            && bin_meta.dev() == db_meta.dev()
+            && bin_meta.ino() == db_meta.ino()
+        {
+            return Err(Error::Invalid(
+                "--db must not be the analyzed binary".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Filters for [`Project::functions_filtered`]: every present field must match.
@@ -468,6 +503,7 @@ impl Project {
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
     ) -> Result<Self> {
+        reject_db_is_binary(binary, db_path)?;
         // Single-open bounded read: one handle, chunked with checked
         // accumulation, so a growing file cannot slip past a stat cap.
         let bytes = read_input_bytes(binary)?;
