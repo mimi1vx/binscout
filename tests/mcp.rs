@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 28 tools, and call every one against fixtures.
+//! list the 29 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_twenty_eight_tools() {
+fn handshake_lists_twenty_nine_tools() {
     let lines = vec![
         req(
             1,
@@ -113,6 +113,7 @@ fn handshake_lists_twenty_eight_tools() {
             "annotations_import",
             "block_insns",
             "blocks",
+            "bytes",
             "callees",
             "callers",
             "cfg",
@@ -138,7 +139,7 @@ fn handshake_lists_twenty_eight_tools() {
             "symbols",
             "xrefs",
         ],
-        "exactly the 28 tools"
+        "exactly the 29 tools"
     );
     let search = tools
         .iter()
@@ -179,6 +180,18 @@ fn handshake_lists_twenty_eight_tools() {
         .expect("input schema properties");
     for key in ["binary", "db", "raw"] {
         assert!(props.contains_key(key), "annotations_export exposes {key}");
+    }
+    let bytes = tools
+        .iter()
+        .find(|t| t["name"] == "bytes")
+        .expect("bytes listed");
+    let props = bytes["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in [
+        "binary", "db", "raw", "fat_arch", "addr", "len", "as", "endian",
+    ] {
+        assert!(props.contains_key(key), "bytes exposes {key}");
     }
     let diff = tools
         .iter()
@@ -226,6 +239,11 @@ fn all_tools_return_json_over_stdio() {
             13,
             "disasm",
             json!({"binary": b(), "db": d(), "addr": "0x0", "len": 3}),
+        ),
+        call(
+            32,
+            "bytes",
+            json!({"binary": b(), "db": d(), "addr": "0x0", "len": 3, "as": "u8"}),
         ),
         call(14, "cfg", json!({"binary": b(), "db": d(), "addr": "0x0"})),
         call(15, "xrefs", json!({"binary": b(), "db": d()})),
@@ -281,7 +299,7 @@ fn all_tools_return_json_over_stdio() {
         ),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 23, "{resps:?}");
+    assert_eq!(resps.len(), 24, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -322,6 +340,15 @@ fn all_tools_return_json_over_stdio() {
     let dis: Value = serde_json::from_str(tool_text(by_id[&13])).expect("disasm json");
     assert_eq!(dis["insns"].as_array().expect("envelope insns").len(), 3);
     assert!(dis["error_at"].is_null(), "clean disasm error_at:null");
+
+    let bytes: Value = serde_json::from_str(tool_text(by_id[&32])).expect("bytes json");
+    assert_eq!(bytes["addr"], 0);
+    assert_eq!(bytes["addr_hex"], "0x0");
+    assert_eq!(bytes["file_off"], 0);
+    assert!(bytes["section"].is_null(), "{bytes}");
+    assert_eq!(bytes["len"], 3);
+    assert_eq!(bytes["bytes_hex"], "9090c3");
+    assert_eq!(bytes["values"], json!([144, 144, 195]));
 
     let flirt: Value = serde_json::from_str(tool_text(by_id[&28])).expect("flirt_hints json");
     assert_eq!(flirt["protocol"], 1);

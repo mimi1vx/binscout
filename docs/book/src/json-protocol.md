@@ -403,6 +403,33 @@ $ binscout search-bytes fw.bin 90 --range 0x0 0x2
 {"items":[{"addr":0,"addr_hex":"0x0","file_off":0,"len":1,"section":null},{"addr":1,"addr_hex":"0x1","file_off":1,"len":1,"section":null}],"limit":50,"next_offset":null,"offset":0,"protocol":1,"total":2}
 ```
 
+### `bytes`
+
+```sh
+binscout bytes B ADDR --len N [--as VIEW] [--endian le|be]
+```
+
+MCP tool `bytes` (`binary`, `db`?, `raw`?, `addr`, `len`, `as`?,
+`endian?`). Reads `len` bytes at `addr` with the same 1 MiB range cap
+as `disasm`/`ir` (empty and over-cap ranges error; unmapped ranges
+are `NotFound`): BSS/zero-fill tails read as zeros. `as` selects the
+typed `values` decoding (`u8` default; `u16`, `u32`, `u64`, `ptr`
+for pointer-width integers, `cstr` for one NUL-terminated lossy UTF-8
+string, `utf16` for one NUL-terminated lossy UTF-16 string);
+`endian` (`le` default, `be`) orders multi-byte units. Trailing
+partial units are dropped. `file_off` is the range start's file
+offset (null when the start byte is zero-fill or otherwise
+unbacked); `section` is the covering file-backed section name (null
+for zero-fill and section-less ranges); `bytes_hex` is the range as
+continuous lowercase hex. The provenance converts either direction
+(`file_off_of` for VA-to-offset, `va_of_file_off` for the reverse;
+raw mappings use the blob offset). Querying never writes a sidecar.
+
+```sh
+$ binscout bytes fw.elf 0x401000 --len 3 --as u16 --endian be
+{"addr":4198400,"addr_hex":"0x401000","bytes_hex":"5589e5","file_off":512,"len":3,"section":".text","values":[21897]}
+```
+
 ### `annotations-export` / `annotations-import`
 
 ```sh
@@ -529,7 +556,7 @@ Library variants and their surfaces:
 
 Validation rules: bad addresses, unknown xref/diagnostic kinds,
 overlong or uncompilable string patterns, malformed byte-search
-patterns, unmapped or over-cap (`> 1 MiB`) decode ranges, unknown
+patterns, unmapped or over-cap (`> 1 MiB`) decode/byte ranges, unknown
 functions/blocks, rename of a non-entry, over-8 KiB annotation text,
 raw-option misuse, and annotation identity/conflict failures all
 error as above without writing. Clipping a limit to 1024 rows,

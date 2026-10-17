@@ -349,6 +349,98 @@ impl Serialize for SliceNode {
     }
 }
 
+/// Typed view over raw bytes for [`Project::bytes_view`].
+///
+/// `U8`/`U16`/`U32`/`U64` decode fixed-width little- or big-endian
+/// integers (`values` holds the floor of `len / width` rows); `Ptr`
+/// decodes pointer-width integers (8 bytes on 64-bit targets, 4
+/// otherwise); `CStr` decodes the range up to the first NUL byte as one
+/// lossy UTF-8 string; `Utf16` decodes UTF-16 code units in the selected
+/// byte order up to the first NUL unit as one lossy string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytesAs {
+    /// One row per byte.
+    U8,
+    /// 2-byte units.
+    U16,
+    /// 4-byte units.
+    U32,
+    /// 8-byte units.
+    U64,
+    /// Pointer-width units (arch-dependent).
+    Ptr,
+    /// NUL-terminated lossy UTF-8 string.
+    CStr,
+    /// NUL-terminated lossy UTF-16 string.
+    Utf16,
+}
+
+/// Byte order for multi-byte [`BytesAs`] views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytesEndian {
+    /// Least significant byte first.
+    Le,
+    /// Most significant byte first.
+    Be,
+}
+
+/// Raw byte range with VA/file provenance and a typed view.
+///
+/// `bytes_hex` is the range as continuous lowercase hex; `values` is the
+/// [`BytesAs`] decoding (integers as numbers, `cstr`/`utf16` as a single
+/// string row). `file_off`/`section` describe the range start only: the
+/// file offset is null when the start byte is zero-fill/BSS or otherwise
+/// unbacked, and the section is the covering file-backed section name
+/// (null for zero-fill and section-less ranges, following
+/// [`Project::search_bytes`] provenance).
+///
+/// JSON pairs `addr` with `addr_hex`; `file_off` stays a plain
+/// integer-or-null like the search and section views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytesView {
+    /// Range start virtual address.
+    pub addr: u64,
+    /// File offset of the range start, if file-backed.
+    pub file_off: Option<u64>,
+    /// Covering file-backed section name, if any.
+    pub section: Option<String>,
+    /// Raw bytes of the range.
+    pub bytes: Vec<u8>,
+    /// Typed decoding of [`BytesView::bytes`].
+    pub values: Vec<serde_json::Value>,
+}
+
+impl BytesView {
+    /// Range bytes as continuous lowercase hex.
+    #[must_use]
+    pub fn bytes_hex(&self) -> String {
+        let mut out = String::with_capacity(self.bytes.len() * 2);
+        for b in &self.bytes {
+            out.push(char::from_digit(u32::from(*b >> 4), 16).expect("hex digit"));
+            out.push(char::from_digit(u32::from(*b & 0x0f), 16).expect("hex digit"));
+        }
+        out
+    }
+}
+
+impl serde::Serialize for BytesView {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("BytesView", 7)?;
+        st.serialize_field("addr", &self.addr)?;
+        st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
+        st.serialize_field("file_off", &self.file_off)?;
+        st.serialize_field("section", &self.section)?;
+        st.serialize_field("len", &self.bytes.len())?;
+        st.serialize_field("bytes_hex", &self.bytes_hex())?;
+        st.serialize_field("values", &self.values)?;
+        st.end()
+    }
+}
+
 /// One page of rows under the protocol-1 envelope
 /// (`docs/book/src/json-protocol.md`).
 ///
@@ -1258,6 +1350,155 @@ impl Project {
             out[..have].copy_from_slice(&seg.data[off..off + have]);
         }
         Ok(out)
+    }
+
+    /// File offset of the byte at `va`, if file-backed.
+    ///
+    /// Sections win over the raw fallback: an address inside a section's
+    /// file-backed prefix reports `section.file_off + (va - vaddr)`;
+    /// otherwise raw mappings report the blob offset `va - base`. Zero
+    /// fill/BSS tails and unmapped addresses report `None`, matching the
+    /// `file_off` provenance of [`Project::search_bytes`].
+    #[must_use]
+    pub fn file_off_of(&self, va: u64) -> Option<u64> {
+        for sec in &self.binary.sections {
+            if sec.data.is_empty() || va < sec.vaddr {
+                continue;
+            }
+            let d = va - sec.vaddr;
+            if d < sec.data.len() as u64 {
+                return sec.file_off.checked_add(d);
+            }
+        }
+        if self.binary.format == crate::loader::BinaryFormat::Raw {
+            for seg in &self.binary.segments {
+                if va < seg.vaddr {
+                    continue;
+                }
+                let d = va - seg.vaddr;
+                if d < seg.data.len() as u64 {
+                    return Some(d);
+                }
+            }
+        }
+        None
+    }
+
+    /// Virtual address backed by file offset `off`, if any.
+    ///
+    /// Reverse of [`Project::file_off_of`]: the first file-backed section
+    /// (or raw blob prefix) covering `off` reports its VA. Gaps, BSS, and
+    /// past-end offsets report `None`.
+    #[must_use]
+    pub fn va_of_file_off(&self, off: u64) -> Option<u64> {
+        for sec in &self.binary.sections {
+            if sec.data.is_empty() || off < sec.file_off {
+                continue;
+            }
+            let d = off - sec.file_off;
+            if d < sec.data.len() as u64 {
+                return sec.vaddr.checked_add(d);
+            }
+        }
+        if self.binary.format == crate::loader::BinaryFormat::Raw {
+            for seg in &self.binary.segments {
+                if off < seg.data.len() as u64 {
+                    return seg.vaddr.checked_add(off);
+                }
+            }
+        }
+        None
+    }
+
+    /// Name of the file-backed section covering `va`, if any.
+    ///
+    /// Zero-fill/BSS tails and section-less ranges report `None`, matching
+    /// the `section` provenance of [`Project::search_bytes`].
+    #[must_use]
+    pub fn section_of(&self, va: u64) -> Option<&str> {
+        for sec in &self.binary.sections {
+            if sec.data.is_empty() || va < sec.vaddr {
+                continue;
+            }
+            let d = va - sec.vaddr;
+            if d < sec.data.len() as u64 {
+                return Some(sec.name.as_str());
+            }
+        }
+        None
+    }
+
+    /// Raw byte range at `va` with VA/file provenance and a typed view.
+    ///
+    /// Validates the range through [`Project::bytes_at`] (same 1 MiB cap,
+    /// zero-padded BSS tails, unmapped ranges are [`Error::NotFound`]);
+    /// `file_off`/`section` describe the range start via
+    /// [`Project::file_off_of`]/[`Project::section_of`]. `values` decodes
+    /// the bytes per `as_` in `endian` order (see [`BytesAs`]). Read-only:
+    /// never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// Same as [`Project::bytes_at`].
+    pub fn bytes_view(
+        &self,
+        va: u64,
+        len: usize,
+        as_: BytesAs,
+        endian: BytesEndian,
+    ) -> Result<BytesView> {
+        let bytes = self.bytes_at(va, len)?;
+        let width = match as_ {
+            BytesAs::U8 | BytesAs::CStr => 1,
+            BytesAs::U16 | BytesAs::Utf16 => 2,
+            BytesAs::U32 => 4,
+            BytesAs::U64 => 8,
+            BytesAs::Ptr => match self.binary.arch {
+                crate::disasm::Arch::X86_64 | crate::disasm::Arch::Aarch64 => 8,
+                _ => 4,
+            },
+        };
+        let le = endian == BytesEndian::Le;
+        let get = |w: &[u8]| -> u64 {
+            let mut v = 0u64;
+            if le {
+                for (i, &b) in w.iter().enumerate() {
+                    v |= u64::from(b) << (8 * i);
+                }
+            } else {
+                for &b in w {
+                    v = (v << 8) | u64::from(b);
+                }
+            }
+            v
+        };
+        let values: Vec<serde_json::Value> = match as_ {
+            BytesAs::U8 => bytes.iter().map(|&b| serde_json::Value::from(b)).collect(),
+            BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => bytes
+                .chunks_exact(width)
+                .map(|w| serde_json::Value::from(get(w)))
+                .collect(),
+            BytesAs::CStr => {
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                vec![serde_json::Value::from(
+                    String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                )]
+            }
+            BytesAs::Utf16 => {
+                let (units, _) = bytes.as_chunks::<2>();
+                let units: Vec<u16> = units.iter().map(|w| get(w) as u16).collect();
+                let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+                vec![serde_json::Value::from(String::from_utf16_lossy(
+                    &units[..end],
+                ))]
+            }
+        };
+        Ok(BytesView {
+            addr: va,
+            file_off: self.file_off_of(va),
+            section: self.section_of(va).map(str::to_string),
+            bytes,
+            values,
+        })
     }
 
     /// Disassemble `len` bytes at `va` with the binary's architecture.
@@ -2173,6 +2414,36 @@ pub fn parse_diagnostic_kind(s: &str) -> Result<DiagnosticKind> {
         "unresolved-indirect-call" => Ok(DiagnosticKind::UnresolvedIndirectCall),
         "decode-failure" => Ok(DiagnosticKind::DecodeFailure),
         _ => Err(Error::Invalid(format!("bad diagnostic kind: {s:?}"))),
+    }
+}
+
+/// Parse a typed byte view: `u8`, `u16`, `u32`, `u64`, `ptr`, `cstr`,
+/// or `utf16` (case-insensitive, see [`BytesAs`]).
+///
+/// # Errors
+/// [`Error::Invalid`] for anything else.
+pub fn parse_bytes_as(s: &str) -> Result<BytesAs> {
+    match s.to_lowercase().as_str() {
+        "u8" => Ok(BytesAs::U8),
+        "u16" => Ok(BytesAs::U16),
+        "u32" => Ok(BytesAs::U32),
+        "u64" => Ok(BytesAs::U64),
+        "ptr" => Ok(BytesAs::Ptr),
+        "cstr" => Ok(BytesAs::CStr),
+        "utf16" => Ok(BytesAs::Utf16),
+        _ => Err(Error::Invalid(format!("bad bytes view: {s:?}"))),
+    }
+}
+
+/// Parse a byte order: `le` or `be` (case-insensitive, see [`BytesEndian`]).
+///
+/// # Errors
+/// [`Error::Invalid`] for anything else.
+pub fn parse_bytes_endian(s: &str) -> Result<BytesEndian> {
+    match s.to_lowercase().as_str() {
+        "le" => Ok(BytesEndian::Le),
+        "be" => Ok(BytesEndian::Be),
+        _ => Err(Error::Invalid(format!("bad byte order: {s:?}"))),
     }
 }
 
