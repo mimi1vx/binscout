@@ -638,7 +638,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
     }
 
     if format == BinaryFormat::MachO
-        && let Some(stubs) = macho_stub_addresses(&file, bytes, imports.len())
+        && let Some(stubs) = macho_stub_addresses(bytes, &imports)
     {
         for (imp, addr) in imports.iter_mut().zip(stubs) {
             imp.address = Some(addr);
@@ -700,24 +700,33 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
 
 /// Derive Mach-O stub entry addresses in import order, or `None` on any doubt.
 ///
-/// Pairs the i-th `__stubs`/`__auth_stubs` entry (section-table order) with
-/// the i-th import (`object` bind order). Every guard must hold, otherwise
-/// nothing maps rather than misattributing an address to the wrong import:
-/// thin little-endian Mach-O magic, no `LC_DYLD_CHAINED_FIXUPS` (chained
-/// fixups reorder binds away from stub order), at least one stub section of
-/// type `S_SYMBOL_STUBS` in a `__TEXT*` segment with a nonzero `reserved2`
-/// stride dividing its size, checked entry arithmetic, and total entries
-/// exactly equal to `import_count`. Real binaries routinely fail the last
-/// two guards: `/bin/ls` (arm64e) carries 84 `__auth_stubs` for 90
-/// chained-fixup imports, and its x86_64 slice 84 `__stubs` for 91
-/// `LC_DYLD_INFO` imports (stub-less data binds have no entry).
-fn macho_stub_addresses<'a>(
-    file: &object::File<'a, &'a [u8]>,
-    bytes: &'a [u8],
-    import_count: usize,
-) -> Option<Vec<u64>> {
-    use object::{Object, ObjectSection};
-    if import_count == 0 || import_count > MAX_IMPORTS {
+/// Each `__stubs`/`__auth_stubs` entry resolves through its section's
+/// `reserved1` (the starting index into the `LC_DYSYMTAB` indirect symbol
+/// table) plus the entry position: indirect entry → symtab index → symbol
+/// name, matched against the import of the same name. Positional pairing
+/// would misattribute whenever symtab order differs from indirect-table
+/// order (the symtab import path reports undefined symbols in symtab
+/// order), so every stub must name-match exactly one still-unmapped import.
+/// Every other guard vetoes the whole mapping rather than guessing: thin
+/// little-endian Mach-O magic, no `LC_DYLD_CHAINED_FIXUPS` (chained fixups
+/// reorder binds away from stub order), at least one stub section of type
+/// `S_SYMBOL_STUBS` in a `__TEXT*` segment with a nonzero `reserved2`
+/// stride dividing its size, checked entry arithmetic, total entries
+/// exactly equal to the import count, and a bounds-checked symtab/indirect
+/// table behind every lookup. Real binaries routinely fail the count guard:
+/// `/bin/ls` (arm64e) carries 84 `__auth_stubs` for 90 chained-fixup
+/// imports, and its x86_64 slice 84 `__stubs` for 91 `LC_DYLD_INFO` imports
+/// (stub-less data binds have no entry).
+fn macho_stub_addresses(bytes: &[u8], imports: &[ImportRef]) -> Option<Vec<u64>> {
+    const LC_SEGMENT: u32 = 0x1;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_SYMTAB: u32 = 0x2;
+    const LC_DYSYMTAB: u32 = 0xB;
+    // Section type mask (`SECTION_TYPE`) and `S_SYMBOL_STUBS` per mach-o/loader.h.
+    const SECTION_TYPE: u32 = 0xff;
+    const S_SYMBOL_STUBS: u32 = 0x8;
+    const MAX_COMMANDS: u32 = 4096;
+    if imports.is_empty() || imports.len() > MAX_IMPORTS {
         return None;
     }
     if !is_thin_le_macho(bytes) {
@@ -726,42 +735,161 @@ fn macho_stub_addresses<'a>(
     if macho_has_chained_fixups(bytes) != Some(false) {
         return None;
     }
-    let mut addrs = Vec::new();
-    let mut stubbed = false;
-    for sec in file.sections() {
-        if !matches!(sec.name(), Ok("__stubs" | "__auth_stubs")) {
-            continue;
+    let is64 = bytes
+        .get(0..4)
+        .is_some_and(|m| m == 0xFEED_FACFu32.to_le_bytes());
+    let get32 = |off: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(b))
+    };
+    let get64 = |off: usize| -> Option<u64> {
+        let b: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(b))
+    };
+    let ncmds = get32(16)?;
+    if ncmds > MAX_COMMANDS {
+        return None;
+    }
+    // Stub sections first: symbol/indirect tables may come later in command
+    // order, so collect (base address, entry count, indirect start, stride)
+    // here and resolve names after the walk.
+    let mut sections: Vec<(u64, u64, u32, u64)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut symtab: Option<(usize, usize, usize, usize)> = None;
+    let mut indirect: Option<(usize, usize)> = None;
+    let mut off = if is64 { 32usize } else { 28usize };
+    for _ in 0..ncmds {
+        let base = off;
+        let cmd = get32(base)?;
+        let cmdsize = get32(base + 4)? as usize;
+        if cmdsize < 8 || base.checked_add(cmdsize)? > bytes.len() {
+            return None;
         }
-        let in_text = sec
-            .segment_name()
-            .ok()
-            .flatten()
-            .is_some_and(|s| s.starts_with("__TEXT"));
-        let stride = match sec.flags() {
-            object::SectionFlags::MachO { flags, reserved2 }
-                if flags.typ() == object::macho::S_SYMBOL_STUBS && reserved2 != 0 =>
-            {
-                u64::from(reserved2)
+        match cmd {
+            LC_SYMTAB => {
+                if symtab.is_some() {
+                    return None;
+                }
+                symtab = Some((
+                    get32(base + 8)? as usize,
+                    get32(base + 12)? as usize,
+                    get32(base + 16)? as usize,
+                    get32(base + 20)? as usize,
+                ));
             }
-            _ => return None,
-        };
-        if !in_text {
-            return None;
+            LC_DYSYMTAB => {
+                if indirect.is_some() {
+                    return None;
+                }
+                indirect = Some((get32(base + 56)? as usize, get32(base + 60)? as usize));
+            }
+            LC_SEGMENT | LC_SEGMENT_64 => {
+                if (cmd == LC_SEGMENT_64) != is64 {
+                    return None;
+                }
+                let (nsects, sect_off, sect_len) = if is64 {
+                    (get32(base + 64)? as usize, base + 72, 80usize)
+                } else {
+                    (get32(base + 48)? as usize, base + 56, 68usize)
+                };
+                if nsects.checked_mul(sect_len)?.checked_add(sect_off - base)? > cmdsize {
+                    return None;
+                }
+                for s in 0..nsects {
+                    let sec = sect_off + s * sect_len;
+                    let name_end = bytes
+                        .get(sec..sec + 16)?
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(16);
+                    let name = bytes.get(sec..sec + name_end)?;
+                    if name != b"__stubs" && name != b"__auth_stubs" {
+                        continue;
+                    }
+                    if !bytes.get(sec + 16..sec + 32)?.starts_with(b"__TEXT") {
+                        return None;
+                    }
+                    let (addr, size) = if is64 {
+                        (get64(sec + 32)?, get64(sec + 40)?)
+                    } else {
+                        (u64::from(get32(sec + 32)?), u64::from(get32(sec + 36)?))
+                    };
+                    let flags_off = if is64 { sec + 64 } else { sec + 56 };
+                    let flags = get32(flags_off)?;
+                    let reserved1 = get32(flags_off + 4)?;
+                    let stride = get32(flags_off + 8)?;
+                    if flags & SECTION_TYPE != S_SYMBOL_STUBS || stride == 0 {
+                        return None;
+                    }
+                    let stride = u64::from(stride);
+                    if size == 0 || size % stride != 0 {
+                        return None;
+                    }
+                    let count = size / stride;
+                    total = total.checked_add(count)?;
+                    if total > imports.len() as u64 {
+                        return None;
+                    }
+                    sections.push((addr, count, reserved1, stride));
+                }
+            }
+            _ => {}
         }
-        let size = sec.size();
-        if size == 0 || size % stride != 0 {
-            return None;
-        }
-        let base = sec.address();
-        for i in 0..size / stride {
-            addrs.push(base.checked_add(i.checked_mul(stride)?)?);
-            if addrs.len() > import_count {
+        off = base + cmdsize;
+    }
+    if total != imports.len() as u64 {
+        return None;
+    }
+    let (symoff, nsyms, stroff, strsize) = symtab?;
+    let (indirectoff, nindirect) = indirect?;
+    let nlist = if is64 { 16usize } else { 12usize };
+    if nsyms.checked_mul(nlist)?.checked_add(symoff)? > bytes.len()
+        || strsize.checked_add(stroff)? > bytes.len()
+        || nindirect.checked_mul(4)?.checked_add(indirectoff)? > bytes.len()
+    {
+        return None;
+    }
+    let str_end = stroff + strsize;
+    // Queue of import positions per name: each stub takes the first
+    // still-unmapped import of its resolved name.
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, imp) in imports.iter().enumerate() {
+        by_name.entry(imp.name.as_str()).or_default().push(i);
+    }
+    for positions in by_name.values_mut() {
+        positions.reverse();
+    }
+    let mut addrs: Vec<u64> = vec![0; imports.len()];
+    let mut mapped = 0usize;
+    for (base_addr, count, reserved1, stride) in sections {
+        for i in 0..count {
+            let table_idx = (u64::from(reserved1)).checked_add(i)? as usize;
+            if table_idx >= nindirect {
                 return None;
             }
+            let sym = get32(indirectoff + table_idx * 4)? as usize;
+            if sym >= nsyms {
+                return None;
+            }
+            let strx = get32(symoff + sym * nlist)? as usize;
+            if strx >= strsize {
+                return None;
+            }
+            let name_len = bytes
+                .get(stroff + strx..str_end)?
+                .iter()
+                .position(|&b| b == 0)?;
+            let raw = bytes.get(stroff + strx..stroff + strx + name_len)?;
+            // Same lossy decode the import names went through, so the
+            // comparison cannot disagree on non-UTF-8 bytes.
+            let want = String::from_utf8_lossy(raw).into_owned();
+            let addr = base_addr.checked_add(i.checked_mul(stride)?)?;
+            let imp = by_name.get_mut(want.as_str()).and_then(Vec::pop)?;
+            addrs[imp] = addr;
+            mapped += 1;
         }
-        stubbed = true;
     }
-    if !stubbed || addrs.len() != import_count {
+    if mapped != imports.len() {
         return None;
     }
     Some(addrs)
