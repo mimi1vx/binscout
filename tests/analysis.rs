@@ -1,6 +1,6 @@
 mod common;
 
-use binscout::analysis::{XrefKind, analyze_raw, function_owner};
+use binscout::analysis::{DiagnosticKind, XrefKind, analyze_raw, function_owner};
 use binscout::disasm::{Arch, disasm_range};
 
 use common::builders;
@@ -465,4 +465,47 @@ fn arm32_hostile_word_ends_path_without_abort() {
     let a = analyze_raw(&prefixed, 0x1000, Arch::Arm32, Some(0x1000)).expect("prefixed analyzes");
     assert_eq!(a.summary().insns, 1);
     assert_eq!(a.functions[&0x1000].insn_count(), 1);
+}
+
+#[test]
+fn arm64_pac_retab_ends_function() {
+    // nop; retab; 7x nop at 0x1000: `retab` terminates like `ret`, so the
+    // fallthrough nops are never swallowed into func@0x1000.
+    let mut b = vec![0x1F, 0x20, 0x03, 0xD5, 0xFF, 0x0F, 0x5F, 0xD6];
+    for _ in 0..7 {
+        b.extend([0x1F, 0x20, 0x03, 0xD5]);
+    }
+    let a = analyze_raw(&b, 0x1000, Arch::Aarch64, Some(0x1000)).expect("arm blob analyzes");
+    assert!(a.functions.contains_key(&0x1000));
+    assert_eq!(a.functions[&0x1000].insn_count(), 2);
+    assert_eq!(a.summary().functions, 1);
+}
+
+#[test]
+fn arm64_pac_indirect_call_and_branch_diagnose() {
+    // blraaz x16; ret: indirect call site, then return.
+    let b = vec![0x1F, 0x0A, 0x3F, 0xD6, 0xC0, 0x03, 0x5F, 0xD6];
+    let a = analyze_raw(&b, 0x1000, Arch::Aarch64, Some(0x1000)).expect("arm blob analyzes");
+    assert_eq!(a.functions[&0x1000].insn_count(), 2);
+    assert!(
+        a.diagnostics
+            .records
+            .iter()
+            .any(|d| d.addr == 0x1000 && d.kind == DiagnosticKind::UnresolvedIndirectCall),
+        "blraaz must diagnose: {:?}",
+        a.diagnostics.records
+    );
+    assert!(a.call_edges().is_empty());
+    // braaz x16: indirect branch ends the path.
+    let b = vec![0x1F, 0x0A, 0x1F, 0xD6];
+    let a = analyze_raw(&b, 0x2000, Arch::Aarch64, Some(0x2000)).expect("arm blob analyzes");
+    assert_eq!(a.functions[&0x2000].insn_count(), 1);
+    assert!(
+        a.diagnostics
+            .records
+            .iter()
+            .any(|d| d.addr == 0x2000 && d.kind == DiagnosticKind::UnresolvedIndirectJump),
+        "braaz must diagnose: {:?}",
+        a.diagnostics.records
+    );
 }

@@ -151,16 +151,19 @@
 //!   `fcmpe`/`fccmp`/`fccmpe`, vector `cmeq`/`cmgt`/`cmge`/`cmle`/
 //!   `cmlt`/`cmhi`/`cmhs`/`cmtst`, FP `fcmeq`/`fcmge`/`fcmgt`/`fcmle`/
 //!   `fcmlt`/`facge`/`facgt`, compare-and-swap `cas*` (conditional store
-//!   unmodeled). `BRANCH`: direct `b`/`br` (indirect keeps operands).
+//!   unmodeled). `BRANCH`: direct `b`, indirect `br`/`braa`/`brab`/
+//!   `braaz`/`brabz` (indirect keeps operands).
 //!   `CBRANCH`: `cbz`, `cbnz`, `tbz`, `tbnz`, `b.<cond>`, `bc.<cond>`.
-//!   `CALL`: direct `bl`/`blr` (indirect keeps operands) plus `svc`,
-//!   `hvc`, `smc`. `RETURN`: `ret`, `eret`. `NOP`: `nop`, `hint`,
+//!   `CALL`: direct `bl`, indirect `blr`/`blraa`/`blrab`/`blraaz`/
+//!   `blrabz` (indirect keeps operands) plus `svc`,
+//!   `hvc`, `smc`. `RETURN`: `ret`, `eret`, `retaa`/`retab`/
+//!   `eretaa`/`eretab`. `NOP`: `nop`, `hint`,
 //!   `dmb`, `dsb`, `isb`, `brk`, `hlt`, barriers `sb`/`ssbb`/`pssbb`,
 //!   `clrex`, waits/events `wfe`/`wfi`/`sev`/`sevl`/`yield`,
 //!   `esb`/`csdb`/`psb`/`tsb`, prefetches `prfm`/`prfum`, `sys`/`sysl`,
 //!   flag sets `rmif`/`setf8`/`setf16`, `dcps1`-`dcps3`/`drps`. Still
-//!   unmapped by design: `mrs`/`msr` (system registers), `udf`, pointer
-//!   authentication, MTE tags.
+//!   unmapped by design: `mrs`/`msr` (system registers), `udf`, remaining
+//!   pointer authentication (sign/auth/strip, `retaasppc`-family), MTE tags.
 //!
 //! `lift_arm32` covers ARMv7/ARM32 and Thumb mnemonics as printed by the
 //! disassembler (one `.w`/`.n` width suffix, one condition suffix, and one
@@ -469,7 +472,20 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || is_arm_alu(mnem, IrOp::Shl)
                 || is_arm_alu(mnem, IrOp::Shr)
                 || ARM_CMP.contains(&mnem)
-                || matches!(mnem, "b" | "br" | "bl" | "blr")
+                || matches!(
+                    mnem,
+                    "b" | "br"
+                        | "braa"
+                        | "brab"
+                        | "braaz"
+                        | "brabz"
+                        | "bl"
+                        | "blr"
+                        | "blraa"
+                        | "blrab"
+                        | "blraaz"
+                        | "blrabz"
+                )
                 || is_arm_cbranch(mnem)
                 || is_arm_call(mnem)
                 || is_arm_return(mnem)
@@ -765,7 +781,7 @@ fn aarch64_families() -> Vec<FamilyCoverage> {
         fam(
             IrOp::Branch,
             Implemented,
-            &["b", "br"],
+            &["b", "br", "braa", "brab", "braaz", "brabz"],
             &[],
             Some("indirect forms keep operands without target"),
         ),
@@ -779,7 +795,9 @@ fn aarch64_families() -> Vec<FamilyCoverage> {
         fam(
             IrOp::Call,
             Implemented,
-            &["bl", "blr", "svc", "hvc", "smc"],
+            &[
+                "bl", "blr", "blraa", "blrab", "blraaz", "blrabz", "svc", "hvc", "smc",
+            ],
             &[],
             Some("indirect bl/blr keep operands without target"),
         ),
@@ -1038,14 +1056,16 @@ pub fn lift_aarch64_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
         s if is_arm_alu(s, IrOp::Shl) => first_out_rest_in(insn, IrOp::Shl),
         s if is_arm_alu(s, IrOp::Shr) => first_out_rest_in(insn, IrOp::Shr),
         s if ARM_CMP.contains(&s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
-        "b" | "br" => direct_or_indirect(insn, IrOp::Branch),
+        "b" | "br" | "braa" | "brab" | "braaz" | "brabz" => direct_or_indirect(insn, IrOp::Branch),
         s if is_arm_cbranch(s) => (
             IrOp::CBranch,
             insn.ops.clone(),
             Vec::new(),
             insn.branch_target,
         ),
-        "bl" | "blr" => direct_or_indirect(insn, IrOp::Call),
+        "bl" | "blr" | "blraa" | "blrab" | "blraaz" | "blrabz" => {
+            direct_or_indirect(insn, IrOp::Call)
+        }
         s if is_arm_call(s) => (IrOp::Call, insn.ops.clone(), Vec::new(), None),
         s if is_arm_return(s) => (IrOp::Return, Vec::new(), Vec::new(), None),
         s if is_arm_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
@@ -2215,7 +2235,7 @@ const ARM_CBRANCH: &[&str] = &["cbz", "cbnz", "tbz", "tbnz"];
 /// [`is_arm_cbranch`] prefix rule, so they publish as patterns, not mnemonics.
 const ARM_CBRANCH_PATTERNS: &[&str] = &["b.<cond>", "bc.<cond>"];
 const ARM_CALL: &[&str] = &["svc", "hvc", "smc"];
-const ARM_RETURN: &[&str] = &["ret", "eret"];
+const ARM_RETURN: &[&str] = &["ret", "eret", "retaa", "retab", "eretaa", "eretab"];
 const ARM_NOP: &[&str] = &[
     "nop", "hint", "dmb", "dsb", "isb", "brk", "hlt", "sb", "ssbb", "pssbb", "clrex", "wfe", "wfi",
     "sev", "sevl", "yield", "esb", "csdb", "psb", "tsb", "prfm", "prfum", "sys", "sysl", "rmif",

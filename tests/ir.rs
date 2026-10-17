@@ -883,3 +883,49 @@ fn arm_adrp_add_pair_second_row_carries_final_address() {
     assert_eq!(v[1].op, IrOp::Add);
     assert_eq!(v[1].target, None);
 }
+
+#[test]
+fn arm_pac_control_flow_lifts() {
+    // Pointer-authenticated returns end the function like `ret`.
+    for m in ["retaa", "retab", "eretaa", "eretab"] {
+        assert!(is_mapped(Arch::Aarch64, m), "{m}");
+        let v = lift(Arch::Aarch64, &synth(m, &[]));
+        assert_eq!(v.len(), 1, "{m}");
+        assert_eq!(v[0].op, IrOp::Return, "{m}");
+        assert_eq!(v[0].target, None, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+    // Pointer-authenticated branches/calls are always indirect: operands
+    // kept, no target, mirroring `br`/`blr`.
+    for (m, ops, want) in [
+        ("braa", &["x16", "x15"][..], IrOp::Branch),
+        ("brab", &["x16", "x15"][..], IrOp::Branch),
+        ("braaz", &["x16"][..], IrOp::Branch),
+        ("brabz", &["x16"][..], IrOp::Branch),
+        ("blraa", &["x16", "x15"][..], IrOp::Call),
+        ("blrab", &["x16", "x15"][..], IrOp::Call),
+        ("blraaz", &["x16"][..], IrOp::Call),
+        ("blrabz", &["x16"][..], IrOp::Call),
+    ] {
+        assert!(is_mapped(Arch::Aarch64, m), "{m}");
+        let v = lift(Arch::Aarch64, &synth(m, ops));
+        assert_eq!(v.len(), 1, "{m}");
+        assert_eq!(v[0].op, want, "{m}");
+        assert_eq!(v[0].target, None, "{m}");
+        assert_eq!(v[0].inputs, ops, "{m}");
+        assert_eq!(v[0].warning, None, "{m}");
+    }
+    // Real bytes end to end: retab (0xD65F0FFF), braaz x16, blraaz x16.
+    let v = arm(&[0xFF, 0x0F, 0x5F, 0xD6], 0x4000);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Return, None));
+    let v = arm(&[0x1F, 0x0A, 0x1F, 0xD6], 0x4000);
+    assert_eq!(v[0].op, IrOp::Branch);
+    assert_eq!(v[0].target, None);
+    assert_eq!(v[0].inputs, ["x16"]);
+    assert_eq!(v[0].warning, None);
+    let v = arm(&[0x1F, 0x0A, 0x3F, 0xD6], 0x4000);
+    assert_eq!(v[0].op, IrOp::Call);
+    assert_eq!(v[0].target, None);
+    assert_eq!(v[0].inputs, ["x16"]);
+    assert_eq!(v[0].warning, None);
+}
