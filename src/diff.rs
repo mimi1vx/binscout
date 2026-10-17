@@ -175,11 +175,11 @@ impl Serialize for ChangedRow {
 pub struct DiffSummary {
     /// Byte-identical pairs.
     pub matched: usize,
-    /// Matched-but-differing pairs.
+    /// Matched-but-differing pairs (exact total, even when `truncated`).
     pub changed: usize,
-    /// Functions only in side B.
+    /// Functions only in side B (exact total, even when `truncated`).
     pub added: usize,
-    /// Functions only in side A.
+    /// Functions only in side A (exact total, even when `truncated`).
     pub removed: usize,
     /// Whether any list hit the 1024-row cap.
     pub truncated: bool,
@@ -462,8 +462,17 @@ pub fn diff_projects(a: &Project, b: &Project) -> DiffReport {
     added.sort_by_key(|r| r.entry);
 
     // Shared 1024-row page budget per list, mirroring paged queries.
+    // The summary keeps the exact pre-cap totals so agents see the real
+    // change volume; only the lists are clipped.
     let cap = crate::MAX_ROWS;
     let truncated = added.len() > cap || removed.len() > cap || changed.len() > cap;
+    let summary = DiffSummary {
+        matched,
+        changed: changed.len(),
+        added: added.len(),
+        removed: removed.len(),
+        truncated,
+    };
     added.truncate(cap);
     removed.truncate(cap);
     changed.truncate(cap);
@@ -473,13 +482,7 @@ pub fn diff_projects(a: &Project, b: &Project) -> DiffReport {
         binary_b: b.path().display().to_string(),
         arch_a: crate::db::arch_name(a.binary().arch).to_string(),
         arch_b: crate::db::arch_name(b.binary().arch).to_string(),
-        summary: DiffSummary {
-            matched,
-            changed: changed.len(),
-            added: added.len(),
-            removed: removed.len(),
-            truncated,
-        },
+        summary,
         added,
         removed,
         changed,

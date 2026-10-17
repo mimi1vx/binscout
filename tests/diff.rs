@@ -187,3 +187,46 @@ fn cli_diff_reports_added_removed_changed_and_writes_nothing() {
 fn diff_match_threshold_is_documented_value() {
     assert_eq!(binscout::diff::FUZZY_SIMILARITY_THRESHOLD, 0.8);
 }
+
+#[test]
+fn lib_diff_summary_counts_survive_truncation() {
+    // Side A holds one bare `ret`; side B holds 1500 identical frame
+    // stubs (`push rbp; mov rbp,rsp; ret`, each seeding its own function
+    // via the prologue scan). Nothing pairs, so all 1500 land in `added`:
+    // the summary must report the exact total while the list clips to
+    // the shared 1024-row page budget.
+    let dir = tmpdir("diff-trunc");
+    const N: usize = 1500;
+    const STUB: &[u8] = &[0x55, 0x48, 0x89, 0xE5, 0xC3];
+    let mut blob = Vec::with_capacity(N * STUB.len());
+    for _ in 0..N {
+        blob.extend_from_slice(STUB);
+    }
+    let a = write_bin(&dir, "a.bin", &[0xC3]);
+    let b = write_bin(&dir, "b.bin", &blob);
+    let pa = binscout::Project::open_with_db(&a, &temp_db(&dir, "a")).expect("open a");
+    let pb = binscout::Project::open_with_db(&b, &temp_db(&dir, "b")).expect("open b");
+    assert_eq!(pa.analysis().functions.len(), 1, "fixture A shape");
+    assert_eq!(pb.analysis().functions.len(), N, "fixture B shape");
+
+    let r = binscout::diff::diff_projects(&pa, &pb);
+    assert_eq!(r.summary.matched, 0);
+    assert_eq!(r.summary.changed, 0);
+    assert_eq!(r.summary.removed, 1);
+    assert_eq!(r.summary.added, N);
+    assert!(r.summary.truncated);
+    assert_eq!(r.added.len(), 1024, "list clips to the page budget");
+    assert_eq!(r.removed.len(), 1);
+    assert!(r.changed.is_empty());
+    // Truncation keeps entry order from the head.
+    assert_eq!(r.added.first().map(|f| f.entry), Some(0));
+    assert_eq!(
+        r.added.last().map(|f| f.entry),
+        Some(1023 * STUB.len() as u64)
+    );
+
+    // Reads never create sidecars.
+    assert!(!temp_db(&dir, "a").exists());
+    assert!(!temp_db(&dir, "b").exists());
+    cleanup(&dir);
+}
