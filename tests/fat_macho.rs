@@ -254,6 +254,19 @@ fn fat_mapping_identity_is_per_slice() {
         StoredMapping::for_fat_slice("X86_64"),
         StoredMapping::for_fat_slice("x86_64")
     );
+    // Aliases canonicalize: either spelling shares one snapshot.
+    assert_eq!(
+        StoredMapping::for_fat_slice("arm64"),
+        StoredMapping::for_fat_slice("aarch64")
+    );
+    assert_eq!(
+        StoredMapping::for_fat_slice("ARM64"),
+        StoredMapping::for_fat_slice("aarch64")
+    );
+    assert_eq!(
+        StoredMapping::for_fat_slice("x86-64"),
+        StoredMapping::for_fat_slice("x86_64")
+    );
     assert_ne!(
         StoredMapping::for_fat_slice("x86_64"),
         StoredMapping::for_fat_slice("aarch64")
@@ -265,6 +278,90 @@ fn fat_mapping_identity_is_per_slice() {
             .contains("x86_64"),
         "describe must name the slice"
     );
+}
+
+#[test]
+fn fat_slice_alias_shares_annotations() {
+    let dir = common::tmpdir("fat-alias");
+    let bin = common::write_bin(&dir, "fat.bin", &two_slice_fat32());
+    let db = common::temp_db(&dir, "fat");
+
+    // Rename under the alias spelling, then persist.
+    let mut proj =
+        binscout::open_mapped(&bin, Some(&db), None, Some("arm64")).expect("arm64 slice must open");
+    proj.rename_function(0x1000, "slice_main")
+        .expect("rename under arm64");
+    proj.save().expect("save slice snapshot");
+    drop(proj);
+
+    // The canonical spelling reopens the same snapshot: no mapping
+    // mismatch, and the rename reads back.
+    let again =
+        binscout::open_mapped(&bin, Some(&db), None, Some("aarch64")).expect("aarch64 must reopen");
+    assert_eq!(
+        again.function_name(0x1000).as_deref(),
+        Some("slice_main"),
+        "alias spelling must share annotations with the canonical one"
+    );
+    assert_eq!(again.project_info().mode, "fat");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn thin_input_rejects_fat_arch() {
+    // Loader level: a thin Mach-O slice rejects any selection, even a
+    // valid slice name or a casing of its own arch.
+    let thin = thin_arm64();
+    for sel in ["aarch64", "arm64", "AARCH64", "x86_64", "mips"] {
+        let err = load_with_slice(&thin, Some(sel)).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "thin + {sel} must be invalid, got {err:?}"
+        );
+    }
+    // Thin ELF rejects selections too.
+    for sel in ["x86_64", "mips"] {
+        let err = load_with_slice(&common::minimal_elf(), Some(sel)).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "thin ELF + {sel} must be invalid, got {err:?}"
+        );
+    }
+
+    // Project level: thin binary + --fat-arch errors and writes no sidecar.
+    let dir = common::tmpdir("thin-fat-arch");
+    let bin = common::write_bin(&dir, "thin.bin", &thin);
+    for sel in ["aarch64", "mips"] {
+        let db = common::temp_db(&dir, sel);
+        let err = binscout::open_mapped(&bin, Some(&db), None, Some(sel)).unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid(_)),
+            "thin open + {sel} must be invalid, got {err:?}"
+        );
+        assert!(!db.exists(), "failed open must not create a sidecar");
+    }
+
+    // Unrecognized bytes with a selection report the parse error instead
+    // of silently falling back to raw.
+    let raw = common::write_bin(&dir, "blob.bin", b"not a binary at all");
+    let db = common::temp_db(&dir, "blob");
+    let err = binscout::open_mapped(&raw, Some(&db), None, Some("aarch64")).unwrap_err();
+    assert!(
+        matches!(err, Error::Invalid(_)),
+        "blob + fat_arch must be invalid, got {err:?}"
+    );
+    assert!(!db.exists(), "failed open must not create a sidecar");
+
+    // CLI level: one JSON error value, unsuccessful exit.
+    let bin_s = bin.display().to_string();
+    let db_s = common::temp_db(&dir, "cli").display().to_string();
+    let (ok, v) = cli_run(&["--db", &db_s, "--fat-arch", "aarch64", "load", &bin_s]);
+    assert!(!ok, "thin + --fat-arch must fail: {v}");
+    assert!(
+        v["error"].as_str().is_some_and(|m| m.contains("fat")),
+        "error must name the fat-arch misuse: {v}"
+    );
+    common::cleanup(&dir);
 }
 
 /// Save a snapshot for one fat slice and return the container hash.

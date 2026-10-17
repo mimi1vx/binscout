@@ -107,10 +107,10 @@ pub fn parse_raw_options(
 /// options identically: `raw` `Some` opens the explicit mapping with no
 /// fallback, `fat_arch` `Some` analyzes that fat slice (passed through
 /// unchanged to [`crate::loader::load_with_slice`]; missing/unknown
-/// selections on fat input error listing the available archs), and both
-/// `None` preserves auto detection (container parse with raw x86-64-at-0
-/// fallback). Raw and fat selections are exclusive. Reads never save or
-/// create the sidecar.
+/// selections on fat input error listing the available archs, and any
+/// selection on thin input errors), and both `None` preserves auto
+/// detection (container parse with raw x86-64-at-0 fallback). Raw and fat
+/// selections are exclusive. Reads never save or create the sidecar.
 ///
 /// # Errors
 /// Same as [`Project::open`] plus raw-mapping validation from
@@ -485,7 +485,7 @@ impl Project {
     /// `fat_arch` is the caller-supplied slice selector, passed through
     /// unchanged to [`crate::loader::load_with_slice`] (canonical names
     /// `x86_64`/`x86_32`/`aarch64`/`arm32` case-insensitively, plus the
-    /// `lipo` aliases); it is ignored for thin containers. The selection is
+    /// `lipo` aliases); supplying it for thin input errors. The selection is
     /// part of the cache identity: each slice keeps its own snapshot, and
     /// populated annotation sidecars under another mapping require a
     /// separate DB path.
@@ -2125,22 +2125,27 @@ fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) ->
 ///
 /// `fat_arch` passes through to [`load_with_slice`](crate::loader::load_with_slice):
 /// it selects the slice for fat input (missing/unknown selections error
-/// listing the available archs) and is ignored for thin containers. Only
-/// [`Error::Invalid`] on unrecognized input falls back; recognized
-/// containers that fail to parse (LE included) report the parse error,
-/// and [`Error::Limit`]/[`Error::Unsupported`] propagate unchanged. LE
-/// images that parse flow to analysis as x86_32.
+/// listing the available archs) and errors for thin containers. An
+/// explicit selection also disables the raw fallback, so unrecognized
+/// bytes with a selection report the parse error instead of silently
+/// opening as raw. Only [`Error::Invalid`] on unrecognized input without
+/// a selection falls back; recognized containers that fail to parse (LE
+/// included) report the parse error, and [`Error::Limit`]/
+/// [`Error::Unsupported`] propagate unchanged. LE images that parse flow
+/// to analysis as x86_32.
 fn load_or_raw(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
     match load_with_slice(bytes, fat_arch) {
         Ok(bin) => Ok(bin),
-        Err(Error::Invalid(_)) if !crate::loader::is_recognized(bytes) => load_raw(
-            bytes,
-            RawOptions {
-                base: 0,
-                arch: crate::disasm::Arch::X86_64,
-                entry: None,
-            },
-        ),
+        Err(Error::Invalid(_)) if fat_arch.is_none() && !crate::loader::is_recognized(bytes) => {
+            load_raw(
+                bytes,
+                RawOptions {
+                    base: 0,
+                    arch: crate::disasm::Arch::X86_64,
+                    entry: None,
+                },
+            )
+        }
         Err(e) => Err(e),
     }
 }
