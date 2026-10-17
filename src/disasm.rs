@@ -40,6 +40,15 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// Whether this is an x86 mode (32- or 64-bit).
+    ///
+    /// Corpus signatures scoped to "any x86" match exactly these modes;
+    /// ARM-family modes never match x86 byte idioms.
+    #[must_use]
+    pub fn is_x86(self) -> bool {
+        matches!(self, Self::X86_64 | Self::X86_32)
+    }
+
     /// Default disassembler for this architecture.
     #[must_use]
     pub fn disassembler(self) -> AnyDisasm {

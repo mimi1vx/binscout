@@ -44,7 +44,8 @@ pub const MAX_SIGNATURE_WINDOW: usize = 32;
 /// One corpus entry: an exact leading-byte prefix plus its hint text.
 ///
 /// `arch` scopes the match (`None` matches any x86 mode the [`Insn`] bytes
-/// decode under); `suggested_name` is a hint only, never applied.
+/// decode under, i.e. [`Arch::is_x86`]); `suggested_name` is a hint only,
+/// never applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signature {
     /// Stable id used in [`FlirtHint::signature`].
@@ -167,7 +168,10 @@ pub fn leading_bytes(func: &Function) -> Vec<u8> {
 pub fn match_leading(arch: Arch, leading: &[u8]) -> Vec<&'static Signature> {
     let mut hits: Vec<&'static Signature> = SIGNATURES
         .iter()
-        .filter(|s| s.arch.is_none_or(|a| a == arch))
+        .filter(|s| match s.arch {
+            Some(a) => a == arch,
+            None => arch.is_x86(),
+        })
         .filter(|s| leading.starts_with(s.bytes))
         .collect();
     hits.sort_by_key(|s| Reverse(s.bytes.len()));

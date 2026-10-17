@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use binscout::analysis::analyze_raw;
 use binscout::disasm::Arch;
-use binscout::flirt::{SIGNATURES, hints_for_analysis};
+use binscout::flirt::{SIGNATURES, hints_for_analysis, match_leading};
 use binscout::loader::RawOptions;
 
 use common::{binscout_bin, cleanup, temp_db, tmpdir, write_bin};
@@ -95,6 +95,64 @@ fn hints_never_write_annotations() {
     assert!(p.query_flirt_hints(Some(0xdead), 0, 50).is_err());
     assert!(p.annotation(g).is_none(), "hints never rename");
     assert!(p.annotations().is_empty(), "hints never comment");
+    assert!(!db.exists(), "querying hints never creates a sidecar");
+    cleanup(&dir);
+}
+
+/// Arch-less corpus entries are "any x86" (`nop; ret`, `xor eax,eax; ret`),
+/// not "any arch": the same bytes decode to real ARM instructions
+/// (`90 C3` is Thumb `stmia`), so they must never hint outside x86.
+#[test]
+fn archless_signatures_match_only_x86() {
+    for arch in [Arch::Aarch64, Arch::Arm32, Arch::Thumb] {
+        assert!(
+            match_leading(arch, &[0x90, 0xC3]).is_empty(),
+            "{arch:?} must not match pad_nop_ret"
+        );
+        assert!(
+            match_leading(arch, &[0x31, 0xC0, 0xC3]).is_empty(),
+            "{arch:?} must not match ret0_xor_eax"
+        );
+    }
+    for arch in [Arch::X86_64, Arch::X86_32] {
+        let pad: Vec<&str> = match_leading(arch, &[0x90, 0xC3])
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(pad, ["pad_nop_ret"], "{arch:?} still matches pad_nop_ret");
+        let ret0: Vec<&str> = match_leading(arch, &[0x31, 0xC0, 0xC3])
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            ret0,
+            ["ret0_xor_eax"],
+            "{arch:?} still matches ret0_xor_eax"
+        );
+    }
+}
+
+#[test]
+fn thumb_blob_starting_with_90c3_yields_no_hints() {
+    // `90 C3` is the x86 `nop; ret` padding stub, but the same Thumb
+    // halfword (`0xC390`) decodes as `stmia`: a Thumb function starting
+    // with it must report no hints.
+    let dir = tmpdir("flirt-thumb-nox86");
+    let bin = write_bin(&dir, "thumb.bin", &[0x90, 0xC3, 0x70, 0x47]);
+    let db = temp_db(&dir, "thumb");
+    let p = binscout::Project::open_raw(
+        &bin,
+        &db,
+        RawOptions {
+            base: 0x20000,
+            arch: Arch::Thumb,
+            entry: Some(0x20000),
+        },
+    )
+    .expect("raw thumb open");
+    assert!(p.analysis().functions.contains_key(&0x20000));
+    let page = p.query_flirt_hints(None, 0, 50).expect("hints page");
+    assert_eq!(page.total, 0, "x86-only idioms never hint under Thumb");
     assert!(!db.exists(), "querying hints never creates a sidecar");
     cleanup(&dir);
 }
