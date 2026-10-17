@@ -300,6 +300,21 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Scan mapped bytes for known crypto constants (AES/SHA/MD5 tables,
+    /// ChaCha sigma, Blowfish P-array, TEA delta), paged with xref counts.
+    CryptoScan {
+        binary: PathBuf,
+        /// Keep only this constant (e.g. `aes-sbox`).
+        #[arg(long)]
+        name: Option<String>,
+        /// Keep matches fully inside this section (e.g. `.rdata`).
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Emit the portable annotation interchange document to stdout.
     /// Read-only: never creates or modifies the sidecar.
     AnnotationsExport { binary: PathBuf },
@@ -548,6 +563,22 @@ impl Cli {
                 &pattern,
                 section.as_deref(),
                 range,
+                offset,
+                limit,
+            ),
+            Cmd::CryptoScan {
+                binary,
+                name,
+                section,
+                offset,
+                limit,
+            } => crypto_scan(
+                &binary,
+                db,
+                raw_opts,
+                fat_arch,
+                name.as_deref(),
+                section.as_deref(),
                 offset,
                 limit,
             ),
@@ -1024,6 +1055,25 @@ fn search_bytes(
         .transpose()?;
     let page = p.search_bytes(pattern, section, range, offset, limit)?;
     Ok(serde_json::to_value(page).expect("search_bytes page serializes"))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
+fn crypto_scan(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    name: Option<&str>,
+    section: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw, fat_arch)?;
+    let page = p.crypto_scan(name, section, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("crypto_scan page serializes"))
 }
 
 fn annotations_export(

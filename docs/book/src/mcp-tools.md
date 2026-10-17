@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 29 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 30 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
@@ -33,7 +33,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `xrefs` | binary, to/from/kind, offset/limit | Cross-references filtered by endpoint and kind (`code`, `data`, `string`, `import`, `inferred-code`), paged behind a `total` match count |
 | `strings` | binary, pattern/min_len/section/include_code/decode, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`); `decode` (`xor:<byte>`, `add:<byte>`, `rot:<0-7>`) re-extracts over a read-only in-memory transform with original offsets |
 | `symbols` | binary | Imports, exports, and symbol-table code addresses of the binary (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below exports and above stubs |
-| `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
+| `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, Shannon `entropy` (bits per byte), permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `flirt_hints` | binary, addr?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
@@ -41,6 +41,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears; structured struct-layout hints (`type-hint:{...}`, see [JSON protocol](json-protocol.md)) pass through opaquely |
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address; scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
+| `crypto_scan` | binary, name?/section?, offset?/limit? | Paged crypto-constant matches (`addr`/`addr_hex`, `name`, `file_off`, `section`, `len`, `xrefs_count`) for the static table (AES/SHA/MD5/CRC-32 tables, ChaCha sigma, Blowfish P-array, TEA delta, LE/BE word orders) |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
 | `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |

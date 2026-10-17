@@ -136,6 +136,40 @@ pub struct Section {
     pub executable: bool,
 }
 
+impl Section {
+    /// Shannon entropy of the file-backed bytes, in bits per byte (0–8).
+    ///
+    /// Empty (virtual-only, e.g. `bss`) sections report `0.0`. Values near
+    /// 8 mark dense or encrypted/packed bytes; values under ~6 are typical
+    /// of code and tables. First-minute triage compares this against ~7.2
+    /// when judging whether a section is packed.
+    #[must_use]
+    pub fn entropy(&self) -> f64 {
+        section_entropy(&self.data)
+    }
+}
+
+/// Shannon entropy of `data` in bits per byte (0–8); empty input is `0.0`.
+#[must_use]
+pub fn section_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for b in data {
+        counts[usize::from(*b)] += 1;
+    }
+    let total = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
+}
+
 /// One imported symbol: `library!name`, where `name` is `#ordinal` for
 /// ordinal-only imports and `@0xoff` for LE name-table references.
 ///

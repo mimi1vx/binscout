@@ -3,6 +3,7 @@
 
 pub mod analysis;
 pub mod annotations;
+pub mod crypto;
 pub mod db;
 pub mod diff;
 pub mod disasm;
@@ -2137,12 +2138,15 @@ impl Project {
     }
 
     /// Section table in file order: name, virtual address, in-memory size,
-    /// file offset/size of the raw bytes, and permissions.
+    /// file offset/size of the raw bytes, Shannon entropy, and permissions.
     ///
     /// `vaddr` is the flat virtual address the loader mapped the section at
     /// (PE: `IMAGE_BASE + RVA`, so `.text` at RVA `0x1000` in a
     /// `0x400000`-based image lives at `0x401000`); `file_off` locates the
-    /// section's raw bytes in the file. Raw blobs have no table and report
+    /// section's raw bytes in the file. `entropy` is the Shannon entropy of
+    /// the file-backed bytes in bits per byte (0–8; `0.0` for virtual-only
+    /// sections): values over ~7.2 with a tiny import table mark a
+    /// possibly-packed section. Raw blobs have no table and report
     /// an empty array.
     #[must_use]
     pub fn sections_json(&self) -> serde_json::Value {
@@ -2155,6 +2159,7 @@ impl Project {
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
                     "file_off": s.file_off, "file_size": s.data.len(),
+                    "entropy": s.entropy(),
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })
@@ -2226,6 +2231,48 @@ impl Project {
             offset,
             limit.min(MAX_ROWS),
         )?;
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Scan mapped bytes for known crypto constants, paged.
+    ///
+    /// Runs the static [`crate::crypto::CRYPTO_CONSTS`] table (AES
+    /// S-box/T-table, SHA-1/256 round constants, MD5/CRC-32 tables,
+    /// `expand 32-byte k`, Blowfish P-array, TEA delta, in LE/BE word
+    /// orders) through the same bounded scan as [`Project::search_bytes`].
+    /// `name` keeps one constant (e.g. `aes-sbox`); `section` keeps matches
+    /// fully inside a file-backed section of that exact name. Rows order by
+    /// `(addr, name)` under the protocol-1 [`Page`] envelope; `total` is
+    /// exact. Each row's `xrefs_count` counts analysis xrefs (any kind) to
+    /// its address, so unreferenced short hits (notably `tea-delta`) read
+    /// as indicative only. Read-only: never writes the binary or the
+    /// sidecar.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when `name` matches no table entry or `section`
+    /// names no section, [`Error::Limit`] past the per-pattern scan budget.
+    pub fn crypto_scan(
+        &self,
+        name: Option<&str>,
+        section: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<crate::crypto::CryptoHit>> {
+        let matched = crate::crypto::scan(&self.binary, name, section)?;
+        let total = matched.len();
+        let items = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|(name, m)| crate::crypto::CryptoHit {
+                addr: m.addr,
+                name,
+                file_off: m.file_off,
+                section: m.section,
+                len: m.len,
+                xrefs_count: self.count_xrefs(Some(m.addr), None, None),
+            })
+            .collect();
         Ok(page_envelope(total, offset, limit, items))
     }
 

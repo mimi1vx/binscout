@@ -37,10 +37,11 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, under the page envelope |
 | `diagnostics` | `binscout diagnostics fw.elf --kind decode-failure --func 0x400000` | provenance records (unresolved indirect sites, decode failures) ordered by (`kind`, `addr`) under the page envelope; `--kind` is one of `unresolved-indirect-jump`, `unresolved-indirect-call`, `decode-failure`, `--func` keeps only that function's sites; queries never write a sidecar |
 | `search-bytes` | `binscout search-bytes fw.elf "48 8B ??" --range 0x400000 0x401000` | paged `??`-wildcard matches (`addr`/`addr_hex`, `file_off`, `section`, `len`) ordered by virtual address; `--section` is an exact section-name match, `--range LO HI` is half-open `[LO, HI)`; scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
+| `crypto-scan` | `binscout crypto-scan fw.elf --name aes-sbox --section .rdata` | paged crypto-constant matches (`addr`/`addr_hex`, `name`, `file_off`, `section`, `len`, `xrefs_count`) for the static table (AES S-box/T-table, SHA-1/256 round constants, MD5/CRC-32 tables, `expand 32-byte k`, Blowfish P-array, TEA delta, LE/BE word orders); `--name` keeps one constant, `--section` is an exact section-name match; unreferenced short hits (notably `tea-delta`) read as indicative only |
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `import`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6` | filtered strings by address (`--pattern` substring or `regex:` expression, `--min-len`, `--section`, `--include-code`; executable-memory hits hidden by default; paged by `--start`/`--limit`, `--offset` deprecated; `--decode xor:<byte>`, `add:<byte>`, or `rot:<0-7>` re-extracts over a read-only in-memory transform with original offsets) |
 | `symbols` | `binscout symbols fw.elf` | imports, exports, and symbol-table code addresses (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below exports and above stubs |
-| `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, permissions |
+| `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, Shannon `entropy` (bits per byte), permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `flirt-hints` | `binscout flirt-hints fw.elf [--addr 0x400000]` | FLIRT-like library hints (read-only): corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `--addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
@@ -63,7 +64,10 @@ protocol](json-protocol.md)) pass through `--comment` opaquely, e.g.
 
 `sections` rows carry `name`, `vaddr` (the flat virtual address the loader
 mapped the section at), `size` (in-memory bytes), `file_off`/`file_size`
-(locating the raw bytes in the file), and `readable`/`writable`/`executable`.
+(locating the raw bytes in the file), `entropy` (Shannon entropy of the
+file-backed bytes in bits per byte, `0.0` for virtual-only sections;
+values over ~7.2 with a tiny import table mark a possibly-packed section),
+and `readable`/`writable`/`executable`.
 On PE, `vaddr = IMAGE_BASE + RVA`: `.text` at RVA `0x1000` in a
 `0x400000`-based image lives at `0x401000`, with `file_off` pointing at its
 `PointerToRawData`. Raw blobs have no section table and report `[]`.

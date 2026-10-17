@@ -1,4 +1,4 @@
-//! binscout MCP server: 29 tools over a cached [`Project`].
+//! binscout MCP server: 30 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -557,6 +557,28 @@ pub struct SearchBytesParams {
     pub range_start: Option<String>,
     /// Range end (`0x`-hex or decimal, needs range_start).
     pub range_end: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `crypto_scan` tool: static crypto-constant scan.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CryptoScanParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Keep only this constant (e.g. `aes-sbox`).
+    pub name: Option<String>,
+    /// Keep matches fully inside this section (e.g. `.rdata`).
+    pub section: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -1381,6 +1403,28 @@ impl BinscoutMcp {
             other => ErrorData::internal_error(other.to_string(), None),
         })
         .and_then(|page| ok(serde_json::to_value(page).expect("search_bytes page serializes")))
+    }
+
+    #[tool(
+        name = "crypto_scan",
+        description = "Scan mapped bytes for known crypto constants (AES/SHA/MD5 tables, ChaCha sigma, Blowfish P-array, TEA delta), filtered by name/section, paged with xref counts per hit"
+    )]
+    async fn crypto_scan(&self, p: Parameters<CryptoScanParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (name, section, offset, limit) = (p.name.clone(), p.section.clone(), p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        proj.crypto_scan(
+            name.as_deref(),
+            section.as_deref(),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
+        )
+        .map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })
+        .and_then(|page| ok(serde_json::to_value(page).expect("crypto_scan page serializes")))
     }
 
     #[tool(
