@@ -1,5 +1,5 @@
 use binscout::disasm::{Arch, Disassembler, disasm_range};
-use binscout::ir::{IrOp, coverage, is_mapped, lift, lift_range};
+use binscout::ir::{IrOp, control_op, coverage, is_mapped, lift, lift_range};
 
 mod common;
 
@@ -989,4 +989,240 @@ fn arm_pac_control_flow_lifts() {
     assert_eq!(v[0].target, None);
     assert_eq!(v[0].inputs, ["x16"]);
     assert_eq!(v[0].warning, None);
+}
+
+/// `control_op` agrees with `lift` on one instruction: `Some((op, target))`
+/// exactly when the lifted first row is a control op, `None` otherwise.
+fn assert_control_matches_lift(arch: Arch, insn: &binscout::disasm::Insn) {
+    let rows = lift(arch, insn);
+    assert_eq!(rows.len(), 1, "{:?} {}", arch, insn.mnem);
+    let expected = match rows[0].op {
+        IrOp::Branch | IrOp::CBranch | IrOp::Call | IrOp::Return => {
+            Some((rows[0].op, rows[0].target))
+        }
+        _ => None,
+    };
+    assert_eq!(
+        control_op(arch, insn),
+        expected,
+        "{:?} {} {:?}",
+        arch,
+        insn.mnem,
+        insn.ops
+    );
+}
+
+fn synth_target(mnem: &str, ops: &[&str], target: Option<u64>) -> binscout::disasm::Insn {
+    let mut insn = synth(mnem, ops);
+    insn.branch_target = target;
+    insn
+}
+
+#[test]
+fn control_op_matches_lift() {
+    use Arch::{Aarch64, Arm32, Thumb, X86_32, X86_64};
+    // Every control-flow arm of each lifter, direct (with target) and
+    // indirect (without), plus fallthrough samples and unmapped mnemonics.
+    let cases: &[(Arch, &str, &[&str], Option<u64>)] = &[
+        (X86_64, "jmp", &["0x1005"], Some(0x1005)),
+        (X86_64, "jmp", &["rax"], None),
+        (X86_64, "call", &["0x1005"], Some(0x1005)),
+        (X86_64, "call", &["rax"], None),
+        (X86_64, "syscall", &[], None),
+        (X86_64, "sysenter", &[], None),
+        (X86_64, "int", &["0x3"], None),
+        (X86_64, "int3", &[], None),
+        (X86_64, "ret", &[], None),
+        (X86_64, "retn", &[], None),
+        (X86_64, "retf", &[], None),
+        (X86_64, "iret", &[], None),
+        (X86_64, "iretd", &[], None),
+        (X86_64, "iretq", &[], None),
+        (X86_64, "sysret", &[], None),
+        (X86_64, "sysexit", &[], None),
+        (X86_64, "mov", &["rax", "rbx"], None),
+        (X86_64, "pop", &["rax"], None),
+        (X86_64, "push", &["rax"], None),
+        (X86_64, "add", &["rax", "rbx"], None),
+        (X86_64, "cmp", &["rax", "rbx"], None),
+        (X86_64, "test", &["rax", "rax"], None),
+        (X86_64, "nop", &[], None),
+        (X86_64, "pause", &[], None),
+        (X86_64, "cpuid", &[], None),
+        (X86_64, "ud2", &[], None),
+        (X86_32, "jmp", &["0x1005"], Some(0x1005)),
+        (X86_32, "call", &["0x1005"], Some(0x1005)),
+        (X86_32, "je", &["0x1005"], Some(0x1005)),
+        (X86_32, "ret", &[], None),
+        (X86_32, "mov", &["eax", "ebx"], None),
+        (Aarch64, "b", &["0x4010"], Some(0x4010)),
+        (Aarch64, "br", &["x16"], None),
+        (Aarch64, "braa", &["x16", "x15"], None),
+        (Aarch64, "brab", &["x16", "x15"], None),
+        (Aarch64, "braaz", &["x16"], None),
+        (Aarch64, "brabz", &["x16"], None),
+        (Aarch64, "cbz", &["w0", "0x4010"], Some(0x4010)),
+        (Aarch64, "cbnz", &["x0", "0x4010"], Some(0x4010)),
+        (Aarch64, "tbz", &["w0", "#0", "0x4010"], Some(0x4010)),
+        (Aarch64, "tbnz", &["x0", "#3", "0x4010"], Some(0x4010)),
+        (Aarch64, "b.eq", &["0x4010"], Some(0x4010)),
+        (Aarch64, "b.hs", &["0x4010"], Some(0x4010)),
+        (Aarch64, "bc.eq", &["0x4010"], Some(0x4010)),
+        (Aarch64, "bl", &["0x4010"], Some(0x4010)),
+        (Aarch64, "blr", &["x16"], None),
+        (Aarch64, "blraa", &["x16", "x15"], None),
+        (Aarch64, "blrab", &["x16", "x15"], None),
+        (Aarch64, "blraaz", &["x16"], None),
+        (Aarch64, "blrabz", &["x16"], None),
+        (Aarch64, "svc", &["#0"], None),
+        (Aarch64, "hvc", &["#0"], None),
+        (Aarch64, "smc", &["#0"], None),
+        (Aarch64, "ret", &[], None),
+        (Aarch64, "eret", &[], None),
+        (Aarch64, "retaa", &[], None),
+        (Aarch64, "eretab", &[], None),
+        (Aarch64, "mov", &["x0", "x1"], None),
+        (Aarch64, "add", &["x0", "x0", "#0x10"], None),
+        (Aarch64, "ldr", &["x0", "[x1]"], None),
+        (Aarch64, "nop", &[], None),
+        (Aarch64, "mrs", &["x0", "tpidr_el0"], None),
+        (Arm32, "b", &["0x5008"], Some(0x5008)),
+        (Arm32, "beq", &["0x5008"], Some(0x5008)),
+        (Arm32, "bne", &["0x5008"], Some(0x5008)),
+        (Arm32, "bl", &["0x5008"], Some(0x5008)),
+        (Arm32, "bleq", &["0x5008"], Some(0x5008)),
+        (Arm32, "blx", &["0x5008"], Some(0x5008)),
+        (Arm32, "bx", &["lr"], None),
+        (Arm32, "bx", &["r0"], None),
+        (Arm32, "bxne", &["lr"], None),
+        (Arm32, "cbz", &["r0", "0x5008"], Some(0x5008)),
+        (Arm32, "cbnz", &["r0", "0x5008"], Some(0x5008)),
+        (Arm32, "tbb", &["[r0, r1]"], None),
+        (Arm32, "tbh", &["[r0, r1, lsl #1]"], None),
+        (Arm32, "svc", &["#0"], None),
+        (Arm32, "mov", &["pc", "lr"], None),
+        (Arm32, "movne", &["pc", "lr"], None),
+        (Arm32, "adds", &["pc", "r0", "r1"], None),
+        (Arm32, "ldr", &["pc", "[pc, #-4]"], Some(0x5008)),
+        (Arm32, "pop", &["{r4, pc}"], None),
+        (Arm32, "popeq", &["{r4, pc}"], None),
+        (Arm32, "mov", &["r0", "r1"], None),
+        (Arm32, "ldr", &["r0", "[pc, #4]"], None),
+        (Arm32, "push", &["{r4, lr}"], None),
+        (Arm32, "nop", &[], None),
+        (Arm32, "xyzzy", &[], None),
+        (Thumb, "b", &["0x5008"], Some(0x5008)),
+        (Thumb, "bne", &["0x5008"], Some(0x5008)),
+        (Thumb, "bl", &["0x5008"], Some(0x5008)),
+        (Thumb, "blx", &["0x5008"], Some(0x5008)),
+        (Thumb, "bl.w", &["0x5008"], Some(0x5008)),
+        (Thumb, "bx", &["lr"], None),
+        (Thumb, "cbz", &["r0", "0x5008"], Some(0x5008)),
+        (Thumb, "tbb", &["[r0, r1]"], None),
+        (Thumb, "svc", &["#0"], None),
+        (Thumb, "mov", &["pc", "lr"], None),
+        (Thumb, "pop", &["{r4, pc}"], None),
+        (Thumb, "it", &["tt"], None),
+        (Thumb, "movs", &["r0", "r1"], None),
+        (Thumb, "nop", &[], None),
+    ];
+    for (arch, mnem, ops, target) in cases {
+        let insn = synth_target(mnem, ops, *target);
+        assert_control_matches_lift(*arch, &insn);
+    }
+    // Every x86 conditional-jump mnemonic takes the conditional branch arm.
+    for m in [
+        "jo", "jno", "jb", "jnae", "jc", "jnb", "jae", "jnc", "je", "jz", "jne", "jnz", "jbe",
+        "jna", "jnbe", "ja", "js", "jns", "jp", "jpe", "jnp", "jpo", "jl", "jnge", "jnl", "jge",
+        "jle", "jng", "jnle", "jg", "jcxz", "jecxz", "jrcxz", "loop", "loope", "loopne",
+    ] {
+        let insn = synth_target(m, &["0x1005"], Some(0x1005));
+        assert_control_matches_lift(X86_64, &insn);
+        assert_eq!(
+            control_op(X86_64, &insn),
+            Some((IrOp::CBranch, Some(0x1005))),
+            "{m}"
+        );
+    }
+    // Real decoder output end to end: every instruction decoded from these
+    // blobs must agree too, so mnemonic-format drift cannot hide a gap in
+    // the synthetic corpus above.
+    let x86_blob: &[u8] = &[
+        0x48, 0x89, 0xd8, // mov rax, rbx
+        0x74, 0x02, // je +2
+        0xe8, 0x00, 0x00, 0x00, 0x00, // call +0
+        0xeb, 0x00, // jmp +0
+        0xc3, // ret
+        0x90, // nop
+        0x0f, 0xa2, // cpuid (unmapped)
+    ];
+    let insns = disasm_range(X86_64, x86_blob, 0x1000, 100).expect("x86 decodes");
+    assert!(insns.len() >= 7, "{}", insns.len());
+    for insn in &insns {
+        assert_control_matches_lift(X86_64, insn);
+    }
+    let insns = X86_32
+        .disassembler()
+        .disasm_range(x86_blob, 0x1000)
+        .expect("x86_32 decodes");
+    for insn in &insns {
+        assert_control_matches_lift(X86_32, insn);
+    }
+    let arm_blob: &[u8] = &[
+        0x04, 0x00, 0x00, 0x14, // b #0x10
+        0x04, 0x00, 0x00, 0x94, // bl #0x10
+        0x40, 0x00, 0x00, 0x34, // cbz w0, #0x10
+        0x40, 0x00, 0x00, 0x54, // b.eq #0x10
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+        0x00, 0x00, 0x1f, 0xd6, // br x0
+        0x00, 0x00, 0x3f, 0xd6, // blr x0
+        0x01, 0x00, 0x00, 0xd4, // svc #0
+        0xe0, 0x03, 0x01, 0xaa, // mov x0, x1
+        0xe0, 0x41, 0x30, 0xd5, // mrs x0, tpidr_el0 (unmapped)
+    ];
+    let insns = disasm_range(Aarch64, arm_blob, 0x4000, 100).expect("aarch64 decodes");
+    assert_eq!(insns.len(), 10);
+    let mut saw_control = 0;
+    let mut saw_seq = 0;
+    for insn in &insns {
+        assert_control_matches_lift(Aarch64, insn);
+        if control_op(Aarch64, insn).is_some() {
+            saw_control += 1;
+        } else {
+            saw_seq += 1;
+        }
+    }
+    assert!(saw_control >= 7, "{saw_control}");
+    assert!(saw_seq >= 2, "{saw_seq}");
+    let arm32_blob: &[u8] = &[
+        0x02, 0x00, 0x00, 0xea, // b #0x10
+        0x02, 0x00, 0x00, 0xeb, // bl #0x10
+        0x02, 0x00, 0x00, 0x1a, // bne #0x10
+        0x1e, 0xff, 0x2f, 0xe1, // bx lr
+        0x0e, 0xf0, 0xa0, 0xe1, // mov pc, lr
+        0x04, 0xf0, 0x1f, 0xe5, // ldr pc, [pc, #-4]
+        0x00, 0x00, 0x00, 0xef, // svc #0
+        0x02, 0x00, 0x81, 0xe0, // add r0, r1, r2
+    ];
+    let insns = disasm_range(Arm32, arm32_blob, 0x5000, 100).expect("arm32 decodes");
+    assert_eq!(insns.len(), 8);
+    for insn in &insns {
+        assert_control_matches_lift(Arm32, insn);
+    }
+    let thumb_blob: &[u8] = &[
+        0x08, 0xe0, // b #0x10
+        0x00, 0xf0, 0x00, 0xf8, // bl #0
+        0x70, 0x47, // bx lr
+        0x08, 0xb1, // cbz r0, #8
+        0x00, 0xdf, // svc #0
+        0x08, 0x46, // mov r0, r1
+    ];
+    let insns = Thumb
+        .disassembler()
+        .disasm_range(thumb_blob, 0x5000)
+        .expect("thumb decodes");
+    assert!(insns.len() >= 6, "{}", insns.len());
+    for insn in &insns {
+        assert_control_matches_lift(Thumb, insn);
+    }
 }

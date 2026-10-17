@@ -429,6 +429,88 @@ pub fn lift_range(arch: Arch, insns: &[Insn]) -> Vec<IrInsn> {
     out
 }
 
+/// Control-flow effect of one instruction, without lifting.
+///
+/// Returns the control operation plus its direct target for branches,
+/// calls, and returns, or `None` when the instruction falls through
+/// (lifts to anything but [`IrOp::Branch`]/[`IrOp::CBranch`]/
+/// [`IrOp::Call`]/[`IrOp::Return`], including unmapped mnemonics).
+/// Same outcome as `lift(arch, insn).first()` restricted to the control
+/// ops, with no allocation: only the small control-flow tables are
+/// consulted, never the full data-movement/ALU tables, and no operand
+/// strings are cloned. Hot walker paths call this instead of [`lift`].
+#[must_use]
+pub fn control_op(arch: Arch, insn: &Insn) -> Option<(IrOp, Option<u64>)> {
+    match arch {
+        Arch::X86_64 | Arch::X86_32 => {
+            let mnem = insn.mnem.as_str();
+            if mnem == "jmp" {
+                Some((IrOp::Branch, insn.branch_target))
+            } else if is_x86_jcc(mnem) {
+                Some((IrOp::CBranch, insn.branch_target))
+            } else if is_x86_call(mnem) {
+                Some((IrOp::Call, insn.branch_target))
+            } else if is_x86_return(mnem) {
+                Some((IrOp::Return, None))
+            } else {
+                None
+            }
+        }
+        Arch::Aarch64 => {
+            let mnem = insn.mnem.as_str();
+            if matches!(mnem, "b" | "br" | "braa" | "brab" | "braaz" | "brabz") {
+                Some((IrOp::Branch, insn.branch_target))
+            } else if is_arm_cbranch(mnem) {
+                Some((IrOp::CBranch, insn.branch_target))
+            } else if matches!(mnem, "bl" | "blr" | "blraa" | "blrab" | "blraaz" | "blrabz") {
+                Some((IrOp::Call, insn.branch_target))
+            } else if is_arm_call(mnem) {
+                Some((IrOp::Call, None))
+            } else if is_arm_return(mnem) {
+                Some((IrOp::Return, None))
+            } else {
+                None
+            }
+        }
+        Arch::Arm32 | Arch::Thumb => {
+            let (base, cond) = split_arm_mnem(&insn.mnem);
+            // Same guards and outcomes as `lift_arm32`'s `pc`-write rule.
+            if !is_arm32_store(base)
+                && !is_arm32_branch(base)
+                && !is_arm32_ldm(base)
+                && arm32_dest_is_pc(insn)
+            {
+                if base == "mov" && !cond {
+                    return Some((IrOp::Return, None));
+                } else if cond {
+                    return Some((IrOp::CBranch, None));
+                } else {
+                    return Some((IrOp::Branch, insn.branch_target));
+                }
+            }
+            if is_arm32_ldm(base) && ops_contain_pc(insn) {
+                if cond {
+                    return Some((IrOp::CBranch, None));
+                } else {
+                    return Some((IrOp::Return, None));
+                }
+            }
+            match base {
+                "b" if cond => Some((IrOp::CBranch, insn.branch_target)),
+                "b" => Some((IrOp::Branch, insn.branch_target)),
+                "bl" | "blx" => Some((IrOp::Call, insn.branch_target)),
+                "bx" if !cond && insn.ops.as_slice() == ["lr"] => Some((IrOp::Return, None)),
+                "bx" if cond => Some((IrOp::CBranch, None)),
+                "bx" => Some((IrOp::Branch, insn.branch_target)),
+                "cbz" | "cbnz" => Some((IrOp::CBranch, insn.branch_target)),
+                "tbb" | "tbh" => Some((IrOp::Branch, None)),
+                _ if is_arm32_call(base) => Some((IrOp::Call, None)),
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Whether `mnem` has a lift mapping for `arch`.
 ///
 /// Anything else lifts to fallback [`IrOp::Nop`] with a warning instead of
