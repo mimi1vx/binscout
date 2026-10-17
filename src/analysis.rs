@@ -612,7 +612,7 @@ impl Function {
     /// gray node closes a cycle, grouped by header with sorted latches.
     /// Ifs are blocks whose terminator lifts (see [`crate::ir::lift`]) to
     /// [`IrOp::CBranch`] with exactly two direct-CFG successors. Pure
-    /// read-only pass over `blocks`/`cfg` plus the lift; inferred
+    /// read-only pass over `blocks`/`cfg` plus the control-flow check; inferred
     /// single-slot edges never participate.
     #[must_use]
     pub fn structure(&self, arch: Arch) -> FuncStructure {
@@ -666,17 +666,14 @@ impl Function {
             let Some(last) = block.insns.last() else {
                 continue;
             };
-            let lifted = crate::ir::lift(arch, last);
-            let is_cbranch = matches!(lifted.first(), Some(row) if row.op == IrOp::CBranch);
-            if !is_cbranch {
+            let Some((IrOp::CBranch, target)) = crate::ir::control_op(arch, last) else {
                 continue;
-            }
+            };
             let mut succs = self.successors(*start);
             if succs.len() != 2 {
                 continue;
             }
             succs.sort_unstable();
-            let target = lifted.first().and_then(|row| row.target);
             let (then_target, else_target) = match target {
                 Some(t) if succs.contains(&t) => {
                     (t, if succs[0] == t { succs[1] } else { succs[0] })
@@ -1181,7 +1178,7 @@ pub fn rebuild(
                     .map(|insn| {
                         (
                             insn.addr,
-                            classify(arch, insn),
+                            flow_of(arch, insn),
                             insn.mem_target,
                             insn.mnem.as_str(),
                             insn.size,
@@ -1679,11 +1676,13 @@ impl Flow {
     }
 }
 
-fn classify(arch: Arch, insn: &Insn) -> Flow {
-    match crate::ir::lift(arch, insn)
-        .first()
-        .map(|i| (i.op, i.target))
-    {
+/// Control-flow effect of one instruction, without lifting (see
+/// [`crate::ir::control_op`]). Matches `crate::ir::lift` restricted to
+/// the control ops (see `control_op_matches_lift` in `tests/ir.rs`);
+/// hot paths call this instead of lifting per instruction to skip the
+/// IR allocation and the full mnemonic-table walk.
+fn flow_of(arch: Arch, insn: &Insn) -> Flow {
+    match crate::ir::control_op(arch, insn) {
         Some((IrOp::Branch, target)) => Flow::Branch { target },
         Some((IrOp::CBranch, target)) => Flow::CBranch { target },
         Some((IrOp::Call, target)) => Flow::Call { target },
@@ -2191,7 +2190,7 @@ impl<'a> Walker<'a> {
                 }
                 Err(e) => return Err(e),
             };
-            let flow = classify(self.arch, &insn);
+            let flow = flow_of(self.arch, &insn);
             // Thumb IT predication: the decoder prints no condition suffix
             // inside an IT block, so a predicated `bx lr` (or `pop {.., pc}`)
             // lifts as an unconditional return. Downgrade predicated
@@ -3091,13 +3090,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             let Some(last) = block.insns.last() else {
                 continue;
             };
-            // Stored walker flow, never a fresh classify: Thumb instructions
+            // Stored walker flow, never a fresh flow_of: Thumb instructions
             // inside an IT block decode without a condition suffix, so only
             // the walker's predicated flow keeps the fallthrough edge.
             let flow = decoded
                 .get(&last.addr)
                 .map(|d| d.flow)
-                .unwrap_or_else(|| classify(arch, last));
+                .unwrap_or_else(|| flow_of(arch, last));
             let end = block.end();
             match flow {
                 Flow::Branch { target: Some(t) } => {
@@ -3301,7 +3300,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_maps_lift_ops() {
+    fn flow_of_maps_lift_ops() {
         let ret = Insn {
             addr: 0x1000,
             size: 1,
@@ -3313,7 +3312,7 @@ mod tests {
             table_base: None,
             import: None,
         };
-        assert_eq!(classify(Arch::X86_64, &ret), Flow::Ret);
+        assert_eq!(flow_of(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
             addr: 0x1000,
             size: 5,
@@ -3326,7 +3325,7 @@ mod tests {
             import: None,
         };
         assert_eq!(
-            classify(Arch::X86_64, &call),
+            flow_of(Arch::X86_64, &call),
             Flow::Call {
                 target: Some(0x1005)
             }
