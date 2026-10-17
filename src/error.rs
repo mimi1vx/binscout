@@ -20,6 +20,26 @@ pub enum Error {
     /// Persistent store failure.
     #[error("storage: {0}")]
     Storage(String),
+    /// Operating-system I/O failure (read/stat/open outside the sidecar).
+    #[error("io: {0}")]
+    Io(String),
+}
+
+impl Error {
+    /// Machine-readable kind for the `kind` field of the CLI error
+    /// envelope and the MCP error `data` object. The human message
+    /// (`Display`) is unchanged; match on this instead of parsing it.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "not_found",
+            Self::Unsupported(_) => "unsupported",
+            Self::Invalid(_) => "invalid",
+            Self::Limit(_) => "limit",
+            Self::Storage(_) => "storage",
+            Self::Io(_) => "io",
+        }
+    }
 }
 
 /// Library result alias.

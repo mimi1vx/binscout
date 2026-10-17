@@ -552,7 +552,7 @@ impl Project {
     /// if it is not a file or the arch has no disassembler,
     /// [`Error::Invalid`] on undecodable input,
     /// [`Error::Limit`] on input/name/metadata/snapshot budget overrun,
-    /// [`Error::Storage`] on DB or I/O failure.
+    /// [`Error::Storage`] on DB failure, [`Error::Io`] on I/O failure.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_db(path, &db::default_db_path(path))
     }
@@ -2475,11 +2475,11 @@ fn reload_binary(
 /// # Errors
 /// [`Error::NotFound`] if the path does not exist, [`Error::Unsupported`]
 /// if it is not a file, [`Error::Limit`] past the input cap,
-/// [`Error::Storage`] on I/O failure.
+/// [`Error::Io`] on I/O failure.
 fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
-        _ => Error::Storage(format!("stat {}: {e}", path.display())),
+        _ => Error::Io(format!("stat {}: {e}", path.display())),
     })?;
     if !meta.is_file() {
         return Err(Error::Unsupported(format!(
@@ -2489,7 +2489,7 @@ fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
     }
     let file = std::fs::File::open(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
-        _ => Error::Storage(format!("read {}: {e}", path.display())),
+        _ => Error::Io(format!("read {}: {e}", path.display())),
     })?;
     let cap = crate::loader::MAX_INPUT_BYTES;
     let mut reader = file;
@@ -2507,7 +2507,7 @@ fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) ->
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = std::io::Read::read(reader, &mut chunk)
-            .map_err(|e| Error::Storage(format!("read {label}: {e}")))?;
+            .map_err(|e| Error::Io(format!("read {label}: {e}")))?;
         if n == 0 {
             break;
         }

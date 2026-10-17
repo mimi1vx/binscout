@@ -219,10 +219,7 @@ fn open_uncached(
         }
         None => None,
     };
-    crate::open_mapped(Path::new(binary), db_ref, raw_opts, fat_arch).map_err(|e| match e {
-        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-        other => ErrorData::internal_error(other.to_string(), None),
-    })
+    crate::open_mapped(Path::new(binary), db_ref, raw_opts, fat_arch).map_err(error_data)
 }
 
 /// Parse an MCP `raw` object through the shared CLI/MCP validator.
@@ -236,10 +233,7 @@ fn raw_options(raw: Option<&RawParams>) -> Result<Option<crate::loader::RawOptio
             r.entry.as_deref(),
         ),
     };
-    crate::parse_raw_options(present, arch, base, entry).map_err(|e| match e {
-        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-        other => ErrorData::internal_error(other.to_string(), None),
-    })
+    crate::parse_raw_options(present, arch, base, entry).map_err(error_data)
 }
 
 fn ok(value: serde_json::Value) -> Result<String, ErrorData> {
@@ -247,10 +241,37 @@ fn ok(value: serde_json::Value) -> Result<String, ErrorData> {
         .map_err(|e| ErrorData::internal_error(format!("serialize result: {e}"), None))
 }
 
+/// Domain error to MCP tool error, consistent at every tool site:
+/// `Invalid` and `Limit` are caller-side (`invalid_params`; a limit
+/// means "narrow the query"), `NotFound` is `resource_not_found`, and
+/// `Unsupported`/`Storage`/`Io` stay `internal_error`. Every case
+/// carries `{"kind": ...}` in `data`, so agents branch on the kind
+/// instead of parsing the message.
+/// Domain error to MCP tool error, consistent at every tool site:
+/// `Invalid` and `Limit` are caller-side (`invalid_params`; a limit
+/// means "narrow the query"), `NotFound` is `resource_not_found`, and
+/// `Unsupported`/`Storage`/`Io` stay `internal_error`. The message keeps
+/// the full `Display` text; every case adds `{"kind": ...}` in `data`,
+/// so agents branch on the kind instead of parsing the message.
+fn error_data(e: crate::error::Error) -> ErrorData {
+    let data = Some(serde_json::json!({ "kind": e.kind() }));
+    match &e {
+        crate::error::Error::Invalid(_) | crate::error::Error::Limit(_) => {
+            ErrorData::invalid_params(e.to_string(), data)
+        }
+        crate::error::Error::NotFound(_) => ErrorData::resource_not_found(e.to_string(), data),
+        _ => ErrorData::internal_error(e.to_string(), data),
+    }
+}
+
+/// Ad-hoc caller-side failure (no [`crate::error::Error`]): same
+/// `invalid_params` code with the `invalid` kind.
+fn invalid_params(message: impl Into<std::borrow::Cow<'static, str>>) -> ErrorData {
+    ErrorData::invalid_params(message, Some(serde_json::json!({ "kind": "invalid" })))
+}
+
 fn opt_addr(s: Option<String>) -> Result<Option<u64>, ErrorData> {
-    s.map(|v| parse_addr(&v))
-        .transpose()
-        .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
+    s.map(|v| parse_addr(&v)).transpose().map_err(error_data)
 }
 
 fn all_params<T>(p: Parameters<T>) -> T {
@@ -740,9 +761,8 @@ impl BinscoutMcp {
         };
         let mapping = match (raw_opts, fat_arch) {
             (Some(_), Some(_)) => {
-                return Err(ErrorData::invalid_params(
+                return Err(invalid_params(
                     "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)",
-                    None,
                 ));
             }
             (Some(opts), None) => crate::db::StoredMapping::for_request(Some(opts)),
@@ -859,8 +879,7 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let proj = entry.lock_project();
-        proj.save()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        proj.save().map_err(error_data)?;
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
 
@@ -890,13 +909,12 @@ impl BinscoutMcp {
             range: match (range_lo, range_hi) {
                 (None, None) => None,
                 (Some(lo), Some(hi)) => Some((
-                    parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
-                    parse_addr(&hi).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                    parse_addr(&lo).map_err(error_data)?,
+                    parse_addr(&hi).map_err(error_data)?,
                 )),
                 _ => {
-                    return Err(ErrorData::invalid_params(
+                    return Err(invalid_params(
                         "range_lo and range_hi must be given together",
-                        None,
                     ));
                 }
             },
@@ -914,10 +932,9 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.func_meta(addr)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|m| ok(serde_json::to_value(m).expect("func_meta serializes")))
     }
 
@@ -930,10 +947,9 @@ impl BinscoutMcp {
         let (addr_s, offset, limit) = (p.addr.clone(), p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.func_blocks_page(addr, offset.unwrap_or(0), limit.unwrap_or(50))
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|page| ok(serde_json::to_value(page).expect("blocks page serializes")))
     }
 
@@ -946,12 +962,10 @@ impl BinscoutMcp {
         let (addr_s, block_s, offset, limit) = (p.addr.clone(), p.block.clone(), p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        let block =
-            parse_addr(&block_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        let block = parse_addr(&block_s).map_err(error_data)?;
         proj.func_block_insns_page(addr, block, offset.unwrap_or(0), limit.unwrap_or(50))
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|page| ok(serde_json::to_value(page).expect("block_insns page serializes")))
     }
 
@@ -968,13 +982,10 @@ impl BinscoutMcp {
             .as_deref()
             .map(crate::parse_diagnostic_kind)
             .transpose()
-            .map_err(|e| match e {
-                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?;
+            .map_err(error_data)?;
         let func = opt_addr(func_s)?;
         proj.query_diagnostics(kind, func, offset.unwrap_or(0), limit.unwrap_or(50))
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|page| ok(serde_json::to_value(page).expect("diagnostics page serializes")))
     }
 
@@ -987,10 +998,9 @@ impl BinscoutMcp {
         let (addr_s, len) = (p.addr.clone(), p.len);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.disasm_at(addr, len)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|v| ok(serde_json::to_value(v).expect("partial disasm serializes")))
     }
 
@@ -1004,28 +1014,21 @@ impl BinscoutMcp {
             (p.addr.clone(), p.len, p.r#as.clone(), p.endian.clone());
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         let as_ = as_s
             .as_deref()
             .map(crate::parse_bytes_as)
             .transpose()
-            .map_err(|e| match e {
-                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?
+            .map_err(error_data)?
             .unwrap_or(crate::BytesAs::U8);
         let endian = endian_s
             .as_deref()
             .map(crate::parse_bytes_endian)
             .transpose()
-            .map_err(|e| match e {
-                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?
+            .map_err(error_data)?
             .unwrap_or(crate::BytesEndian::Le);
         proj.bytes_view(addr, len, as_, endian)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|v| ok(serde_json::to_value(v).expect("bytes view serializes")))
     }
 
@@ -1038,11 +1041,8 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.cfg_of(addr)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.cfg_of(addr).map_err(error_data).and_then(ok)
     }
 
     #[tool(
@@ -1054,11 +1054,8 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.structure_of(addr)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.structure_of(addr).map_err(error_data).and_then(ok)
     }
 
     #[tool(
@@ -1070,11 +1067,8 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.pseudo_of(addr)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.pseudo_of(addr).map_err(error_data).and_then(ok)
     }
 
     #[tool(
@@ -1086,18 +1080,14 @@ impl BinscoutMcp {
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.callees_page(
             addr,
             depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
             offset.unwrap_or(0),
             limit.unwrap_or(50),
         )
-        .map_err(|e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })
+        .map_err(error_data)
         .and_then(|page| ok(serde_json::to_value(page).expect("callees page serializes")))
     }
 
@@ -1110,18 +1100,14 @@ impl BinscoutMcp {
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.callers_page(
             addr,
             depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
             offset.unwrap_or(0),
             limit.unwrap_or(50),
         )
-        .map_err(|e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })
+        .map_err(error_data)
         .and_then(|page| ok(serde_json::to_value(page).expect("callers page serializes")))
     }
 
@@ -1134,18 +1120,14 @@ impl BinscoutMcp {
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.slice_page(
             addr,
             depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
             offset.unwrap_or(0),
             limit.unwrap_or(50),
         )
-        .map_err(|e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })
+        .map_err(error_data)
         .and_then(|page| ok(serde_json::to_value(page).expect("slice page serializes")))
     }
 
@@ -1168,7 +1150,7 @@ impl BinscoutMcp {
             .as_deref()
             .map(parse_xref_kind)
             .transpose()
-            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            .map_err(error_data)?;
         let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
         let total = proj.count_xrefs(to, from, kind);
         let rows = proj.query_xrefs(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
@@ -1189,10 +1171,7 @@ impl BinscoutMcp {
             .as_deref()
             .map(crate::loader::strings::parse_decode_spec)
             .transpose()
-            .map_err(|e| match e {
-                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })?;
+            .map_err(error_data)?;
         // Cloned before the move into the open; the decode error above keeps
         // its pre-open precedence.
         let (pattern, min_len, section, include_code, start, offset, limit) = (
@@ -1218,10 +1197,7 @@ impl BinscoutMcp {
             Some(spec) => proj.query_strings_decoded(&filter, spec),
             None => proj.query_strings(&filter),
         }
-        .map_err(|e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })?;
+        .map_err(error_data)?;
         ok(serde_json::to_value(rows).expect("strings serialize"))
     }
 
@@ -1245,7 +1221,7 @@ impl BinscoutMcp {
         entry
             .lock_project()
             .stats_json()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(ok)
     }
 
@@ -1268,11 +1244,8 @@ impl BinscoutMcp {
         let (addr_s, len) = (p.addr.clone(), p.len);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.ir_at(addr, len)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(ok)
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.ir_at(addr, len).map_err(error_data).and_then(ok)
     }
 
     #[tool(
@@ -1281,25 +1254,19 @@ impl BinscoutMcp {
     )]
     async fn ir_coverage(&self, p: Parameters<IrCoverageParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let arch = crate::parse_raw_arch(&p.arch)
-            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let arch = crate::parse_raw_arch(&p.arch).map_err(error_data)?;
         match (p.binary, p.addr, p.len) {
             (None, None, None) => ok(crate::ir_coverage(arch)),
             (Some(binary), Some(addr_s), Some(len)) => {
                 let entry = self.open_owned(binary, p.db, p.raw, p.fat_arch).await?;
                 let proj = entry.lock_project();
-                let addr = parse_addr(&addr_s)
-                    .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+                let addr = parse_addr(&addr_s).map_err(error_data)?;
                 proj.ir_coverage_at(arch, addr, len)
-                    .map_err(|e| match e {
-                        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                        other => ErrorData::internal_error(other.to_string(), None),
-                    })
+                    .map_err(error_data)
                     .and_then(ok)
             }
-            _ => Err(ErrorData::invalid_params(
+            _ => Err(invalid_params(
                 "ir_coverage range needs binary, addr, and len together",
-                None,
             )),
         }
     }
@@ -1315,10 +1282,8 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.rename_function(addr, &name)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.rename_function(addr, &name).map_err(error_data)?;
         ok(proj.annotation_json(addr))
     }
 
@@ -1333,10 +1298,8 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.set_comment(addr, &comment)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.set_comment(addr, &comment).map_err(error_data)?;
         ok(proj.annotation_json(addr))
     }
 
@@ -1359,13 +1322,12 @@ impl BinscoutMcp {
         let range = match (range_start, range_end) {
             (None, None) => None,
             (Some(lo), Some(hi)) => Some((
-                parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
-                parse_addr(&hi).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                parse_addr(&lo).map_err(error_data)?,
+                parse_addr(&hi).map_err(error_data)?,
             )),
             _ => {
-                return Err(ErrorData::invalid_params(
+                return Err(invalid_params(
                     "range_start and range_end must be given together",
-                    None,
                 ));
             }
         };
@@ -1376,10 +1338,7 @@ impl BinscoutMcp {
             offset.unwrap_or(0),
             limit.unwrap_or(50),
         )
-        .map_err(|e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        })
+        .map_err(error_data)
         .and_then(|page| ok(serde_json::to_value(page).expect("search_bytes page serializes")))
     }
 
@@ -1391,12 +1350,12 @@ impl BinscoutMcp {
         let p = all_params(p);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let doc = proj
-            .export_annotations()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let doc = proj.export_annotations().map_err(error_data)?;
         serde_json::from_str::<serde_json::Value>(&doc)
             .map_err(|e| {
-                ErrorData::internal_error(format!("encode annotation document: {e}"), None)
+                error_data(crate::error::Error::Storage(format!(
+                    "encode annotation document: {e}"
+                )))
             })
             .and_then(ok)
     }
@@ -1424,10 +1383,7 @@ impl BinscoutMcp {
         // budgets during validation, before any write, and every failure
         // leaves the DB and memory unchanged.
         proj.import_annotations(&document, overwrite.unwrap_or(false))
-            .map_err(|e| match e {
-                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-                other => ErrorData::internal_error(other.to_string(), None),
-            })
+            .map_err(error_data)
             .and_then(|s| ok(serde_json::json!({"rows": s.rows, "changed": s.changed})))
     }
 
@@ -1442,7 +1398,7 @@ impl BinscoutMcp {
         let proj = entry.lock_project();
         let addr = opt_addr(addr_s)?;
         proj.query_flirt_hints(addr, offset.unwrap_or(0), limit.unwrap_or(50))
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(error_data)
             .and_then(|page| ok(serde_json::to_value(page).expect("flirt hints page serializes")))
     }
 

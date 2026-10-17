@@ -1,7 +1,10 @@
 //! binscout CLI: every command prints exactly one JSON value to stdout.
 //!
 //! Success prints the result with exit 0; failure prints
-//! `{"error": "..."}` with exit 1, so stdout is always valid JSON.
+//! `{"error": "...", "kind": "..."}` with exit 1, so stdout is always
+//! valid JSON. `kind` is the machine-readable [`binscout::error::Error`]
+//! discriminant (`not_found`, `invalid`, `limit`, `unsupported`,
+//! `storage`, `io`); `error` keeps the human message unchanged.
 
 use std::path::PathBuf;
 
@@ -344,7 +347,7 @@ impl Cli {
         ) {
             Ok(o) => o,
             Err(e) => {
-                emit(&serde_json::json!({ "error": e.to_string() }), 1);
+                emit_error(&e);
             }
         };
         let db = self.db.as_deref();
@@ -468,7 +471,7 @@ impl Cli {
                 {
                     Ok(d) => d,
                     Err(e) => {
-                        emit(&serde_json::json!({ "error": e.to_string() }), 1);
+                        emit_error(&e);
                     }
                 };
                 strings(
@@ -579,7 +582,7 @@ impl Cli {
                 emit(&value, 0);
             }
             Err(e) => {
-                emit(&serde_json::json!({ "error": e.to_string() }), 1);
+                emit_error(&e);
             }
         }
     }
@@ -589,9 +592,9 @@ impl Cli {
 ///
 /// `println!` panics with exit 101 when stdout is a closed pipe (EPIPE),
 /// which violates the CLI contract (success exits 0, runtime failure
-/// prints `{"error": ...}` and exits 1). A closed pipe means the consumer
-/// went away, so exit quietly with the intended code instead: success
-/// stays 0 (conventional SIGPIPE-quiet), failure stays 1.
+/// prints `{"error": ..., "kind": ...}` and exits 1). A closed pipe means
+/// the consumer went away, so exit quietly with the intended code instead:
+/// success stays 0 (conventional SIGPIPE-quiet), failure stays 1.
 fn emit(value: &serde_json::Value, code: i32) -> ! {
     use std::io::Write as _;
     let text = value.to_string();
@@ -604,6 +607,16 @@ fn emit(value: &serde_json::Value, code: i32) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// Runtime failure envelope: the human message plus the machine-readable
+/// [`binscout::error::Error::kind`], so agents branch on `kind` instead
+/// of parsing `error`.
+fn emit_error(e: &binscout::error::Error) -> ! {
+    emit(
+        &serde_json::json!({ "error": e.to_string(), "kind": e.kind() }),
+        1,
+    )
 }
 
 /// Best-effort stderr note that never panics, even on a closed stderr.
@@ -1089,7 +1102,7 @@ fn read_transfer_document(path: &std::path::Path) -> binscout::error::Result<Str
     use binscout::error::Error;
     let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => Error::NotFound(path.display().to_string()),
-        _ => Error::Storage(format!("stat {}: {e}", path.display())),
+        _ => Error::Io(format!("stat {}: {e}", path.display())),
     })?;
     if !meta.is_file() {
         return Err(Error::Unsupported(format!(
@@ -1104,7 +1117,7 @@ fn read_transfer_document(path: &std::path::Path) -> binscout::error::Result<Str
         )));
     }
     let bytes =
-        std::fs::read(path).map_err(|e| Error::Storage(format!("read {}: {e}", path.display())))?;
+        std::fs::read(path).map_err(|e| Error::Io(format!("read {}: {e}", path.display())))?;
     if bytes.len() > MAX_TRANSFER_BYTES {
         return Err(Error::Limit(format!(
             "annotation document of {} bytes exceeds the {MAX_TRANSFER_BYTES}-byte cap",

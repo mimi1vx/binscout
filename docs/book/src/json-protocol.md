@@ -1,9 +1,13 @@
 # JSON protocol
 
 Every command prints exactly one JSON value to stdout and exits 0.
-A runtime failure prints a single `{"error": "..."}` value and exits 1,
-so stdout is always valid JSON. (Clap usage errors for unknown
-flags/subcommands still go to stderr with exit 2.)
+A runtime failure prints a single `{"error": "...", "kind": "..."}`
+value and exits 1, so stdout is always valid JSON. (Clap usage errors
+for unknown flags/subcommands still go to stderr with exit 2.) `kind`
+is the machine-readable [`Error`](https://docs.rs/binscout) discriminant
+(`not_found`, `invalid`, `limit`, `unsupported`, `storage`, `io`):
+branch on it instead of parsing `error`, which keeps the human message
+unchanged.
 
 Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
@@ -25,8 +29,10 @@ indirect-jump resolver's edge budget.
 These stability guarantees hold across wire revisions:
 
 - One JSON value on CLI stdout per command. Runtime failure:
-  `{"error": "..."}` on stdout, exit 1. Clap usage errors
-  (unknown flags/subcommands, unparsable numbers): stderr, exit 2.
+  `{"error": "...", "kind": "..."}` on stdout, exit 1 (the `kind`
+  values are frozen below; new variants only add rows). Clap usage
+  errors (unknown flags/subcommands, unparsable numbers): stderr,
+  exit 2.
 - The analyzed binary is never written. The only write target is the
   `redb` sidecar (default `<binary>.rsdbg.redb`, overridable with global
   `--db PATH` on the CLI or the `db` parameter on MCP tools). `load`
@@ -544,15 +550,20 @@ stubs seed no function: with no caller there is nothing to xref.
 
 ## Errors and validation
 
-Library variants and their surfaces:
+Library variants, their machine-readable `kind`, and their surfaces.
+Every MCP tool error carries `{"kind": ...}` in the JSON-RPC error
+`data`, so agents branch on `kind` instead of parsing the message:
+`not_found` (retry with a snapped address), `limit` (narrow the
+query), `unsupported` (give up).
 
-| `Error` | CLI | MCP |
-|---|---|---|
-| `NotFound` (`not found: …`) | `{"error": …}`, exit 1 | tool error |
-| `Unsupported` (`unsupported: …`) | `{"error": …}`, exit 1 | tool error |
-| `Invalid` (`invalid opcode: …`) | `{"error": …}`, exit 1 | `invalid_params` |
-| `Limit` (`limit exceeded: …`) | `{"error": …}`, exit 1 | tool error |
-| `Storage` (`storage: …`) | `{"error": …}`, exit 1 | tool error |
+| `Error` | `kind` | CLI | MCP |
+|---|---|---|---|
+| `NotFound` (`not found: …`) | `not_found` | `{"error", "kind"}`, exit 1 | `resource_not_found` |
+| `Unsupported` (`unsupported: …`) | `unsupported` | `{"error", "kind"}`, exit 1 | `internal_error` |
+| `Invalid` (`invalid opcode: …`) | `invalid` | `{"error", "kind"}`, exit 1 | `invalid_params` |
+| `Limit` (`limit exceeded: …`) | `limit` | `{"error", "kind"}`, exit 1 | `invalid_params` |
+| `Storage` (`storage: …`) | `storage` | `{"error", "kind"}`, exit 1 | `internal_error` |
+| `Io` (`io: …`) | `io` | `{"error", "kind"}`, exit 1 | `internal_error` |
 
 Validation rules: bad addresses, unknown xref/diagnostic kinds,
 overlong or uncompilable string patterns, malformed byte-search
