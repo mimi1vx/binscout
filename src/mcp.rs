@@ -1168,7 +1168,7 @@ impl BinscoutMcp {
         ok(serde_json::to_value(rows).expect("strings serialize"))
     }
 
-<    #[tool(
+    #[tool(
         name = "symbols",
         description = "Imports, exports, and symbol-table code addresses of the binary"
     )]

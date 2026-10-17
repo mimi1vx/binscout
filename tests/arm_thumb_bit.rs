@@ -28,6 +28,7 @@ fn odd_arm_entry_is_masked_with_diagnostic() {
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
+        symbols: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic arm elf must analyze");
     for (entry, f) in &a.functions {

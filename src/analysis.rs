@@ -1750,15 +1750,6 @@ struct Decoded {
     flow: Flow,
 }
 
-</// Seed addresses from the entry point, exports, symbol-table entries,
-/// and Mach-O stub entries resolving to executable code. When none exists
-/// (raw blobs, stripped objects), the first executable byte seeds analysis
-/// so some function is always found.
-///
-/// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
-/// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
-/// the odd address (a queued discovery address never decoded as given).
-fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<Diagnostic>) {
 /// Normalize a seed address for `arch`, clearing the ARM Thumb
 /// interworking bit.
 ///
@@ -1789,6 +1780,15 @@ fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr
     seeds.push(addr);
 }
 
+/// Seed addresses from the entry point, exports, symbol-table entries,
+/// and Mach-O stub entries resolving to executable code. When none exists
+/// (raw blobs, stripped objects), the first executable byte seeds analysis
+/// so some function is always found.
+///
+/// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
+/// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
+/// the odd address (a queued discovery address never decoded as given).
+fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<Diagnostic>) {
     let mut seeds: Vec<u64> = Vec::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
     if let Some(entry) = bin.entry
@@ -2710,7 +2710,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // point.
     let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
     let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
-<    // Normalized like the seeds: an odd ARM export address and its masked
+    // Normalized like the seeds: an odd ARM export address and its masked
     // seed are the same function.
     let export_addrs: BTreeSet<u64> = bin
         .exports
@@ -2805,7 +2805,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-<    // Export names for entries, then symbol-table names, then Mach-O
+    // Export names for entries, then symbol-table names, then Mach-O
     // stub import names. Precedence per address: export > symbol > stub;
     // annotation renames win over all three at display time (see
     // `Project::function_name`). Export addresses normalize like seeds
