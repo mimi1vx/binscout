@@ -1,11 +1,26 @@
-//! binscout MCP server: 27 stateless tools over [`Project`].
+//! binscout MCP server: 28 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
 //! tool errors, never as silent empty results.
+//!
+//! Opens go through a small in-process LRU (`CACHE_CAPACITY` entries):
+//! the first call for a binary pays the full open (file read, content hash,
+//! analysis or sidecar replay) while repeat calls only stat the binary and
+//! reuse the entry while its length and mtime agree. A changed file reopens
+//! outside any lock and replaces the entry. Reads never save; the sidecar
+//! is written solely by `load` and the annotation setters, exactly like
+//! the CLI.
+//!
+//! Tool bodies are `async` and run the open inside
+//! [`tokio::task::spawn_blocking`], so analysis never stalls the MCP event
+//! loop. Only a brief map lookup plus one per-project [`Mutex`] guard the
+//! cached entries, so different binaries open concurrently.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::SystemTime;
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
@@ -18,7 +33,7 @@ use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
 /// Mirrors the CLI `--raw --arch ARCH --base ADDR [--entry ADDR]` flags:
 /// `arch`/`base` are required when `raw` is present, `entry` is optional,
 /// and addresses parse as `0x`-hex or decimal via [`parse_addr`].
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct RawParams {
     /// Raw arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`.
     pub arch: Option<String>,
@@ -28,17 +43,174 @@ pub struct RawParams {
     pub entry: Option<String>,
 }
 
+/// Max live projects in the in-process MCP cache: enough for an agent
+/// comparing a couple of builds, small enough that idle entries cannot pile
+/// up resident analysis. In-flight calls keep their `Arc` alive past
+/// eviction, so eviction never invalidates a running query.
+const CACHE_CAPACITY: usize = 4;
+
+/// Identity of one cached project: canonical binary path, resolved sidecar
+/// path, and loader mapping description. File identity (length plus mtime)
+/// rides alongside in the entry and revalidates on every call, so an edited
+/// binary reopens instead of serving stale analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CacheKey {
+    /// Canonicalized binary path.
+    binary: String,
+    /// Explicit `db` path (canonicalized when it exists, absolutized
+    /// otherwise) or the default sidecar of the canonical binary.
+    db: String,
+    /// Loader mapping ([`crate::db::StoredMapping::describe`]).
+    mapping: String,
+}
+
+/// One cached open: validation file facts plus the project behind its own
+/// lock. Sharing the handler shares the cache; each entry serializes its
+/// own queries and read-modify-write annotations independently of the
+/// other entries.
+#[derive(Debug)]
+struct ProjectEntry {
+    /// Cache identity; never inserted for fallback opens that skipped the
+    /// stat (missing binary: the open reports the error instead).
+    key: CacheKey,
+    /// Binary length at open time; a mismatch reopens.
+    file_len: u64,
+    /// Binary mtime at open time; a mismatch reopens.
+    file_mtime: SystemTime,
+    /// The open project. Mutations (rename/comment/import) hold this
+    /// across their persist; queries hold it across row reads.
+    project: Mutex<Project>,
+}
+
+impl ProjectEntry {
+    /// Lock the project, tolerating a poisoned mutex: a panicked tool call
+    /// must not wedge later calls on the same binary.
+    fn lock_project(&self) -> MutexGuard<'_, Project> {
+        self.project.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// In-memory-only entry for opens that skipped validation (the binary
+    /// could not be statted, so no later call could match it anyway).
+    fn ephemeral(project: Project) -> Self {
+        Self {
+            key: CacheKey {
+                binary: String::new(),
+                db: String::new(),
+                mapping: String::new(),
+            },
+            file_len: 0,
+            file_mtime: SystemTime::UNIX_EPOCH,
+            project: Mutex::new(project),
+        }
+    }
+}
+
+/// In-process LRU over open projects, shared by every tool call served by
+/// one `binscout-mcp` process. The map lock is held only for pointer
+/// manipulations, never across file I/O or analysis.
+#[derive(Debug, Default)]
+struct ProjectCache {
+    /// Entries plus MRU-first key order.
+    state: Mutex<CacheState>,
+}
+
+/// Map plus recency order behind [`ProjectCache::state`].
+#[derive(Debug, Default)]
+struct CacheState {
+    /// Live entries by identity.
+    entries: HashMap<CacheKey, Arc<ProjectEntry>>,
+    /// Key recency, most-recently-used first.
+    order: VecDeque<CacheKey>,
+}
+
+impl ProjectCache {
+    /// Return the entry when the key is cached and the file facts still
+    /// match, refreshing its recency. A length/mtime mismatch returns
+    /// `None` so the caller reopens and replaces the entry; the stale
+    /// entry stays valid for calls already holding it.
+    fn lookup(&self, key: &CacheKey, len: u64, mtime: SystemTime) -> Option<Arc<ProjectEntry>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = state.entries.get(key)?.clone();
+        if entry.file_len != len || entry.file_mtime != mtime {
+            return None;
+        }
+        if let Some(pos) = state.order.iter().position(|k| k == key) {
+            state.order.remove(pos);
+        }
+        state.order.push_front(key.clone());
+        Some(entry)
+    }
+
+    /// Insert an entry, replacing the same key or evicting
+    /// least-recently-used entries past [`CACHE_CAPACITY`].
+    fn insert(&self, entry: Arc<ProjectEntry>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = state.order.iter().position(|k| k == &entry.key) {
+            state.order.remove(pos);
+        }
+        state.order.push_front(entry.key.clone());
+        state.entries.insert(entry.key.clone(), entry);
+        while state.entries.len() > CACHE_CAPACITY {
+            match state.order.pop_back() {
+                Some(old) => {
+                    state.entries.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Join failure of a blocking open: the analysis thread itself never
+/// returns this, only a cancelled runtime does.
+fn join_error(e: tokio::task::JoinError) -> ErrorData {
+    ErrorData::internal_error(format!("background open failed: {e}"), None)
+}
+
+/// Resolve an explicit `db` string for cache identity: canonicalized when
+/// the file exists, else its canonicalized parent plus the file name.
+/// Best-effort: distinct spellings of one path only cost a duplicate
+/// entry, never a wrong one.
+///
+/// Parent canonicalization (not just absolutization) keeps the key
+/// stable across sidecar creation: the pre-creation key must equal the
+/// post-creation canonical path, or one file would fork into two cache
+/// keys — and two handle mutexes, breaking the single-handle guarantee.
+/// (`/tmp` on macOS is a symlink, so a plain absolute path is not
+/// stable.) When even the parent is unresolvable the open itself will
+/// fail, so any stable string does.
+fn resolve_db_str(db: &str) -> String {
+    if let Ok(canonical) = std::fs::canonicalize(db) {
+        return canonical.display().to_string();
+    }
+    let path = Path::new(db);
+    if let (Some(parent), Some(file)) = (path.parent(), path.file_name())
+        && let Ok(canon_parent) = std::fs::canonicalize(parent)
+    {
+        return canon_parent.join(file).display().to_string();
+    }
+    if path.is_absolute() {
+        return db.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let base = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            base.join(path).display().to_string()
+        }
+        Err(_) => db.to_string(),
+    }
+}
+
 /// Shared validated opener: explicit `db` path (or the default sidecar),
 /// the optional explicit raw mapping, and the optional fat Mach-O slice
 /// selection, parsed through [`crate::parse_raw_options`] so CLI and MCP
-/// interpret options identically.
-fn open(
+/// interpret options identically. Never saves; see [`Project::save`].
+fn open_uncached(
     binary: &str,
     db: Option<&str>,
-    raw: Option<&RawParams>,
+    raw_opts: Option<crate::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> Result<Project, ErrorData> {
-    let raw_opts = raw_options(raw)?;
     let db_path;
     let db_ref = match db {
         Some(d) => {
@@ -478,23 +650,161 @@ pub struct DiffParams {
     pub fat_arch: Option<String>,
 }
 
-/// MCP server handler; serializes tool calls behind one lock.
+/// MCP server handler; tools share one project cache.
+///
+/// The cache lock is held only for map manipulations: opens run outside
+/// any lock (in `spawn_blocking`), and each cached project carries its own
+/// [`Mutex`], so calls on different binaries proceed concurrently while
+/// calls on one binary serialize. `redb` handles are never held across
+/// calls — every sidecar open/save reopens its file under that file's
+/// handle mutex (see the `db_locks` field), so the single-handle rule
+/// holds without a global call lock.
 #[derive(Debug, Clone, Default)]
 pub struct BinscoutMcp {
-    /// Serializes tool calls: `redb` allows one open handle per file per
-    /// process, and rename/comment are read-modify-write cycles.
-    lock: Arc<Mutex<()>>,
+    /// In-process LRU over open projects (see [`ProjectCache`]).
+    cache: Arc<ProjectCache>,
+    /// One mutex per sidecar path, shared by every entry that names it.
+    ///
+    /// `redb` enforces a single open handle per file per process with an
+    /// OS file lock: a second open while a writable handle lives fails
+    /// with `DatabaseAlreadyOpen`. Every window holding a sidecar handle —
+    /// miss opens (read-only) and annotation persists/saves (writable) —
+    /// runs under the file's mutex, so same-sidecar calls serialize while
+    /// different sidecars proceed concurrently. Weak refs so idle files
+    /// release their mutex; any spelling that resolves to one path shares
+    /// one mutex through [`resolve_db_str`].
+    db_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 impl BinscoutMcp {
-    /// New handler with a fresh call-serializing lock.
+    /// New handler with a fresh project cache.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn guard(&self) -> MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    /// Mutex serializing sidecar-handle windows for one resolved `db` path
+    /// (see the [`BinscoutMcp::db_locks`] field docs). Shared by opens and
+    /// persists; always taken before the entry lock, never after.
+    fn db_lock(&self, db: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.db_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = locks.get(db).and_then(Weak::upgrade) {
+            return live;
+        }
+        let live = Arc::new(Mutex::new(()));
+        locks.insert(db.to_string(), Arc::downgrade(&live));
+        locks.retain(|_, w| w.strong_count() > 0);
+        live
+    }
+
+    /// Cache identity plus validation facts for one open request, or `None`
+    /// when the binary cannot be statted: the open path then runs uncached
+    /// so it reports the canonical error.
+    fn cache_key(
+        binary: &str,
+        db: Option<&str>,
+        raw_opts: Option<crate::loader::RawOptions>,
+        fat_arch: Option<&str>,
+    ) -> Result<Option<(CacheKey, u64, SystemTime)>, ErrorData> {
+        let bin_path = Path::new(binary);
+        let (meta, canonical) = match (std::fs::metadata(bin_path), std::fs::canonicalize(bin_path))
+        {
+            (Ok(meta), Ok(canonical)) => (meta, canonical),
+            _ => return Ok(None),
+        };
+        let mtime = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let mapping = match (raw_opts, fat_arch) {
+            (Some(_), Some(_)) => {
+                return Err(ErrorData::invalid_params(
+                    "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)",
+                    None,
+                ));
+            }
+            (Some(opts), None) => crate::db::StoredMapping::for_request(Some(opts)),
+            (None, Some(arch)) => crate::db::StoredMapping::for_fat_slice(arch),
+            (None, None) => crate::db::StoredMapping::for_request(None),
+        };
+        let db_str = match db {
+            Some(d) => resolve_db_str(d),
+            None => format!("{}.rsdbg.redb", canonical.display()),
+        };
+        Ok(Some((
+            CacheKey {
+                binary: canonical.display().to_string(),
+                db: db_str,
+                mapping: mapping.describe(),
+            },
+            meta.len(),
+            mtime,
+        )))
+    }
+
+    /// Open through the cache: a length/mtime-validated hit returns the
+    /// live entry, otherwise the binary opens outside any lock and the
+    /// result replaces the entry. Synchronous file I/O and analysis: call
+    /// from `spawn_blocking` via [`BinscoutMcp::open_owned`].
+    fn cached_entry(
+        &self,
+        binary: &str,
+        db: Option<&str>,
+        raw: Option<&RawParams>,
+        fat_arch: Option<&str>,
+    ) -> Result<Arc<ProjectEntry>, ErrorData> {
+        let raw_opts = raw_options(raw)?;
+        let keyed = Self::cache_key(binary, db, raw_opts, fat_arch)?;
+        let Some((key, len, mtime)) = keyed else {
+            return Ok(Arc::new(ProjectEntry::ephemeral(open_uncached(
+                binary, db, raw_opts, fat_arch,
+            )?)));
+        };
+        if let Some(hit) = self.cache.lookup(&key, len, mtime) {
+            return Ok(hit);
+        }
+        // The sidecar read inside the open holds a handle, so it runs under
+        // the file mutex; analysis itself needs no lock and concurrent
+        // misses on other files proceed.
+        let db_mutex = self.db_lock(&key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let project = open_uncached(binary, db, raw_opts, fat_arch)?;
+        // Re-stat so the stored facts describe the opened bytes; when the
+        // file changed mid-open (or vanished) the entry stays ephemeral and
+        // the next call revalidates from scratch.
+        let entry = match Self::cache_key(binary, db, raw_opts, fat_arch)? {
+            Some((_, fresh_len, fresh_mtime)) => {
+                let entry = Arc::new(ProjectEntry {
+                    key,
+                    file_len: fresh_len,
+                    file_mtime: fresh_mtime,
+                    project: Mutex::new(project),
+                });
+                self.cache.insert(entry.clone());
+                entry
+            }
+            None => Arc::new(ProjectEntry::ephemeral(project)),
+        };
+        Ok(entry)
+    }
+
+    /// Async entry point for every binary-taking tool: the open (file
+    /// read, hash, analysis or sidecar replay) runs on the blocking pool
+    /// while the caller only awaits the `Arc`. Queries then run inline
+    /// under the entry lock: row reads plus serialization, no I/O.
+    async fn open_owned(
+        &self,
+        binary: String,
+        db: Option<String>,
+        raw: Option<RawParams>,
+        fat_arch: Option<String>,
+    ) -> Result<Arc<ProjectEntry>, ErrorData> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            this.cached_entry(&binary, db.as_deref(), raw.as_ref(), fat_arch.as_deref())
+        })
+        .await
+        .map_err(join_error)?
     }
 }
 
@@ -510,15 +820,25 @@ impl BinscoutMcp {
         name = "project_info",
         description = "Open a binary and report arch, format, entry, and analysis counts"
     )]
-    fn project_info(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn project_info(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
+    }
+
+    #[tool(
+        name = "load",
+        description = "Open a binary and persist the analysis snapshot to the project DB (binary untouched); CLI `load` parity, warms the sidecar so later opens replay it instead of re-analyzing"
+    )]
+    async fn load(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let proj = entry.lock_project();
+        proj.save()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
 
@@ -526,20 +846,26 @@ impl BinscoutMcp {
         name = "functions",
         description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit"
     )]
-    fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        // Cloned before the move into the open so filter errors keep their
+        // post-open precedence (a missing binary still reports first).
+        let (query, caller, callee, range_lo, range_hi, offset, limit) = (
+            p.query.clone(),
+            p.caller.clone(),
+            p.callee.clone(),
+            p.range_lo.clone(),
+            p.range_hi.clone(),
+            p.offset,
+            p.limit,
+        );
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let filter = FunctionFilter {
-            query: p.query,
-            caller: opt_addr(p.caller)?,
-            callee: opt_addr(p.callee)?,
-            range: match (p.range_lo, p.range_hi) {
+            query,
+            caller: opt_addr(caller)?,
+            callee: opt_addr(callee)?,
+            range: match (range_lo, range_hi) {
                 (None, None) => None,
                 (Some(lo), Some(hi)) => Some((
                     parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
@@ -553,7 +879,7 @@ impl BinscoutMcp {
                 }
             },
         };
-        let rows = proj.functions_filtered(&filter, p.offset.unwrap_or(0), p.limit.unwrap_or(50));
+        let rows = proj.functions_filtered(&filter, offset.unwrap_or(0), limit.unwrap_or(50));
         ok(serde_json::Value::Array(rows))
     }
 
@@ -561,17 +887,13 @@ impl BinscoutMcp {
         name = "func",
         description = "Compact metadata of one function: entry, name, and block/insn/call counts. Any address inside the function snaps to its containing entry"
     )]
-    fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.func_meta(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|m| ok(serde_json::to_value(m).expect("func_meta serializes")))
@@ -581,18 +903,14 @@ impl BinscoutMcp {
         name = "blocks",
         description = "Block summaries of one function ordered by block start, paged with total block count. Any address inside the function snaps to its containing entry"
     )]
-    fn blocks(&self, p: Parameters<BlocksParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn blocks(&self, p: Parameters<BlocksParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, offset, limit) = (p.addr.clone(), p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.func_blocks_page(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.func_blocks_page(addr, offset.unwrap_or(0), limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("blocks page serializes")))
     }
@@ -601,20 +919,16 @@ impl BinscoutMcp {
         name = "block_insns",
         description = "Instructions of one function-owned block in address order, paged. Addr snaps to its containing function; block must be a block start belonging to that function"
     )]
-    fn block_insns(&self, p: Parameters<BlockInsnsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn block_insns(&self, p: Parameters<BlockInsnsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, block_s, offset, limit) = (p.addr.clone(), p.block.clone(), p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let block =
-            parse_addr(&p.block).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.func_block_insns_page(addr, block, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+            parse_addr(&block_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.func_block_insns_page(addr, block, offset.unwrap_or(0), limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("block_insns page serializes")))
     }
@@ -623,17 +937,12 @@ impl BinscoutMcp {
         name = "diagnostics",
         description = "Analysis provenance: unresolved indirect sites and decode failures, filtered by kind and containing function, paged under the protocol-1 envelope"
     )]
-    fn diagnostics(&self, p: Parameters<DiagnosticsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn diagnostics(&self, p: Parameters<DiagnosticsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
-        let kind = p
-            .kind
+        let (kind_s, func_s, offset, limit) = (p.kind.clone(), p.func.clone(), p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let kind = kind_s
             .as_deref()
             .map(crate::parse_diagnostic_kind)
             .transpose()
@@ -641,8 +950,8 @@ impl BinscoutMcp {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
                 other => ErrorData::internal_error(other.to_string(), None),
             })?;
-        let func = opt_addr(p.func)?;
-        proj.query_diagnostics(kind, func, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+        let func = opt_addr(func_s)?;
+        proj.query_diagnostics(kind, func, offset.unwrap_or(0), limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("diagnostics page serializes")))
     }
@@ -651,18 +960,14 @@ impl BinscoutMcp {
         name = "disasm",
         description = "Disassemble len bytes at addr with the binary architecture; returns the valid prefix plus error_at for the first bad opcode (null on a clean range)"
     )]
-    fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, len) = (p.addr.clone(), p.len);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.disasm_at(addr, p.len)
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.disasm_at(addr, len)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|v| ok(serde_json::to_value(v).expect("partial disasm serializes")))
     }
@@ -671,17 +976,13 @@ impl BinscoutMcp {
         name = "cfg",
         description = "Control-flow graph of one function: block nodes plus block edges. Any address inside the function snaps to its containing entry"
     )]
-    fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.cfg_of(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
@@ -691,17 +992,13 @@ impl BinscoutMcp {
         name = "structure",
         description = "Approximate control-flow structure of one function: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning. Any address inside the function snaps to its containing entry"
     )]
-    fn structure(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn structure(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.structure_of(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
@@ -711,17 +1008,13 @@ impl BinscoutMcp {
         name = "pseudo",
         description = "Approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning. Any address inside the function snaps to its containing entry"
     )]
-    fn pseudo(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn pseudo(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.pseudo_of(addr)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
@@ -731,22 +1024,18 @@ impl BinscoutMcp {
         name = "callees",
         description = "Transitive callees of one function out to depth hops (direct callees are depth 1), ordered by entry with shortest distance, paged under the protocol-1 envelope. Addr snaps to its containing function"
     )]
-    fn callees(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn callees(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.callees_page(
             addr,
-            p.depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
-            p.offset.unwrap_or(0),
-            p.limit.unwrap_or(50),
+            depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
         )
         .map_err(|e| match e {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
@@ -759,22 +1048,18 @@ impl BinscoutMcp {
         name = "callers",
         description = "Transitive callers of one function out to depth hops (direct callers are depth 1), ordered by entry with shortest distance, paged under the protocol-1 envelope. Addr snaps to its containing function"
     )]
-    fn callers(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn callers(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.callers_page(
             addr,
-            p.depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
-            p.offset.unwrap_or(0),
-            p.limit.unwrap_or(50),
+            depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
         )
         .map_err(|e| match e {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
@@ -787,22 +1072,18 @@ impl BinscoutMcp {
         name = "slice",
         description = "Backward slice of one address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors, out to depth hops (direct predecessors are depth 1), ordered by address with shortest distance, paged under the protocol-1 envelope. Any address is a valid root"
     )]
-    fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         proj.slice_page(
             addr,
-            p.depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
-            p.offset.unwrap_or(0),
-            p.limit.unwrap_or(50),
+            depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
         )
         .map_err(|e| match e {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
@@ -815,24 +1096,25 @@ impl BinscoutMcp {
         name = "xrefs",
         description = "Cross-references filtered by to/from address and kind, paged with total match count"
     )]
-    fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
-        let kind = p
-            .kind
+        let (kind_s, to_s, from_s, offset, limit) = (
+            p.kind.clone(),
+            p.to.clone(),
+            p.from.clone(),
+            p.offset,
+            p.limit,
+        );
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let kind = kind_s
             .as_deref()
             .map(parse_xref_kind)
             .transpose()
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        let (to, from) = (opt_addr(p.to)?, opt_addr(p.from)?);
+        let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
         let total = proj.count_xrefs(to, from, kind);
-        let rows = proj.query_xrefs(to, from, kind, p.offset.unwrap_or(0), p.limit.unwrap_or(50));
+        let rows = proj.query_xrefs(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
         ok(serde_json::json!({ "total": total, "xrefs": rows }))
     }
 
@@ -840,8 +1122,7 @@ impl BinscoutMcp {
         name = "strings",
         description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>"
     )]
-    fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         if p.offset.is_some() {
             eprintln!("warning: strings offset is deprecated, use start");
@@ -855,19 +1136,26 @@ impl BinscoutMcp {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
                 other => ErrorData::internal_error(other.to_string(), None),
             })?;
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        // Cloned before the move into the open; the decode error above keeps
+        // its pre-open precedence.
+        let (pattern, min_len, section, include_code, start, offset, limit) = (
+            p.pattern.clone(),
+            p.min_len,
+            p.section.clone(),
+            p.include_code,
+            p.start,
+            p.offset,
+            p.limit,
+        );
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let filter = crate::analysis::StringsFilter {
-            pattern: p.pattern,
-            min_len: p.min_len,
-            section: p.section,
-            include_code: p.include_code.unwrap_or(false),
-            start: p.start.or(p.offset).unwrap_or(0),
-            limit: p.limit.unwrap_or(50),
+            pattern,
+            min_len,
+            section,
+            include_code: include_code.unwrap_or(false),
+            start: start.or(offset).unwrap_or(0),
+            limit: limit.unwrap_or(50),
         };
         let rows = match decode {
             Some(spec) => proj.query_strings_decoded(&filter, spec),
@@ -881,68 +1169,48 @@ impl BinscoutMcp {
     }
 
     #[tool(name = "symbols", description = "Imports and exports of the binary")]
-    fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        ok(open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?
-        .symbols_json())
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        ok(entry.lock_project().symbols_json())
     }
 
     #[tool(
         name = "stats",
         description = "Storage stats: binary size, sidecar DB size, and analysis counts"
     )]
-    fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?
-        .stats_json()
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-        .and_then(ok)
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        entry
+            .lock_project()
+            .stats_json()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(ok)
     }
 
     #[tool(
         name = "sections",
         description = "Section table: name, virtual address (PE: IMAGE_BASE + RVA), in-memory and file sizes, permissions"
     )]
-    fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        ok(open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?
-        .sections_json())
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        ok(entry.lock_project().sections_json())
     }
 
     #[tool(
         name = "ir",
         description = "Lift len bytes at addr to P-code-inspired IR"
     )]
-    fn ir(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn ir(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, len) = (p.addr.clone(), p.len);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.ir_at(addr, p.len)
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.ir_at(addr, len)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
     }
@@ -951,21 +1219,16 @@ impl BinscoutMcp {
         name = "ir_coverage",
         description = "Machine-readable IR lift coverage for one arch (implemented families, partial mappings, limitations); with binary/addr/len adds per-range decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary"
     )]
-    fn ir_coverage(&self, p: Parameters<IrCoverageParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn ir_coverage(&self, p: Parameters<IrCoverageParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let arch = crate::parse_raw_arch(&p.arch)
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         match (p.binary, p.addr, p.len) {
             (None, None, None) => ok(crate::ir_coverage(arch)),
-            (Some(binary), Some(addr), Some(len)) => {
-                let proj = open(
-                    &binary,
-                    p.db.as_deref(),
-                    p.raw.as_ref(),
-                    p.fat_arch.as_deref(),
-                )?;
-                let addr = parse_addr(&addr)
+            (Some(binary), Some(addr_s), Some(len)) => {
+                let entry = self.open_owned(binary, p.db, p.raw, p.fat_arch).await?;
+                let proj = entry.lock_project();
+                let addr = parse_addr(&addr_s)
                     .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
                 proj.ir_coverage_at(arch, addr, len)
                     .map_err(|e| match e {
@@ -985,18 +1248,16 @@ impl BinscoutMcp {
         name = "rename",
         description = "Rename a function in the project DB (binary untouched); empty name clears"
     )]
-    fn rename(&self, p: Parameters<RenameParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn rename(&self, p: Parameters<RenameParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let mut proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, name) = (p.addr.clone(), p.name.clone());
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.rename_function(addr, &p.name)
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.rename_function(addr, &name)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(proj.annotation_json(addr))
     }
@@ -1005,18 +1266,16 @@ impl BinscoutMcp {
         name = "comment",
         description = "Comment any address in the project DB (binary untouched); empty comment clears"
     )]
-    fn comment(&self, p: Parameters<CommentParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn comment(&self, p: Parameters<CommentParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let mut proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let (addr_s, comment) = (p.addr.clone(), p.comment.clone());
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
         let addr =
-            parse_addr(&p.addr).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
-        proj.set_comment(addr, &p.comment)
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.set_comment(addr, &comment)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(proj.annotation_json(addr))
     }
@@ -1025,16 +1284,19 @@ impl BinscoutMcp {
         name = "search_bytes",
         description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count"
     )]
-    fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
-        let range = match (p.range_start, p.range_end) {
+        let (pattern, section, range_start, range_end, offset, limit) = (
+            p.pattern.clone(),
+            p.section.clone(),
+            p.range_start.clone(),
+            p.range_end.clone(),
+            p.offset,
+            p.limit,
+        );
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let range = match (range_start, range_end) {
             (None, None) => None,
             (Some(lo), Some(hi)) => Some((
                 parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
@@ -1048,11 +1310,11 @@ impl BinscoutMcp {
             }
         };
         proj.search_bytes(
-            &p.pattern,
-            p.section.as_deref(),
+            &pattern,
+            section.as_deref(),
             range,
-            p.offset.unwrap_or(0),
-            p.limit.unwrap_or(50),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
         )
         .map_err(|e| match e {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
@@ -1065,15 +1327,10 @@ impl BinscoutMcp {
         name = "annotations_export",
         description = "Emit the portable annotation interchange document (revision, sha256, size, mapping, sorted rows); read-only, never creates or modifies the sidecar"
     )]
-    fn annotations_export(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn annotations_export(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
         let doc = proj
             .export_annotations()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -1088,24 +1345,25 @@ impl BinscoutMcp {
         name = "annotations_import",
         description = "Atomically merge a portable annotation document into the project DB; returns row/change counts. Default fails on conflicting fields, overwrite replaces supplied fields only"
     )]
-    fn annotations_import(
+    async fn annotations_import(
         &self,
         p: Parameters<AnnotationsImportParams>,
     ) -> Result<String, ErrorData> {
-        let _guard = self.guard();
         let p = all_params(p);
+        // Cloned before the move into the open so the transport note below
+        // still holds: validation happens after the open, inside the entry
+        // lock, before any write.
+        let (document, overwrite) = (p.document.clone(), p.overwrite);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
         // Transport note: rmcp delivers `document` as a fully-materialized
         // `String` before this runs, so no pre-parse cap exists at this
         // layer; the core re-checks the 16 MiB serialized cap plus row/text
         // budgets during validation, before any write, and every failure
         // leaves the DB and memory unchanged.
-        let mut proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
-        proj.import_annotations(&p.document, p.overwrite.unwrap_or(false))
+        proj.import_annotations(&document, overwrite.unwrap_or(false))
             .map_err(|e| match e {
                 crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
                 other => ErrorData::internal_error(other.to_string(), None),
@@ -1117,17 +1375,13 @@ impl BinscoutMcp {
         name = "flirt_hints",
         description = "FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope. Suggested names stay hints; read-only, never renames or writes the sidecar"
     )]
-    fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let proj = open(
-            &p.binary,
-            p.db.as_deref(),
-            p.raw.as_ref(),
-            p.fat_arch.as_deref(),
-        )?;
-        let addr = opt_addr(p.addr)?;
-        proj.query_flirt_hints(addr, p.offset.unwrap_or(0), p.limit.unwrap_or(50))
+        let (addr_s, offset, limit) = (p.addr.clone(), p.offset, p.limit);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let addr = opt_addr(addr_s)?;
+        proj.query_flirt_hints(addr, offset.unwrap_or(0), limit.unwrap_or(50))
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("flirt hints page serializes")))
     }
@@ -1136,45 +1390,181 @@ impl BinscoutMcp {
         name = "diff",
         description = "Function-level diff between two binaries: byte-identical pairs are matched, content-matched pairs are changed (with the match reason), the rest is added (only in B) / removed (only in A). Both projects open read-only, never creating or modifying a sidecar"
     )]
-    fn diff(&self, p: Parameters<DiffParams>) -> Result<String, ErrorData> {
-        let _guard = self.guard();
+    async fn diff(&self, p: Parameters<DiffParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let raw_opts = raw_options(p.raw.as_ref())?;
-        let db_a_path;
-        let db_a = match p.db_a.as_deref() {
-            Some(d) => {
-                db_a_path = Path::new(d).to_path_buf();
-                Some(db_a_path.as_path())
+        raw_options(p.raw.as_ref())?;
+        // Both sides open concurrently on the blocking pool; each lands on
+        // its own cache entry (same binary twice shares one). Guards take
+        // in pointer order below, so opposite-side concurrent diffs cannot
+        // deadlock.
+        let (entry_a, entry_b) = tokio::join!(
+            self.open_owned(
+                p.binary_a.clone(),
+                p.db_a.clone(),
+                p.raw.clone(),
+                p.fat_arch.clone(),
+            ),
+            self.open_owned(
+                p.binary_b.clone(),
+                p.db_b.clone(),
+                p.raw.clone(),
+                p.fat_arch.clone(),
+            )
+        );
+        let (entry_a, entry_b) = (entry_a?, entry_b?);
+        if Arc::ptr_eq(&entry_a, &entry_b) {
+            let proj = entry_a.lock_project();
+            let report = crate::diff::diff_projects(&proj, &proj);
+            ok(serde_json::to_value(report).expect("diff report serializes"))
+        } else if Arc::as_ptr(&entry_a) < Arc::as_ptr(&entry_b) {
+            let a = entry_a.lock_project();
+            let b = entry_b.lock_project();
+            let report = crate::diff::diff_projects(&a, &b);
+            ok(serde_json::to_value(report).expect("diff report serializes"))
+        } else {
+            let b = entry_b.lock_project();
+            let a = entry_a.lock_project();
+            let report = crate::diff::diff_projects(&a, &b);
+            ok(serde_json::to_value(report).expect("diff report serializes"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique scratch dir for one test; removed afterwards.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "binscout-mcp-cache-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Raw x86-64 blob (`nop; nop; ret`) at its own path: unrecognized
+    /// bytes open through the raw fallback at base 0.
+    fn write_blob(dir: &std::path::Path, name: &str, byte: u8) -> std::path::PathBuf {
+        let mut bytes = vec![0x90, 0x90, 0xC3];
+        bytes.push(byte);
+        let path = dir.join(name);
+        std::fs::write(&path, &bytes).expect("write blob");
+        path
+    }
+
+    fn open_params(bin: &std::path::Path, db: &std::path::Path) -> (String, Option<String>) {
+        (bin.display().to_string(), Some(db.display().to_string()))
+    }
+
+    #[test]
+    fn repeat_open_returns_same_entry() {
+        let dir = scratch("hit");
+        let bin = write_blob(&dir, "a.bin", 0x90);
+        let db = dir.join("a.redb");
+        let (binary, db_s) = open_params(&bin, &db);
+        let mcp = BinscoutMcp::new();
+        let first = mcp
+            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .expect("first open");
+        let second = mcp
+            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .expect("second open");
+        assert!(Arc::ptr_eq(&first, &second), "hit must reuse the entry");
+        assert!(!db.exists(), "reads never create the sidecar");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edited_binary_reopens() {
+        let dir = scratch("stale");
+        let bin = write_blob(&dir, "a.bin", 0x90);
+        let db = dir.join("a.redb");
+        let (binary, db_s) = open_params(&bin, &db);
+        let mcp = BinscoutMcp::new();
+        let first = mcp
+            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .expect("first open");
+        assert_eq!(first.lock_project().analysis().summary().insns, 3);
+        // Same path, different length: the entry must revalidate.
+        std::fs::write(&bin, [0x90, 0xC3]).expect("rewrite blob");
+        let second = mcp
+            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .expect("second open");
+        assert!(!Arc::ptr_eq(&first, &second), "edit must replace the entry");
+        assert_eq!(second.lock_project().analysis().summary().insns, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mapping_and_db_split_entries() {
+        let dir = scratch("keys");
+        let bin = write_blob(&dir, "a.bin", 0x90);
+        let db_a = dir.join("a.redb");
+        let db_b = dir.join("b.redb");
+        let mcp = BinscoutMcp::new();
+        let raw = |base: &str| RawParams {
+            arch: Some("x86_64".to_string()),
+            base: Some(base.to_string()),
+            entry: None,
+        };
+        let auto = mcp
+            .cached_entry(
+                &bin.display().to_string(),
+                Some(&db_a.display().to_string()),
+                None,
+                None,
+            )
+            .expect("auto open");
+        let raw_open = mcp
+            .cached_entry(
+                &bin.display().to_string(),
+                Some(&db_a.display().to_string()),
+                Some(&raw("0x1000")),
+                None,
+            )
+            .expect("raw open");
+        let other_db = mcp
+            .cached_entry(
+                &bin.display().to_string(),
+                Some(&db_b.display().to_string()),
+                None,
+                None,
+            )
+            .expect("other db open");
+        assert!(!Arc::ptr_eq(&auto, &raw_open), "mapping splits entries");
+        assert!(!Arc::ptr_eq(&auto, &other_db), "db path splits entries");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lru_evicts_past_capacity() {
+        let dir = scratch("lru");
+        let mcp = BinscoutMcp::new();
+        let mut first_key = String::new();
+        for i in 0..CACHE_CAPACITY + 1 {
+            let bin = write_blob(&dir, &format!("f{i}.bin"), i as u8);
+            let db = dir.join(format!("f{i}.redb"));
+            let (binary, db_s) = open_params(&bin, &db);
+            if i == 0 {
+                first_key = binary.clone();
             }
-            None => None,
-        };
-        let db_b_path;
-        let db_b = match p.db_b.as_deref() {
-            Some(d) => {
-                db_b_path = Path::new(d).to_path_buf();
-                Some(db_b_path.as_path())
-            }
-            None => None,
-        };
-        let map_err = |e| match e {
-            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
-            other => ErrorData::internal_error(other.to_string(), None),
-        };
-        let a = crate::open_mapped(
-            Path::new(&p.binary_a),
-            db_a,
-            raw_opts,
-            p.fat_arch.as_deref(),
-        )
-        .map_err(map_err)?;
-        let b = crate::open_mapped(
-            Path::new(&p.binary_b),
-            db_b,
-            raw_opts,
-            p.fat_arch.as_deref(),
-        )
-        .map_err(map_err)?;
-        let report = crate::diff::diff_projects(&a, &b);
-        ok(serde_json::to_value(report).expect("diff report serializes"))
+            mcp.cached_entry(&binary, db_s.as_deref(), None, None)
+                .expect("open");
+        }
+        let state = mcp.cache.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(state.entries.len(), CACHE_CAPACITY);
+        assert!(
+            state.entries.keys().all(|k| k.binary != first_key),
+            "least-recently-used entry must evict"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

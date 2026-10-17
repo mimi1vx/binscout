@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 27 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 28 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
@@ -16,6 +16,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | Tool | Parameters | Does |
 |---|---|---|
 | `project_info` | binary | Open a binary and report arch, format, entry, mapping (`mode`, `base`), diagnostic totals, and `analysis_revision` |
+| `load` | binary | Persist the analysis snapshot to the project DB (binary untouched); CLI `load` parity, warms the sidecar so later opens replay it instead of re-analyzing |
 | `functions` | binary, query/caller/callee/range_lo/range_hi, offset/limit | List functions with rename-resolved names, filtered (`query` case-insensitive substring; `caller`/`callee` addresses resolving to call-graph neighbors; `range_lo` + `range_hi` bounding entries) and paged |
 | `func` | binary, addr | Compact metadata of one function: entry, name, block/insn/call counts, discovery `reasons` |
 | `blocks` | binary, addr, offset?/limit? | Block summaries of the containing function by block start, under the page envelope |
@@ -46,9 +47,13 @@ document as text; failures are tool errors. Attach it to any MCP client:
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
 `code`, `data`, `string`, and `inferred-code` (case-insensitive);
 stored rows keep the historical `Code`/`Data`/`String` spelling while
-inferred rows serialize as kebab-case `inferred-code`. Calls are
-serialized behind one lock because `redb` allows a single open handle
-per file per process.
+inferred rows serialize as kebab-case `inferred-code`. One server process
+keeps a 4-entry LRU of open projects keyed by binary, sidecar, and
+mapping and revalidated by file length plus mtime, so repeat calls skip
+re-analysis; each entry has its own lock and each sidecar file its own
+handle mutex, so calls on different binaries proceed concurrently while
+calls sharing a binary or sidecar serialize (`redb` allows a single open
+handle per file per process).
 
 ## Raw mapping and inferred edges
 
