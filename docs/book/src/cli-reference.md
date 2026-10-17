@@ -47,7 +47,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, sha256, size, mapping, sorted rows); read-only, never creates a sidecar |
 | `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns row/change counts, default fails on conflicts |
-| `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; per-side `--db-a`/`--db-b` instead of the global `--db`, global `--raw` mapping applies to both |
+| `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; per-side `--db-a`/`--db-b` instead of the global `--db`, the global `--raw` mapping or `--fat-arch` selection (if any) applies to both |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal
 strings. `func`/`cfg`/`blocks` snap any address inside the function to
