@@ -1750,23 +1750,58 @@ struct Decoded {
     flow: Flow,
 }
 
-/// Seed addresses from the entry point, exports, symbol-table entries,
+</// Seed addresses from the entry point, exports, symbol-table entries,
 /// and Mach-O stub entries resolving to executable code. When none exists
 /// (raw blobs, stripped objects), the first executable byte seeds analysis
 /// so some function is always found.
-fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
+///
+/// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
+/// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
+/// the odd address (a queued discovery address never decoded as given).
+fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<Diagnostic>) {
+/// Normalize a seed address for `arch`, clearing the ARM Thumb
+/// interworking bit.
+///
+/// On ARM ELF, `e_entry` and `STT_FUNC` values carry bit 0 set for Thumb
+/// functions, but ARM containers decode as [`Arch::Arm32`]: an odd seed
+/// would read misaligned garbage. Returns the (possibly masked) address
+/// plus whether the bit was set; callers record a diagnostic for masked
+/// seeds. Structured for later interworking support: the flag marks the
+/// seeds a Thumb-capable walker would decode as Thumb instead of masking.
+fn normalize_arm_seed(arch: Arch, addr: u64) -> (u64, bool) {
+    if arch == Arch::Arm32 && addr & 1 == 1 {
+        (addr & !1, true)
+    } else {
+        (addr, false)
+    }
+}
+
+/// Push one seed address, masking the ARM Thumb bit (see
+/// [`normalize_arm_seed`]) and recording the odd address when masked.
+fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr: u64) {
+    let (addr, masked) = normalize_arm_seed(arch, addr);
+    if masked {
+        diags.push(Diagnostic {
+            addr: addr | 1,
+            kind: DiagnosticKind::DecodeFailure,
+        });
+    }
+    seeds.push(addr);
+}
+
     let mut seeds: Vec<u64> = Vec::new();
+    let mut diags: Vec<Diagnostic> = Vec::new();
     if let Some(entry) = bin.entry
         && space.code_bytes(entry).is_some()
     {
-        seeds.push(entry);
+        push_seed(&mut seeds, &mut diags, bin.arch, entry);
     }
     for exp in &bin.exports {
         if let Some(addr) = exp.address
             && seeds.len() < MAX_SEEDS
             && space.code_bytes(addr).is_some()
         {
-            seeds.push(addr);
+            push_seed(&mut seeds, &mut diags, bin.arch, addr);
         }
     }
     // Symbol-table code addresses (locals included): the only seed path
@@ -1796,7 +1831,7 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
     }
     seeds.sort_unstable();
     seeds.dedup();
-    seeds
+    (seeds, diags)
 }
 
 /// Prologue-scan hits outside `reached` that decode. These seed the second
@@ -2041,6 +2076,14 @@ struct Walker<'a> {
     fallthroughs: BTreeSet<u64>,
     call_targets: BTreeSet<u64>,
     diagnostics: BTreeSet<Diagnostic>,
+    /// Remaining predicated slots in the open Thumb IT block, with the
+    /// address expecting the next one. The single-instruction decoder is
+    /// stateless, so the worklist carries the IT state instead; the address
+    /// check keeps stale state from predicating unrelated decodes when the
+    /// worklist visits out of linear order (a branch into an IT block then
+    /// fails open to the old stateless decode).
+    it_remaining: u8,
+    it_next: Option<u64>,
 }
 
 impl<'a> Walker<'a> {
@@ -2053,6 +2096,8 @@ impl<'a> Walker<'a> {
             fallthroughs: BTreeSet::new(),
             call_targets: BTreeSet::new(),
             diagnostics: BTreeSet::new(),
+            it_remaining: 0,
+            it_next: None,
         }
     }
 
@@ -2097,6 +2142,37 @@ impl<'a> Walker<'a> {
                 Err(e) => return Err(e),
             };
             let flow = classify(self.arch, &insn);
+            // Thumb IT predication: the decoder prints no condition suffix
+            // inside an IT block, so a predicated `bx lr` (or `pop {.., pc}`)
+            // lifts as an unconditional return. Downgrade predicated
+            // terminators to conditional branches: the site keeps its
+            // indirect-jump diagnostic and the fallthrough stays reachable.
+            // The stored `Insn` keeps its faithful decode; only the flow is
+            // predicated (edge building reuses it below).
+            let opens_it = if self.arch == Arch::Thumb {
+                crate::disasm::it_block_len(&insn.mnem)
+            } else {
+                None
+            };
+            let predicated =
+                opens_it.is_none() && self.it_remaining > 0 && self.it_next == Some(va);
+            if predicated {
+                self.it_remaining -= 1;
+                self.it_next = Some(va.wrapping_add(u64::from(insn.size)));
+            }
+            if let Some(n) = opens_it {
+                self.it_remaining = n;
+                self.it_next = Some(va.wrapping_add(u64::from(insn.size)));
+            }
+            let flow = if predicated {
+                match flow {
+                    Flow::Ret => Flow::CBranch { target: None },
+                    Flow::Branch { target } => Flow::CBranch { target },
+                    other => other,
+                }
+            } else {
+                flow
+            };
             match flow {
                 Flow::Branch { target: None } | Flow::CBranch { target: None } => {
                     if self.diagnostics.insert(Diagnostic {
@@ -2585,7 +2661,8 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // hits in code round one never reached. Both rounds' seeds become
     // entries; incidental pattern matches inside reached code do not.
     let mut walk = Walker::new(arch, &space);
-    let seeds1 = authoritative_seeds(&space, bin);
+    let (seeds1, seed_diags) = authoritative_seeds(&space, bin);
+    walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
     let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
     let seeds2 = prologue_seeds(arch, &space, &round1)?;
@@ -2633,12 +2710,19 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // point.
     let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
     let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
-    let export_addrs: BTreeSet<u64> = bin.exports.iter().filter_map(|e| e.address).collect();
+<    // Normalized like the seeds: an odd ARM export address and its masked
+    // seed are the same function.
+    let export_addrs: BTreeSet<u64> = bin
+        .exports
+        .iter()
+        .filter_map(|e| e.address.map(|a| normalize_arm_seed(arch, a).0))
+        .collect();
+    let entry_norm = bin.entry.map(|e| normalize_arm_seed(arch, e).0);
     let symbol_addrs: BTreeSet<u64> = bin.symbols.iter().map(|s| s.address).collect();
     let mut reasons: BTreeMap<u64, BTreeSet<DiscoveryReason>> = BTreeMap::new();
     for e in &entries {
         let mut r = BTreeSet::new();
-        if Some(*e) == bin.entry {
+        if Some(*e) == entry_norm {
             r.insert(DiscoveryReason::Entry);
         }
         if export_addrs.contains(e) {
@@ -2721,14 +2805,17 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries, then symbol-table names, then Mach-O
+<    // Export names for entries, then symbol-table names, then Mach-O
     // stub import names. Precedence per address: export > symbol > stub;
     // annotation renames win over all three at display time (see
-    // `Project::function_name`).
+    // `Project::function_name`). Export addresses normalize like seeds
+    // so an odd ARM export still names its function.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
-            names.entry(addr).or_insert_with(|| exp.name.clone());
+            names
+                .entry(normalize_arm_seed(arch, addr).0)
+                .or_insert_with(|| exp.name.clone());
         }
     }
     for sym in &bin.symbols {
@@ -2816,7 +2903,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
             let Some(last) = block.insns.last() else {
                 continue;
             };
-            let flow = classify(arch, last);
+            // Stored walker flow, never a fresh classify: Thumb instructions
+            // inside an IT block decode without a condition suffix, so only
+            // the walker's predicated flow keeps the fallthrough edge.
+            let flow = decoded
+                .get(&last.addr)
+                .map(|d| d.flow)
+                .unwrap_or_else(|| classify(arch, last));
             let end = block.end();
             match flow {
                 Flow::Branch { target: Some(t) } => {
@@ -3282,7 +3375,7 @@ mod tests {
         .expect("raw loads");
         let space = AddrSpace::new(&bin);
         let mut walk = Walker::new(Arch::X86_32, &space);
-        let seeds = authoritative_seeds(&space, &bin);
+        let seeds = authoritative_seeds(&space, &bin).0;
         walk.run(seeds.clone()).expect("round one walks");
         let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
         let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");
