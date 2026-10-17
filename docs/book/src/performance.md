@@ -86,7 +86,36 @@ sound reading is "negligible". On the large fixture the workflow pass
 reopen costs about the same as cold analysis — layout replay is not
 observably cheaper than reanalysis for a 3.9 KB input. Whether any of
 this matters for real-world binaries (megabytes, not kilobytes) is
-unresolved by this data.
+resolved by the MCP cache measurement below, not by this table.
+
+## MCP server cache
+
+One `binscout-mcp` process keeps a 4-entry LRU of open projects keyed
+by binary, sidecar, and mapping and revalidated by file length plus
+mtime (see `docs/book/src/mcp-tools.md`). The first call for a binary
+pays the full open; repeat calls only stat plus query. The regression
+test `tests/mcp_cache.rs:second_functions_call_is_ten_times_faster`
+drives two `functions` calls in one server session over a ~2.9 MB raw
+x86-64 blob (900k `nop` into `ret`, one function, 900_001 decoded
+instructions, plus 2M unreachable padding bytes) and asserts the
+cached call is at least 10x faster than the first.
+
+Platform: macOS 27.0.1, arm64 (Apple Silicon), rustc 1.99.0.
+Client-side round-trip per `functions` call (one warm-up-free first
+call, faster of two cached repeats):
+
+| Build | First call (open + analyze + query) | Cached call (stat + query) | Ratio |
+|---|---|---|---|
+| debug | 6211.5 ms | 2.4 ms | ~2550x |
+| release (`--release`) | 719.0 ms | 0.2 ms | ~4600x |
+
+Same-session outputs agree exactly (asserted by the test); no sidecar
+is written by either call. The ratio is structural — full analysis
+versus a `stat` plus `HashMap` lookup — not a tuned benchmark, so it
+holds with wide margin on any machine: analysis scales with input
+size while the hit path does not touch the binary at all (a companion
+test keeps the binary `chmod 000` after the first call and the cached
+call still succeeds byte-identically).
 
 ## Limitations
 
