@@ -451,6 +451,53 @@ $ binscout bytes fw.elf 0x401000 --len 3 --as u16 --endian be
 {"addr":4198400,"addr_hex":"0x401000","bytes_hex":"5589e5","file_off":512,"len":3,"section":".text","values":[21897]}
 ```
 
+### `headers`
+
+```sh
+binscout headers B
+```
+
+MCP tool `headers` (`binary`, `db`?, `raw`?). On-demand header
+metadata: triage staples plus file hashes, parsed from the container
+bytes on every call and never persisted. Reads never save or create a
+sidecar. The top level carries `protocol`, the detected container
+`format` (`pe`/`elf`/`macho`/`coff`/`le`/`raw`), `size`, `sha256` (the
+project's content identity) and `md5` (hex, e.g. for VirusTotal
+lookups); exactly one of `pe`/`elf`/`macho` is non-null. Unknown
+fields degrade to `null`/empty rather than erroring, and every string
+clips to 256 characters with per-list caps, so hostile headers cannot
+blow up the document (additive-only: the wire `protocol` is unchanged).
+
+- `pe`: `timestamp` (`TimeDateStamp`), `subsystem` plus
+  `subsystem_name`, `dll_characteristics` plus decoded `aslr` (DYNAMIC_BASE),
+  `dep` (NX_COMPAT), `cfg` (GUARD_CF) and `high_entropy_va` mitigations,
+  `rich` (`present`, up to 256 `entries` of `comp_id`/`count`, `md5` over
+  the unmasked entries), `imphash` (lowercase `library.name` pairs in
+  table order, comma-joined, MD5-hashed; ordinal-only imports render as
+  `library.N`; null when there are no imports), `authenticode`
+  (`present`, `size`), `pdb` (`path`, `guid`, `age`, null when no CodeView
+  record), `version_info` (`present`, `file_version` like `"1.2.3.4"`),
+  `delay_load` (libraries with bounded `functions` plus `count`) and
+  `export_forwarders` (`name`/`forward` rows for RVAs landing inside the
+  export directory).
+- `elf`: `interp` (`PT_INTERP`, null for static binaries), `needed`
+  (`DT_NEEDED`), `runpath`/`rpath`, `relro` (`none`/`partial`/`full`:
+  `PT_GNU_RELRO` plus `DF_BIND_NOW`/`DF_1_NOW` for full), `nx`
+  (`PT_GNU_STACK` without the execute flag; false when the segment is
+  absent), `pie` (`ET_DYN` with an interpreter), `build_id` (hex, from
+  `PT_NOTE`), `stripped` (no `.symtab` section).
+- `macho`: `commands` (load-command names in order), `dylibs`
+  (`LC_LOAD_DYLIB`-family names), `platform`, `min_os`/`sdk`
+  (`LC_BUILD_VERSION` preferred, else `LC_VERSION_MIN_*`), `uuid`,
+  `code_signature` (`present`, `size`) and `entitlements` (`present`,
+  `size`, from slot 5 of the signature superblob). Fat containers report
+  the slice matching the loaded arch.
+
+MD5 and imphash/Rich hashes are fingerprints, never security controls,
+and are implemented inline so no new dependency enters the supply chain;
+`tlsh`/`ssdeep` stay out for the same reason (new deps need a
+`deny.toml` review first).
+
 ### `annotations-export` / `annotations-import`
 
 ```sh

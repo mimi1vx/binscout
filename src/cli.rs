@@ -273,6 +273,11 @@ pub enum Cmd {
     },
     /// Storage stats: binary size, sidecar DB size, and analysis counts.
     Stats { binary: PathBuf },
+    /// Header metadata: triage staples (PE mitigations/imphash/PDB, ELF
+    /// interpreter/needed/RELRO/NX/PIE, Mach-O load commands/codesign) plus
+    /// `sha256`/`md5`. Computed on demand from the container bytes, never
+    /// persisted; querying never writes a sidecar.
+    Headers { binary: PathBuf },
     /// Read or write the annotation at `addr`.
     Annotate {
         binary: PathBuf,
@@ -519,6 +524,7 @@ impl Cli {
                 len,
             ),
             Cmd::Stats { binary } => stats(&binary, db, raw_opts, fat_arch),
+            Cmd::Headers { binary } => headers(&binary, db, raw_opts, fat_arch),
             Cmd::FlirtHints {
                 binary,
                 addr,
@@ -991,6 +997,15 @@ fn stats(
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
     open(binary, db, raw, fat_arch)?.stats_json()
+}
+
+fn headers(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    open(binary, db, raw, fat_arch)?.headers_json()
 }
 
 fn flirt_hints(

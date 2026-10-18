@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 31 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 32 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
@@ -38,6 +38,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `flirt_hints` | binary, addr?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
+| `headers` | binary | Header metadata: triage staples (PE mitigations/imphash/PDB, ELF interp/needed/RELRO/NX/PIE, Mach-O load commands/codesign) plus `sha256`/`md5`; computed on demand, never persisted |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears; structured struct-layout hints (`type-hint:{...}`, see [JSON protocol](json-protocol.md)) pass through opaquely |
 | `define_func` | binary, addr, mode? | Assert "there is code here": store a user function seed and re-analyze so it materializes; `mode` (`arm`/`thumb`) selects the 32-bit ARM decode, other arches reject it |

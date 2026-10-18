@@ -1,4 +1,4 @@
-//! binscout MCP server: 31 tools over a cached [`Project`].
+//! binscout MCP server: 32 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -1282,6 +1282,20 @@ impl BinscoutMcp {
         entry
             .lock_project()
             .stats_json()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "headers",
+        description = "Header metadata: triage staples (PE mitigations/imphash/PDB, ELF interpreter/needed/RELRO/NX/PIE, Mach-O load commands/codesign) plus sha256/md5. Computed on demand from the container bytes, never persisted"
+    )]
+    async fn headers(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        entry
+            .lock_project()
+            .headers_json()
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(ok)
     }

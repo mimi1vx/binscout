@@ -85,6 +85,7 @@ fn all_query_commands_return_json() {
         vec!["diagnostics".into(), bin.clone()],
         vec!["ir".into(), bin.clone(), "0x0".into(), "3".into()],
         vec!["stats".into(), bin.clone()],
+        vec!["headers".into(), bin.clone()],
         vec!["annotate".into(), bin.clone(), "0x0".into()],
         vec!["annotations-export".into(), bin.clone()],
     ];
