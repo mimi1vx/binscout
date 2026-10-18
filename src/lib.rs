@@ -1673,8 +1673,14 @@ impl Project {
     ) -> Vec<serde_json::Value> {
         // Resolve anchor addresses once: None = filter disabled,
         // Some(None) = anchor lies in no function (matches nothing).
-        let caller: Option<Option<u64>> =
-            filter.caller.map(|a| self.analysis.containing_function(a));
+        // Caller/callee target sets are materialized once as sorted arrays
+        // so per-function checks binary-search instead of allocating and
+        // sorting a `calls_of` Vec per row.
+        let callers: Option<Option<Vec<u64>>> = filter.caller.map(|a| {
+            self.analysis
+                .containing_function(a)
+                .map(|c| self.analysis.callers_of(c))
+        });
         let callee_calls: Option<Option<Vec<u64>>> = filter.callee.map(|a| {
             self.analysis
                 .containing_function(a)
@@ -1688,15 +1694,15 @@ impl Project {
             .functions
             .values()
             .filter(|f| range.is_none_or(|(lo, hi)| f.entry >= lo && f.entry <= hi))
-            .filter(|f| match caller {
+            .filter(|f| match &callers {
                 None => true,
                 Some(None) => false,
-                Some(Some(c)) => self.analysis.calls_of(f.entry).contains(&c),
+                Some(Some(cs)) => cs.binary_search(&f.entry).is_ok(),
             })
             .filter(|f| match &callee_calls {
                 None => true,
                 Some(None) => false,
-                Some(Some(cs)) => cs.contains(&f.entry),
+                Some(Some(cs)) => cs.binary_search(&f.entry).is_ok(),
             })
             .filter(|f| match &query {
                 Some(q) => self
@@ -2522,10 +2528,17 @@ impl Project {
                     .ok_or_else(|| Error::NotFound(format!("function {a:#x}")))
             })
             .transpose()?;
-        let matched: Vec<FlirtHint> = crate::flirt::hints_for_analysis(&self.analysis)
-            .into_iter()
-            .filter(|h| entry.is_none_or(|e| h.entry == e))
-            .collect();
+        let matched: Vec<FlirtHint> = match entry {
+            Some(e) => {
+                let func = self
+                    .analysis
+                    .functions
+                    .get(&e)
+                    .ok_or_else(|| Error::NotFound(format!("function {e:#x}")))?;
+                crate::flirt::hints_for_function(self.analysis.arch, func)
+            }
+            None => crate::flirt::hints_for_analysis(&self.analysis),
+        };
         let total = matched.len();
         let items = matched
             .into_iter()
