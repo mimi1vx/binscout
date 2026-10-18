@@ -632,7 +632,12 @@ fn load(
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch)?;
-    p.save()?;
+    // Cache hit: the open replayed the stored snapshot (content, mapping,
+    // and revision already verified equal), so rewriting every table would
+    // only churn free pages. Misses and stale opens still save below.
+    if !p.snapshot_fresh() {
+        p.save()?;
+    }
     Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
 }
 
