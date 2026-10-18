@@ -1,4 +1,4 @@
-//! binscout MCP server: 35 tools over a cached [`Project`].
+//! binscout MCP server: 37 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -719,6 +719,10 @@ pub struct FlirtHintsParams {
     /// Only hints for the function containing this address (`0x`-hex or
     /// decimal string).
     pub addr: Option<String>,
+    /// Extra user signatures: path to our JSON document (as emitted by
+    /// `sig_gen`) or an IDA `.pat` file (by extension). Read per call;
+    /// never written.
+    pub sigs: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -885,6 +889,7 @@ struct BatchSearchBytes {
 #[derive(serde::Deserialize)]
 struct BatchFlirt {
     addr: Option<String>,
+    sigs: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -1198,10 +1203,22 @@ fn run_batch_op(
                 .map(|v| parse_addr(&v))
                 .transpose()
                 .map_err(|e| e.to_string())?;
-            proj.query_flirt_hints(addr, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+            let extra = a
+                .sigs
+                .map(|s| crate::flirt::load_signature_file(std::path::Path::new(&s)))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or_default();
+            proj.query_flirt_hints_with(addr, a.offset.unwrap_or(0), a.limit.unwrap_or(50), &extra)
                 .map_err(|e| e.to_string())
                 .map(|page| serde_json::to_value(page).expect("flirt hints page serializes"))
         }
+        "sig_gen" => Ok(serde_json::to_value(proj.generate_signatures())
+            .expect("signature document serializes")),
+        "go_funcs" => proj
+            .go_funcs()
+            .map_err(|e| e.to_string())
+            .map(|funcs| serde_json::to_value(funcs).expect("go funcs serialize")),
         "ir_coverage" => {
             let a: BatchIrCoverage = parse_op(tool, params)?;
             let arch = crate::parse_raw_arch(&a.arch).map_err(|e| e.to_string())?;
@@ -2135,13 +2152,49 @@ impl BinscoutMcp {
     )]
     async fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let (addr_s, offset, limit) = (p.addr.clone(), p.offset, p.limit);
+        let (addr_s, sigs_s, offset, limit) = (p.addr.clone(), p.sigs.clone(), p.offset, p.limit);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
         let addr = opt_addr(addr_s)?;
-        proj.query_flirt_hints(addr, offset.unwrap_or(0), limit.unwrap_or(50))
+        let extra = sigs_s
+            .map(|s| {
+                crate::flirt::load_signature_file(std::path::Path::new(&s)).map_err(|e| match e {
+                    crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        proj.query_flirt_hints_with(addr, offset.unwrap_or(0), limit.unwrap_or(50), &extra)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
             .and_then(|page| ok(serde_json::to_value(page).expect("flirt hints page serializes")))
+    }
+
+    #[tool(
+        name = "sig_gen",
+        description = "Emit a JSON signature document for the binary's named functions (masked leading bytes with len/crc): the sigs input that flirt_hints reads back. Read-only, never writes the binary or the sidecar"
+    )]
+    async fn sig_gen(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        ok(
+            serde_json::to_value(proj.generate_signatures())
+                .expect("signature document serializes"),
+        )
+    }
+
+    #[tool(
+        name = "go_funcs",
+        description = "Recover Go functions from the pclntab table: linker names plus exact entry/end ranges for stripped Go binaries. Empty array when no table is located; read-only, never writes the binary or the sidecar"
+    )]
+    async fn go_funcs(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        proj.go_funcs()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .and_then(|funcs| ok(serde_json::to_value(funcs).expect("go funcs serialize")))
     }
 
     #[tool(

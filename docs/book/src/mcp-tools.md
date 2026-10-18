@@ -38,7 +38,9 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
-| `flirt_hints` | binary, addr?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
+| `flirt_hints` | binary, addr?, sigs?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; `sigs` adds a user signature file path (our JSON, as emitted by `sig_gen`, or an IDA `.pat` file by extension); suggested names stay hints, querying never writes a sidecar |
+| `sig_gen` | binary | Emit a JSON signature document for the binary's named functions (masked leading bytes with `len`/`crc`): the `sigs` input that `flirt_hints` reads back; read-only, never writes the binary or the sidecar |
+| `go_funcs` | binary | Recover Go functions from the `pclntab` table (linker names plus exact entry/end ranges) for stripped Go binaries; empty array when no table is located; read-only, never writes the binary or the sidecar |
 | `stats` | binary | Storage stats: binary size, sidecar DB size, and analysis counts |
 | `headers` | binary | Header metadata: triage staples (PE mitigations/imphash/PDB, ELF interp/needed/RELRO/NX/PIE, Mach-O load commands/codesign) plus `sha256`/`md5`; computed on demand, never persisted |
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |

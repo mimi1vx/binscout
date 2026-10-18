@@ -8,6 +8,7 @@ pub mod diff;
 pub mod disasm;
 pub mod error;
 pub mod flirt;
+pub mod gopclntab;
 pub mod headers;
 pub mod ir;
 pub mod loader;
@@ -16,7 +17,7 @@ pub mod pseudo;
 pub mod search;
 pub mod stackstrings;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3603,6 +3604,25 @@ impl Project {
         offset: usize,
         limit: usize,
     ) -> Result<Page<FlirtHint>> {
+        self.query_flirt_hints_with(addr, offset, limit, &[])
+    }
+
+    /// [`Project::query_flirt_hints`] plus `extra` user signatures (see
+    /// [`crate::flirt::load_signature_file`): builtin hints come first
+    /// per function (longest first), then user matches (longest first).
+    ///
+    /// Read-only like the base query: user files never reach the binary
+    /// or the sidecar.
+    ///
+    /// # Errors
+    /// Same as [`Project::query_flirt_hints`].
+    pub fn query_flirt_hints_with(
+        &self,
+        addr: Option<u64>,
+        offset: usize,
+        limit: usize,
+        extra: &[crate::flirt::RuntimeSignature],
+    ) -> Result<Page<FlirtHint>> {
         let entry = addr
             .map(|a| {
                 self.analysis
@@ -3610,7 +3630,7 @@ impl Project {
                     .ok_or_else(|| Error::NotFound(format!("function {a:#x}")))
             })
             .transpose()?;
-        let matched: Vec<FlirtHint> = crate::flirt::hints_for_analysis(&self.analysis)
+        let matched: Vec<FlirtHint> = crate::flirt::hints_for_analysis_with(&self.analysis, extra)
             .into_iter()
             .filter(|h| entry.is_none_or(|e| h.entry == e))
             .collect();
@@ -3621,6 +3641,59 @@ impl Project {
             .take(limit.min(MAX_ROWS))
             .collect();
         Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Emit a JSON signature document for the project's named functions
+    /// (see [`crate::flirt::SignatureFile`]): the `sig-gen` output that
+    /// `--sigs` reads back.
+    ///
+    /// Each rename-resolved named function contributes its masked
+    /// leading bytes ([`crate::flirt::generate_for_function`]); unnamed,
+    /// too-short, or too-masked functions are skipped, and identical
+    /// `(arch, bytes)` shapes keep only the lowest entry's name.
+    /// Read-only: never writes the binary or the sidecar.
+    #[must_use]
+    pub fn generate_signatures(&self) -> crate::flirt::SignatureFile {
+        let is_mapped = |va: u64| {
+            self.binary
+                .segments
+                .iter()
+                .any(|g| va >= g.vaddr && va.saturating_sub(g.vaddr) < g.mem_size)
+        };
+        let mut seen = HashSet::new();
+        let mut signatures = Vec::new();
+        for (entry, func) in &self.analysis.functions {
+            let Some(name) = self.function_name(*entry) else {
+                continue;
+            };
+            let arch = func.decode_arch.unwrap_or(self.analysis.arch);
+            let Some(row) = crate::flirt::generate_for_function(arch, func, &name, is_mapped)
+            else {
+                continue;
+            };
+            if seen.insert((row.arch.clone(), row.bytes.clone())) {
+                signatures.push(row);
+            }
+        }
+        crate::flirt::SignatureFile {
+            version: crate::flirt::SIGNATURE_FILE_VERSION,
+            signatures,
+        }
+    }
+
+    /// Recover Go functions from the `pclntab` table (see
+    /// [`crate::gopclntab::recover`]): linker names plus exact
+    /// `[entry, end)` ranges, in functab order.
+    ///
+    /// Empty when no table is located (not a Go binary); only a
+    /// located-but-corrupt table errors. Read-only: never writes the
+    /// binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on a corrupt located table,
+    /// [`Error::Unsupported`] on a big-endian table.
+    pub fn go_funcs(&self) -> Result<Vec<crate::gopclntab::GoFunc>> {
+        crate::gopclntab::recover(&self.binary)
     }
 }
 
