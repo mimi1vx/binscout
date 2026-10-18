@@ -44,12 +44,18 @@ pub const MAX_FUNCTIONS: usize = 100_000;
 pub const MAX_XREFS_PER_KIND: usize = 1_000_000;
 /// Cap on discovery seeds (entry/exports/prologues) per call.
 pub const MAX_SEEDS: usize = 100_000;
+/// Cap on pointer-scan seeds per [`analyze_with_options`] call.
+///
+/// Lower-confidence aligned-pointer hits stop here so hostile data cannot
+/// inflate the authoritative seed budget; the global [`MAX_SEEDS`] cap
+/// still bounds the combined set.
+pub const MAX_POINTER_SEEDS: usize = 10_000;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 11;
+pub const ANALYSIS_REVISION: u32 = 12;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -184,7 +190,8 @@ impl Serialize for Xref {
 /// hit at once. Stored sorted and deduplicated.
 ///
 /// Wire form is kebab-case (`entry`, `export`, `symbol`, `direct-call`,
-/// `prologue`); pre-provenance rows in the historical CamelCase spelling
+/// `prologue`, `pdata`, `tls-callback`, `init-array`, `function-starts`,
+/// `pointer`); pre-provenance rows in the historical CamelCase spelling
 /// still decode via aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -211,6 +218,35 @@ pub enum DiscoveryReason {
     /// code, missed callbacks).
     #[serde(alias = "User")]
     User,
+    /// PE `.pdata` `RUNTIME_FUNCTION` start resolving to executable code.
+    ///
+    /// Exact starts for every non-leaf function on 64-bit Windows.
+    #[serde(alias = "Pdata")]
+    Pdata,
+    /// PE TLS callback resolving to executable code.
+    ///
+    /// `IMAGE_TLS_DIRECTORY.AddressOfCallBacks` entry: a common
+    /// malware anti-debug entry point.
+    #[serde(alias = "TlsCallback")]
+    TlsCallback,
+    /// ELF init/fini address resolving to executable code.
+    ///
+    /// `.init_array`/`.fini_array`/`.ctors`/`.dtors` entries plus `DT_INIT`,
+    /// `DT_FINI`, and `DT_INIT_ARRAY`/`DT_FINI_ARRAY` slots.
+    #[serde(alias = "InitArray")]
+    InitArray,
+    /// Mach-O `LC_FUNCTION_STARTS` address resolving to executable code.
+    ///
+    /// Exact starts decoded from ULEB deltas off the `__TEXT` base.
+    #[serde(alias = "FunctionStarts")]
+    FunctionStarts,
+    /// Aligned pointer-sized value in non-executable data landing on
+    /// decodable executable code (vtables, callback tables).
+    ///
+    /// Lower confidence than table-derived seeds: opt-in via
+    /// [`AnalyzeOptions::pointer_scan`], never on by default.
+    #[serde(alias = "Pointer")]
+    Pointer,
 }
 
 /// Decode mode of one user-defined function seed (`define-func --mode`).
@@ -274,6 +310,36 @@ pub struct UserSeed {
     pub addr: u64,
     /// Decode-mode override, if any.
     pub mode: Option<SeedMode>,
+}
+
+/// Analysis options selecting opt-in discovery sources.
+///
+/// Only the pointer scan is gated: table-derived seeds (`.pdata`, TLS
+/// callbacks, ELF init/fini, `LC_FUNCTION_STARTS`) are authoritative and
+/// always on, while aligned-pointer hits are lower confidence and stay
+/// off unless requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnalyzeOptions {
+    /// Scan aligned pointer-sized values in non-executable data for
+    /// decodable executable targets ([`DiscoveryReason::Pointer`]).
+    ///
+    /// Off by default; enable only when hunting vtables or callback
+    /// tables that no table names.
+    pub pointer_scan: bool,
+}
+
+impl AnalyzeOptions {
+    /// Default options: pointer scan off.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Options with the pointer scan enabled.
+    #[must_use]
+    pub fn with_pointer_scan() -> Self {
+        Self { pointer_scan: true }
+    }
 }
 
 /// What an analysis diagnostic records.
@@ -2523,8 +2589,73 @@ fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr
     seeds.push(addr);
 }
 
+/// Aligned pointer-scan seeds: pointer-sized values in non-executable
+/// data landing on decodable executable code.
+///
+/// Scans every non-executable segment at VA-aligned pointer strides (8
+/// bytes on 64-bit targets, 4 otherwise), reading little-endian values.
+/// A value seeds only when it lies in executable file-backed bytes that
+/// decode via [`crate::disasm::disasm_first`]. Zeroes, unmapped targets,
+/// and undecodable targets are skipped, never guessed. Output is sorted,
+/// deduplicated, and stops at [`MAX_POINTER_SEEDS`].
+///
+/// Lower confidence than table-derived seeds (vtables and callback tables
+/// share the shape with stray pointers), so callers gate it behind
+/// [`AnalyzeOptions::pointer_scan`].
+fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
+    let ptr: usize = match bin.arch {
+        Arch::X86_64 | Arch::Aarch64 => 8,
+        _ => 4,
+    };
+    let mut out: Vec<u64> = Vec::new();
+    for seg in &space.all {
+        if seg.executable || seg.data.is_empty() {
+            continue;
+        }
+        let misalign = (seg.vaddr % ptr as u64) as usize;
+        let mut off = if misalign == 0 { 0 } else { ptr - misalign };
+        while off.saturating_add(ptr) <= seg.data.len() {
+            if out.len() >= MAX_POINTER_SEEDS {
+                break;
+            }
+            let raw = &seg.data[off..off + ptr];
+            let target: u64 = if ptr == 8 {
+                u64::from_le_bytes(raw.try_into().unwrap_or([0; 8]))
+            } else {
+                u64::from(u32::from_le_bytes(raw.try_into().unwrap_or([0; 4])))
+            };
+            off += ptr;
+            if target == 0 {
+                continue;
+            }
+            let (canon, _) = normalize_arm_seed(bin.arch, target);
+            if canon == 0 {
+                continue;
+            }
+            let Some(bytes) = space.code_bytes(canon) else {
+                continue;
+            };
+            if !matches!(
+                crate::disasm::disasm_first(bin.arch, bytes, canon),
+                Ok(Some(_))
+            ) {
+                continue;
+            }
+            out.push(canon);
+        }
+        if out.len() >= MAX_POINTER_SEEDS {
+            break;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out.truncate(MAX_POINTER_SEEDS);
+    out
+}
+
 /// Seed addresses from the entry point, exports, symbol-table entries,
-/// and Mach-O stub entries resolving to executable code, plus user
+/// Mach-O stub entries, `.pdata`/`TLS`/init/`LC_FUNCTION_STARTS` tables,
+/// and optional pointer-scan hits resolving to executable code, plus user
 /// seeds from `define-func`. When none exists (raw blobs, stripped
 /// objects), the first executable byte seeds analysis so some function
 /// is always found.
@@ -2537,10 +2668,15 @@ fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr
 /// seeds under different arches both queue; the walk decodes first-wins
 /// from a stably address-sorted stack, so an explicit user mode wins over
 /// the project-arch seed.
+///
+/// Table seeds (`.pdata` starts, TLS callbacks, ELF init/fini,
+/// `LC_FUNCTION_STARTS`) are authoritative and always on; pointer-scan
+/// hits join only when `options.pointer_scan` holds.
 fn authoritative_seeds(
     space: &AddrSpace,
     bin: &LoadedBinary,
     user: &[UserSeed],
+    options: AnalyzeOptions,
 ) -> (Vec<(u64, Arch)>, Vec<Diagnostic>) {
     let mut seeds: Vec<u64> = Vec::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
@@ -2563,6 +2699,41 @@ fn authoritative_seeds(
     for sym in &bin.symbols {
         if seeds.len() < MAX_SEEDS && space.code_bytes(sym.address).is_some() {
             seeds.push(sym.address);
+        }
+    }
+    // PE `.pdata` starts: exact starts for every non-leaf function.
+    for (start, _) in &bin.pdata_funcs {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(*start).is_some() {
+            push_seed(&mut seeds, &mut diags, bin.arch, *start);
+        }
+    }
+    // PE TLS callbacks: malware anti-debug entry points.
+    for addr in &bin.tls_callbacks {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
+            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
+        }
+    }
+    // ELF init/fini addresses: constructors and destructors nothing calls.
+    for addr in &bin.init_funcs {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
+            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
+        }
+    }
+    // Mach-O `LC_FUNCTION_STARTS`: exact starts off the `__TEXT` base.
+    for addr in &bin.func_starts {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
+            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
+        }
+    }
+    // Pointer scan (opt-in): aligned data pointers to decodable code.
+    if options.pointer_scan {
+        for addr in pointer_seeds(space, bin) {
+            if seeds.len() >= MAX_SEEDS {
+                break;
+            }
+            if space.code_bytes(addr).is_some() {
+                seeds.push(addr);
+            }
         }
     }
     // Mach-O stub entries carry their import's address (see
@@ -3617,9 +3788,30 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
 /// are inert (no function, no error), exactly like any other seed that
 /// fails to decode.
 ///
+/// Pointer-scan seeds stay off: use [`analyze_with_options`] with
+/// [`AnalyzeOptions::pointer_scan`] to opt in.
+///
 /// # Errors
 /// [`Error::Limit`] when instruction, function, or seed caps are exceeded.
 pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analysis> {
+    analyze_with_options(bin, user, AnalyzeOptions::default())
+}
+
+/// Run recursive descent with user-defined function seeds and analysis
+/// options, and build functions, CFGs, callgraph, and xrefs.
+///
+/// `options.pointer_scan` enables the lower-confidence aligned-pointer
+/// scan ([`DiscoveryReason::Pointer`]); table-derived seeds (`.pdata`,
+/// TLS callbacks, ELF init/fini, `LC_FUNCTION_STARTS`) are always on.
+/// Entries reached through an enabled source gain its reason.
+///
+/// # Errors
+/// [`Error::Limit`] when instruction, function, or seed caps are exceeded.
+pub fn analyze_with_options(
+    bin: &LoadedBinary,
+    user: &[UserSeed],
+    options: AnalyzeOptions,
+) -> Result<Analysis> {
     let arch = bin.arch;
     let space = AddrSpace::new(bin);
 
@@ -3628,7 +3820,7 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     // up prologue hits in code round one never reached. Both rounds' seeds
     // become entries; incidental pattern matches inside reached code do not.
     let mut walk = Walker::new(&space);
-    let (seeds1, seed_diags) = authoritative_seeds(&space, bin, user);
+    let (seeds1, seed_diags) = authoritative_seeds(&space, bin, user, options);
     walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
     let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
@@ -3673,6 +3865,7 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     }
     // Discovery provenance: every seed path that reached an entry.
     // `seeds1` holds the entry point, exports, symbol-table addresses,
+    // table-derived seeds (`.pdata`, TLS, init, function-starts, pointer),
     // user seeds, or the fallback base; `seeds2` holds prologue hits;
     // `call_targets` holds direct calls. A fallback base that is neither
     // entry nor export still counts as `Entry`: it seeded analysis as the
@@ -3688,6 +3881,31 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
         .collect();
     let entry_norm = bin.entry.map(|e| normalize_arm_seed(arch, e).0);
     let symbol_addrs: BTreeSet<u64> = bin.symbols.iter().map(|s| s.address).collect();
+    let pdata_addrs: BTreeSet<u64> = bin
+        .pdata_funcs
+        .iter()
+        .map(|(s, _)| normalize_arm_seed(arch, *s).0)
+        .collect();
+    let tls_addrs: BTreeSet<u64> = bin
+        .tls_callbacks
+        .iter()
+        .map(|a| normalize_arm_seed(arch, *a).0)
+        .collect();
+    let init_addrs: BTreeSet<u64> = bin
+        .init_funcs
+        .iter()
+        .map(|a| normalize_arm_seed(arch, *a).0)
+        .collect();
+    let starts_addrs: BTreeSet<u64> = bin
+        .func_starts
+        .iter()
+        .map(|a| normalize_arm_seed(arch, *a).0)
+        .collect();
+    let pointer_addrs: BTreeSet<u64> = if options.pointer_scan {
+        pointer_seeds(&space, bin).into_iter().collect()
+    } else {
+        BTreeSet::new()
+    };
     let user_set: BTreeSet<u64> = user
         .iter()
         .map(|s| match (arch, s.mode) {
@@ -3715,6 +3933,21 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
         }
         if user_set.contains(e) {
             r.insert(DiscoveryReason::User);
+        }
+        if pdata_addrs.contains(e) {
+            r.insert(DiscoveryReason::Pdata);
+        }
+        if tls_addrs.contains(e) {
+            r.insert(DiscoveryReason::TlsCallback);
+        }
+        if init_addrs.contains(e) {
+            r.insert(DiscoveryReason::InitArray);
+        }
+        if starts_addrs.contains(e) {
+            r.insert(DiscoveryReason::FunctionStarts);
+        }
+        if pointer_addrs.contains(e) {
+            r.insert(DiscoveryReason::Pointer);
         }
         if r.is_empty() && seeds1_set.contains(e) {
             r.insert(DiscoveryReason::Entry);
@@ -4453,6 +4686,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         }
     }
 
@@ -4583,7 +4820,7 @@ mod tests {
         .expect("raw loads");
         let space = AddrSpace::new(&bin);
         let mut walk = Walker::new(&space);
-        let seeds = authoritative_seeds(&space, &bin, &[]).0;
+        let seeds = authoritative_seeds(&space, &bin, &[], AnalyzeOptions::default()).0;
         walk.run(seeds.clone()).expect("round one walks");
         let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
         let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");

@@ -57,6 +57,26 @@ pub const MAX_DEMANGLED_BYTES: usize = 8192;
 /// 16 MiB holds 100k typical (~160 B) names with headroom yet rejects
 /// 100k repeated 4 KiB names (~400 MiB) well before OOM.
 pub const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+/// Cap on PE `.pdata` function ranges per binary.
+///
+/// Matches [`MAX_SYMBOLS`]: one range per non-leaf function, bounded like
+/// any other table-derived seed source.
+pub const MAX_PDATA_FUNCS: usize = 100_000;
+/// Cap on PE TLS callback addresses per binary.
+///
+/// Callbacks are a null-terminated pointer array; real images carry a
+/// handful, so this cap only bounds hostile tables.
+pub const MAX_TLS_CALLBACKS: usize = 4096;
+/// Cap on ELF init/fini addresses per binary.
+///
+/// Covers `.init_array`/`.fini_array`/`.ctors` entries plus `DT_INIT`,
+/// `DT_FINI`, and `DT_INIT_ARRAY`/`DT_FINI_ARRAY` slots.
+pub const MAX_INIT_FUNCS: usize = 100_000;
+/// Cap on Mach-O `LC_FUNCTION_STARTS` addresses per binary.
+///
+/// Matches [`MAX_SYMBOLS`]: one start per function, bounded like any
+/// other table-derived seed source.
+pub const MAX_FUNC_STARTS: usize = 100_000;
 
 /// One loaded object: a contiguous virtual range with its file bytes.
 ///
@@ -329,6 +349,29 @@ pub struct LoadedBinary {
     ///
     /// Empty for raw blobs and LE images, which have no symbol tables.
     pub symbols: Vec<SymbolRef>,
+    /// PE `.pdata` function ranges as `(start_va, end_va)` in table order.
+    ///
+    /// Exact starts and ends for every non-leaf function on 64-bit Windows
+    /// (`RUNTIME_FUNCTION` records); empty on other formats. Capped at
+    /// [`MAX_PDATA_FUNCS`].
+    pub pdata_funcs: Vec<(u64, u64)>,
+    /// PE TLS callback addresses in callback-array order.
+    ///
+    /// `IMAGE_TLS_DIRECTORY.AddressOfCallBacks` null-terminated array;
+    /// empty when absent (most binaries) or on other formats. Capped at
+    /// [`MAX_TLS_CALLBACKS`].
+    pub tls_callbacks: Vec<u64>,
+    /// ELF init/fini addresses in discovery order.
+    ///
+    /// `.init_array`/`.fini_array`/`.ctors`/`.dtors` entries plus `DT_INIT`,
+    /// `DT_FINI`, and `DT_INIT_ARRAY`/`DT_FINI_ARRAY` slots; empty on
+    /// other formats. Capped at [`MAX_INIT_FUNCS`].
+    pub init_funcs: Vec<u64>,
+    /// Mach-O `LC_FUNCTION_STARTS` addresses in table order.
+    ///
+    /// Exact starts decoded from ULEB deltas off the `__TEXT` base; empty
+    /// on other formats. Capped at [`MAX_FUNC_STARTS`].
+    pub func_starts: Vec<u64>,
 }
 
 /// Options for [`load_raw`].
@@ -526,6 +569,10 @@ pub fn load_raw_vec(bytes: Vec<u8>, opts: RawOptions) -> Result<LoadedBinary> {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     })
 }
 
@@ -708,6 +755,28 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         &mut demangle_cache,
     )?;
 
+    let (pdata_funcs, tls_callbacks, init_funcs, func_starts) = match format {
+        BinaryFormat::Pe => (
+            pe_pdata_ranges(bytes, &segments),
+            pe_tls_callbacks(bytes, &segments),
+            Vec::new(),
+            Vec::new(),
+        ),
+        BinaryFormat::Elf => (
+            Vec::new(),
+            Vec::new(),
+            elf_init_funcs(bytes, &segments, &sections),
+            Vec::new(),
+        ),
+        BinaryFormat::MachO => (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            macho_function_starts(bytes),
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+    };
+
     Ok(LoadedBinary {
         format,
         arch,
@@ -717,6 +786,10 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         imports,
         exports,
         symbols,
+        pdata_funcs,
+        tls_callbacks,
+        init_funcs,
+        func_starts,
     })
 }
 
@@ -1496,6 +1569,554 @@ fn elf_got_slots<'a>(
     }
 }
 
+/// File-backed bytes at `va` within a single segment, if any.
+///
+/// Discovery tables (`.pdata`, TLS directories, init arrays) live in one
+/// section, so cross-segment spans and BSS tails report `None` rather than
+/// synthesizing bytes.
+fn segment_bytes_at(segments: &[Segment], va: u64, len: usize) -> Option<&[u8]> {
+    for seg in segments {
+        let Some(off) = va.checked_sub(seg.vaddr) else {
+            continue;
+        };
+        let Ok(off) = usize::try_from(off) else {
+            continue;
+        };
+        let Some(end) = off.checked_add(len) else {
+            continue;
+        };
+        if end <= seg.data.len() {
+            return seg.data.get(off..end);
+        }
+    }
+    None
+}
+
+/// PE `.pdata` function ranges as `(start_va, end_va)` in table order.
+///
+/// 64-bit Windows only (`RUNTIME_FUNCTION` records); 32-bit PEs and other
+/// formats yield nothing. Reads the exception directory via `object` for
+/// the image base and table bounds, then each 12-byte record through the
+/// segment store. Malformed, truncated, or unmapped records are skipped,
+/// never guessed; output stops at [`MAX_PDATA_FUNCS`].
+fn pe_pdata_ranges(bytes: &[u8], segments: &[Segment]) -> Vec<(u64, u64)> {
+    use object::read::pe::PeFile64;
+    use object::{LittleEndian as LE, pe as pe_const};
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let (base, dir_rva, dir_size) = match FileKind::parse(bytes) {
+        Ok(FileKind::Pe64) => {
+            let Ok(pe) = PeFile64::parse(bytes) else {
+                return out;
+            };
+            let base = pe.relative_address_base();
+            let Some(d) = pe.data_directory(pe_const::IMAGE_DIRECTORY_ENTRY_EXCEPTION) else {
+                return out;
+            };
+            (base, d.virtual_address.get(LE), d.size.get(LE))
+        }
+        Ok(FileKind::Pe32) => return out,
+        _ => return out,
+    };
+    if dir_rva == 0 || dir_size < 12 {
+        return out;
+    }
+    let count = (dir_size as usize / 12).min(MAX_PDATA_FUNCS);
+    for i in 0..count {
+        let Some(rec_va) = base
+            .checked_add(u64::from(dir_rva))
+            .and_then(|b| b.checked_add((i as u64).checked_mul(12)?))
+        else {
+            break;
+        };
+        let Some(rec) = segment_bytes_at(segments, rec_va, 12) else {
+            continue;
+        };
+        let begin = u32::from_le_bytes(rec[0..4].try_into().unwrap_or([0; 4]));
+        let end = u32::from_le_bytes(rec[4..8].try_into().unwrap_or([0; 4]));
+        if begin == 0 || end <= begin {
+            continue;
+        }
+        let (Some(start), Some(stop)) = (
+            base.checked_add(u64::from(begin)),
+            base.checked_add(u64::from(end)),
+        ) else {
+            continue;
+        };
+        out.push((start, stop));
+        if out.len() >= MAX_PDATA_FUNCS {
+            break;
+        }
+    }
+    out
+}
+
+/// PE TLS callback addresses in callback-array order.
+///
+/// Reads the TLS directory via `object` for the `AddressOfCallBacks` VA,
+/// then the null-terminated pointer array through the segment store.
+/// 32-bit images use 4-byte slots, 64-bit 8-byte slots. Unmapped or
+/// truncated arrays stop the scan; output stops at [`MAX_TLS_CALLBACKS`].
+fn pe_tls_callbacks(bytes: &[u8], segments: &[Segment]) -> Vec<u64> {
+    use object::read::pe::{PeFile32, PeFile64};
+    use object::{LittleEndian as LE, pe as pe_const};
+    let mut out: Vec<u64> = Vec::new();
+    enum Kind {
+        P32,
+        P64,
+    }
+    let kind = match FileKind::parse(bytes) {
+        Ok(FileKind::Pe32) => Kind::P32,
+        Ok(FileKind::Pe64) => Kind::P64,
+        _ => return out,
+    };
+    let (ptr, dir_va, dir_len) = match kind {
+        Kind::P64 => {
+            let Ok(pe) = PeFile64::parse(bytes) else {
+                return out;
+            };
+            let base = pe.relative_address_base();
+            let Some(d) = pe.data_directory(pe_const::IMAGE_DIRECTORY_ENTRY_TLS) else {
+                return out;
+            };
+            let (rva, size) = (d.virtual_address.get(LE), d.size.get(LE));
+            if rva == 0 || size < 40 {
+                return out;
+            }
+            let Some(va) = base.checked_add(u64::from(rva)) else {
+                return out;
+            };
+            (8usize, va, size as usize)
+        }
+        Kind::P32 => {
+            let Ok(pe) = PeFile32::parse(bytes) else {
+                return out;
+            };
+            let base = pe.relative_address_base();
+            let Some(d) = pe.data_directory(pe_const::IMAGE_DIRECTORY_ENTRY_TLS) else {
+                return out;
+            };
+            let (rva, size) = (d.virtual_address.get(LE), d.size.get(LE));
+            if rva == 0 || size < 24 {
+                return out;
+            }
+            let Some(va) = base.checked_add(u64::from(rva)) else {
+                return out;
+            };
+            (4usize, va, size as usize)
+        }
+    };
+    let dir_len = dir_len.min(64);
+    let Some(dir) = segment_bytes_at(segments, dir_va, dir_len) else {
+        return out;
+    };
+    let callbacks: u64 = match ptr {
+        8 => {
+            if dir.len() < 32 {
+                return out;
+            }
+            u64::from_le_bytes(dir[24..32].try_into().unwrap_or([0; 8]))
+        }
+        _ => {
+            if dir.len() < 16 {
+                return out;
+            }
+            u64::from(u32::from_le_bytes(dir[12..16].try_into().unwrap_or([0; 4])))
+        }
+    };
+    if callbacks == 0 {
+        return out;
+    }
+    let mut cur = callbacks;
+    for _ in 0..MAX_TLS_CALLBACKS {
+        let Some(slot) = segment_bytes_at(segments, cur, ptr) else {
+            break;
+        };
+        let target: u64 = if ptr == 8 {
+            u64::from_le_bytes(slot.try_into().unwrap_or([0; 8]))
+        } else {
+            u64::from(u32::from_le_bytes(slot.try_into().unwrap_or([0; 4])))
+        };
+        if target == 0 {
+            break;
+        }
+        out.push(target);
+        let Some(next) = cur.checked_add(ptr as u64) else {
+            break;
+        };
+        cur = next;
+    }
+    out
+}
+
+/// ELF init/fini addresses in discovery order.
+///
+/// Section entries (`.init_array`, `.fini_array`, `.ctors`, `.dtors`) plus
+/// dynamic tags (`DT_INIT`, `DT_FINI`, `DT_INIT_ARRAY`/`DT_FINI_ARRAY` with
+/// their sizes). Values are pointer-sized file bytes decoded with the ELF
+/// endianness; zeroes are skipped. Total output stops at
+/// [`MAX_INIT_FUNCS`].
+fn elf_init_funcs(bytes: &[u8], segments: &[Segment], sections: &[Section]) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if bytes.get(..4) != Some(b"\x7fELF".as_slice()) || bytes.len() < 64 {
+        return out;
+    }
+    let (is64, le) = match (bytes.get(4), bytes.get(5)) {
+        (Some(1), Some(1)) => (false, true),
+        (Some(1), Some(2)) => (false, false),
+        (Some(2), Some(1)) => (true, true),
+        (Some(2), Some(2)) => (true, false),
+        _ => return out,
+    };
+    let ptr = if is64 { 8usize } else { 4usize };
+    let u16at = |off: usize| -> Option<u16> {
+        let w: [u8; 2] = bytes.get(off..off + 2)?.try_into().ok()?;
+        Some(if le {
+            u16::from_le_bytes(w)
+        } else {
+            u16::from_be_bytes(w)
+        })
+    };
+    let u32at = |off: usize| -> Option<u32> {
+        let w: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+        Some(if le {
+            u32::from_le_bytes(w)
+        } else {
+            u32::from_be_bytes(w)
+        })
+    };
+    let u64at = |off: usize| -> Option<u64> {
+        if is64 {
+            let w: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+            Some(if le {
+                u64::from_le_bytes(w)
+            } else {
+                u64::from_be_bytes(w)
+            })
+        } else {
+            Some(u64::from(u32at(off)?))
+        }
+    };
+    let read_ptr_at = |va: u64| -> Option<u64> {
+        let raw = segment_bytes_at(segments, va, ptr)?;
+        if ptr == 8 {
+            let w: [u8; 8] = raw.try_into().ok()?;
+            Some(if le {
+                u64::from_le_bytes(w)
+            } else {
+                u64::from_be_bytes(w)
+            })
+        } else {
+            let w: [u8; 4] = raw.try_into().ok()?;
+            Some(u64::from(if le {
+                u32::from_le_bytes(w)
+            } else {
+                u32::from_be_bytes(w)
+            }))
+        }
+    };
+    let push = |va: u64, out: &mut Vec<u64>| {
+        if va != 0 && out.len() < MAX_INIT_FUNCS {
+            out.push(va);
+        }
+    };
+    for sec in sections {
+        if !matches!(
+            sec.name.as_str(),
+            ".init_array" | ".fini_array" | ".ctors" | ".dtors"
+        ) {
+            continue;
+        }
+        let mut off = 0u64;
+        while off.saturating_add(ptr as u64) <= sec.file_size {
+            if out.len() >= MAX_INIT_FUNCS {
+                return out;
+            }
+            let Some(va) = sec.vaddr.checked_add(off) else {
+                break;
+            };
+            match read_ptr_at(va) {
+                Some(v) if v != 0 => out.push(v),
+                None => break,
+                _ => {}
+            }
+            off += ptr as u64;
+        }
+    }
+    let (phoff, phentsize, phnum) = if is64 {
+        match (u64at(32), u16at(54), u16at(56)) {
+            (Some(a), Some(b), Some(c)) => (a, b as usize, c as usize),
+            _ => return out,
+        }
+    } else {
+        match (u32at(28), u16at(42), u16at(44)) {
+            (Some(a), Some(b), Some(c)) => (u64::from(a), b as usize, c as usize),
+            _ => return out,
+        }
+    };
+    let phsize = if is64 { 56 } else { 32 };
+    if phentsize < phsize || phnum > 256 {
+        return out;
+    }
+    let mut dyn_off: Option<(u64, u64)> = None;
+    for i in 0..phnum {
+        let Some(ph_base) = phoff.checked_add((i * phentsize) as u64) else {
+            return out;
+        };
+        let base = ph_base as usize;
+        if base.saturating_add(phentsize) > bytes.len() {
+            return out;
+        }
+        let (t, off, filesz) = if is64 {
+            let (Some(t), Some(off), Some(filesz)) =
+                (u32at(base), u64at(base + 8), u64at(base + 32))
+            else {
+                return out;
+            };
+            (t, off, filesz)
+        } else {
+            let (Some(t), Some(off), Some(filesz)) =
+                (u32at(base), u32at(base + 4), u32at(base + 16))
+            else {
+                return out;
+            };
+            (t, u64::from(off), u64::from(filesz))
+        };
+        if t == 2 {
+            dyn_off = Some((off, filesz));
+            break;
+        }
+    }
+    let Some((doff, dsize)) = dyn_off else {
+        return out;
+    };
+    let entry = if is64 { 16 } else { 8 };
+    if dsize > 1024 * 1024 || (doff as usize) > bytes.len() {
+        return out;
+    }
+    let count = (dsize as usize / entry).min(1024);
+    let mut init: Option<u64> = None;
+    let mut fini: Option<u64> = None;
+    let mut init_array: Option<(u64, u64)> = None;
+    let mut fini_array: Option<(u64, u64)> = None;
+    let mut init_sz: u64 = 0;
+    let mut fini_sz: u64 = 0;
+    let mut init_va: u64 = 0;
+    let mut fini_va: u64 = 0;
+    for i in 0..count {
+        let Some(base) = (doff as usize).checked_add(i * entry) else {
+            break;
+        };
+        if base.saturating_add(entry) > bytes.len() {
+            break;
+        }
+        let (tag, val) = if is64 {
+            let (Some(t), Some(v)) = (bytes.get(base..base + 8), bytes.get(base + 8..base + 16))
+            else {
+                break;
+            };
+            let (Ok(t), Ok(v)) = (<[u8; 8]>::try_from(t), <[u8; 8]>::try_from(v)) else {
+                break;
+            };
+            let tt = if le {
+                i64::from_le_bytes(t)
+            } else {
+                i64::from_be_bytes(t)
+            };
+            let vv = if le {
+                u64::from_le_bytes(v)
+            } else {
+                u64::from_be_bytes(v)
+            };
+            (tt, vv)
+        } else {
+            let (Some(t), Some(v)) = (u32at(base), u32at(base + 4)) else {
+                break;
+            };
+            (i64::from(t), u64::from(v))
+        };
+        match tag {
+            0 => break,
+            12 => init = Some(val),
+            13 => fini = Some(val),
+            25 => init_va = val,
+            27 => init_sz = val,
+            26 => fini_va = val,
+            28 => fini_sz = val,
+            _ => {}
+        }
+    }
+    if init_va != 0 {
+        init_array = Some((init_va, init_sz));
+    }
+    if fini_va != 0 {
+        fini_array = Some((fini_va, fini_sz));
+    }
+    if let Some(v) = init {
+        push(v, &mut out);
+    }
+    if let Some(v) = fini {
+        push(v, &mut out);
+    }
+    for (va, sz) in [init_array, fini_array].into_iter().flatten() {
+        let mut n = (sz as usize / ptr).min(MAX_INIT_FUNCS.saturating_sub(out.len()));
+        let mut cur = va;
+        while n > 0 {
+            if out.len() >= MAX_INIT_FUNCS {
+                return out;
+            }
+            match read_ptr_at(cur) {
+                Some(v) if v != 0 => out.push(v),
+                None => break,
+                _ => {}
+            }
+            cur = match cur.checked_add(ptr as u64) {
+                Some(c) => c,
+                None => break,
+            };
+            n -= 1;
+        }
+    }
+    out
+}
+
+/// Mach-O `LC_FUNCTION_STARTS` addresses in table order.
+///
+/// Decodes ULEB deltas off the `__TEXT` base; anything doubtful (non-thin
+/// image, truncated commands, unreadable payload, overflow) yields the
+/// prefix so far. Output stops at [`MAX_FUNC_STARTS`].
+fn macho_function_starts(bytes: &[u8]) -> Vec<u64> {
+    const LC_SEGMENT: u32 = 0x1;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_FUNCTION_STARTS: u32 = 0x26;
+    const MAX_COMMANDS: u32 = 4096;
+    let mut out: Vec<u64> = Vec::new();
+    if bytes.len() < 32 || !is_thin_le_macho(bytes) {
+        return out;
+    }
+    let is64 = bytes[0..4] == 0xFEED_FACFu32.to_le_bytes();
+    let get32 = |off: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(b))
+    };
+    let get64 = |off: usize| -> Option<u64> {
+        let b: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(b))
+    };
+    let Some(ncmds) = get32(16) else {
+        return out;
+    };
+    if ncmds > MAX_COMMANDS {
+        return out;
+    }
+    let mut off = if is64 { 32usize } else { 28usize };
+    let mut text_base: Option<u64> = None;
+    let mut first_seg: Option<u64> = None;
+    let mut payloads: Vec<(usize, usize)> = Vec::new();
+    for _ in 0..ncmds {
+        let base = off;
+        let Some(cmd) = get32(base) else {
+            return out;
+        };
+        let Some(cmdsize_u32) = get32(base + 4) else {
+            return out;
+        };
+        let cmdsize = cmdsize_u32 as usize;
+        if cmdsize < 8 || base.checked_add(cmdsize).is_none_or(|e| e > bytes.len()) {
+            return out;
+        }
+        match cmd {
+            LC_SEGMENT | LC_SEGMENT_64 => {
+                if (cmd == LC_SEGMENT_64) != is64 {
+                    return out;
+                }
+                let (Some(vmaddr), seg_off) = (
+                    if is64 {
+                        get64(base + 24)
+                    } else {
+                        get32(base + 24).map(u64::from)
+                    },
+                    base + 8,
+                ) else {
+                    return out;
+                };
+                if first_seg.is_none() {
+                    first_seg = Some(vmaddr);
+                }
+                let Some(seg_name) = bytes.get(seg_off..seg_off + 16) else {
+                    return out;
+                };
+                let name_len = seg_name.iter().position(|&b| b == 0).unwrap_or(16);
+                let Some(name) = bytes.get(seg_off..seg_off + name_len) else {
+                    return out;
+                };
+                if name == b"__TEXT" && text_base.is_none() {
+                    text_base = Some(vmaddr);
+                }
+            }
+            LC_FUNCTION_STARTS => {
+                let (Some(dataoff_u32), Some(datasize_u32)) = (get32(base + 8), get32(base + 12))
+                else {
+                    return out;
+                };
+                let (dataoff, datasize) = (dataoff_u32 as usize, datasize_u32 as usize);
+                let Some(end) = dataoff.checked_add(datasize) else {
+                    return out;
+                };
+                if end > bytes.len() {
+                    return out;
+                }
+                payloads.push((dataoff, datasize));
+            }
+            _ => {}
+        }
+        off = base + cmdsize;
+    }
+    let Some(mut addr) = text_base.or(first_seg) else {
+        return out;
+    };
+    for (dataoff, datasize) in payloads {
+        let end = dataoff + datasize;
+        let mut pos = dataoff;
+        while pos < end {
+            if out.len() >= MAX_FUNC_STARTS {
+                return out;
+            }
+            let mut result: u64 = 0;
+            let mut shift: u32 = 0;
+            let mut done = false;
+            for _ in 0..10 {
+                if pos >= end {
+                    return out;
+                }
+                let b = bytes[pos];
+                pos += 1;
+                let low = u64::from(b & 0x7F);
+                if shift >= 64 && low != 0 {
+                    return out;
+                }
+                result |= low.checked_shl(shift).unwrap_or(0);
+                if b & 0x80 == 0 {
+                    done = true;
+                    break;
+                }
+                shift += 7;
+            }
+            if !done {
+                return out;
+            }
+            if result == 0 {
+                break;
+            }
+            let Some(next) = addr.checked_add(result) else {
+                return out;
+            };
+            addr = next;
+            out.push(addr);
+        }
+    }
+    out
+}
+
 /// True for thin little-endian Mach-O images (32- or 64-bit).
 ///
 /// Fat container bytes and big-endian images are not stub-mapped; fat
@@ -1862,6 +2483,10 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         imports,
         exports,
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     }
 }
 

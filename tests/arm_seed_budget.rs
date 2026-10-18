@@ -92,6 +92,10 @@ fn test_bin(arch: Arch, entry: Option<u64>, segs: Vec<Segment>) -> LoadedBinary 
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     }
 }
 

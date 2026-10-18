@@ -1069,6 +1069,11 @@ fn reason_code(reason: crate::analysis::DiscoveryReason) -> u8 {
         crate::analysis::DiscoveryReason::DirectCall => 3,
         crate::analysis::DiscoveryReason::Prologue => 4,
         crate::analysis::DiscoveryReason::User => 5,
+        crate::analysis::DiscoveryReason::Pdata => 6,
+        crate::analysis::DiscoveryReason::TlsCallback => 7,
+        crate::analysis::DiscoveryReason::InitArray => 8,
+        crate::analysis::DiscoveryReason::FunctionStarts => 9,
+        crate::analysis::DiscoveryReason::Pointer => 10,
     }
 }
 
@@ -1081,6 +1086,11 @@ fn decode_reason(v: u8) -> Result<crate::analysis::DiscoveryReason> {
         3 => Ok(crate::analysis::DiscoveryReason::DirectCall),
         4 => Ok(crate::analysis::DiscoveryReason::Prologue),
         5 => Ok(crate::analysis::DiscoveryReason::User),
+        6 => Ok(crate::analysis::DiscoveryReason::Pdata),
+        7 => Ok(crate::analysis::DiscoveryReason::TlsCallback),
+        8 => Ok(crate::analysis::DiscoveryReason::InitArray),
+        9 => Ok(crate::analysis::DiscoveryReason::FunctionStarts),
+        10 => Ok(crate::analysis::DiscoveryReason::Pointer),
         _ => Err(Error::Storage(format!("decode row: bad reason {v}"))),
     }
 }
@@ -2541,7 +2551,7 @@ mod tests {
                 "unexpected: {err:?}"
             );
         }
-        for v in [255u8, 9] {
+        for v in [255u8, 11] {
             assert!(decode_xref_kind(v).is_err());
             assert!(decode_diagnostic_kind(v).is_err());
             assert!(decode_reason(v).is_err());
