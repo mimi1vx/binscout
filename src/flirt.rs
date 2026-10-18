@@ -62,7 +62,7 @@ pub const MIN_GEN_FIXED_BYTES: usize = 2;
 
 /// One corpus entry: an exact leading-byte prefix plus its hint text.
 ///
-/// `arch` scopes the match (`None` matches any x86 mode the [`Insn`] bytes
+/// `arch` scopes the match (`None` matches any x86 mode the [`crate::disasm::Insn`] bytes
 /// decode under, i.e. [`Arch::is_x86`]); `suggested_name` is a hint only,
 /// never applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,17 +162,18 @@ impl Serialize for FlirtHint {
 
 /// Leading bytes of `func`: decoded instruction bytes at and after the entry
 /// in address order, capped at [`MAX_SIGNATURE_WINDOW`].
+///
+/// Blocks iterate in start order (already address order), stopping once the
+/// window fills so large functions never decode past the signature prefix.
 #[must_use]
 pub fn leading_bytes(func: &Function) -> Vec<u8> {
-    let mut insns: Vec<&Insn> = func
+    let mut out = Vec::with_capacity(MAX_SIGNATURE_WINDOW);
+    for insn in func
         .blocks
-        .values()
-        .flat_map(|b| b.insns.iter())
+        .range(func.entry..)
+        .flat_map(|(_, b)| b.insns.iter())
         .filter(|i| i.addr >= func.entry)
-        .collect();
-    insns.sort_by_key(|i| i.addr);
-    let mut out = Vec::new();
-    for insn in insns {
+    {
         if out.len() >= MAX_SIGNATURE_WINDOW {
             break;
         }
