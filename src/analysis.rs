@@ -1818,11 +1818,13 @@ impl Analysis {
     ///
     /// Each segment's bytes are transformed with `decode` (see
     /// [`strings::DecodeSpec`]), then extracted and section-tagged exactly
-    /// like [`analyze`], so single-byte
-    /// XOR/add/rot-obfuscated text shows up with its original offsets and
-    /// virtual addresses. The same [`StringsFilter`] semantics apply to the
-    /// decoded rows (a `pattern` matches decoded text). Strictly read-only:
-    /// the binary and the sidecar are never written.
+    /// like [`analyze`], so single-byte XOR/add/rot- and rolling
+    /// multi-byte XOR-obfuscated text shows up with its original offsets
+    /// and virtual addresses. [`strings::DecodeSpec::Base64`] instead
+    /// detects base64 blobs per segment (see [`strings::extract_base64`])
+    /// and reports their plaintext. The same [`StringsFilter`] semantics
+    /// apply to the decoded rows (a `pattern` matches decoded text).
+    /// Strictly read-only: the binary and the sidecar are never written.
     ///
     /// # Errors
     /// [`Error::Invalid`] when `pattern` is overlong or a `regex:`
@@ -1864,6 +1866,22 @@ pub(crate) fn decoded_string_hits(
 ) -> Vec<StringHit> {
     let mut hits: Vec<StringHit> = Vec::new();
     for seg in &bin.segments {
+        // Base64 is detection, not a byte transform: scan the raw
+        // segment for blobs instead of decoding a transformed copy.
+        if matches!(decode, strings::DecodeSpec::Base64) {
+            for mut h in strings::extract_base64(
+                &seg.data,
+                strings::DEFAULT_MIN_LEN,
+                strings::DEFAULT_MAX_HITS,
+                Some(seg.vaddr),
+            ) {
+                let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
+                h.section = section;
+                h.executable = executable;
+                hits.push(h);
+            }
+            continue;
+        }
         let decoded = decode.apply(&seg.data);
         for mut h in strings::extract(
             &decoded,
@@ -3727,13 +3745,18 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     let spans: Vec<(u64, u64)> = strings
         .iter()
         .filter_map(|h| {
-            h.vaddr.map(|v| {
-                let len = match h.encoding {
-                    Encoding::Ascii => h.value.len() as u64,
-                    Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
-                };
-                (v, v.wrapping_add(len))
-            })
+            // String-xref recovery spans the byte-exact classic passes
+            // only (ASCII plus ASCII-subset UTF-16). Multibyte hits
+            // (UTF-8, BMP letters) are listing coverage: their shifted
+            // readings of code and ASCII text would otherwise swallow
+            // neighboring classic spans and reroute established string
+            // refs, so they never participate in xref recovery.
+            let len = match h.encoding {
+                Encoding::Ascii => h.value.len() as u64,
+                Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
+                Encoding::Utf8 | Encoding::Utf16LeBmp | Encoding::Base64 => return None,
+            };
+            h.vaddr.map(|v| (v, v.wrapping_add(len)))
         })
         .collect();
     let span_index = StringSpanIndex::new(spans);

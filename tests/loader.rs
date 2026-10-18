@@ -296,18 +296,23 @@ fn raw_mode_maps_single_segment_with_base_and_entry() {
 #[test]
 fn strings_extract_ascii_utf16_and_paginate() {
     // "hello" ASCII, "ABCD" LE (exactly min_len so the shifted BE ghost
-    // "BCD" stays under it), then "s000".."s009".
+    // "BCD" stays under it), then "s000".."s009". The LE run also carries
+    // a shifted BMP-letter twin at the odd offset, like the documented
+    // shifted BE twin.
     let mut bytes = b"\x00hello\x00\xFF".to_vec();
     bytes.extend_from_slice(&[0x41, 0x00, 0x42, 0x00, 0x43, 0x00, 0x44, 0x00, 0xFF]);
     for i in 0..10 {
         bytes.extend_from_slice(format!("s{i:03}\x00").as_bytes());
     }
     let hits = extract(&bytes, 4, 10_000, None);
-    assert_eq!(hits.len(), 12);
+    assert_eq!(hits.len(), 13);
     assert_eq!(hits[0].value, "hello");
     assert_eq!(hits[0].encoding, Encoding::Ascii);
-    assert_eq!(hits[1].value, "ABCD");
-    assert_eq!(hits[1].encoding, Encoding::Utf16Le);
+    assert_eq!(hits[1].value, "䇿䈀䌀䐀");
+    assert_eq!(hits[1].encoding, Encoding::Utf16LeBmp);
+    assert_eq!(hits[1].offset, 7);
+    assert_eq!(hits[2].value, "ABCD");
+    assert_eq!(hits[2].encoding, Encoding::Utf16Le);
     assert!(
         hits.iter().all(|h| h.encoding != Encoding::Utf16Be),
         "no BE ghosts expected at min_len"
@@ -338,8 +343,18 @@ fn strings_extract_ascii_utf16_and_paginate() {
 #[test]
 fn short_runs_excluded() {
     let hits = extract(b"\x00ab\x00abc\x00abcd\x00", 4, 100, None);
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].value, "abcd");
+    // Short ASCII runs stay excluded; the NUL-separated letters also
+    // chain into one shifted BMP-letter reading (same artifact class as
+    // the shifted BE twin), pinned here so it cannot drift silently.
+    // (The run starts at offset 3: the lone unit at offset 0 advances
+    // the cursor past the offset-1 start, exactly like rejected short
+    // runs in the classic passes.)
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].value, "愀换愀换");
+    assert_eq!(hits[0].encoding, Encoding::Utf16LeBmp);
+    assert_eq!(hits[0].offset, 3);
+    assert_eq!(hits[1].value, "abcd");
+    assert_eq!(hits[1].encoding, Encoding::Ascii);
 }
 
 #[test]

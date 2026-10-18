@@ -14,6 +14,7 @@ pub mod loader;
 pub mod mcp;
 pub mod pseudo;
 pub mod search;
+pub mod stackstrings;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1930,9 +1931,12 @@ impl Project {
             let Some(start) = h.vaddr else {
                 continue;
             };
+            // Same classic-only rule as xref recovery (see `analyze`):
+            // multibyte hits are listing coverage, never span participants.
             let len = match h.encoding {
                 Encoding::Ascii => h.value.len() as u64,
                 Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
+                Encoding::Utf8 | Encoding::Utf16LeBmp | Encoding::Base64 => continue,
             };
             spans.push((start, start.wrapping_add(len), h.value.as_str()));
         }
@@ -3321,9 +3325,10 @@ impl Project {
     ///
     /// Re-extracts over a per-segment decoded copy (see
     /// [`Analysis::strings_decoded_view`]) with the same filter semantics
-    /// as [`Project::query_strings`]: single-byte XOR/add/rot-obfuscated
-    /// text shows up with its original offsets and addresses. Strictly
-    /// read-only: the binary and the sidecar are never written.
+    /// as [`Project::query_strings`]: single-byte XOR/add/rot- and rolling
+    /// multi-byte XOR-obfuscated text shows up with its original offsets
+    /// and addresses, and `base64` reports base64 blobs' plaintext.
+    /// Strictly read-only: the binary and the sidecar are never written.
     ///
     /// # Errors
     /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
@@ -3351,11 +3356,21 @@ impl Project {
     ) -> Result<Page<StringHit>> {
         let total = self
             .analysis
-            .strings_decoded_count(&self.binary, filter, decode)?;
+            .strings_decoded_count(&self.binary, filter, decode.clone())?;
         let items = self
             .analysis
             .strings_decoded_view(&self.binary, filter, decode)?;
         Ok(page_envelope(total, filter.start, filter.limit, items))
+    }
+
+    /// Recovered stack-constructed strings: runs of
+    /// `mov [rsp/rbp+off], imm` within one block, reassembled with
+    /// function and address (see [`crate::stackstrings::recover`]).
+    /// A separate surface from [`Project::query_strings`]: read-only,
+    /// never writes the binary or the sidecar.
+    #[must_use]
+    pub fn stack_strings(&self) -> Vec<crate::stackstrings::StackString> {
+        crate::stackstrings::recover(&self.analysis)
     }
 
     /// Search mapped file bytes for a literal/wildcard pattern, paged.

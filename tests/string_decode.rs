@@ -9,7 +9,7 @@ use std::process::Command;
 use serde_json::Value;
 
 use binscout::analysis::StringsFilter;
-use binscout::loader::strings::{DecodeSpec, parse_decode_spec};
+use binscout::loader::strings::{DecodeSpec, Encoding, parse_decode_spec};
 
 use common::{binscout_bin, cleanup, temp_db, tmpdir, write_bin};
 
@@ -36,6 +36,15 @@ fn filter() -> StringsFilter {
         limit: 1024,
         ..StringsFilter::default()
     }
+}
+
+/// ASCII-channel values: decoded ASCII text carries a shifted
+/// BMP-letter twin, so decode assertions pin the Ascii rows.
+fn ascii_values(rows: &[binscout::loader::strings::StringHit]) -> Vec<&str> {
+    rows.iter()
+        .filter(|h| h.encoding == Encoding::Ascii)
+        .map(|h| h.value.as_str())
+        .collect()
 }
 
 /// Run the CLI; returns exit success and parsed stdout JSON.
@@ -67,11 +76,18 @@ fn xor_obfuscated_marker_decodes_via_new_flag() {
     let rows = p
         .query_strings_decoded(&filter(), DecodeSpec::Xor(0x41))
         .expect("decoded query works");
-    assert_eq!(
-        rows.iter().map(|h| h.value.as_str()).collect::<Vec<_>>(),
-        [MARKER]
-    );
-    let hit = &rows[0];
+    // ASCII-channel assertion: decoded ASCII text carries a shifted
+    // BMP-letter twin, so the decode contract pins the Ascii hit.
+    let ascii: Vec<&str> = rows
+        .iter()
+        .filter(|h| h.encoding == Encoding::Ascii)
+        .map(|h| h.value.as_str())
+        .collect();
+    assert_eq!(ascii, [MARKER]);
+    let hit = rows
+        .iter()
+        .find(|h| h.encoding == Encoding::Ascii && h.value == MARKER)
+        .expect("ascii marker");
     assert_eq!(
         hit.offset, MARKER_OFF,
         "offsets refer to the original binary"
@@ -97,10 +113,7 @@ fn add_and_rot_views_decode_their_encodings() {
     let rows = p
         .query_strings_decoded(&filter(), DecodeSpec::Add(7))
         .expect("add view works");
-    assert_eq!(
-        rows.iter().map(|h| h.value.as_str()).collect::<Vec<_>>(),
-        [MARKER]
-    );
+    assert_eq!(ascii_values(&rows), [MARKER]);
 
     let rot_bin = write_bin(&dir, "rot.bin", &obfuscated_blob(|b| b.rotate_right(3)));
     let rot_db = temp_db(&dir, "rot");
@@ -108,10 +121,7 @@ fn add_and_rot_views_decode_their_encodings() {
     let rows = p
         .query_strings_decoded(&filter(), DecodeSpec::Rot(3))
         .expect("rot view works");
-    assert_eq!(
-        rows.iter().map(|h| h.value.as_str()).collect::<Vec<_>>(),
-        [MARKER]
-    );
+    assert_eq!(ascii_values(&rows), [MARKER]);
 
     // Wrong keys stay obfuscated: the marker is absent, never mis-decoded.
     let rows = p
@@ -174,6 +184,7 @@ fn cli_decode_flag_and_bad_spec_envelope() {
         .as_array()
         .expect("array")
         .iter()
+        .filter(|r| r["encoding"] == "Ascii")
         .map(|r| r["value"].as_str().expect("row value"))
         .collect();
     assert_eq!(vals, [MARKER]);

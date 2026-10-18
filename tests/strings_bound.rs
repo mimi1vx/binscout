@@ -2,7 +2,8 @@
 //!
 //! Reference extraction mirrors the old allocate-all-then-sort path; the
 //! tests below pin the new lazy merge to it across caps (including zero),
-//! minimum lengths, both endians, odd offsets/lengths, EOF and
+//! minimum lengths, all five passes (ASCII, both UTF-16 endians, UTF-8,
+//! BMP-letter LE), odd offsets/lengths, EOF and
 //! equal-offset ties, and verify dense short-run stress stays bounded.
 
 mod common;
@@ -10,7 +11,10 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use binscout::loader::strings::{Encoding, StringHit, extract};
+use binscout::loader::strings::{
+    BMP_DIVERSITY_LEN, BMP_DIVERSITY_MIN, Encoding, MAX_BMP_RUN_CHARS, StringHit,
+    bmp_distinct_units, bmp_letter_script, extract, suppress_bmp_shadows,
+};
 
 use common::builders;
 
@@ -76,6 +80,45 @@ fn ref_unit_at(bytes: &[u8], i: usize, little: bool) -> Option<u8> {
     (ref_is_print(c) && z == 0).then_some(c)
 }
 
+/// Mirror of the BMP-letter pass: non-ASCII alphabetic LE units of one
+/// script only, disjoint from [`ref_unit_at`].
+fn ref_bmp_unit_at(bytes: &[u8], i: usize) -> Option<(char, u8)> {
+    let pair = bytes.get(i..i + 2)?;
+    let u = u16::from_le_bytes([pair[0], pair[1]]);
+    if u < 0x80 {
+        return None;
+    }
+    let script = bmp_letter_script(u)?;
+    let c = char::from_u32(u32::from(u))?;
+    c.is_alphabetic().then_some((c, script))
+}
+
+/// Mirror of the UTF-8 pass: one printable character plus byte length.
+fn ref_utf8_char_at(bytes: &[u8], i: usize) -> Option<(char, usize)> {
+    let b = *bytes.get(i)?;
+    if ref_is_print(b) {
+        return Some((b as char, 1));
+    }
+    if b < 0x80 {
+        return None;
+    }
+    for len in 2..=4usize {
+        let Some(sl) = bytes.get(i..i + len) else {
+            continue;
+        };
+        let Ok(s) = std::str::from_utf8(sl) else {
+            continue;
+        };
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if !c.is_control() && c != '\u{FEFF}' => return Some((c, len)),
+            (Some(_), None) => return None,
+            _ => continue,
+        }
+    }
+    None
+}
+
 fn reference_extract(
     bytes: &[u8],
     min_len: usize,
@@ -108,7 +151,7 @@ fn reference_extract(
             }
         }
     }
-    // UTF-16 both endians.
+    // UTF-16 both endians (classic ASCII subset).
     for little in [true, false] {
         let mut i = 0;
         while i + 1 < bytes.len() {
@@ -138,8 +181,76 @@ fn reference_extract(
             }
         }
     }
+    // UTF-8 runs holding at least one multibyte character.
+    {
+        let mut i = 0;
+        while i < bytes.len() {
+            if ref_utf8_char_at(bytes, i).is_some() {
+                let start = i;
+                let mut value = String::new();
+                let mut count = 0usize;
+                let mut multi = false;
+                while let Some((c, len)) = ref_utf8_char_at(bytes, i) {
+                    value.push(c);
+                    count += 1;
+                    multi |= len > 1;
+                    i += len;
+                }
+                if count >= min && multi {
+                    hits.push(StringHit {
+                        offset: start,
+                        vaddr: ref_va(base_va, start),
+                        encoding: Encoding::Utf8,
+                        value,
+                        section: None,
+                        executable: false,
+                    });
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // UTF-16LE BMP-letter runs (one script per run, chunked like the
+    // lazy cursor: capped chunks rescan their remainder).
+    {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if let Some((_, script)) = ref_bmp_unit_at(bytes, i) {
+                let start = i;
+                let mut value = String::new();
+                let mut count = 0usize;
+                while count < MAX_BMP_RUN_CHARS
+                    && let Some((c, s)) = ref_bmp_unit_at(bytes, i)
+                {
+                    if s != script {
+                        break;
+                    }
+                    value.push(c);
+                    count += 1;
+                    i += 2;
+                }
+                if count >= min
+                    && !(count > BMP_DIVERSITY_LEN
+                        && bmp_distinct_units(bytes, start, i) < BMP_DIVERSITY_MIN)
+                {
+                    hits.push(StringHit {
+                        offset: start,
+                        vaddr: ref_va(base_va, start),
+                        encoding: Encoding::Utf16LeBmp,
+                        value,
+                        section: None,
+                        executable: false,
+                    });
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
     hits.sort_by_key(|h| h.offset);
     hits.truncate(max_hits);
+    suppress_bmp_shadows(bytes, &mut hits);
     hits
 }
 
@@ -358,8 +469,12 @@ fn dense_stress_small_cap_bounds_owned_hits() {
     reset_thread_allocs();
     let hits = extract(&bytes, 4, cap, None);
     let (count, bytes_alloc) = thread_allocs();
-    assert_eq!(hits, full[..cap]);
-    assert_eq!(hits.len(), cap);
+    // Same-cap eager oracle (collect, sort, cap, suppress): suppressed
+    // BMP shadows consume cap slots, so a capped page may come back
+    // short; the prefix property holds only past suppression.
+    let want = reference_extract(&bytes, 4, cap, None);
+    assert_eq!(hits, want);
+    assert_eq!(hits.len(), want.len());
     // One String per retained hit plus a handful of Vec growth
     // reallocations; far below the 20k-hit reference population.
     assert!(
