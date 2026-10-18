@@ -20,10 +20,9 @@ use redb::ReadableTable;
 // Table handles for hand-crafted sidecars (mirror `binscout::db` layouts).
 const META: redb::TableDefinition<&str, String> = redb::TableDefinition::new("meta");
 const BINARIES: redb::TableDefinition<u64, String> = redb::TableDefinition::new("binaries");
-const FUNCTIONS: redb::TableDefinition<u64, String> = redb::TableDefinition::new("functions");
-const BLOCKS: redb::TableDefinition<String, String> = redb::TableDefinition::new("blocks");
-const XREFS: redb::TableDefinition<String, String> = redb::TableDefinition::new("xrefs");
-const STRINGS: redb::TableDefinition<u64, String> = redb::TableDefinition::new("strings");
+const FUNCTIONS: redb::TableDefinition<u64, Vec<u8>> = redb::TableDefinition::new("functions");
+const XREFS: redb::TableDefinition<u64, Vec<u8>> = redb::TableDefinition::new("xrefs");
+const STRINGS: redb::TableDefinition<u64, Vec<u8>> = redb::TableDefinition::new("strings");
 const ANNOTATIONS: redb::TableDefinition<u64, String> = redb::TableDefinition::new("annotations");
 
 /// Minimal 64-bit LE ELF: one `PT_LOAD` (`nop; nop; ret`) at `0x400000`.
@@ -62,26 +61,63 @@ fn bootstrap_with_annotations(bin: &Path, db: &Path) -> Vec<u8> {
     std::fs::read(bin).expect("reread fixture")
 }
 
-/// Insert one undecodable row into a `u64`-keyed table under a fresh key.
-fn poison_u64_row(db_path: &Path, table: redb::TableDefinition<u64, String>, key: u64) {
+/// Overwrite the first strings chunk with garbage.
+fn poison_strings_chunk(db_path: &Path) {
     let db = db::open_db(db_path).expect("open db");
     let wtxn = db.begin_write().expect("begin write");
     {
-        let mut t = wtxn.open_table(table).expect("open table");
+        let mut t = wtxn.open_table(STRINGS).expect("open table");
+        t.insert(0u64, b"{not valid chunk".to_vec())
+            .expect("poison chunk");
+    }
+    wtxn.commit().expect("commit");
+}
+
+/// Insert one undecodable annotation row under a fresh key.
+fn poison_annotation_row(db_path: &Path, key: u64) {
+    let db = db::open_db(db_path).expect("open db");
+    let wtxn = db.begin_write().expect("begin write");
+    {
+        let mut t = wtxn.open_table(ANNOTATIONS).expect("open table");
         t.insert(key, "{not valid json".to_string())
             .expect("poison row");
     }
     wtxn.commit().expect("commit");
 }
 
-/// Insert one undecodable row into a `String`-keyed table under a fresh key.
-fn poison_str_row(db_path: &Path, table: redb::TableDefinition<String, String>, key: &str) {
+/// Overwrite one function row with garbage.
+fn poison_function_row(db_path: &Path, key: u64) {
     let db = db::open_db(db_path).expect("open db");
     let wtxn = db.begin_write().expect("begin write");
     {
-        let mut t = wtxn.open_table(table).expect("open table");
-        t.insert(key.to_string(), "{not valid json".to_string())
+        let mut t = wtxn.open_table(FUNCTIONS).expect("open table");
+        t.insert(key, b"{not valid row".to_vec())
             .expect("poison row");
+    }
+    wtxn.commit().expect("commit");
+}
+
+/// Overwrite the first xref chunk with garbage.
+fn poison_xref_chunk(db_path: &Path) {
+    let db = db::open_db(db_path).expect("open db");
+    let wtxn = db.begin_write().expect("begin write");
+    {
+        let mut t = wtxn.open_table(XREFS).expect("open table");
+        t.insert(0u64, b"{not valid chunk".to_vec())
+            .expect("poison chunk");
+    }
+    wtxn.commit().expect("commit");
+}
+
+/// Insert one key-only diagnostics row with a bad kind discriminant.
+fn poison_diag_row(db_path: &Path, key: (u64, u8)) {
+    let db = db::open_db(db_path).expect("open db");
+    let wtxn = db.begin_write().expect("begin write");
+    {
+        const DIAGNOSTICS: redb::TableDefinition<(u64, u8), ()> =
+            redb::TableDefinition::new("diagnostics");
+        let mut t = wtxn.open_table(DIAGNOSTICS).expect("open table");
+        t.insert(key, ()).expect("poison row");
     }
     wtxn.commit().expect("commit");
 }
@@ -476,11 +512,11 @@ fn stale_corrupt_derived_rows_are_discarded() {
     bootstrap_with_annotations(&bin, &db);
     let (old_hash, old_sha256, old_size) = ident(&bytes);
 
-    // Poison one row per derived table. A full decode must choke on these.
-    poison_u64_row(&db, FUNCTIONS, u64::MAX);
-    poison_str_row(&db, BLOCKS, "ff:ff");
-    poison_str_row(&db, XREFS, "ff");
-    poison_u64_row(&db, STRINGS, u64::MAX);
+    // Poison one chunk per derived table. A full decode must choke on these.
+    poison_function_row(&db, u64::MAX);
+    poison_xref_chunk(&db);
+    poison_strings_chunk(&db);
+    poison_diag_row(&db, (u64::MAX, 255));
     {
         let handle = db::open_db(&db).expect("open db");
         let err = db::load(&handle).unwrap_err();
@@ -544,7 +580,7 @@ fn stale_corrupt_annotations_still_error() {
     let db = common::temp_db(&dir, "a");
 
     bootstrap_with_annotations(&bin, &db);
-    poison_u64_row(&db, ANNOTATIONS, u64::MAX);
+    poison_annotation_row(&db, u64::MAX);
 
     let new_bytes = patched(bytes);
     std::fs::write(&bin, &new_bytes).expect("patch fixture");
@@ -661,9 +697,9 @@ fn stale_snapshot_reads_one_coherent_sidecar_generation() {
 
 #[test]
 fn stale_open_ignores_large_derived_tables() {
-    // Functional proof that discarded rows cost nothing to decode: twenty
-    // thousand corrupt block rows plus a patched binary still open fast and
-    // correct, because the stale path never touches the blocks table.
+    // Functional proof that discarded rows cost nothing to decode: junk
+    // rows plus a patched binary still open fast and correct, because the
+    // stale path never touches the derived tables.
     let dir = common::tmpdir("stale-large");
     let bytes = small_elf();
     let bin = common::write_bin(&dir, "l.bin", &bytes);
@@ -674,9 +710,9 @@ fn stale_open_ignores_large_derived_tables() {
         let handle = db::open_db(&db).expect("open db");
         let wtxn = handle.begin_write().expect("begin write");
         {
-            let mut t = wtxn.open_table(BLOCKS).expect("open blocks");
-            for i in 0..20_000u32 {
-                t.insert(format!("junk:{i:08x}"), "{not json".to_string())
+            let mut t = wtxn.open_table(FUNCTIONS).expect("open functions");
+            for i in 0..20_000u64 {
+                t.insert(u64::MAX - i, b"{not row".to_vec())
                     .expect("junk row");
             }
         }

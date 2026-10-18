@@ -46,7 +46,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 9;
+pub const ANALYSIS_REVISION: u32 = 10;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -507,10 +507,16 @@ impl Function {
         self.blocks.values().map(|b| b.insns.len()).sum()
     }
 
-    /// Successor block starts of `block`.
+    /// Successor block starts of `block`, sorted.
+    ///
+    /// Sorted so fresh and snapshot-rebuilt analyses answer identically:
+    /// graph neighbor order follows edge insertion, which differs between
+    /// the walk (target before fallthrough) and the snapshot replay.
     #[must_use]
     pub fn successors(&self, block: u64) -> Vec<u64> {
-        self.cfg.neighbors(block).collect()
+        let mut succs: Vec<u64> = self.cfg.neighbors(block).collect();
+        succs.sort_unstable();
+        succs
     }
 
     /// Predecessor block starts of `block`.
@@ -526,13 +532,16 @@ impl Function {
             .collect()
     }
 
-    /// All CFG edges as `(from_block, to_block)` pairs.
+    /// All CFG edges as sorted `(from_block, to_block)` pairs.
     ///
     /// Direct edges only; inferred single-slot resolutions live in
-    /// [`Function::inferred_edges`].
+    /// [`Function::inferred_edges`]. Sorted for the same fresh/rebuilt
+    /// determinism as [`Function::successors`].
     #[must_use]
     pub fn edges(&self) -> Vec<(u64, u64)> {
-        self.cfg.all_edges().map(|(a, b, _)| (a, b)).collect()
+        let mut edges: Vec<(u64, u64)> = self.cfg.all_edges().map(|(a, b, _)| (a, b)).collect();
+        edges.sort_unstable();
+        edges
     }
 
     /// Inferred block edges as sorted `(from_block, to_block)` pairs.
@@ -3097,6 +3106,12 @@ fn collect_stubs<'a>(
     rows: impl Iterator<Item = (u64, Flow, Option<u64>, &'a str, u8)>,
     slots: &BTreeMap<u64, usize>,
 ) -> BTreeMap<u64, usize> {
+    // No import slots, no stubs: every match below needs `slots.get(&m)`,
+    // so skipping the walk (and the caller's per-row flow computation)
+    // is exact, not a heuristic.
+    if slots.is_empty() {
+        return BTreeMap::new();
+    }
     let mut stubs = BTreeMap::new();
     let mut prev: Option<(u64, &'a str, u8)> = None;
     for (addr, flow, mem, mnem, size) in rows {

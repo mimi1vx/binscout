@@ -1,11 +1,23 @@
 //! M5 persist: `redb` project store plus annotations.
 //!
 //! One project DB holds a single binary's snapshot: the [`BinaryMeta`] row,
-//! one [`FunctionRecord`] per function, one [`BlockRecord`] per basic block,
-//! the [`Xref`] set, extracted [`StringHit`]s, and user [`Annotation`]s.
-//! Values are JSON so rows stay debuggable with any `redb` inspector.
+//! one function row per function (carrying that function's block layouts),
+//! [`Xref`] entries in chunks, extracted [`StringHit`] bodies in chunks,
+//! and user [`Annotation`]s.
+//! Metadata, annotations, and user seeds stay JSON so they remain readable
+//! with any `redb` inspector; derived rows (functions, xrefs, strings,
+//! diagnostics) are compact little-endian binary. Per-instruction JSON
+//! objects, `0x`-hex twins, and `format!`-built keys once made small
+//! binaries produce ~20x sidecars, so derived tables use binary values
+//! (functions and diagnostics keep tuple keys) or small chunked blobs
+//! (xrefs and strings) with integer keys and no duplicated hex.
 //!
-//! Block rows store address ranges plus successors only; instructions are
+//! Chunking keeps single values small enough to pack like small rows while
+//! row visits stay in the dozens: cache-hit opens decode tens of rows
+//! instead of tens of thousands.
+//!
+//! Block layouts store address ranges plus per-instruction sizes only;
+//! instructions are
 //! re-decoded from the binary on open (see
 //! [`Analysis::rebuild`](crate::analysis::rebuild)). Caching rendered
 //! instructions made small binaries produce huge sidecars, so derived text
@@ -50,7 +62,14 @@ use crate::loader::strings::StringHit;
 /// Version 7 adds the `func_seeds` table plus the `seeds_hash` snapshot
 /// identity (see [`FuncSeed`]): user-defined function seeds persist
 /// across opens and join analysis on every open.
-pub const SCHEMA_VERSION: u32 = 7;
+///
+/// Version 8 stores derived rows as compact binary: functions keep one
+/// row per function (carrying its block layouts, no per-block keys) while
+/// xrefs and strings pack many entries per small chunked blob row; key
+/// twins, per-instruction JSON objects, and `format!`-built keys are gone.
+/// Old sidecars stay readable as stale (the stale path never opens derived
+/// tables), so they re-analyze instead of erroring.
+pub const SCHEMA_VERSION: u32 = 8;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -60,6 +79,12 @@ pub use crate::analysis::ANALYSIS_REVISION;
 pub const MAX_SNAPSHOT_FUNCTIONS: usize = 100_000;
 /// Cap on cached block rows (blocks never exceed decoded instructions).
 pub const MAX_SNAPSHOT_BLOCKS: usize = 1_000_000;
+/// Max xrefs per `xrefs` blob row (fixed 17-byte entries): small enough
+/// to pack like small rows while row visits stay in the dozens.
+const XREFS_PER_ROW: usize = 512;
+/// Max strings per `strings` blob row: small enough to pack like small
+/// rows while row visits stay in the dozens.
+const STRINGS_PER_ROW: usize = 128;
 /// Cap on cached xref rows (1M per kind times three kinds).
 pub const MAX_SNAPSHOT_XREFS: usize = 3_000_000;
 /// Cap on cached string rows (10k per segment times 256 segments, rounded up).
@@ -79,13 +104,12 @@ pub const MAX_ANNOTATION_BYTES: usize = 8192;
 
 const META: TableDefinition<&str, String> = TableDefinition::new("meta");
 const BINARIES: TableDefinition<u64, String> = TableDefinition::new("binaries");
-const FUNCTIONS: TableDefinition<u64, String> = TableDefinition::new("functions");
-const BLOCKS: TableDefinition<String, String> = TableDefinition::new("blocks");
-const XREFS: TableDefinition<String, String> = TableDefinition::new("xrefs");
-const STRINGS: TableDefinition<u64, String> = TableDefinition::new("strings");
+const FUNCTIONS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("functions");
+const XREFS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("xrefs");
+const STRINGS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("strings");
 const ANNOTATIONS: TableDefinition<u64, String> = TableDefinition::new("annotations");
 const FUNC_SEEDS: TableDefinition<u64, String> = TableDefinition::new("func_seeds");
-const DIAGNOSTICS: TableDefinition<String, String> = TableDefinition::new("diagnostics");
+const DIAGNOSTICS: TableDefinition<(u64, u8), ()> = TableDefinition::new("diagnostics");
 
 /// Deterministic 64-bit FNV-1a hash of the binary bytes.
 ///
@@ -448,60 +472,6 @@ pub fn stale_carry_plausible(
     stored.arch == current_arch && stored.format == current_format && stored.entry == current_entry
 }
 
-/// One function row: export name plus sorted direct callees.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FunctionRecord {
-    /// Function entry address.
-    pub entry: u64,
-    /// Export name or rename, if any.
-    pub name: Option<String>,
-    /// Sorted direct callees.
-    pub calls: Vec<u64>,
-    /// Sorted, deduplicated discovery reasons.
-    ///
-    /// Defaults to empty so layouts written before provenance tracking
-    /// still decode; such snapshots never hit the cache (their analysis
-    /// revision mismatches) and re-analyze instead.
-    #[serde(default)]
-    pub reasons: Vec<crate::analysis::DiscoveryReason>,
-    /// Canonical decode-arch override, if the function decoded under a
-    /// user seed mode rather than the project arch.
-    ///
-    /// Defaults to `None` (project arch) so rows written before seed
-    /// modes still decode; such snapshots never hit the cache (their
-    /// analysis revision mismatches) and re-analyze instead.
-    #[serde(default)]
-    pub arch: Option<String>,
-}
-
-/// One basic-block row: address range, per-instruction boundaries, and
-/// sorted successors.
-///
-/// Instructions are not stored; the open path re-decodes each recorded
-/// `(address, size)` boundary from the binary (see
-/// [`crate::analysis::rebuild`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockRecord {
-    /// Owning function entry.
-    pub func_entry: u64,
-    /// Address of the first instruction.
-    pub start: u64,
-    /// End address (one past the last byte).
-    pub end: u64,
-    /// `(address, size)` of every instruction in address order.
-    pub insns: Vec<crate::analysis::InsnLayout>,
-    /// Successor block starts.
-    pub succs: Vec<u64>,
-    /// Inferred successor block starts from resolved single-slot indirect
-    /// jumps; direct successors stay in [`BlockRecord::succs`].
-    ///
-    /// Defaults to empty so rows written before inference still decode;
-    /// such snapshots never hit the cache (their analysis revision
-    /// mismatches) and re-analyze instead.
-    #[serde(default)]
-    pub inferred_succs: Vec<u64>,
-}
-
 /// User annotation at one address: rename and/or free-text comment.
 ///
 /// Stored only in the project DB; the analyzed binary is never modified.
@@ -784,42 +754,547 @@ pub fn open_db_read_only(path: &Path) -> Result<redb::ReadOnlyDatabase> {
         .map_err(|e| Error::Storage(format!("open db: {e}")))
 }
 
-fn block_key(func_entry: u64, start: u64) -> String {
-    format!("{func_entry:016x}:{start:016x}")
-}
-
-fn xref_kind_name(kind: crate::analysis::XrefKind) -> &'static str {
-    match kind {
-        crate::analysis::XrefKind::Code => "code",
-        crate::analysis::XrefKind::Data => "data",
-        crate::analysis::XrefKind::String => "string",
-        crate::analysis::XrefKind::Import => "import",
-        crate::analysis::XrefKind::InferredCode => "inferred-code",
-    }
-}
-
-fn xref_key(x: &Xref) -> String {
-    format!("{:016x}:{}:{:016x}", x.from, xref_kind_name(x.kind), x.to)
-}
-
-fn diagnostic_kind_name(kind: crate::analysis::DiagnosticKind) -> &'static str {
-    match kind {
-        crate::analysis::DiagnosticKind::UnresolvedIndirectJump => "indirect_jump",
-        crate::analysis::DiagnosticKind::UnresolvedIndirectCall => "indirect_call",
-        crate::analysis::DiagnosticKind::DecodeFailure => "decode_failure",
-    }
-}
-
-fn diagnostic_key(d: &crate::analysis::Diagnostic) -> String {
-    format!("{:016x}:{}", d.addr, diagnostic_kind_name(d.kind))
-}
-
 fn json<T: Serialize>(v: &T) -> Result<String> {
     serde_json::to_string(v).map_err(|e| Error::Storage(format!("encode row: {e}")))
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T> {
     serde_json::from_str(s).map_err(|e| Error::Storage(format!("decode row: {e}")))
+}
+
+/// Little-endian binary writer for derived snapshot rows.
+///
+/// `functions` and `strings` chunked blobs plus `xrefs` chunked entries
+/// store compact binary instead of JSON: per-instruction JSON objects,
+/// `0x`-hex twins, and `format!`-built keys once made small binaries
+/// produce ~20x sidecars. Counts are `u32` (row sizes stay far below 4 GiB:
+/// mapped bytes cap at 256 MiB), addresses `u64`, sizes single bytes.
+struct Writer {
+    buf: Vec<u8>,
+}
+
+impl Writer {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Length-prefixed bytes (`u32` length, then the bytes).
+    fn bytes(&mut self, v: &[u8]) {
+        // Infallible: every stored blob derives from mapped bytes or their
+        // names, all bounded by the 256 MiB loader cap.
+        self.u32(v.len() as u32);
+        self.buf.extend_from_slice(v);
+    }
+
+    fn str(&mut self, v: &str) {
+        self.bytes(v.as_bytes());
+    }
+
+    /// Raw bytes, appended without a length prefix.
+    ///
+    /// Only for concatenating self-delimiting rows in chunked blobs: the
+    /// reader consumes exactly one row per call and checks the chunk end
+    /// afterwards.
+    fn raw(&mut self, v: &[u8]) {
+        self.buf.extend_from_slice(v);
+    }
+
+    /// Unsigned LEB128: block-start deltas ascend, so small gaps take one
+    /// or two bytes instead of eight.
+    fn uleb128(&mut self, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                self.u8(b);
+                break;
+            }
+            self.u8(b | 0x80);
+        }
+    }
+
+    /// Flag byte (`0` = none, `1` = some) plus the length-prefixed string.
+    fn opt_str(&mut self, v: Option<&str>) {
+        match v {
+            Some(s) => {
+                self.u8(1);
+                self.str(s);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    /// Count plus the `u64` items.
+    fn u64_vec(&mut self, vs: &[u64]) {
+        // Infallible: row item counts stay far below `u32::MAX` (snapshot
+        // row caps bound every vector encoded here).
+        self.u32(vs.len() as u32);
+        for &v in vs {
+            self.u64(v);
+        }
+    }
+
+    /// Successor and inferred-successor lists of one block.
+    ///
+    /// Direct successors never exceed two per block (branch target plus
+    /// fallthrough at most) and inferred never exceed fifteen, so both
+    /// counts usually pack into one byte: the low two bits hold the direct
+    /// count, the high six the inferred count. Longer lists (only reachable
+    /// if analysis ever grows new edge shapes) take the `0xFF` escape hatch
+    /// plus two `u32` counts.
+    fn succ_lists(&mut self, succs: &[u64], inferred: &[u64]) {
+        if succs.len() <= 3 && inferred.len() <= 15 {
+            self.u8(succs.len() as u8 | ((inferred.len() as u8) << 2));
+        } else {
+            self.u8(0xFF);
+            // Infallible: lengths stay far below `u32::MAX` (see above).
+            self.u32(succs.len() as u32);
+            self.u32(inferred.len() as u32);
+        }
+        for &v in succs.iter().chain(inferred) {
+            self.u64(v);
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+/// Little-endian binary reader for derived snapshot rows.
+///
+/// Every failure reports `decode row`, the same marker the stale-cache
+/// policy keys corrupt-row errors on.
+struct Reader<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        let (&b, rest) = self
+            .buf
+            .split_first()
+            .ok_or_else(|| Error::Storage("decode row: truncated".to_string()))?;
+        self.buf = rest;
+        Ok(b)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        let (b, rest) = self
+            .buf
+            .split_at_checked(4)
+            .ok_or_else(|| Error::Storage("decode row: truncated".to_string()))?;
+        self.buf = rest;
+        Ok(u32::from_le_bytes(b.try_into().expect("split 4 bytes")))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        let (b, rest) = self
+            .buf
+            .split_at_checked(8)
+            .ok_or_else(|| Error::Storage("decode row: truncated".to_string()))?;
+        self.buf = rest;
+        Ok(u64::from_le_bytes(b.try_into().expect("split 8 bytes")))
+    }
+
+    /// A `u32` count of `width`-byte items, bounded by the bytes left so a
+    /// forged count cannot pre-size a huge allocation.
+    fn count(&mut self, width: usize) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > self.buf.len() / width.max(1) {
+            return Err(Error::Storage("decode row: count exceeds row".to_string()));
+        }
+        Ok(n)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let n = self.count(1)?;
+        let (b, rest) = self.buf.split_at(n);
+        self.buf = rest;
+        Ok(b)
+    }
+
+    fn str(&mut self) -> Result<&'a str> {
+        let b = self.bytes()?;
+        std::str::from_utf8(b).map_err(|_| Error::Storage("decode row: bad utf-8".to_string()))
+    }
+
+    fn opt_string(&mut self) -> Result<Option<String>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.str()?.to_string())),
+            _ => Err(Error::Storage("decode row: bad option flag".to_string())),
+        }
+    }
+
+    /// Count plus the `u64` items.
+    fn u64_vec(&mut self) -> Result<Vec<u64>> {
+        let n = self.count(8)?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.u64()?);
+        }
+        Ok(out)
+    }
+
+    /// Successor and inferred-successor lists of one block (see
+    /// [`Writer::succ_lists`]).
+    fn succ_lists(&mut self) -> Result<(Vec<u64>, Vec<u64>)> {
+        let (n, m) = match self.u8()? {
+            // Guarded below like [`Reader::count`]: a forged escape must
+            // not pre-size a huge allocation.
+            0xFF => (self.u32()? as usize, self.u32()? as usize),
+            b => {
+                let m = (b >> 2) as usize;
+                if m > 15 {
+                    return Err(Error::Storage(
+                        "decode row: bad successor counts".to_string(),
+                    ));
+                }
+                ((b & 0x03) as usize, m)
+            }
+        };
+        let total = n
+            .checked_add(m)
+            .ok_or_else(|| Error::Storage("decode row: bad successor counts".to_string()))?;
+        if total > self.buf.len() / 8 {
+            return Err(Error::Storage("decode row: count exceeds row".to_string()));
+        }
+        let mut out = Vec::with_capacity(total);
+        for _ in 0..total {
+            out.push(self.u64()?);
+        }
+        let inferred = out.split_off(n.min(out.len()));
+        Ok((out, inferred))
+    }
+
+    /// Flag byte (`0` = absent, `1` = present) plus the `u64` item.
+    fn opt_u64(&mut self) -> Result<Option<u64>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()?)),
+            _ => Err(Error::Storage("decode row: bad option flag".to_string())),
+        }
+    }
+
+    /// Unsigned LEB128 (see [`Writer::uleb128`]).
+    fn uleb128(&mut self) -> Result<u64> {
+        let mut out = 0u64;
+        for i in 0..10 {
+            let b = self.u8()?;
+            if i == 9 && b & 0x7e != 0 {
+                return Err(Error::Storage("decode row: varint overflow".to_string()));
+            }
+            out |= ((b & 0x7f) as u64) << (7 * i);
+            if b & 0x80 == 0 {
+                return Ok(out);
+            }
+        }
+        Err(Error::Storage("decode row: bad varint".to_string()))
+    }
+
+    fn end(&self) -> Result<()> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Storage("decode row: trailing bytes".to_string()))
+        }
+    }
+}
+
+/// Discriminant of an [`XrefKind`](crate::analysis::XrefKind) for xref keys.
+///
+/// Order matches the kind's `Ord` (code, data, string, import,
+/// inferred-code) so key order equals the `(from, kind, to)` sort.
+fn xref_kind_code(kind: crate::analysis::XrefKind) -> u8 {
+    match kind {
+        crate::analysis::XrefKind::Code => 0,
+        crate::analysis::XrefKind::Data => 1,
+        crate::analysis::XrefKind::String => 2,
+        crate::analysis::XrefKind::Import => 3,
+        crate::analysis::XrefKind::InferredCode => 4,
+    }
+}
+
+/// Inverse of [`xref_kind_code`].
+fn decode_xref_kind(v: u8) -> Result<crate::analysis::XrefKind> {
+    match v {
+        0 => Ok(crate::analysis::XrefKind::Code),
+        1 => Ok(crate::analysis::XrefKind::Data),
+        2 => Ok(crate::analysis::XrefKind::String),
+        3 => Ok(crate::analysis::XrefKind::Import),
+        4 => Ok(crate::analysis::XrefKind::InferredCode),
+        _ => Err(Error::Storage(format!("decode row: bad xref kind {v}"))),
+    }
+}
+
+/// Discriminant of a [`DiscoveryReason`](crate::analysis::DiscoveryReason).
+fn reason_code(reason: crate::analysis::DiscoveryReason) -> u8 {
+    match reason {
+        crate::analysis::DiscoveryReason::Entry => 0,
+        crate::analysis::DiscoveryReason::Export => 1,
+        crate::analysis::DiscoveryReason::Symbol => 2,
+        crate::analysis::DiscoveryReason::DirectCall => 3,
+        crate::analysis::DiscoveryReason::Prologue => 4,
+        crate::analysis::DiscoveryReason::User => 5,
+    }
+}
+
+/// Inverse of [`reason_code`].
+fn decode_reason(v: u8) -> Result<crate::analysis::DiscoveryReason> {
+    match v {
+        0 => Ok(crate::analysis::DiscoveryReason::Entry),
+        1 => Ok(crate::analysis::DiscoveryReason::Export),
+        2 => Ok(crate::analysis::DiscoveryReason::Symbol),
+        3 => Ok(crate::analysis::DiscoveryReason::DirectCall),
+        4 => Ok(crate::analysis::DiscoveryReason::Prologue),
+        5 => Ok(crate::analysis::DiscoveryReason::User),
+        _ => Err(Error::Storage(format!("decode row: bad reason {v}"))),
+    }
+}
+
+/// Discriminant of a [`DiagnosticKind`](crate::analysis::DiagnosticKind)
+/// for diagnostics keys; order matches its `Ord` so key order equals the
+/// `(addr, kind)` sort.
+fn diagnostic_kind_code(kind: crate::analysis::DiagnosticKind) -> u8 {
+    match kind {
+        crate::analysis::DiagnosticKind::UnresolvedIndirectJump => 0,
+        crate::analysis::DiagnosticKind::UnresolvedIndirectCall => 1,
+        crate::analysis::DiagnosticKind::DecodeFailure => 2,
+    }
+}
+
+/// Inverse of [`diagnostic_kind_code`].
+fn decode_diagnostic_kind(v: u8) -> Result<crate::analysis::DiagnosticKind> {
+    match v {
+        0 => Ok(crate::analysis::DiagnosticKind::UnresolvedIndirectJump),
+        1 => Ok(crate::analysis::DiagnosticKind::UnresolvedIndirectCall),
+        2 => Ok(crate::analysis::DiagnosticKind::DecodeFailure),
+        _ => Err(Error::Storage(format!(
+            "decode row: bad diagnostic kind {v}"
+        ))),
+    }
+}
+
+/// Discriminant of a [`Encoding`](crate::loader::strings::Encoding).
+fn encoding_code(enc: crate::loader::strings::Encoding) -> u8 {
+    match enc {
+        crate::loader::strings::Encoding::Ascii => 0,
+        crate::loader::strings::Encoding::Utf16Le => 1,
+        crate::loader::strings::Encoding::Utf16Be => 2,
+    }
+}
+
+/// Inverse of [`encoding_code`].
+fn decode_encoding(v: u8) -> Result<crate::loader::strings::Encoding> {
+    match v {
+        0 => Ok(crate::loader::strings::Encoding::Ascii),
+        1 => Ok(crate::loader::strings::Encoding::Utf16Le),
+        2 => Ok(crate::loader::strings::Encoding::Utf16Be),
+        _ => Err(Error::Storage(format!("decode row: bad encoding {v}"))),
+    }
+}
+
+/// Encode one function row: name, sorted callees, reasons, decode-arch
+/// override, and its block layouts in start order. The entry rides in the
+/// table key; blocks ride in the value so one row holds the whole function
+/// and no per-block key repeats the entry. The first block start is
+/// absolute, the rest are unsigned LEB128 deltas from the previous start
+/// (starts ascend, so deltas never go negative and small gaps take one or
+/// two bytes). Lengths are `u32`: blocks never exceed the 256 MiB loader
+/// cap.
+fn encode_function(f: &crate::analysis::FunctionLayout) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.opt_str(f.name.as_deref());
+    w.u64_vec(&f.calls);
+    // Infallible: reasons stay in the single digits.
+    w.u32(f.reasons.len() as u32);
+    for &r in &f.reasons {
+        w.u8(reason_code(r));
+    }
+    w.opt_str(f.arch.as_deref());
+    let mut blocks: Vec<&crate::analysis::BlockLayout> = f.blocks.iter().collect();
+    blocks.sort_by_key(|b| b.start);
+    // Infallible: block counts stay far below `u32::MAX` (snapshot row caps
+    // bound every vector encoded here).
+    w.u32(blocks.len() as u32);
+    let mut prev = 0u64;
+    let mut first = true;
+    for b in blocks {
+        if first {
+            w.u64(b.start);
+            first = false;
+        } else {
+            w.uleb128(b.start.wrapping_sub(prev));
+        }
+        prev = b.start;
+        // Infallible: block lengths stay far below `u32::MAX` (blocks lie
+        // within mapped bytes, capped at 256 MiB).
+        w.u32(b.end.wrapping_sub(b.start) as u32);
+        // Infallible: blocks hold far fewer than `u32::MAX` instructions.
+        w.u32(b.insns.len() as u32);
+        for i in &b.insns {
+            w.u8(i.size);
+        }
+        let mut addr = b.start;
+        let mut contiguous = true;
+        for i in &b.insns {
+            if i.addr != addr {
+                contiguous = false;
+            }
+            addr = addr.wrapping_add(u64::from(i.size));
+        }
+        if contiguous {
+            w.u8(0);
+        } else {
+            w.u8(1);
+            for i in &b.insns {
+                w.u64(i.addr);
+            }
+        }
+        w.succ_lists(&b.succs, &b.inferred_succs);
+    }
+    w.finish()
+}
+
+/// Decode one function row; `entry` rides in the table key.
+fn decode_function(entry: u64, raw: &[u8]) -> Result<(crate::analysis::FunctionLayout, usize)> {
+    let mut r = Reader::new(raw);
+    let name = r.opt_string()?;
+    let calls = r.u64_vec()?;
+    let n_reasons = r.count(1)?;
+    let mut reasons = Vec::with_capacity(n_reasons);
+    for _ in 0..n_reasons {
+        reasons.push(decode_reason(r.u8()?)?);
+    }
+    let arch = r.opt_string()?;
+    let n_blocks = r.count(8)?;
+    let mut blocks = Vec::with_capacity(n_blocks.min(1024));
+    let mut prev = 0u64;
+    let mut first = true;
+    for _ in 0..n_blocks {
+        let start = if first {
+            first = false;
+            r.u64()?
+        } else {
+            prev.wrapping_add(r.uleb128()?)
+        };
+        prev = start;
+        let len = r.u32()?;
+        let end = start.wrapping_add(u64::from(len));
+        let n = r.count(1)?;
+        let mut sizes = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            sizes.push(r.u8()?);
+        }
+        let mut addrs: Vec<u64> = Vec::with_capacity(n.min(1024));
+        match r.u8()? {
+            0 => {
+                let mut addr = start;
+                for &size in &sizes {
+                    addrs.push(addr);
+                    addr = addr.wrapping_add(u64::from(size));
+                }
+            }
+            1 => {
+                for _ in 0..n {
+                    addrs.push(r.u64()?);
+                }
+            }
+            f => {
+                return Err(Error::Storage(format!(
+                    "decode row: bad block address flag {f}"
+                )));
+            }
+        }
+        let (succs, inferred_succs) = r.succ_lists()?;
+        let insns = sizes
+            .into_iter()
+            .zip(addrs)
+            .map(|(size, addr)| crate::analysis::InsnLayout { addr, size })
+            .collect();
+        blocks.push(crate::analysis::BlockLayout {
+            start,
+            end,
+            insns,
+            succs,
+            inferred_succs,
+        });
+    }
+    let layout = crate::analysis::FunctionLayout {
+        entry,
+        name,
+        calls,
+        blocks,
+        reasons,
+        arch,
+    };
+    let n = layout.blocks.len();
+    r.end()?;
+    Ok((layout, n))
+}
+
+/// Encode one string row without the wire `vaddr_hex` twin.
+fn encode_string(h: &StringHit) -> Vec<u8> {
+    let mut w = Writer::new();
+    // Infallible: offsets index mapped bytes, bounded by the 256 MiB loader
+    // cap, so they always fit `u32`.
+    w.u32(h.offset as u32);
+    match h.vaddr {
+        Some(v) => {
+            w.u8(1);
+            w.u64(v);
+        }
+        None => w.u8(0),
+    }
+    w.u8(encoding_code(h.encoding));
+    w.str(&h.value);
+    w.opt_str(h.section.as_deref());
+    w.u8(u8::from(h.executable));
+    w.finish()
+}
+
+/// Decode one string body from the shared chunk reader. Consumes exactly
+/// one body: the caller checks the chunk end afterwards.
+fn decode_string(r: &mut Reader<'_>) -> Result<StringHit> {
+    let offset = r.u32()? as usize;
+    let vaddr = r.opt_u64()?;
+    let encoding = decode_encoding(r.u8()?)?;
+    let value = r.str()?.to_string();
+    let section = r.opt_string()?;
+    let executable = match r.u8()? {
+        0 => false,
+        1 => true,
+        f => {
+            return Err(Error::Storage(format!(
+                "decode row: bad executable flag {f}"
+            )));
+        }
+    };
+    Ok(StringHit {
+        offset,
+        vaddr,
+        encoding,
+        value,
+        section,
+        executable,
+    })
 }
 
 /// Reject one annotation whose name/comment exceeds the per-field budget.
@@ -893,7 +1368,6 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
         "meta" => wtxn.delete_table(META),
         "binaries" => wtxn.delete_table(BINARIES),
         "functions" => wtxn.delete_table(FUNCTIONS),
-        "blocks" => wtxn.delete_table(BLOCKS),
         "xrefs" => wtxn.delete_table(XREFS),
         "strings" => wtxn.delete_table(STRINGS),
         "annotations" => wtxn.delete_table(ANNOTATIONS),
@@ -963,7 +1437,7 @@ pub enum AnnotationSave {
 /// transaction that would modify `annotations`, so an annotation never lands
 /// on a snapshot written for different bytes by another process. On match,
 /// inserts (`Some` non-empty) or deletes (`None`/empty) only that row and
-/// commits; the `functions`/`blocks`/`xrefs`/`strings` tables are never
+/// commits; the `functions`/`xrefs`/`strings` tables are never
 /// opened for writing. Identity ignores [`BinaryMeta::binary_path`]
 /// (see [`BinaryMeta::fast_write_eq`]): opening the same file via
 /// different relative/absolute spellings still takes the fast path.
@@ -1063,7 +1537,7 @@ pub fn save_annotation(
 /// [`BinaryMeta::binary_path`] (see [`BinaryMeta::fast_write_eq`]).
 /// On match, upserts (`Some` non-empty)
 /// or deletes (`None`) every entry of `changes` and commits once; the
-/// `functions`/`blocks`/`xrefs`/`strings` tables are never opened for
+/// `functions`/`xrefs`/`strings` tables are never opened for
 /// writing. An empty `changes` map commits nothing and returns
 /// [`AnnotationSave::Fast`]. On a fresh DB or any content/revision mismatch
 /// under the same mapping, aborts without writing and returns
@@ -1202,10 +1676,11 @@ fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) ->
 
 /// Persist `meta`, `analysis`, `annotations`, and `seeds` to `db` in one transaction.
 ///
-/// Clears all nine tables first so a smaller re-analysis leaves no stale
+/// Clears all eight tables first so a smaller re-analysis leaves no stale
 /// rows. Row counts are checked against the snapshot budgets before
 /// committing, so a snapshot that [`load`] could not read back is never
-/// written. Only block layouts persist; instructions re-decode on open.
+/// written. Only block layouts persist (inside their function chunk);
+/// instructions re-decode on open.
 /// Never touches the analyzed binary. Overwriting a populated sidecar under
 /// an incompatible (or ambiguous legacy) mapping errors instead of dropping
 /// user rows; use a separate DB path for the new mapping.
@@ -1230,7 +1705,6 @@ pub fn save(
         "meta",
         "binaries",
         "functions",
-        "blocks",
         "xrefs",
         "strings",
         "annotations",
@@ -1276,42 +1750,28 @@ pub fn save(
             .open_table(FUNCTIONS)
             .map_err(|e| Error::Storage(format!("open functions: {e}")))?;
         for f in &layouts {
-            let rec = FunctionRecord {
-                entry: f.entry,
-                name: f.name.clone(),
-                calls: f.calls.clone(),
-                reasons: f.reasons.clone(),
-                arch: f.arch.clone(),
-            };
-            t.insert(f.entry, json(&rec)?)
+            t.insert(f.entry, encode_function(f))
                 .map_err(|e| Error::Storage(format!("write functions: {e}")))?;
-        }
-    }
-    {
-        let mut t = wtxn
-            .open_table(BLOCKS)
-            .map_err(|e| Error::Storage(format!("open blocks: {e}")))?;
-        for f in &layouts {
-            for b in &f.blocks {
-                let rec = BlockRecord {
-                    func_entry: f.entry,
-                    start: b.start,
-                    end: b.end,
-                    insns: b.insns.clone(),
-                    succs: b.succs.clone(),
-                    inferred_succs: b.inferred_succs.clone(),
-                };
-                t.insert(block_key(f.entry, b.start), json(&rec)?)
-                    .map_err(|e| Error::Storage(format!("write blocks: {e}")))?;
-            }
         }
     }
     {
         let mut t = wtxn
             .open_table(XREFS)
             .map_err(|e| Error::Storage(format!("open xrefs: {e}")))?;
-        for x in &analysis.xrefs {
-            t.insert(xref_key(x), json(x)?)
+        // Chunked blob rows: one row per xref costs microseconds in
+        // debug builds, so fixed 17-byte entries pack `XREFS_PER_ROW`
+        // per row behind a count prefix. Chunks stay small enough to
+        // pack like small rows.
+        for (chunk, group) in analysis.xrefs.chunks(XREFS_PER_ROW).enumerate() {
+            let mut w = Writer::new();
+            // Infallible: chunks hold at most `XREFS_PER_ROW` entries.
+            w.u32(group.len() as u32);
+            for x in group {
+                w.u64(x.from);
+                w.u8(xref_kind_code(x.kind));
+                w.u64(x.to);
+            }
+            t.insert(chunk as u64, w.finish())
                 .map_err(|e| Error::Storage(format!("write xrefs: {e}")))?;
         }
     }
@@ -1319,8 +1779,16 @@ pub fn save(
         let mut t = wtxn
             .open_table(STRINGS)
             .map_err(|e| Error::Storage(format!("open strings: {e}")))?;
-        for (i, h) in analysis.strings.iter().enumerate() {
-            t.insert(i as u64, json(h)?)
+        // Chunked blob rows like `xrefs`: self-delimiting bodies need no
+        // per-row framing beyond the chunk count.
+        for (chunk, group) in analysis.strings.chunks(STRINGS_PER_ROW).enumerate() {
+            let mut w = Writer::new();
+            // Infallible: chunks hold at most `STRINGS_PER_ROW` bodies.
+            w.u32(group.len() as u32);
+            for h in group {
+                w.raw(&encode_string(h));
+            }
+            t.insert(chunk as u64, w.finish())
                 .map_err(|e| Error::Storage(format!("write strings: {e}")))?;
         }
     }
@@ -1350,7 +1818,7 @@ pub fn save(
             .open_table(DIAGNOSTICS)
             .map_err(|e| Error::Storage(format!("open diagnostics: {e}")))?;
         for d in &analysis.diagnostics.records {
-            t.insert(diagnostic_key(d), json(d)?)
+            t.insert((d.addr, diagnostic_kind_code(d.kind)), ())
                 .map_err(|e| Error::Storage(format!("write diagnostics: {e}")))?;
         }
     }
@@ -1433,15 +1901,17 @@ struct SnapshotParts {
     diagnostics: Vec<crate::analysis::Diagnostic>,
 }
 
-/// Decode the derived `functions`/`blocks`/`xrefs`/`strings` tables into
+/// Decode the derived `functions`/`xrefs`/`strings` tables into
 /// persistable layouts.
 ///
-/// A missing table or an undecodable row is corruption and errors; callers
-/// holding a known-stale snapshot must not call this at all (see the
-/// stale-cache policy on [`load_cached`]). Row counts are capped so a
-/// forged sidecar fails fast with [`Error::Limit`].
+/// Function rows carry their block layouts, so no separate block table is
+/// read. A missing table or an undecodable row is corruption and errors; callers holding a known-stale snapshot must not
+/// call this at all (see the stale-cache policy on [`load_cached`]). Row
+/// counts are capped so a forged sidecar fails fast with [`Error::Limit`].
 fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
-    let mut records: Vec<FunctionRecord> = Vec::new();
+    let mut records: Vec<crate::analysis::FunctionLayout> = Vec::new();
+    let mut block_count: usize = 0;
+    let mut inferred_count: usize = 0;
     {
         let t = rtxn
             .open_table(FUNCTIONS)
@@ -1450,68 +1920,43 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
             .iter()
             .map_err(|e| Error::Storage(format!("read functions: {e}")))?
         {
-            let (_, v) = row.map_err(|e| Error::Storage(format!("read functions: {e}")))?;
+            let (k, v) = row.map_err(|e| Error::Storage(format!("read functions: {e}")))?;
             let raw = v.value();
             if records.len() >= MAX_SNAPSHOT_FUNCTIONS {
                 return Err(Error::Limit("snapshot functions exceed cap".to_string()));
             }
-            records.push(decode(&raw)?);
-        }
-    }
-    let mut blocks_by_func: BTreeMap<u64, Vec<crate::analysis::BlockLayout>> = BTreeMap::new();
-    let mut block_count: usize = 0;
-    let mut inferred_count: usize = 0;
-    {
-        let t = rtxn
-            .open_table(BLOCKS)
-            .map_err(|e| Error::Storage(format!("open blocks: {e}")))?;
-        for row in t
-            .iter()
-            .map_err(|e| Error::Storage(format!("read blocks: {e}")))?
-        {
-            let (_, v) = row.map_err(|e| Error::Storage(format!("read blocks: {e}")))?;
-            let raw = v.value();
-            block_count += 1;
+            let (mut layout, n) = decode_function(k.value(), &raw)?;
+            block_count += n;
             if block_count > MAX_SNAPSHOT_BLOCKS {
                 return Err(Error::Limit("snapshot blocks exceed cap".to_string()));
             }
-            let rec: BlockRecord = decode(&raw)?;
-            inferred_count += rec.inferred_succs.len();
+            inferred_count += layout
+                .blocks
+                .iter()
+                .map(|b| b.inferred_succs.len())
+                .sum::<usize>();
             if inferred_count > MAX_SNAPSHOT_INFERRED_EDGES {
                 return Err(Error::Limit(
                     "snapshot inferred edges exceed cap".to_string(),
                 ));
             }
-            blocks_by_func
-                .entry(rec.func_entry)
-                .or_default()
-                .push(crate::analysis::BlockLayout {
-                    start: rec.start,
-                    end: rec.end,
-                    insns: rec.insns,
-                    succs: rec.succs,
-                    inferred_succs: rec.inferred_succs,
-                });
+            layout.blocks.sort_by_key(|b| b.start);
+            let mut reasons = layout.reasons.clone();
+            reasons.sort_unstable();
+            reasons.dedup();
+            layout.reasons = reasons;
+            records.push(layout);
         }
     }
+    // Numeric entry order, independent of key encoding: `call_edges` below
+    // follows this order.
+    records.sort_by_key(|f| f.entry);
     let mut functions: Vec<FunctionLayout> = Vec::new();
     let mut call_edges: Vec<(u64, u64)> = Vec::new();
     for rec in records {
         let entry = rec.entry;
-        let mut blocks = blocks_by_func.remove(&entry).unwrap_or_default();
-        blocks.sort_by_key(|b| b.start);
-        let mut reasons = rec.reasons.clone();
-        reasons.sort_unstable();
-        reasons.dedup();
-        functions.push(FunctionLayout {
-            entry,
-            name: rec.name.clone(),
-            calls: rec.calls.clone(),
-            blocks,
-            reasons,
-            arch: rec.arch.clone(),
-        });
-        call_edges.extend(rec.calls.into_iter().map(|c| (entry, c)));
+        call_edges.extend(rec.calls.iter().map(|c| (entry, *c)));
+        functions.push(rec);
     }
     let mut xrefs: Vec<Xref> = Vec::new();
     {
@@ -1524,10 +1969,19 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read xrefs: {e}")))?;
             let raw = v.value();
-            if xrefs.len() >= MAX_SNAPSHOT_XREFS {
-                return Err(Error::Limit("snapshot xrefs exceed cap".to_string()));
+            let mut r = Reader::new(&raw);
+            // Width 17 (one fixed entry): valid chunks never trip this.
+            let n = r.count(17)?;
+            for _ in 0..n {
+                if xrefs.len() >= MAX_SNAPSHOT_XREFS {
+                    return Err(Error::Limit("snapshot xrefs exceed cap".to_string()));
+                }
+                let from = r.u64()?;
+                let kind = decode_xref_kind(r.u8()?)?;
+                let to = r.u64()?;
+                xrefs.push(Xref { from, to, kind });
             }
-            xrefs.push(decode(&raw)?);
+            r.end()?;
         }
     }
     xrefs.sort_by_key(|a| (a.from, a.kind, a.to));
@@ -1542,10 +1996,17 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
         {
             let (_, v) = row.map_err(|e| Error::Storage(format!("read strings: {e}")))?;
             let raw = v.value();
-            if strings.len() >= MAX_SNAPSHOT_STRINGS {
-                return Err(Error::Limit("snapshot strings exceed cap".to_string()));
+            let mut r = Reader::new(&raw);
+            // Width 8 (below the 11-byte minimum body): valid chunks
+            // never trip this.
+            let n = r.count(8)?;
+            for _ in 0..n {
+                if strings.len() >= MAX_SNAPSHOT_STRINGS {
+                    return Err(Error::Limit("snapshot strings exceed cap".to_string()));
+                }
+                strings.push(decode_string(&mut r)?);
             }
-            strings.push(decode(&raw)?);
+            r.end()?;
         }
     }
     let diagnostics = read_diagnostics(rtxn)?;
@@ -1571,12 +2032,15 @@ fn read_diagnostics(rtxn: &redb::ReadTransaction) -> Result<Vec<crate::analysis:
         .iter()
         .map_err(|e| Error::Storage(format!("read diagnostics: {e}")))?
     {
-        let (_, v) = row.map_err(|e| Error::Storage(format!("read diagnostics: {e}")))?;
-        let raw = v.value();
+        let (k, _) = row.map_err(|e| Error::Storage(format!("read diagnostics: {e}")))?;
+        let (addr, kind) = k.value();
         if diagnostics.len() >= MAX_SNAPSHOT_DIAGNOSTICS {
             return Err(Error::Limit("snapshot diagnostics exceed cap".to_string()));
         }
-        diagnostics.push(decode(&raw)?);
+        diagnostics.push(crate::analysis::Diagnostic {
+            addr,
+            kind: decode_diagnostic_kind(kind)?,
+        });
     }
     diagnostics.sort_unstable();
     diagnostics.dedup();
@@ -1709,7 +2173,7 @@ pub enum Snapshot {
     Hit(Box<Loaded>),
     /// Stored hash, mapping, analysis revision, or schema version differs:
     /// metadata plus annotations and seeds only; the derived
-    /// `functions`/`blocks`/`xrefs`/`strings` tables were never opened.
+    /// `functions`/`xrefs`/`strings` tables were never opened.
     Stale {
         /// Snapshot metadata (row 0 of `binaries`).
         meta: BinaryMeta,
@@ -1754,7 +2218,7 @@ pub enum Snapshot {
 ///
 /// Stale-cache policy (a deliberate behavior change; strict all-input
 /// equivalence with [`load`] is not claimed): a stale snapshot's derived
-/// rows are discarded unchecked, so corrupt derived rows (bad JSON, unknown
+/// rows are discarded unchecked, so corrupt derived rows (bad encodings,
 /// shapes) and missing derived tables no longer error — [`load`] would have
 /// errored on them before the caller ever compared hashes. Schema `version`,
 /// `arch`, and `format` are likewise unchecked on the stale path since they
@@ -1957,6 +2421,160 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    fn sample_layout() -> crate::analysis::FunctionLayout {
+        use crate::analysis::{BlockLayout, DiscoveryReason, FunctionLayout, InsnLayout};
+        FunctionLayout {
+            entry: 0x1000,
+            name: Some("f".to_string()),
+            calls: vec![0x1020, 0x1040],
+            blocks: vec![
+                BlockLayout {
+                    start: 0x1000,
+                    end: 0x1008,
+                    insns: vec![
+                        InsnLayout {
+                            addr: 0x1000,
+                            size: 5,
+                        },
+                        InsnLayout {
+                            addr: 0x1005,
+                            size: 3,
+                        },
+                    ],
+                    succs: vec![0x1008, 0x1010],
+                    inferred_succs: vec![0x1020],
+                },
+                BlockLayout {
+                    start: 0x1008,
+                    end: 0x1009,
+                    insns: vec![InsnLayout {
+                        addr: 0x1008,
+                        size: 1,
+                    }],
+                    succs: vec![],
+                    inferred_succs: vec![],
+                },
+            ],
+            reasons: vec![DiscoveryReason::Entry, DiscoveryReason::DirectCall],
+            arch: Some("thumb".to_string()),
+        }
+    }
+
+    fn decode_body(entry: u64, raw: &[u8]) -> Result<crate::analysis::FunctionLayout> {
+        let (layout, _) = decode_function(entry, raw)?;
+        Ok(layout)
+    }
+
+    #[test]
+    fn binary_function_row_round_trip() {
+        let layout = sample_layout();
+        let back = decode_body(layout.entry, &encode_function(&layout)).expect("round trip");
+        assert_eq!(back, layout);
+        let minimal = crate::analysis::FunctionLayout {
+            entry: 0x2000,
+            name: None,
+            calls: vec![],
+            blocks: vec![],
+            reasons: vec![],
+            arch: None,
+        };
+        let back = decode_body(minimal.entry, &encode_function(&minimal)).expect("round trip");
+        assert_eq!(back, minimal);
+    }
+
+    #[test]
+    fn binary_explicit_addresses_survive() {
+        // Overlapping decodes never share one block from real analysis, but
+        // the explicit-address flag must not lose them if they ever do.
+        let mut layout = sample_layout();
+        layout.blocks[0].insns[1].addr = 0x1001;
+        let raw = encode_function(&layout);
+        let back = decode_body(layout.entry, &raw).expect("round trip");
+        assert_eq!(back, layout);
+        assert_eq!(back.blocks[0].insns[1].addr, 0x1001);
+    }
+
+    fn decode_str(raw: &[u8]) -> Result<StringHit> {
+        let mut r = Reader::new(raw);
+        let hit = decode_string(&mut r)?;
+        r.end()?;
+        Ok(hit)
+    }
+
+    #[test]
+    fn binary_rows_reject_garbage() {
+        for bad in [
+            vec![2u8],               // bad option flag
+            vec![1, 9, 0, 0, 0, 65], // bad UTF-8
+            vec![255u8],             // bad varint
+            vec![1, 0, 0, 0],        // truncated string
+        ] {
+            let err = decode_str(&bad).unwrap_err();
+            assert!(
+                err.to_string().contains("decode row"),
+                "unexpected: {err:?}"
+            );
+        }
+        for v in [255u8, 9] {
+            assert!(decode_xref_kind(v).is_err());
+            assert!(decode_diagnostic_kind(v).is_err());
+            assert!(decode_reason(v).is_err());
+            assert!(decode_encoding(v).is_err());
+        }
+        // Truncations and trailing bytes fail.
+        let good = encode_function(&sample_layout());
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad.truncate(i);
+            let err = decode_body(sample_layout().entry, &bad).unwrap_err();
+            assert!(
+                err.to_string().contains("decode row"),
+                "prefix {i} decoded: {bad:?}"
+            );
+        }
+        let mut bad = good.clone();
+        bad.push(0);
+        assert!(decode_body(sample_layout().entry, &bad).is_err());
+    }
+
+    #[test]
+    fn codec_uleb128_round_trip() {
+        for v in [0u64, 1, 127, 128, 300, 0xFFFF_FFFF, u64::MAX] {
+            let mut w = Writer::new();
+            w.uleb128(v);
+            let raw = w.finish();
+            let mut r = Reader::new(&raw);
+            assert_eq!(r.uleb128().unwrap(), v);
+            assert!(r.end().is_ok());
+        }
+        assert!(Reader::new(&[0x80]).uleb128().is_err());
+        let mut bad = vec![0xFF; 9];
+        bad.push(0x7F);
+        assert!(Reader::new(&bad).uleb128().is_err());
+    }
+
+    #[test]
+    fn codec_string_row_round_trip() {
+        let hit = StringHit {
+            offset: 12,
+            vaddr: Some(0x1012),
+            encoding: crate::loader::strings::Encoding::Ascii,
+            value: "hi".to_string(),
+            section: Some(".text".to_string()),
+            executable: true,
+        };
+        assert_eq!(decode_str(&encode_string(&hit)).unwrap(), hit);
+        let bare = StringHit {
+            offset: 0,
+            vaddr: None,
+            encoding: crate::loader::strings::Encoding::Utf16Le,
+            value: "AB".to_string(),
+            section: None,
+            executable: false,
+        };
+        assert_eq!(decode_str(&encode_string(&bare)).unwrap(), bare);
     }
 
     #[test]

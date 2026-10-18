@@ -308,7 +308,7 @@ fn revision_mismatch_reanalyzes_instead_of_synthesizing_clean() {
 
 #[test]
 fn missing_diagnostics_table_errors_instead_of_clean_synthesis() {
-    const DIAGNOSTICS: redb::TableDefinition<String, String> =
+    const DIAGNOSTICS: redb::TableDefinition<(u64, u8), ()> =
         redb::TableDefinition::new("diagnostics");
 
     let dir = common::tmpdir("diag-missing-table");
