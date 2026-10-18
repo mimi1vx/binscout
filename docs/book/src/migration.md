@@ -12,14 +12,15 @@ the current binaries.
 
 ## Tool count and versions
 
-The MCP server exposes 29 tools: `project_info`, `load`, `functions`,
+The MCP server exposes 32 tools: `project_info`, `load`, `functions`,
 `func`, `blocks`, `block_insns`, `diagnostics`, `disasm`, `bytes`, `cfg`,
 `structure`, `pseudo`, `callees`, `callers`, `slice`,
 `xrefs`, `strings`, `symbols`, `stats`, `sections`, `ir`,
-`ir_coverage`, `flirt_hints`, `rename`, `comment`, `search_bytes`,
+`ir_coverage`, `flirt_hints`, `rename`, `comment`, `annotation`,
+`define_func`, `undefine_func`, `search_bytes`,
 `annotations_export`, `annotations_import`, `diff`. The CLI has the same
-capabilities as 27 subcommands (`load` covers `project_info`;
-`annotate` covers `rename`/`comment`); the MCP `load` tool is the
+capabilities as 29 subcommands (`load` covers `project_info`;
+`annotate` covers `rename`/`comment`/`annotation`); the MCP `load` tool is the
 sidecar-warming counterpart of the CLI `load`.
 
 Three versions move independently:
@@ -204,3 +205,39 @@ a run still valid at 8 slots is open-ended, so the site stays
 unresolved rather than partially recovered); 100,000 per project;
 exhaustion keeps the site unresolved with `inferred_truncated`
 set and the excess in `inferred_omitted`.
+
+## Opt-in envelope preview (protocol-2 track)
+
+`functions` and `strings` still return bare arrays by default, but both
+accept an opt-in envelope: `--envelope` on the CLI, `envelope: true` on
+the MCP tools. The envelope is the protocol-1 page shape with an exact
+`total`, so agents learn the match count without paging to the end:
+
+```sh
+$ binscout functions fw.elf --envelope --limit 1
+{"items":[{"blocks":1,"calls_count":0,"entry":4198400,"entry_hex":"0x401000","id":"func@0x401000","insns":3,"name":"main"}],"limit":1,"next_offset":1,"offset":0,"protocol":1,"total":2}
+$ binscout strings fw.elf --envelope --limit 0
+{"items":[],"limit":0,"next_offset":null,"offset":0,"protocol":1,"total":5}
+```
+
+Planned breaking changes, staged behind this flag so no default output
+moves until the version bump:
+
+- `functions` rows trade the unbounded `calls` target array for
+  `calls_count` (envelope rows already do this; the legacy bare array
+  keeps `calls`). Direct callees remain one `callees` query away
+  (`depth` 1 orders the same targets by entry with their distance).
+- `functions` and `strings` adopt the page envelope as their default
+  shape (`xrefs` keeps its own `{"total", "xrefs"}` wrapper until the
+  same migration aligns it).
+
+Additive and already shipped (no migration needed): `cfg`,
+`structure`, `pseudo` (and the library `func_detail`) echo the
+requested address in `query_addr`/`query_addr_hex`; `functions`
+accepts `range_start`/`range_end` as aliases of its inclusive
+`range_lo`/`range_hi`, `search_bytes` accepts `range_lo`/`range_hi`
+as aliases of its half-open `range_start`/`range_end` (canonical
+names win, aliases warn on stderr); the MCP `annotation` tool reads
+the current rename/comment row (CLI `annotate` without flags parity),
+read-only. The type-hint API stays a comment-channel convention (see
+[JSON protocol](json-protocol.md)); it is out of scope for this track.

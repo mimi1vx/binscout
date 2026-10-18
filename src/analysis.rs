@@ -1792,6 +1792,16 @@ impl Analysis {
         filter_string_hits(&self.strings, filter)
     }
 
+    /// Exact count of [`Analysis::strings_page_filtered`] matches, before
+    /// paging. Lets agents learn the string count without paging to the
+    /// end; the opt-in envelope reports this as `total`.
+    ///
+    /// # Errors
+    /// Same as [`Analysis::strings_page_filtered`].
+    pub fn strings_count_filtered(&self, filter: &StringsFilter) -> Result<usize> {
+        count_string_hits(&self.strings, filter)
+    }
+
     /// Decoded-view strings: re-extract over an in-memory decoded copy.
     ///
     /// Each segment's bytes are transformed with `decode` (see
@@ -1811,6 +1821,31 @@ impl Analysis {
         filter: &StringsFilter,
         decode: strings::DecodeSpec,
     ) -> Result<Vec<StringHit>> {
+        let hits = self.decoded_hits(bin, decode);
+        filter_string_hits(&hits, filter)
+    }
+
+    /// Exact count of [`Analysis::strings_decoded_view`] matches.
+    ///
+    /// # Errors
+    /// Same as [`Analysis::strings_decoded_view`].
+    pub fn strings_decoded_count(
+        &self,
+        bin: &LoadedBinary,
+        filter: &StringsFilter,
+        decode: strings::DecodeSpec,
+    ) -> Result<usize> {
+        let hits = self.decoded_hits(bin, decode);
+        count_string_hits(&hits, filter)
+    }
+
+    /// Decoded-view hits over a per-segment decoded copy, section-tagged
+    /// exactly like [`analyze`].
+    ///
+    /// Shared by [`Analysis::strings_decoded_view`] and
+    /// [`Analysis::strings_decoded_count`] so the count and the page agree
+    /// on the underlying rows.
+    fn decoded_hits(&self, bin: &LoadedBinary, decode: strings::DecodeSpec) -> Vec<StringHit> {
         let mut hits: Vec<StringHit> = Vec::new();
         for seg in &bin.segments {
             let decoded = decode.apply(&seg.data);
@@ -1829,7 +1864,7 @@ impl Analysis {
             }
         }
         hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
-        filter_string_hits(&hits, filter)
+        hits
     }
 }
 
@@ -1895,6 +1930,53 @@ fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<
         }
     }
     Ok(out)
+}
+
+/// Exact count of [`filter_string_hits`] matches, before paging.
+///
+/// Mirrors the filter loop row-for-row (executable-memory hiding, section,
+/// length, lazy pattern compile) without the page cap or the filled-page
+/// early exit, so the count and the page agree on the match set and on
+/// pattern error semantics.
+///
+/// # Errors
+/// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
+/// expression fails to compile.
+fn count_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<usize> {
+    let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
+    // Compiled once, lazily at the first row reaching pattern evaluation:
+    // a malformed/overlong pattern errors only when a row survives the
+    // earlier filters, matching `filter_string_hits`.
+    let mut matcher: Option<strings::PatternMatcher<'_>> = None;
+    let mut matched: usize = 0;
+    for h in hits {
+        if h.executable && !show_code {
+            continue;
+        }
+        if let Some(sec) = &filter.section
+            && h.section.as_deref() != Some(sec.as_str())
+        {
+            continue;
+        }
+        if let Some(min) = filter.min_len
+            && h.value.chars().count() < min
+        {
+            continue;
+        }
+        if let Some(pat) = &filter.pattern {
+            if matcher.is_none() {
+                matcher = Some(strings::PatternMatcher::compile(pat)?);
+            }
+            let Some(m) = matcher.as_ref() else {
+                continue;
+            };
+            if !m.is_match(&h.value) {
+                continue;
+            }
+        }
+        matched += 1;
+    }
+    Ok(matched)
 }
 
 /// Control-flow effect of one instruction, from its M3 lift.

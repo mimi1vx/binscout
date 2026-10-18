@@ -67,6 +67,12 @@ pub enum Cmd {
         offset: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Wrap matches in the protocol-1 page envelope with an exact
+        /// `total` and compact `calls_count` rows (opt-in preview of the
+        /// planned functions-shape migration; default stays a bare array
+        /// with the full `calls` target array).
+        #[arg(long)]
+        envelope: bool,
     },
     /// Compact metadata of one function: entry, name, and block/insn/call
     /// counts. Any address inside the function snaps to its containing
@@ -233,6 +239,11 @@ pub enum Cmd {
         /// offsets; never writes the binary.
         #[arg(long)]
         decode: Option<String>,
+        /// Wrap matches in the protocol-1 page envelope with an exact
+        /// `total` (opt-in preview of the planned strings-shape
+        /// migration; default stays a bare array).
+        #[arg(long)]
+        envelope: bool,
     },
     /// Imports and exports.
     Symbols { binary: PathBuf },
@@ -373,8 +384,11 @@ impl Cli {
                 range,
                 offset,
                 limit,
+                envelope,
             } => functions_filter(query, caller, callee, range).and_then(|filter| {
-                functions(&binary, db, raw_opts, fat_arch, &filter, offset, limit)
+                functions(
+                    &binary, db, raw_opts, fat_arch, &filter, offset, limit, envelope,
+                )
             }),
             Cmd::Func { binary, addr } => func(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Blocks {
@@ -472,6 +486,7 @@ impl Cli {
                 section,
                 include_code,
                 decode,
+                envelope,
             } => {
                 if offset.is_some() {
                     warn("warning: --offset is deprecated, use --start");
@@ -499,6 +514,7 @@ impl Cli {
                         limit,
                     },
                     decode,
+                    envelope,
                 )
             }
             Cmd::Symbols { binary } => symbols(&binary, db, raw_opts, fat_arch),
@@ -682,6 +698,10 @@ fn functions_filter(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn functions(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
@@ -690,11 +710,19 @@ fn functions(
     filter: &binscout::FunctionFilter,
     offset: usize,
     limit: usize,
+    envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch)?;
-    Ok(serde_json::Value::Array(
-        p.functions_filtered(filter, offset, limit),
-    ))
+    if envelope {
+        Ok(
+            serde_json::to_value(p.functions_envelope(filter, offset, limit))
+                .expect("functions envelope serializes"),
+        )
+    } else {
+        Ok(serde_json::Value::Array(
+            p.functions_filtered(filter, offset, limit),
+        ))
+    }
 }
 
 fn func(
@@ -924,8 +952,16 @@ fn strings(
     fat_arch: Option<&str>,
     filter: &binscout::analysis::StringsFilter,
     decode: Option<binscout::loader::strings::DecodeSpec>,
+    envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch)?;
+    if envelope {
+        let page = match decode {
+            Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
+            None => p.query_strings_envelope(filter)?,
+        };
+        return Ok(serde_json::to_value(page).expect("strings envelope serializes"));
+    }
     let rows = match decode {
         Some(spec) => p.query_strings_decoded(filter, spec)?,
         None => p.query_strings(filter)?,
