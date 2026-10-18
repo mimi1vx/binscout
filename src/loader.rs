@@ -140,7 +140,7 @@ pub enum BinaryFormat {
 /// sections whose `size` is purely virtual, and may trail `size` when the
 /// tail is zero-fill). Byte reads resolve through segments by VA, so a
 /// container holds the input once instead of twice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     /// Section name (`objN` for LE objects, which have no names).
     pub name: String,
@@ -153,12 +153,49 @@ pub struct Section {
     pub file_off: u64,
     /// File-backed byte count starting at `vaddr`.
     pub file_size: u64,
+    /// Shannon entropy of the file-backed bytes, in bits per byte (0-8).
+    pub entropy: f64,
     /// Section is readable.
     pub readable: bool,
     /// Section is writable.
     pub writable: bool,
     /// Section is executable.
     pub executable: bool,
+}
+
+impl Section {
+    /// Shannon entropy of the file-backed bytes, in bits per byte (0–8).
+    ///
+    /// Stored at load time from the file-backed prefix; empty
+    /// (virtual-only, e.g. `bss`) sections report `0.0`. Values near
+    /// 8 mark dense or encrypted/packed bytes; values under ~6 are typical
+    /// of code and tables. First-minute triage compares this against ~7.2
+    /// when judging whether a section is packed.
+    #[must_use]
+    pub fn entropy(&self) -> f64 {
+        self.entropy
+    }
+}
+
+/// Shannon entropy of `data` in bits per byte (0–8); empty input is `0.0`.
+#[must_use]
+pub fn section_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for b in data {
+        counts[usize::from(*b)] += 1;
+    }
+    let total = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 /// One imported symbol: `library!name`, where `name` is `#ordinal` for
@@ -329,7 +366,7 @@ impl Serialize for SymbolRef {
 }
 
 /// A parsed binary ready for disassembly and analysis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoadedBinary {
     /// Container format.
     pub format: BinaryFormat,
@@ -672,6 +709,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
             size: sec.size(),
             file_off,
             file_size: data.len() as u64,
+            entropy: section_entropy(data),
             readable,
             writable,
             executable,
@@ -2469,6 +2507,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
             size: o.virtual_size as u64,
             file_off: 0,
             file_size: s.data.len() as u64,
+            entropy: section_entropy(&s.data),
             readable: o.readable,
             writable: o.writable,
             executable: o.executable,

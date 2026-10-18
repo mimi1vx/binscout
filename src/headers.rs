@@ -1503,6 +1503,7 @@ mod tests {
     fn bin_at(image_base: u64, rva: u32, data: Vec<u8>) -> LoadedBinary {
         let vaddr = image_base + u64::from(rva);
         let file_size = data.len() as u64;
+        let entropy = crate::loader::section_entropy(&data);
         LoadedBinary {
             format: BinaryFormat::Pe,
             arch: crate::disasm::Arch::X86_32,
@@ -1521,6 +1522,7 @@ mod tests {
                 size: file_size,
                 file_off: 0,
                 file_size,
+                entropy,
                 readable: true,
                 writable: false,
                 executable: false,

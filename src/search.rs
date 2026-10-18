@@ -558,6 +558,7 @@ mod tests {
                 size: 0x100,
                 file_off: 0,
                 file_size: 0,
+                entropy: 0.0,
                 readable: true,
                 writable: true,
                 executable: false,

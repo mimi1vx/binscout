@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 40 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 41 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`; `batch` takes one
 envelope plus a list of read-only ops) and returns one JSON
@@ -35,7 +35,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `strings` | binary, pattern/min_len/section/include_code/decode, start/limit | Extracted strings ordered by address, filtered and paged; executable-memory hits hidden unless `pattern`, `section`, or `include_code` is given (`offset` is a deprecated alias of `start`, warning on stderr; `envelope:true` returns the protocol-1 page envelope with an exact `total` instead of the bare array); `decode` (`xor:<byte>`, `xor:0x<HEXKEY>` rolling multi-byte key, `add:<byte>`, `rot:<0-7>`, or bare `base64`) re-extracts over a read-only in-memory transform with original offsets |
 | `stack_strings` | binary | Recovered stack-constructed strings: runs of `mov [rsp/rbp+off], imm` within one block, reassembled with function and address; read-only, never writes the binary or the sidecar |
 | `symbols` | binary | Imports, exports, and symbol-table code addresses of the binary (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below exports and above stubs |
-| `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
+| `sections` | binary | Section table: name, virtual address (`IMAGE_BASE + RVA` on PE), in-memory/file sizes, Shannon `entropy` (bits per byte), permissions |
 | `ir` | binary, addr, len | Lift `len` bytes at `addr` to P-code-inspired IR (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir_coverage` | arch, binary?/addr?/len? | Machine-readable lift coverage for one arch (implemented families, partial mappings, limitations); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `flirt_hints` | binary, addr?, sigs?, offset?/limit? | FLIRT-like library hints: corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `addr` keeps only the containing function's hints; `sigs` adds a user signature file path (our JSON, as emitted by `sig_gen`, or an IDA `.pat` file by extension); suggested names stay hints, querying never writes a sidecar |
@@ -51,6 +51,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `define_func` | binary, addr, mode? | Assert "there is code here": store a user function seed and re-analyze so it materializes; `mode` (`arm`/`thumb`) selects the 32-bit ARM decode, other arches reject it |
 | `undefine_func` | binary, addr | Assert "this isn't a function": exclude the seed (kept as data) and re-analyze |
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address (`range_start` + `range_end` bound the half-open `[lo, hi)` range; `range_lo`/`range_hi` are deprecated aliases, warning on stderr); scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
+| `crypto_scan` | binary, name?/section?, offset?/limit? | Paged crypto-constant matches (`addr`/`addr_hex`, `name`, `file_off`, `section`, `len`, `xrefs_count`) for the static table (AES/SHA/MD5/CRC-32 tables, ChaCha sigma, Blowfish P-array, TEA delta, LE/BE word orders) |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
 | `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch?, offset?/limit?, transfer_renames? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason, plus BinDiff-style neighbour propagation); each list pages under the protocol-1 envelope; `transfer_renames` embeds the side-B rename document for `annotations_import`; both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |

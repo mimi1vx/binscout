@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 40 tools, and call every one against fixtures.
+//! list the 41 tools, and call every one against fixtures.
 
 mod common;
 
@@ -120,6 +120,7 @@ fn handshake_lists_tools() {
             "callers",
             "cfg",
             "comment",
+            "crypto_scan",
             "define_func",
             "diagnostics",
             "diff",
@@ -150,7 +151,7 @@ fn handshake_lists_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 40 tools"
+        "exactly the 41 tools"
     );
     let search = tools
         .iter()
@@ -213,6 +214,16 @@ fn handshake_lists_tools() {
         .expect("input schema properties");
     for key in ["binary_a", "binary_b", "db_a", "db_b", "raw"] {
         assert!(props.contains_key(key), "diff exposes {key}");
+    }
+    let crypto = tools
+        .iter()
+        .find(|t| t["name"] == "crypto_scan")
+        .expect("crypto_scan listed");
+    let props = crypto["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in ["binary", "db", "raw", "name", "section", "offset", "limit"] {
+        assert!(props.contains_key(key), "crypto_scan exposes {key}");
     }
 }
 
@@ -1491,6 +1502,46 @@ fn search_bytes_parity_filters_and_errors() {
         assert!(by_id[&id].get("result").is_none());
     }
     assert!(!db_path.exists(), "failed queries never create the sidecar");
+    cleanup(&dir);
+}
+
+// `crypto_scan` MCP: raw parity with the CLI, name filter, and schema.
+#[test]
+fn crypto_scan_parity_and_filter() {
+    let dir = tmpdir("mcp-crypto-scan");
+    let mut bytes = vec![0x90u8; 64];
+    bytes[8..24].copy_from_slice(&[
+        0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab,
+        0x76,
+    ]);
+    bytes[32..48].copy_from_slice(b"expand 32-byte k");
+    let raw = write_bin(&dir, "t.bin", &bytes).display().to_string();
+    let db_path = temp_db(&dir, "c");
+    let db = db_path.display().to_string();
+
+    let page = tool_once(
+        10,
+        "crypto_scan",
+        json!({"binary": raw, "db": db, "raw": {"arch": "x86_64", "base": "0x1000"}}),
+    );
+    assert_eq!(page["protocol"], 1);
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["items"][0]["name"], "aes-sbox");
+    assert_eq!(page["items"][0]["addr"], 0x1008);
+    assert_eq!(page["items"][0]["addr_hex"], "0x1008");
+    assert!(page["items"][0]["xrefs_count"].is_number(), "{page}");
+    assert_eq!(page["items"][1]["name"], "chacha-sigma");
+    assert_eq!(page["items"][1]["addr"], 0x1020);
+
+    let only = tool_once(
+        11,
+        "crypto_scan",
+        json!({"binary": raw, "db": db, "raw": {"arch": "x86_64", "base": "0x1000"}, "name": "aes-sbox"}),
+    );
+    assert_eq!(only["total"], 1);
+    assert_eq!(only["items"][0]["addr"], 0x1008);
+
+    assert!(!db_path.exists(), "crypto queries never create the sidecar");
     cleanup(&dir);
 }
 

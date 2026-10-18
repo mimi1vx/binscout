@@ -256,6 +256,7 @@ fn table_binary() -> LoadedBinary {
             size: 0x30,
             file_off: 0,
             file_size: 0x30,
+            entropy: 0.0,
             readable: true,
             writable: false,
             executable: true,
