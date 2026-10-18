@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 33 tools, and call every one against fixtures.
+//! list the 37 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_thirty_three_tools() {
+fn handshake_lists_thirty_seven_tools() {
     let lines = vec![
         req(
             1,
@@ -127,6 +127,7 @@ fn handshake_lists_thirty_three_tools() {
             "flirt_hints",
             "func",
             "functions",
+            "get_type_hint",
             "headers",
             "ir",
             "ir_coverage",
@@ -136,6 +137,7 @@ fn handshake_lists_thirty_three_tools() {
             "rename",
             "search_bytes",
             "sections",
+            "set_type_hint",
             "slice",
             "stack_strings",
             "stats",
@@ -145,7 +147,7 @@ fn handshake_lists_thirty_three_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 35 tools"
+        "exactly the 37 tools"
     );
     let search = tools
         .iter()
@@ -195,7 +197,7 @@ fn handshake_lists_thirty_three_tools() {
         .as_object()
         .expect("input schema properties");
     for key in [
-        "binary", "db", "raw", "fat_arch", "addr", "len", "as", "endian",
+        "binary", "db", "raw", "fat_arch", "addr", "len", "as", "endian", "as_type",
     ] {
         assert!(props.contains_key(key), "bytes exposes {key}");
     }

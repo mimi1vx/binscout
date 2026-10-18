@@ -269,6 +269,43 @@ fn check_hint_shape(hint: &TypeHint) -> Result<()> {
     Ok(())
 }
 
+/// Parse the wire JSON of a [`TypeHint`] (the object after [`TYPE_HINT_PREFIX`]).
+///
+/// Accepts the same `{"kind":"struct","name":..,"size":..,"fields":[..]}`
+/// shape [`format_type_hint`] emits, so CLI `--json` and MCP `hint`
+/// strings round-trip without the comment channel. Shape only: never
+/// consults the binary.
+///
+/// # Errors
+/// [`Error::Invalid`] on malformed JSON, a wrong `kind`, or shape
+/// violations (see [`TypeHint`]).
+pub fn parse_type_hint_json(json: &str) -> Result<TypeHint> {
+    let wire: WireHint = serde_json::from_str(json.trim())
+        .map_err(|e| Error::Invalid(format!("malformed type hint: {e}")))?;
+    if wire.kind != TYPE_HINT_STRUCT_KIND {
+        return Err(Error::Invalid(format!(
+            "unsupported type hint kind {:?} (expected {TYPE_HINT_STRUCT_KIND:?})",
+            wire.kind
+        )));
+    }
+    let hint = TypeHint {
+        name: wire.name,
+        size: wire.size,
+        fields: wire.fields,
+    };
+    check_hint_shape(&hint)?;
+    Ok(hint)
+}
+
+/// Render a [`TypeHint`] as its wire JSON value.
+///
+/// The same `{"kind":"struct",..}` object [`format_type_hint`] stores
+/// after [`TYPE_HINT_PREFIX`], so a `type-hint --get` / `get_type_hint`
+/// `hint` accepts its own value back as `--json` / `hint`.
+#[must_use]
+pub fn type_hint_json(hint: &TypeHint) -> serde_json::Value {
+    serde_json::to_value(WireHint::from(hint)).expect("type hint serializes")
+}
 /// Format `hint` as a comment-channel string: [`TYPE_HINT_PREFIX`] plus
 /// compact JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`).
 ///
@@ -313,22 +350,8 @@ pub fn parse_type_hint(comment: &str) -> Result<Option<TypeHint>> {
     let Some(rest) = comment.strip_prefix(TYPE_HINT_PREFIX) else {
         return Ok(None);
     };
-    let first = rest.lines().next().unwrap_or("").trim();
-    let wire: WireHint = serde_json::from_str(first)
-        .map_err(|e| Error::Invalid(format!("malformed type hint: {e}")))?;
-    if wire.kind != TYPE_HINT_STRUCT_KIND {
-        return Err(Error::Invalid(format!(
-            "unsupported type hint kind {:?} (expected {TYPE_HINT_STRUCT_KIND:?})",
-            wire.kind
-        )));
-    }
-    let hint = TypeHint {
-        name: wire.name,
-        size: wire.size,
-        fields: wire.fields,
-    };
-    check_hint_shape(&hint)?;
-    Ok(Some(hint))
+    let first = rest.lines().next().unwrap_or("");
+    parse_type_hint_json(first).map(Some)
 }
 
 /// Import outcome: document rows seen and stored addresses changed.
