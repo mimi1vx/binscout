@@ -1,4 +1,4 @@
-//! binscout MCP server: 38 tools over a cached [`Project`].
+//! binscout MCP server: 40 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -253,6 +253,23 @@ fn raw_options(raw: Option<&RawParams>) -> Result<Option<crate::loader::RawOptio
     })
 }
 
+/// Read the structured type hint at `addr` as `{"addr", "hint"}`.
+///
+/// `hint` is the wire `{"kind":"struct",..}` object, or null when the
+/// comment carries no hint; a corrupt hint is an error, never silent.
+fn hint_envelope(proj: &Project, addr: u64) -> Result<serde_json::Value, ErrorData> {
+    let hint = proj.type_hint_at(addr).map_err(|e| match e {
+        crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+        other => ErrorData::internal_error(other.to_string(), None),
+    })?;
+    let (addr_json, addr_hex) = crate::addr_pair(addr);
+    Ok(serde_json::json!({
+        "addr": addr_json,
+        "addr_hex": addr_hex,
+        "hint": hint.map(|h| crate::annotations::type_hint_json(&h)),
+    }))
+}
+
 fn ok(value: serde_json::Value) -> Result<String, ErrorData> {
     serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(format!("serialize result: {e}"), None))
@@ -484,6 +501,10 @@ pub struct BytesParams {
     pub r#as: Option<String>,
     /// Byte order for multi-byte views: `le` or `be` (default `le`).
     pub endian: Option<String>,
+    /// Address of a stored type hint whose struct fields render over the
+    /// range start (`0x`-hex or decimal string; `len` must cover the
+    /// struct size).
+    pub as_type: Option<String>,
 }
 
 /// Parameters for the `xrefs` tool.
@@ -565,6 +586,25 @@ pub struct CommentParams {
     pub addr: String,
     /// Comment text (empty string clears).
     pub comment: String,
+}
+
+/// Parameters for the `set_type_hint` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SetTypeHintParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Address storing the hint (`0x`-hex or decimal string, any address).
+    pub addr: String,
+    /// Wire hint JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`);
+    /// empty string clears the hint (plain comments are left alone).
+    pub hint: String,
 }
 
 /// Parameters for the `define_func` tool.
@@ -797,9 +837,9 @@ pub struct BatchOp {
 /// The envelope opens the binary once; every op runs in order under that
 /// entry lock and returns its own element of the `results` array, so one
 /// round trip replaces the `func`/`cfg`/`pseudo`/`xrefs` per-function loop.
-/// Write tools (`load`, `rename`, `comment`, `define_func`,
-/// `undefine_func`, `annotations_import`) stay explicit top-level calls
-/// and are rejected per op, as is the two-binary `diff`.
+/// Write tools (`load`, `rename`, `comment`, `set_type_hint`,
+/// `define_func`, `undefine_func`, `annotations_import`) stay explicit
+/// top-level calls and are rejected per op, as is the two-binary `diff`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
     /// Path to the analyzed binary (shared by every op).
@@ -859,6 +899,7 @@ struct BatchBytes {
     len: usize,
     r#as: Option<String>,
     endian: Option<String>,
+    as_type: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1002,6 +1043,17 @@ fn run_batch_op(
                 _ => proj.pseudo_of(addr).map_err(|e| e.to_string()),
             }
         }
+        "get_type_hint" => {
+            let a: BatchAddr = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            let hint = proj.type_hint_at(addr).map_err(|e| e.to_string())?;
+            let (addr_json, addr_hex) = crate::addr_pair(addr);
+            Ok(serde_json::json!({
+                "addr": addr_json,
+                "addr_hex": addr_hex,
+                "hint": hint.map(|h| crate::annotations::type_hint_json(&h)),
+            }))
+        }
         "blocks" => {
             let a: BatchBlocks = parse_op(tool, params)?;
             let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
@@ -1048,6 +1100,11 @@ fn run_batch_op(
         "bytes" => {
             let a: BatchBytes = parse_op(tool, params)?;
             let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            let as_type = a
+                .as_type
+                .map(|v| parse_addr(&v))
+                .transpose()
+                .map_err(|e| e.to_string())?;
             let as_ = a
                 .r#as
                 .as_deref()
@@ -1062,9 +1119,15 @@ fn run_batch_op(
                 .transpose()
                 .map_err(invalid_msg)?
                 .unwrap_or(crate::BytesEndian::Le);
-            proj.bytes_view(addr, a.len, as_, endian)
-                .map_err(|e| e.to_string())
-                .map(|v| serde_json::to_value(v).expect("bytes view serializes"))
+            match as_type {
+                Some(hint) => proj
+                    .bytes_view_as_type(addr, a.len, as_, endian, hint)
+                    .map_err(|e| e.to_string()),
+                None => proj
+                    .bytes_view(addr, a.len, as_, endian)
+                    .map_err(|e| e.to_string())
+                    .map(|v| serde_json::to_value(v).expect("bytes view serializes")),
+            }
         }
         "functions" => {
             let a: BatchFunctions = parse_op(tool, params)?;
@@ -1265,11 +1328,15 @@ fn run_batch_op(
                 ),
             }
         }
-        "load" | "rename" | "comment" | "define_func" | "undefine_func" | "annotations_import" => {
-            Err(format!(
-                "batch rejects write tool {tool:?}: run it as a top-level call to keep writes explicit"
-            ))
-        }
+        "load"
+        | "rename"
+        | "comment"
+        | "set_type_hint"
+        | "define_func"
+        | "undefine_func"
+        | "annotations_import" => Err(format!(
+            "batch rejects write tool {tool:?}: run it as a top-level call to keep writes explicit"
+        )),
         "diff" | "diff_func" => Err(
             "batch rejects two-binary diff tools: they open two binaries; call them as top-level tools"
                 .to_string(),
@@ -1637,16 +1704,25 @@ impl BinscoutMcp {
 
     #[tool(
         name = "bytes",
-        description = "Read len bytes at addr with typed views and VA/file provenance; returns addr twins, file_off (null for zero-fill), section, bytes_hex, and decoded values (ranges cap at 1 MiB)"
+        description = "Read len bytes at addr with typed views and VA/file provenance; returns addr twins, file_off (null for zero-fill), section, bytes_hex, and decoded values (ranges cap at 1 MiB). as_type takes a stored type-hint address and renders its struct fields over the range start (len must cover the struct size)"
     )]
     async fn bytes(&self, p: Parameters<BytesParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let (addr_s, len, as_s, endian_s) =
-            (p.addr.clone(), p.len, p.r#as.clone(), p.endian.clone());
+        let (addr_s, len, as_s, endian_s, as_type_s) = (
+            p.addr.clone(),
+            p.len,
+            p.r#as.clone(),
+            p.endian.clone(),
+            p.as_type.clone(),
+        );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
         let addr =
             parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let as_type = as_type_s
+            .map(|v| parse_addr(&v))
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let as_ = as_s
             .as_deref()
             .map(crate::parse_bytes_as)
@@ -1665,9 +1741,19 @@ impl BinscoutMcp {
                 other => ErrorData::internal_error(other.to_string(), None),
             })?
             .unwrap_or(crate::BytesEndian::Le);
-        proj.bytes_view(addr, len, as_, endian)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            .and_then(|v| ok(serde_json::to_value(v).expect("bytes view serializes")))
+        match as_type {
+            Some(hint) => proj
+                .bytes_view_as_type(addr, len, as_, endian, hint)
+                .map_err(|e| match e {
+                    crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                    other => ErrorData::internal_error(other.to_string(), None),
+                })
+                .and_then(ok),
+            None => proj
+                .bytes_view(addr, len, as_, endian)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                .and_then(|v| ok(serde_json::to_value(v).expect("bytes view serializes"))),
+        }
     }
 
     #[tool(
@@ -2016,6 +2102,40 @@ impl BinscoutMcp {
         proj.set_comment(addr, &comment)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(proj.annotation_json(addr))
+    }
+
+    #[tool(
+        name = "set_type_hint",
+        description = "Store a structured struct-layout hint at any address from wire JSON {kind, name, size, fields} (binary untouched); empty hint clears the hint, plain comments are left alone"
+    )]
+    async fn set_type_hint(&self, p: Parameters<SetTypeHintParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (addr_s, hint) = (p.addr.clone(), p.hint.clone());
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.set_type_hint_json(addr, &hint).map_err(|e| match e {
+            crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+            other => ErrorData::internal_error(other.to_string(), None),
+        })?;
+        hint_envelope(&proj, addr).and_then(ok)
+    }
+
+    #[tool(
+        name = "get_type_hint",
+        description = "Read the structured struct-layout hint at one address (wire JSON or null; corrupt hints error, plain comments read as null). Read-only: never creates or modifies the sidecar"
+    )]
+    async fn get_type_hint(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        hint_envelope(&proj, addr).and_then(ok)
     }
 
     #[tool(
@@ -2541,6 +2661,7 @@ mod tests {
             "load",
             "rename",
             "comment",
+            "set_type_hint",
             "define_func",
             "undefine_func",
             "annotations_import",

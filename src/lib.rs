@@ -902,6 +902,35 @@ impl LoaderProject {
         bytes_view_of(&self.binary, va, len, as_, endian)
     }
 
+    /// Raw byte range with the struct layout stored at `hint_addr` rendered
+    /// over it.
+    ///
+    /// Same result as [`Project::bytes_view_as_type`]: the range reads
+    /// through the shared helper (same 1 MiB cap, zero-padded BSS tails,
+    /// unmapped ranges are [`Error::NotFound`]). Read-only: never writes
+    /// the binary or the sidecar.
+    ///
+    /// # Errors
+    /// Same as [`Project::bytes_view_as_type`].
+    pub fn bytes_view_as_type(
+        &self,
+        va: u64,
+        len: usize,
+        as_: BytesAs,
+        endian: BytesEndian,
+        hint_addr: u64,
+    ) -> Result<serde_json::Value> {
+        bytes_view_as_type_of(
+            &self.binary,
+            &self.annotations,
+            va,
+            len,
+            as_,
+            endian,
+            hint_addr,
+        )
+    }
+
     /// Search mapped file bytes for a literal/wildcard pattern, paged.
     ///
     /// Same page as [`Project::search_bytes`]: `pattern` is
@@ -1087,6 +1116,21 @@ fn section_of_in(bin: &LoadedBinary, va: u64) -> Option<&str> {
     None
 }
 
+/// Decode up to 8 bytes as one integer in `endian` order.
+fn decode_int(bytes: &[u8], le: bool) -> u64 {
+    let mut v = 0u64;
+    if le {
+        for (i, &b) in bytes.iter().enumerate() {
+            v |= u64::from(b) << (8 * i);
+        }
+    } else {
+        for &b in bytes {
+            v = (v << 8) | u64::from(b);
+        }
+    }
+    v
+}
+
 /// Raw byte range with VA/file provenance and a typed view from one loaded
 /// binary (the [`Project::bytes_view`] core, shared with the loader-only
 /// open).
@@ -1109,24 +1153,11 @@ fn bytes_view_of(
         },
     };
     let le = endian == BytesEndian::Le;
-    let get = |w: &[u8]| -> u64 {
-        let mut v = 0u64;
-        if le {
-            for (i, &b) in w.iter().enumerate() {
-                v |= u64::from(b) << (8 * i);
-            }
-        } else {
-            for &b in w {
-                v = (v << 8) | u64::from(b);
-            }
-        }
-        v
-    };
     let values: Vec<serde_json::Value> = match as_ {
         BytesAs::U8 => bytes.iter().map(|&b| serde_json::Value::from(b)).collect(),
         BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => bytes
             .chunks_exact(width)
-            .map(|w| serde_json::Value::from(get(w)))
+            .map(|w| serde_json::Value::from(decode_int(w, le)))
             .collect(),
         BytesAs::CStr => {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
@@ -1136,7 +1167,7 @@ fn bytes_view_of(
         }
         BytesAs::Utf16 => {
             let (units, _) = bytes.as_chunks::<2>();
-            let units: Vec<u16> = units.iter().map(|w| get(w) as u16).collect();
+            let units: Vec<u16> = units.iter().map(|w| decode_int(w, le) as u16).collect();
             let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
             vec![serde_json::Value::from(String::from_utf16_lossy(
                 &units[..end],
@@ -1150,6 +1181,84 @@ fn bytes_view_of(
         bytes,
         values,
     })
+}
+
+/// Raw byte range with a stored struct layout rendered over it.
+///
+/// Reads `[va, va+len)` exactly like [`Project::bytes_view`] (same 1 MiB
+/// cap, zero-padded BSS tails, unmapped ranges are [`Error::NotFound`])
+/// with the same `values` typed decoding in `endian` order, then renders
+/// the [`TypeHint`](crate::annotations::TypeHint) stored at `hint_addr`
+/// as `fields`: one row per struct field with its own `addr`/`addr_hex`
+/// twins, `bytes_hex`, and integer `value` in `endian` order (null for
+/// fields wider than 8 bytes). The result also echoes the wire hint in
+/// `hint` and where it was read from in `hint_addr`/`hint_addr_hex`. The
+/// hint address keeps the any-address comment contract: a missing hint is
+/// [`Error::Invalid`], never silent.
+fn bytes_view_as_type_of(
+    bin: &LoadedBinary,
+    annotations: &BTreeMap<u64, Annotation>,
+    va: u64,
+    len: usize,
+    as_: BytesAs,
+    endian: BytesEndian,
+    hint_addr: u64,
+) -> Result<serde_json::Value> {
+    let hint = match annotations
+        .get(&hint_addr)
+        .and_then(|a| a.comment.as_deref())
+    {
+        None => {
+            return Err(Error::Invalid(format!("no type hint at {hint_addr:#x}")));
+        }
+        Some(text) => crate::annotations::parse_type_hint(text)?
+            .ok_or_else(|| Error::Invalid(format!("no type hint at {hint_addr:#x}")))?,
+    };
+    let size = usize::try_from(hint.size).unwrap_or(usize::MAX);
+    if len < size {
+        return Err(Error::Invalid(format!(
+            "range length {len} smaller than struct {} size {}",
+            hint.name, hint.size
+        )));
+    }
+    let view = bytes_view_of(bin, va, len, as_, endian)?;
+    let le = endian == BytesEndian::Le;
+    let fields: Vec<serde_json::Value> = hint
+        .fields
+        .iter()
+        .map(|f| {
+            let off = f.offset as usize;
+            let end = off + f.size as usize;
+            let bytes = &view.bytes[off..end];
+            let mut bytes_hex = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                bytes_hex.push(char::from_digit(u32::from(*b >> 4), 16).expect("hex digit"));
+                bytes_hex.push(char::from_digit(u32::from(*b & 0x0f), 16).expect("hex digit"));
+            }
+            let (addr, addr_hex) = addr_pair(va + f.offset);
+            let value = if bytes.len() <= 8 {
+                serde_json::Value::from(decode_int(bytes, le))
+            } else {
+                serde_json::Value::Null
+            };
+            serde_json::json!({
+                "name": f.name,
+                "offset": f.offset,
+                "size": f.size,
+                "addr": addr,
+                "addr_hex": addr_hex,
+                "bytes_hex": bytes_hex,
+                "value": value,
+            })
+        })
+        .collect();
+    let mut value = serde_json::to_value(&view).expect("bytes view serializes");
+    let (hint_addr_json, hint_addr_hex) = addr_pair(hint_addr);
+    value["hint"] = crate::annotations::type_hint_json(&hint);
+    value["hint_addr"] = serde_json::Value::from(hint_addr_json);
+    value["hint_addr_hex"] = serde_json::Value::from(hint_addr_hex);
+    value["fields"] = serde_json::Value::Array(fields);
+    Ok(value)
 }
 
 /// Opened analysis project: binary plus its cached analysis and annotations.
@@ -2410,6 +2519,37 @@ impl Project {
         self.set_comment(addr, &comment)
     }
 
+    /// Store a structured struct-layout/sizeof hint from its wire JSON.
+    ///
+    /// Parses `json` as the `{"kind":"struct",..}` object
+    /// [`crate::annotations::format_type_hint`] emits (see
+    /// [`crate::annotations::parse_type_hint_json`]) and stores it exactly
+    /// like [`Project::set_type_hint`]: any address, the 8 KiB cap,
+    /// immediate persistence, and the export/import round-trip. An empty
+    /// (or whitespace-only) `json` clears the hint, mirroring the empty
+    /// comment clear: when the comment at `addr` carries a hint (or a
+    /// corrupt hint prefix) it is cleared, otherwise a plain free-text
+    /// comment is left alone and clearing is a no-op.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on malformed JSON or hint shape violations,
+    /// [`Error::Limit`] when the formatted hint exceeds 8 KiB,
+    /// [`Error::Storage`] when the annotation cannot be persisted.
+    pub fn set_type_hint_json(&mut self, addr: u64, json: &str) -> Result<()> {
+        if json.trim().is_empty() {
+            let carries = self
+                .annotation(addr)
+                .and_then(|a| a.comment.as_deref())
+                .is_some_and(|c| c.starts_with(crate::annotations::TYPE_HINT_PREFIX));
+            if carries {
+                self.set_comment(addr, "")?;
+            }
+            return Ok(());
+        }
+        let hint = crate::annotations::parse_type_hint_json(json)?;
+        self.set_type_hint(addr, &hint)
+    }
+
     /// Read back the structured hint at `addr`, if the comment carries one.
     ///
     /// `Ok(None)` when there is no annotation, no comment, or a plain
@@ -2672,6 +2812,45 @@ impl Project {
         endian: BytesEndian,
     ) -> Result<BytesView> {
         bytes_view_of(&self.binary, va, len, as_, endian)
+    }
+
+    /// Raw byte range with the struct layout stored at `hint_addr` rendered
+    /// over it.
+    ///
+    /// Reads `[va, va+len)` exactly like [`Project::bytes_view`] (same 1
+    /// MiB cap, zero-padded BSS tails, unmapped ranges are
+    /// [`Error::NotFound`]) with the same `values` typed decoding in
+    /// `endian` order, then renders the
+    /// [`TypeHint`](crate::annotations::TypeHint) stored at `hint_addr` as
+    /// `fields`: one row per struct field with its own `addr`/`addr_hex`
+    /// twins, `bytes_hex`, and integer `value` in `endian` order (null for
+    /// fields wider than 8 bytes). The result also echoes the wire hint in
+    /// `hint` and where it was read from in `hint_addr`/`hint_addr_hex`.
+    /// `len` must cover the struct size; extra bytes read normally. The
+    /// hint address keeps the any-address comment contract. Read-only:
+    /// never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when no hint is stored at `hint_addr`, on a
+    /// corrupt hint, or when `len` is smaller than the struct size; same as
+    /// [`Project::bytes_at`] otherwise.
+    pub fn bytes_view_as_type(
+        &self,
+        va: u64,
+        len: usize,
+        as_: BytesAs,
+        endian: BytesEndian,
+        hint_addr: u64,
+    ) -> Result<serde_json::Value> {
+        bytes_view_as_type_of(
+            &self.binary,
+            &self.annotations,
+            va,
+            len,
+            as_,
+            endian,
+            hint_addr,
+        )
     }
 
     /// Disassemble `len` bytes at `va` with the binary's architecture.

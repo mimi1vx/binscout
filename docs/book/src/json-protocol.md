@@ -634,9 +634,28 @@ Struct-layout/`sizeof` metadata travels in the comment channel as a
 any-address, 8 KiB-cap rules as any comment, survive export/import as
 opaque strings, and are never validated against the binary: a wrong
 hint misleads exactly like a wrong free-text comment. Readers parse
-them with `annotations::parse_type_hint` / `Project::type_hint_at`;
+them with `annotations::parse_type_hint` / `Project::type_hint_at`
+(wire JSON in and out via `annotations::parse_type_hint_json` /
+`annotations::type_hint_json` / `Project::set_type_hint_json`);
 ordinary comments without the prefix decode to "no hint", never an
-error. Free text may follow the hint's first line.
+error. Free text may follow the hint's first line. Raw `type-hint:`
+comments written before the dedicated surface keep working: they read
+back through `type-hint --get` / `get_type_hint` unchanged.
+
+The dedicated surface is `binscout type-hint B ADDR --json '{...}'`
+to store (empty `--json` clears the hint, leaving plain comments
+alone) and `binscout type-hint B ADDR --get` to read (bare
+`type-hint` reads too; `--json` with `--get` is an error); MCP mirrors
+it with `set_type_hint` (`hint` string, empty clears) and
+`get_type_hint`. Both return `{"addr", "addr_hex", "hint"}` where
+`hint` is the wire `{"kind":"struct",..}` object or null, and both
+persist exactly like `comment`. `bytes B ADDR --len N --as-type H`
+renders the hint stored at `H` as struct `fields` over the range start
+(`--len` must cover the struct size; extra bytes read normally; each
+field carries its own `addr`/`addr_hex` twins, `bytes_hex`, and the
+endian-decoded integer `value`, null past 8 bytes). `pseudo` and
+`disasm` do not consume hints yet: `[reg+off]` stays unannotated until
+the structured-IR work this rendering depends on lands.
 
 ### Inferred edges (indirect-jump resolver)
 

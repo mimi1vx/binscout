@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 38 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 40 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`; `batch` takes one
 envelope plus a list of read-only ops) and returns one JSON
@@ -23,7 +23,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `blocks` | binary, addr, offset?/limit? | Block summaries of the containing function by block start, under the page envelope |
 | `block_insns` | binary, addr, block, offset?/limit? | That block's instructions in address order, under the page envelope; `block` must belong to the function |
 | `disasm` | binary, addr, len | Disassemble `len` bytes at `addr` with the binary architecture; the valid prefix plus `error_at` for the first bad opcode (ranges cap at 1 MiB) |
-| `bytes` | binary, addr, len, as?/endian? | Raw bytes at `addr` (`len` caps at 1 MiB, BSS tails read as zeros) with VA/file provenance (`file_off` null for zero-fill, `section` null when section-less) plus `bytes_hex` and typed `values` (`u8`/`u16`/`u32`/`u64`/`ptr`/`cstr`/`utf16`, `le`/`be` byte order) |
+| `bytes` | binary, addr, len, as?/endian?/as_type? | Raw bytes at `addr` (`len` caps at 1 MiB, BSS tails read as zeros) with VA/file provenance (`file_off` null for zero-fill, `section` null when section-less) plus `bytes_hex` and typed `values` (`u8`/`u16`/`u32`/`u64`/`ptr`/`cstr`/`utf16`, `le`/`be` byte order); `as_type` takes a stored type-hint address and renders its struct fields over the range start (`len` must cover the struct size) |
 | `cfg` | binary, addr | Control-flow graph of one function: block nodes plus block edges; `inferred_edges` holds provenance-marked indirect-jump resolutions (single-slot absolutes and guarded scaled-index tables; raw-only, same-function); `query_addr` echoes the address passed in `addr` |
 | `structure` | binary, addr | Approximate control-flow structure of one function: syntactic loops (back-edge headers with latches) and ifs (two-successor branch sites with then/else targets) plus an approximation warning; `addr` snaps to its containing function, `query_addr` echoes it |
 | `pseudo` | binary, addr | Approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning; `addr` snaps to its containing function, `query_addr` echoes it |
@@ -46,6 +46,8 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `rename` | binary, addr, name | Rename a function in the project DB (binary untouched); empty name clears |
 | `annotation` | binary, addr | Read the annotation at one address (rename/comment with addr twins; nulls when unset); read-only, never creates or modifies the sidecar; CLI `annotate` without flags parity |
 | `comment` | binary, addr, comment | Comment any address in the project DB (binary untouched); empty comment clears; structured struct-layout hints (`type-hint:{...}`, see [JSON protocol](json-protocol.md)) pass through opaquely |
+| `set_type_hint` | binary, addr, hint | Store a structured struct-layout hint at any address from wire JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`) in the project DB (binary untouched); empty hint clears the hint, plain comments are left alone |
+| `get_type_hint` | binary, addr | Read the structured struct-layout hint at one address (`{"addr", "addr_hex", "hint"}` with the wire object or null; corrupt hints error, plain comments read as null); read-only, never creates or modifies the sidecar |
 | `define_func` | binary, addr, mode? | Assert "there is code here": store a user function seed and re-analyze so it materializes; `mode` (`arm`/`thumb`) selects the 32-bit ARM decode, other arches reject it |
 | `undefine_func` | binary, addr | Assert "this isn't a function": exclude the seed (kept as data) and re-analyze |
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address (`range_start` + `range_end` bound the half-open `[lo, hi)` range; `range_lo`/`range_hi` are deprecated aliases, warning on stderr); scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
@@ -97,7 +99,7 @@ Rules:
   and friends) are rejected inside `params`. (`ir_coverage` takes
   `arch` plus optional `addr`/`len`; the binary always comes from the
   envelope.)
-- Read-only tools only: `load`, `rename`, `comment`, `define_func`,
+- Read-only tools only: `load`, `rename`, `comment`, `set_type_hint`, `define_func`,
   `undefine_func`, and `annotations_import` are rejected per op (writes
   stay explicit top-level calls), as are the two-binary `diff` and
   `diff_func`,

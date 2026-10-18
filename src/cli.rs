@@ -137,6 +137,10 @@ pub enum Cmd {
         /// Byte order for multi-byte views: `le` or `be`.
         #[arg(long, default_value = "le")]
         endian: String,
+        /// Render struct fields over the range from the type hint stored at
+        /// this address (`--len` must cover the struct size).
+        #[arg(long)]
+        as_type: Option<String>,
     },
     /// Control-flow graph of one function. Any address inside the function
     /// snaps to its containing entry.
@@ -330,6 +334,18 @@ pub enum Cmd {
         #[arg(long)]
         mode: Option<String>,
     },
+    /// Read or write the structured type hint at `addr`.
+    TypeHint {
+        binary: PathBuf,
+        addr: String,
+        /// Wire hint JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`);
+        /// empty string clears the hint (plain comments are left alone).
+        #[arg(long)]
+        json: Option<String>,
+        /// Read the hint (the default when `--json` is absent).
+        #[arg(long)]
+        get: bool,
+    },
     /// Exclude the function seed at `addr` ("this isn't a function") and
     /// re-analyze immediately. The row is kept as data. Persists to the
     /// sidecar; the binary is untouched.
@@ -488,8 +504,17 @@ impl Cli {
                 len,
                 as_view,
                 endian,
+                as_type,
             } => bytes(
-                &binary, db, raw_opts, fat_arch, &addr, len, &as_view, &endian,
+                &binary,
+                db,
+                raw_opts,
+                fat_arch,
+                &addr,
+                len,
+                &as_view,
+                &endian,
+                as_type.as_deref(),
             ),
             Cmd::Cfg { binary, addr } => cfg(&binary, db, raw_opts, fat_arch, &addr),
             Cmd::Structure { binary, addr } => structure(&binary, db, raw_opts, fat_arch, &addr),
@@ -629,6 +654,12 @@ impl Cli {
             Cmd::DefineFunc { binary, addr, mode } => {
                 define_func(&binary, db, raw_opts, fat_arch, &addr, mode.as_deref())
             }
+            Cmd::TypeHint {
+                binary,
+                addr,
+                json,
+                get,
+            } => type_hint(&binary, db, raw_opts, fat_arch, &addr, json.as_deref(), get),
             Cmd::UndefineFunc { binary, addr } => {
                 undefine_func(&binary, db, raw_opts, fat_arch, &addr)
             }
@@ -928,22 +959,52 @@ fn bytes(
     len: usize,
     as_view: &str,
     endian: &str,
+    as_type: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let view = match open_loader(binary, db, raw, fat_arch)? {
-        binscout::LoaderOpened::Cached(p) => p.bytes_view(
-            binscout::parse_addr(addr)?,
-            len,
-            binscout::parse_bytes_as(as_view)?,
-            binscout::parse_bytes_endian(endian)?,
-        )?,
-        binscout::LoaderOpened::Fresh(p) => p.bytes_view(
-            binscout::parse_addr(addr)?,
-            len,
-            binscout::parse_bytes_as(as_view)?,
-            binscout::parse_bytes_endian(endian)?,
-        )?,
-    };
-    Ok(serde_json::to_value(view).expect("bytes view serializes"))
+    let addr = binscout::parse_addr(addr)?;
+    let as_type = as_type.map(binscout::parse_addr).transpose()?;
+    let as_ = binscout::parse_bytes_as(as_view)?;
+    let endian = binscout::parse_bytes_endian(endian)?;
+    match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => match as_type {
+            Some(hint) => p.bytes_view_as_type(addr, len, as_, endian, hint),
+            None => Ok(serde_json::to_value(p.bytes_view(addr, len, as_, endian)?)
+                .expect("bytes view serializes")),
+        },
+        binscout::LoaderOpened::Fresh(p) => match as_type {
+            Some(hint) => p.bytes_view_as_type(addr, len, as_, endian, hint),
+            None => Ok(serde_json::to_value(p.bytes_view(addr, len, as_, endian)?)
+                .expect("bytes view serializes")),
+        },
+    }
+}
+
+fn type_hint(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    addr: &str,
+    json: Option<&str>,
+    get: bool,
+) -> binscout::error::Result<serde_json::Value> {
+    if json.is_some() && get {
+        return Err(binscout::error::Error::Invalid(
+            "type-hint takes either --json or --get, not both".to_string(),
+        ));
+    }
+    let mut p = open(binary, db, raw, fat_arch)?;
+    let addr = binscout::parse_addr(addr)?;
+    if let Some(json) = json {
+        p.set_type_hint_json(addr, json)?;
+    }
+    let hint = p.type_hint_at(addr)?;
+    let (addr_json, addr_hex) = binscout::addr_pair(addr);
+    Ok(serde_json::json!({
+        "addr": addr_json,
+        "addr_hex": addr_hex,
+        "hint": hint.map(|h| binscout::annotations::type_hint_json(&h)),
+    }))
 }
 
 fn cfg(

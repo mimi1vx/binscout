@@ -1,12 +1,12 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the tools, and call every one against fixtures.
+//! list the 40 tools, and call every one against fixtures.
 
 mod common;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
@@ -128,6 +128,7 @@ fn handshake_lists_tools() {
             "flirt_hints",
             "func",
             "functions",
+            "get_type_hint",
             "go_funcs",
             "headers",
             "ir",
@@ -138,6 +139,7 @@ fn handshake_lists_tools() {
             "rename",
             "search_bytes",
             "sections",
+            "set_type_hint",
             "sig_gen",
             "slice",
             "stack_strings",
@@ -148,7 +150,7 @@ fn handshake_lists_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 38 tools"
+        "exactly the 40 tools"
     );
     let search = tools
         .iter()
@@ -198,7 +200,7 @@ fn handshake_lists_tools() {
         .as_object()
         .expect("input schema properties");
     for key in [
-        "binary", "db", "raw", "fat_arch", "addr", "len", "as", "endian",
+        "binary", "db", "raw", "fat_arch", "addr", "len", "as", "endian", "as_type",
     ] {
         assert!(props.contains_key(key), "bytes exposes {key}");
     }
@@ -379,14 +381,18 @@ fn all_tools_return_json_over_stdio() {
 
     let structure: Value = serde_json::from_str(tool_text(by_id[&30])).expect("structure json");
     assert_eq!(structure["entry"], 0);
-    assert!(structure["structure"]["loops"]
-        .as_array()
-        .expect("loops")
-        .is_empty());
-    assert!(structure["structure"]["ifs"]
-        .as_array()
-        .expect("ifs")
-        .is_empty());
+    assert!(
+        structure["structure"]["loops"]
+            .as_array()
+            .expect("loops")
+            .is_empty()
+    );
+    assert!(
+        structure["structure"]["ifs"]
+            .as_array()
+            .expect("ifs")
+            .is_empty()
+    );
     assert!(
         structure["structure"]["warning"]
             .as_str()
