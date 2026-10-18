@@ -69,6 +69,17 @@ handle mutex, so calls on different binaries proceed concurrently while
 calls sharing a binary or sidecar serialize (`redb` allows a single open
 handle per file per process).
 
+## Errors
+
+Failures are tool errors carrying the JSON-RPC code plus
+`data: {"kind": ...}`: `invalid_params` for bad inputs and over-cap
+ranges (`kind` `invalid` or `limit` — narrow the query),
+`resource_not_found` for unknown functions and addresses (`kind`
+`not_found` — retry with a snapped address), and `internal_error` for
+unsupported inputs plus sidecar and filesystem failures (`kind`
+`unsupported`, `storage`, or `io` — give up or retry nothing). See
+[JSON protocol](json-protocol.md) for the full variant table.
+
 ## Batch
 
 One MCP round trip for the `func` → `cfg` → `pseudo` → `xrefs`

@@ -1561,11 +1561,12 @@ fn annotations_export_import_parity_and_atomicity() {
     );
     assert_eq!(summary["changed"], 0, "re-import is idempotent");
 
-    // Documented failures are protocol-level errors, never results.
-    // `Invalid` (malformed, conflict, duplicate) is `invalid_params`
-    // (-32602); `Storage`/`NotFound`/`Limit` (identity, mapping, unknown
-    // rename, oversize) is a tool error (-32603). Every failure must
-    // leave the target DB untouched.
+    // Documented failures are protocol-level errors, never results:
+    // `Invalid` (malformed, conflict, duplicate) and `Limit` (oversize)
+    // are `invalid_params` (-32602); `NotFound` (unknown rename) is
+    // `resource_not_found` (-32002); `Storage` (identity, mapping)
+    // stays a tool error (-32603). Every failure carries `data.kind`
+    // and must leave the target DB untouched.
     let mut conflict = doc.clone();
     for row in conflict["annotations"].as_array_mut().expect("rows") {
         if row["addr"].as_u64() == Some(BASIC_ENTRY_VA) {
@@ -1629,10 +1630,13 @@ fn annotations_export_import_parity_and_atomicity() {
         assert_eq!(by_id[&id]["error"]["code"], -32602, "{:?}", by_id[&id]);
         assert!(by_id[&id].get("result").is_none());
     }
-    for id in [33u64, 34] {
-        assert_eq!(by_id[&id]["error"]["code"], -32603, "{:?}", by_id[&id]);
-        assert!(by_id[&id].get("result").is_none());
-    }
+    // Unknown rename target is `resource_not_found` with kind `not_found`.
+    assert_eq!(by_id[&33]["error"]["code"], -32002, "{:?}", by_id[&33]);
+    assert_eq!(by_id[&33]["error"]["data"]["kind"], "not_found");
+    assert!(by_id[&33].get("result").is_none());
+    // Identity mismatch stays `internal_error`.
+    assert_eq!(by_id[&34]["error"]["code"], -32603, "{:?}", by_id[&34]);
+    assert!(by_id[&34].get("result").is_none());
     let doc_after = tool_once(17, "annotations_export", json!({"binary": bin, "db": db_b}));
     assert_eq!(doc, doc_after, "failed imports write nothing");
 
@@ -1702,12 +1706,14 @@ fn annotations_export_import_parity_and_atomicity() {
     ];
     let resps = session(&lines);
     assert_eq!(resps.len(), 2, "{resps:?}");
+    // Oversize is `invalid_params` with kind `limit`.
     assert_eq!(
         resps[1]["error"]["code"],
-        -32603,
+        -32602,
         "{:?}",
         resps[1].get("error").map(|e| &e["code"])
     );
+    assert_eq!(resps[1]["error"]["data"]["kind"], "limit");
     assert!(
         !std::path::Path::new(&db_d).exists(),
         "rejected input writes nothing"
