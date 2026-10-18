@@ -868,7 +868,7 @@ impl LoaderProject {
                 let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
-                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "file_off": s.file_off, "file_size": s.file_size,
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })
@@ -1044,11 +1044,11 @@ fn bytes_at_in(bin: &LoadedBinary, va: u64, len: usize) -> Result<Vec<u8>> {
 /// [`Project::file_off_of`] core, shared with the loader-only open).
 fn file_off_of_in(bin: &LoadedBinary, va: u64) -> Option<u64> {
     for sec in &bin.sections {
-        if sec.data.is_empty() || va < sec.vaddr {
+        if sec.file_size == 0 || va < sec.vaddr {
             continue;
         }
         let d = va - sec.vaddr;
-        if d < sec.data.len() as u64 {
+        if d < sec.file_size {
             return sec.file_off.checked_add(d);
         }
     }
@@ -1070,11 +1070,11 @@ fn file_off_of_in(bin: &LoadedBinary, va: u64) -> Option<u64> {
 /// [`Project::section_of`] core, shared with the loader-only open).
 fn section_of_in(bin: &LoadedBinary, va: u64) -> Option<&str> {
     for sec in &bin.sections {
-        if sec.data.is_empty() || va < sec.vaddr {
+        if sec.file_size == 0 || va < sec.vaddr {
             continue;
         }
         let d = va - sec.vaddr;
-        if d < sec.data.len() as u64 {
+        if d < sec.file_size {
             return Some(sec.name.as_str());
         }
     }
@@ -1495,9 +1495,9 @@ impl Project {
             load_raw_vec(bytes, opts)?
         } else {
             let loaded = load_or_raw(&bytes, fat_arch)?;
-            // The loader owns its bytes from here on; drop the read buffer
-            // so containers hold segments plus sections instead of those
-            // plus the input.
+            // The loader owns its bytes from here on (segments hold the
+            // file-backed ranges, sections are metadata over them); drop
+            // the read buffer so containers hold the input once.
             drop(bytes);
             loaded
         };
@@ -2542,11 +2542,11 @@ impl Project {
     #[must_use]
     pub fn va_of_file_off(&self, off: u64) -> Option<u64> {
         for sec in &self.binary.sections {
-            if sec.data.is_empty() || off < sec.file_off {
+            if sec.file_size == 0 || off < sec.file_off {
                 continue;
             }
             let d = off - sec.file_off;
-            if d < sec.data.len() as u64 {
+            if d < sec.file_size {
                 return sec.vaddr.checked_add(d);
             }
         }
@@ -3407,7 +3407,7 @@ impl Project {
                 let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
-                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "file_off": s.file_off, "file_size": s.file_size,
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })

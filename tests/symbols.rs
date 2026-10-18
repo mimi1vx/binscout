@@ -255,7 +255,7 @@ fn table_binary() -> LoadedBinary {
             vaddr: 0x1000,
             size: 0x30,
             file_off: 0,
-            data: vec![0xC3u8; 0x30],
+            file_size: 0x30,
             readable: true,
             writable: false,
             executable: true,

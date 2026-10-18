@@ -23,8 +23,8 @@ use crate::loader::le::{LeImage, LeTarget};
 pub const MAX_SEGMENTS: usize = 256;
 /// Cap on sections per binary.
 pub const MAX_SECTIONS: usize = 2048;
-/// Cap on materialized segment bytes and, separately, section bytes
-/// (zero-fill/`bss` tails stay virtual).
+/// Cap on materialized segment bytes and, separately, file-backed section
+/// bytes named by the table (zero-fill/`bss` tails stay virtual).
 pub const MAX_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
 /// Cap on imports per binary.
 pub const MAX_IMPORTS: usize = 100_000;
@@ -113,8 +113,13 @@ pub enum BinaryFormat {
     Raw,
 }
 
-/// One named section with its file bytes (`data` may be empty for `bss`-like
-/// sections whose `size` is purely virtual).
+/// One named section mapping over the [`Segment`] byte store.
+///
+/// Sections carry no owned bytes: `file_off` plus `file_size` name the
+/// file-backed prefix at `vaddr` (`file_size` is `0` for `bss`-like
+/// sections whose `size` is purely virtual, and may trail `size` when the
+/// tail is zero-fill). Byte reads resolve through segments by VA, so a
+/// container holds the input once instead of twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     /// Section name (`objN` for LE objects, which have no names).
@@ -126,8 +131,8 @@ pub struct Section {
     /// File offset of the raw data (`0` when the section has no on-disk
     /// range, e.g. `bss`, or the container has no section table).
     pub file_off: u64,
-    /// File-backed bytes starting at `vaddr`.
-    pub data: Vec<u8>,
+    /// File-backed byte count starting at `vaddr`.
+    pub file_size: u64,
     /// Section is readable.
     pub readable: bool,
     /// Section is writable.
@@ -619,7 +624,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
             vaddr: sec.address(),
             size: sec.size(),
             file_off,
-            data: data.to_vec(),
+            file_size: data.len() as u64,
             readable,
             writable,
             executable,
@@ -1753,7 +1758,8 @@ fn demangle_bounded(
 /// name-table imports keep their table offset as `@0xoff` because [`LeImage`]
 /// retains decoded names without offsets. Exports resolve entry bundles to
 /// flat addresses, skipping bundles whose object index is out of range.
-/// Sections mirror objects as `objN` sharing each segment's bytes.
+/// Sections mirror objects as `objN` file-size metadata over each
+/// segment's bytes.
 /// `symbols` is empty: LE images carry no symbol table.
 /// LE owned names are budgeted at [`le::parse_le`] time (shared 16 MiB
 /// aggregate); this mapping only clones that bounded set plus small
@@ -1841,7 +1847,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
             vaddr: o.reloc_base as u64,
             size: o.virtual_size as u64,
             file_off: 0,
-            data: s.data.clone(),
+            file_size: s.data.len() as u64,
             readable: o.readable,
             writable: o.writable,
             executable: o.executable,
@@ -2165,7 +2171,7 @@ mod tests {
         );
         assert_eq!(bin.sections.len(), 1);
         assert_eq!(bin.sections[0].name, "obj1");
-        assert_eq!(bin.sections[0].data, [0x90, 0x90, 0xC3]);
+        assert_eq!(bin.sections[0].file_size, 3);
     }
 
     #[test]

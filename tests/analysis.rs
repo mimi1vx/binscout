@@ -291,7 +291,7 @@ fn query_pages_and_summary() {
 fn pe32_basic_absolute_imm32_recovers_data_and_string_xrefs() {
     let bytes = common::fixture_bytes(builders::BASIC_NAME);
     let bin = binscout::loader::load(&bytes).expect("synthetic PE32 must load");
-    let text = &bin.sections[0].data;
+    let text = common::section_bytes(&bin, 0);
     assert_eq!(bin.sections[0].vaddr, builders::TEXT_VA);
     let windows = common::le32_refs(text, builders::TEXT_VA, builders::BASIC_STRING_VA);
     assert_eq!(windows.len(), 2, "ground truth: two push-imm32 refs");
