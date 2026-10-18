@@ -6,7 +6,7 @@ mod common;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
@@ -128,6 +128,7 @@ fn handshake_lists_tools() {
             "flirt_hints",
             "func",
             "functions",
+            "go_funcs",
             "headers",
             "ir",
             "ir_coverage",
@@ -137,6 +138,7 @@ fn handshake_lists_tools() {
             "rename",
             "search_bytes",
             "sections",
+            "sig_gen",
             "slice",
             "stack_strings",
             "stats",
@@ -146,7 +148,7 @@ fn handshake_lists_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 36 tools"
+        "exactly the 38 tools"
     );
     let search = tools
         .iter()
@@ -377,18 +379,14 @@ fn all_tools_return_json_over_stdio() {
 
     let structure: Value = serde_json::from_str(tool_text(by_id[&30])).expect("structure json");
     assert_eq!(structure["entry"], 0);
-    assert!(
-        structure["structure"]["loops"]
-            .as_array()
-            .expect("loops")
-            .is_empty()
-    );
-    assert!(
-        structure["structure"]["ifs"]
-            .as_array()
-            .expect("ifs")
-            .is_empty()
-    );
+    assert!(structure["structure"]["loops"]
+        .as_array()
+        .expect("loops")
+        .is_empty());
+    assert!(structure["structure"]["ifs"]
+        .as_array()
+        .expect("ifs")
+        .is_empty());
     assert!(
         structure["structure"]["warning"]
             .as_str()
@@ -1714,5 +1712,53 @@ fn annotations_export_import_parity_and_atomicity() {
         fixture,
         "binary untouched"
     );
+    cleanup(&dir);
+}
+
+#[test]
+fn sig_gen_go_funcs_and_sigs_param_over_mcp() {
+    let dir = tmpdir("mcp-sigs");
+    // x86_64 blob: frame + call (F) at 0, framed return-1 leaf (G) at 0x20.
+    let mut blob = vec![0x55u8, 0x48, 0x89, 0xE5, 0xE8];
+    blob.extend_from_slice(&(0x20i32 - 0x09).to_le_bytes());
+    blob.push(0xC3);
+    blob.extend(vec![0x90; 0x20 - blob.len()]);
+    blob.extend([0x55, 0x48, 0x89, 0xE5, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+    let bin = write_bin(&dir, "crt.bin", &blob).display().to_string();
+    let db = temp_db(&dir, "crt").display().to_string();
+    let raw = json!({"arch": "x86_64", "base": "0x1000", "entry": "0x1000"});
+
+    let doc: Value = tool_once(60, "sig_gen", json!({"binary": bin, "db": db, "raw": raw}));
+    assert_eq!(doc["version"], 1, "{doc}");
+    assert!(doc["signatures"].as_array().expect("rows").is_empty());
+
+    // Rename G through MCP so sig-gen has a named function.
+    let _: Value = tool_once(
+        61,
+        "rename",
+        json!({"binary": bin, "db": db, "raw": raw, "addr": "0x1020", "name": "leaf_g"}),
+    );
+    let doc: Value = tool_once(62, "sig_gen", json!({"binary": bin, "db": db, "raw": raw}));
+    let rows = doc["signatures"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{doc}");
+    assert_eq!(rows[0]["name"], "leaf_g");
+
+    // sig-gen output feeds flirt_hints through the sigs path.
+    let sig_path = dir.join("gen.json");
+    std::fs::write(&sig_path, doc.to_string()).expect("write sigs");
+    let hints: Value = tool_once(
+        63,
+        "flirt_hints",
+        json!({"binary": bin, "db": db, "raw": raw, "sigs": sig_path.display().to_string()}),
+    );
+    let items = hints["items"].as_array().expect("items");
+    assert!(
+        items.iter().any(|i| i["suggested_name"] == "leaf_g"),
+        "user signature hints: {hints}"
+    );
+
+    // No Go table in this blob: empty array, not an error.
+    let go: Value = tool_once(64, "go_funcs", json!({"binary": bin, "db": db, "raw": raw}));
+    assert_eq!(go, Value::Array(vec![]), "{go}");
     cleanup(&dir);
 }

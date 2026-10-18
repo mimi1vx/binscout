@@ -384,17 +384,53 @@ complete recovery.
 ### `flirt-hints`
 
 ```sh
-binscout flirt-hints B [--addr ADDR] [--offset N] [--limit N]
+binscout flirt-hints B [--addr ADDR] [--sigs SIGS] [--offset N] [--limit N]
 ```
 
-MCP tool `flirt_hints` (`binary`, `db`?, `raw`?, `addr?`, `offset?`,
-`limit?`). Each row pairs a function entry (`entry`/`entry_hex`) with
+MCP tool `flirt_hints` (`binary`, `db`?, `raw`?, `addr`?, `sigs`?,
+`offset?`, `limit?`). Each row pairs a function entry (`entry`/`entry_hex`) with
 the matched corpus `signature` id, its `suggested_name`, and the
 `reason` that keeps the row a hint rather than an identity. `addr`
 snaps to its containing function and keeps only that function's hints
-(`NotFound` when in no function). Suggested names are never applied:
+(`NotFound` when in no function). `sigs` adds a user signature file:
+our JSON document (as emitted by `sig-gen`, validated: `len`/`crc`
+must agree, patterns cap at the 32-byte match window, unset arch means
+any-x86) or an IDA `.pat` file (by extension; head bytes and primary
+name only, crc/references/tail ignored). Suggested names are never applied:
 renaming stays an explicit `rename`/`annotate` write. Querying never
 writes a sidecar.
+
+### `sig-gen`
+
+```sh
+binscout sig-gen B
+```
+
+MCP tool `sig_gen` (`binary`, `db`?, `raw`?). Emits the JSON signature
+document for the binary's named functions (`{"version": 1,
+"signatures": [{"name", "arch", "bytes", "len", "crc"}]}`): masked
+leading bytes (`??` where a call/jump displacement or a mapped-memory
+data address varies per build), the rename-resolved name, and the
+`len`/`crc` integrity pair that `--sigs` revalidates. Unnamed,
+too-short, or all-masked functions are skipped; identical shapes keep
+only the lowest entry's name. Read-only: never writes the binary or
+the sidecar.
+
+### `go-funcs`
+
+```sh
+binscout go-funcs B
+```
+
+MCP tool `go_funcs` (`binary`, `db`?, `raw`?). Recovers Go functions
+from the `pclntab` table (`f0`/`f1`/`fa`/`fb` magics for Go 1.18+ back
+to 1.2, little-endian): linker names plus exact entry/end ranges from
+`functab`/`funcnametab`, in functab order. Prefers the `.gopclntab`
+section and otherwise scans readable segments for the magic, so
+stripped (section-less) binaries still resolve; 1.18+ PCs anchor at
+the `.text` VA (or the lowest executable segment). Empty array when no
+table is located; a located-but-corrupt table (or a big-endian table)
+errors. Read-only: never writes the binary or the sidecar.
 
 ### `ir-coverage`
 

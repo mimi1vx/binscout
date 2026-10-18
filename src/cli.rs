@@ -284,11 +284,24 @@ pub enum Cmd {
         /// Only hints for the function containing this address.
         #[arg(long)]
         addr: Option<String>,
+        /// Extra user signatures: our JSON document (as emitted by
+        /// `sig-gen`) or an IDA `.pat` file (by extension).
+        #[arg(long)]
+        sigs: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         offset: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Emit a JSON signature document for the binary's named functions
+    /// (masked leading bytes with `len`/`crc`): the `--sigs` input that
+    /// `flirt-hints` reads back. Read-only: never writes the binary or
+    /// a sidecar.
+    SigGen { binary: PathBuf },
+    /// Recover Go functions from the `pclntab` table (linker names plus
+    /// exact boundaries). Empty array when no table is located.
+    /// Read-only: never writes the binary or a sidecar.
+    GoFuncs { binary: PathBuf },
     /// Storage stats: binary size, sidecar DB size, and analysis counts.
     Stats { binary: PathBuf },
     /// Header metadata: triage staples (PE mitigations/imphash/PDB, ELF
@@ -584,6 +597,7 @@ impl Cli {
             Cmd::FlirtHints {
                 binary,
                 addr,
+                sigs,
                 offset,
                 limit,
             } => flirt_hints(
@@ -592,9 +606,12 @@ impl Cli {
                 raw_opts,
                 fat_arch,
                 addr.as_deref(),
+                sigs.as_deref(),
                 offset,
                 limit,
             ),
+            Cmd::SigGen { binary } => sig_gen(&binary, db, raw_opts, fat_arch),
+            Cmd::GoFuncs { binary } => go_funcs(&binary, db, raw_opts, fat_arch),
             Cmd::Annotate {
                 binary,
                 addr,
@@ -1189,18 +1206,47 @@ fn headers(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn flirt_hints(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
     addr: Option<&str>,
+    sigs: Option<&std::path::Path>,
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
+    let extra = sigs
+        .map(binscout::flirt::load_signature_file)
+        .transpose()?
+        .unwrap_or_default();
     let p = open(binary, db, raw, fat_arch)?;
-    let page = p.query_flirt_hints(opt_addr(addr)?, offset, limit)?;
+    let page = p.query_flirt_hints_with(opt_addr(addr)?, offset, limit, &extra)?;
     Ok(serde_json::to_value(page).expect("flirt hints page serializes"))
+}
+
+fn sig_gen(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw, fat_arch)?;
+    Ok(serde_json::to_value(p.generate_signatures()).expect("signature document serializes"))
+}
+
+fn go_funcs(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw, fat_arch)?;
+    Ok(serde_json::to_value(p.go_funcs()?).expect("go funcs serialize"))
 }
 
 fn annotate(

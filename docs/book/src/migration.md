@@ -12,13 +12,13 @@ the current binaries.
 
 ## Tool count and versions
 
-The MCP server exposes 35 tools: `project_info`, `load`, `functions`,
+The MCP server exposes 38 tools: `project_info`, `load`, `functions`,
 `func`, `blocks`, `block_insns`, `diagnostics`, `disasm`, `bytes`, `cfg`,
 `structure`, `pseudo`, `callees`, `callers`, `slice`,
-`xrefs`, `strings`, `symbols`, `stats`, `sections`, `ir`,
-`ir_coverage`, `flirt_hints`, `rename`, `comment`, `annotation`,
+`xrefs`, `strings`, `symbols`, `stats`, `sections`, `headers`, `ir`,
+`ir_coverage`, `flirt_hints`, `sig_gen`, `go_funcs`, `rename`, `comment`, `annotation`,
 `define_func`, `undefine_func`, `search_bytes`,
-`annotations_export`, `annotations_import`, `diff`, `stack_strings`, `batch`. The CLI has the same
+`annotations_export`, `annotations_import`, `diff`, `diff_func`, `stack_strings`, `batch`. The CLI has the same
 capabilities as 29 subcommands (`load` covers `project_info`;
 `annotate` covers `rename`/`comment`/`annotation`); the MCP `load` tool is the
 sidecar-warming counterpart of the CLI `load`.
