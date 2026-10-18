@@ -354,7 +354,8 @@ fn compact_meta_has_no_unbounded_arrays() {
             "insns",
             "calls",
             "reasons",
-            "inferred_edges"
+            "inferred_edges",
+            "noreturn"
         ]),
         "compact metadata carries counts plus the reason set only"
     );

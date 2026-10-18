@@ -337,6 +337,13 @@ pub struct FuncMeta {
     /// Defaults to zero so metadata written before inference still decodes.
     #[serde(default)]
     pub inferred_edges: usize,
+    /// Whether this function never returns (see
+    /// [`crate::analysis::Function::noreturn`]).
+    ///
+    /// Defaults to `false` so metadata written before noreturn tracking
+    /// still decodes.
+    #[serde(default)]
+    pub noreturn: bool,
 }
 
 impl Serialize for FuncMeta {
@@ -345,7 +352,7 @@ impl Serialize for FuncMeta {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("FuncMeta", 9)?;
+        let mut st = serializer.serialize_struct("FuncMeta", 10)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("entry", &self.entry)?;
         st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
@@ -355,6 +362,7 @@ impl Serialize for FuncMeta {
         st.serialize_field("calls", &self.calls)?;
         st.serialize_field("reasons", &self.reasons)?;
         st.serialize_field("inferred_edges", &self.inferred_edges)?;
+        st.serialize_field("noreturn", &self.noreturn)?;
         st.end()
     }
 }
@@ -2533,6 +2541,7 @@ impl Project {
                     "id": f.id(), "entry": entry_json, "entry_hex": entry_hex,
                     "name": self.function_name(entry),
                     "blocks": f.blocks.len(), "insns": f.insn_count(), "calls": self.analysis.calls_of(entry),
+                    "noreturn": f.noreturn,
                 })
             })
             .collect()
@@ -2619,6 +2628,7 @@ impl Project {
                     "name": self.function_name(entry),
                     "blocks": f.blocks.len(), "insns": f.insn_count(),
                     "calls_count": self.analysis.calls_count(entry),
+                    "noreturn": f.noreturn,
                 })
             })
             .collect();
@@ -2677,6 +2687,7 @@ impl Project {
             "blocks": blocks, "edges": f.edges(),
             "inferred_edges": f.inferred_edges(),
             "calls": self.analysis.calls_of(entry),
+            "noreturn": f.noreturn,
         }))
     }
 
@@ -2708,6 +2719,7 @@ impl Project {
             calls: self.analysis.calls_count(entry),
             reasons: f.reason_list(),
             inferred_edges: f.inferred_edges().len(),
+            noreturn: f.noreturn,
         })
     }
 
@@ -3594,7 +3606,8 @@ pub fn parse_xref_kind(s: &str) -> Result<XrefKind> {
 }
 
 /// Parse a diagnostics kind filter: `unresolved-indirect-jump`,
-/// `unresolved-indirect-call`, or `decode-failure` (case-insensitive).
+/// `unresolved-indirect-call`, `noreturn-cut`, or `decode-failure`
+/// (case-insensitive).
 ///
 /// # Errors
 /// [`Error::Invalid`] for anything else.
@@ -3602,6 +3615,7 @@ pub fn parse_diagnostic_kind(s: &str) -> Result<DiagnosticKind> {
     match s.to_lowercase().as_str() {
         "unresolved-indirect-jump" => Ok(DiagnosticKind::UnresolvedIndirectJump),
         "unresolved-indirect-call" => Ok(DiagnosticKind::UnresolvedIndirectCall),
+        "noreturn-cut" => Ok(DiagnosticKind::NoreturnCut),
         "decode-failure" => Ok(DiagnosticKind::DecodeFailure),
         _ => Err(Error::Invalid(format!("bad diagnostic kind: {s:?}"))),
     }
@@ -3787,6 +3801,7 @@ mod tests {
                 DiagnosticKind::UnresolvedIndirectCall,
             ),
             ("DECODE-FAILURE", DiagnosticKind::DecodeFailure),
+            ("noreturn-cut", DiagnosticKind::NoreturnCut),
         ] {
             assert_eq!(parse_diagnostic_kind(s).expect("known kind"), want);
         }

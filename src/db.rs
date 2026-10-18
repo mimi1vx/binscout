@@ -1077,6 +1077,7 @@ fn diagnostic_kind_code(kind: crate::analysis::DiagnosticKind) -> u8 {
         crate::analysis::DiagnosticKind::UnresolvedIndirectJump => 0,
         crate::analysis::DiagnosticKind::UnresolvedIndirectCall => 1,
         crate::analysis::DiagnosticKind::DecodeFailure => 2,
+        crate::analysis::DiagnosticKind::NoreturnCut => 3,
     }
 }
 
@@ -1086,6 +1087,7 @@ fn decode_diagnostic_kind(v: u8) -> Result<crate::analysis::DiagnosticKind> {
         0 => Ok(crate::analysis::DiagnosticKind::UnresolvedIndirectJump),
         1 => Ok(crate::analysis::DiagnosticKind::UnresolvedIndirectCall),
         2 => Ok(crate::analysis::DiagnosticKind::DecodeFailure),
+        3 => Ok(crate::analysis::DiagnosticKind::NoreturnCut),
         _ => Err(Error::Storage(format!(
             "decode row: bad diagnostic kind {v}"
         ))),
