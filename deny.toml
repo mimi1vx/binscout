@@ -14,6 +14,7 @@ yanked = "deny"
 allow = [
   "0BSD",
   "Apache-2.0",
+  "BSL-1.0",
   "LGPL-2.1-or-later",
   "MIT",
   "NCSA",
@@ -47,7 +48,6 @@ reason = "major-version split: tracing-attributes 0.1.31 (via rmcp) and windows-
 name = "syn"
 version = "3"
 reason = "major-version split: clap_derive/darling/serde/thiserror/tokio-macros ecosystem has moved to syn 3 while tracing/windows chains still pin syn 2; unresolvable by cargo update, revisit after upstream releases"
-
 
 # hashbrown 0.15 vs 0.17 is pinned by upstream crates, not fixable by
 # `cargo update` (verified 2026-10-16: `cargo update` locks 0 packages; both
