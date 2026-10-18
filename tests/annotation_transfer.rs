@@ -560,9 +560,10 @@ fn oversized_export_fails_explicitly() {
         diagnostics_omitted: p.analysis().diagnostics.omitted,
         inferred_truncated: p.analysis().diagnostics.inferred_truncated,
         inferred_omitted: p.analysis().diagnostics.inferred_omitted,
+        seeds_hash: 0,
     };
     let handle = db::open_db(&db).expect("create db");
-    db::save(&handle, &meta, p.analysis(), &annotations).expect("bulk save");
+    db::save(&handle, &meta, p.analysis(), &annotations, p.func_seeds()).expect("bulk save");
     drop(handle);
     drop(p);
 

@@ -81,7 +81,7 @@ fn slice_cycle_guard_excludes_root_and_terminates() {
     for e in [0x1000u64, 0x2000] {
         functions.insert(
             e,
-            Function::from_parts(e, None, BTreeMap::new(), &[], vec![], &[]),
+            Function::from_parts(e, None, BTreeMap::new(), &[], vec![], &[], None),
         );
     }
     // No blocks: only xref edges apply; the 0x1000 -> 0x2000 edge would

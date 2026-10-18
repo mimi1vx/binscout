@@ -89,7 +89,7 @@ fn cycle_guard_excludes_root_and_terminates() {
     for e in [0x1000, 0x2000] {
         functions.insert(
             e,
-            Function::from_parts(e, None, BTreeMap::new(), &[], vec![], &[]),
+            Function::from_parts(e, None, BTreeMap::new(), &[], vec![], &[], None),
         );
     }
     let a = Analysis::from_parts(

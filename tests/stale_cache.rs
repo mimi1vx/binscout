@@ -327,7 +327,12 @@ fn version_mismatch_is_stale_but_carries_annotations() {
         )
         .expect("load_cached")
         {
-            db::Snapshot::Stale { meta, annotations } => {
+            db::Snapshot::Stale {
+                meta,
+                annotations,
+                seeds,
+            } => {
+                assert!(seeds.is_empty(), "no seeds stored");
                 assert_eq!(meta.version, 999);
                 assert_eq!(
                     annotations.get(&0x400000).and_then(|a| a.name.as_deref()),
@@ -357,7 +362,12 @@ fn version_mismatch_is_stale_but_carries_annotations() {
         )
         .expect("load_cached")
         {
-            db::Snapshot::Stale { meta, annotations } => {
+            db::Snapshot::Stale {
+                meta,
+                annotations,
+                seeds,
+            } => {
+                assert!(seeds.is_empty(), "no seeds stored");
                 assert_eq!(meta.version, 999);
                 assert_eq!(
                     annotations.get(&0x400000).and_then(|a| a.name.as_deref()),
@@ -628,8 +638,13 @@ fn stale_snapshot_reads_one_coherent_sidecar_generation() {
     match db::load_cached(&handle, hash_a, &sha_a, size_a, &db::StoredMapping::Auto)
         .expect("load_cached")
     {
-        db::Snapshot::Stale { meta, annotations } => {
+        db::Snapshot::Stale {
+            meta,
+            annotations,
+            seeds,
+        } => {
             assert_eq!(meta, expected.meta, "stale meta is generation b");
+            assert!(seeds.is_empty(), "no seeds stored");
             assert_eq!(
                 annotations, expected.annotations,
                 "stale annotations are generation b's"

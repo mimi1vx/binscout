@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_twenty_nine_tools() {
+fn handshake_lists_thirty_one_tools() {
     let lines = vec![
         req(
             1,
@@ -118,6 +118,7 @@ fn handshake_lists_twenty_nine_tools() {
             "callers",
             "cfg",
             "comment",
+            "define_func",
             "diagnostics",
             "diff",
             "disasm",
@@ -137,9 +138,10 @@ fn handshake_lists_twenty_nine_tools() {
             "strings",
             "structure",
             "symbols",
+            "undefine_func",
             "xrefs",
         ],
-        "exactly the 29 tools"
+        "exactly the 31 tools"
     );
     let search = tools
         .iter()
@@ -415,6 +417,49 @@ fn all_tools_return_json_over_stdio() {
     assert!(by_id[&25].get("result").is_none());
     assert!(by_id[&26].get("error").is_some(), "{:?}", by_id[&26]);
     assert!(by_id[&26].get("result").is_none());
+
+    assert_eq!(
+        std::fs::read(dir.join("m.bin")).expect("reread"),
+        fixture,
+        "binary untouched"
+    );
+    cleanup(&dir);
+}
+
+// `define_func` materializes a function and `undefine_func` retracts it.
+// Sequential `tool_once` sessions (one server process each) keep this
+// deterministic and prove the seeds survive a DB reopen.
+#[test]
+fn define_undefine_round_trip() {
+    let dir = tmpdir("mcp-define");
+    let fixture = std::fs::read("tests/fixtures/raw-x64.bin").expect("fixture");
+    let bin = write_bin(&dir, "m.bin", &fixture).display().to_string();
+    let db = temp_db(&dir, "m").display().to_string();
+
+    let v = tool_once(
+        10,
+        "define_func",
+        json!({"binary": bin, "db": db, "addr": "0x2"}),
+    );
+    assert_eq!(v["addr"], 2);
+    assert_eq!(v["addr_hex"], "0x2");
+    assert!(v["mode"].is_null(), "{v}");
+    assert_eq!(v["excluded"], false);
+
+    let func = tool_once(11, "func", json!({"binary": bin, "db": db, "addr": "0x2"}));
+    assert_eq!(func["entry"], 2);
+    assert_eq!(func["reasons"], json!(["user"]));
+
+    let v = tool_once(
+        12,
+        "undefine_func",
+        json!({"binary": bin, "db": db, "addr": "0x2"}),
+    );
+    assert_eq!(v["addr"], 2);
+    assert_eq!(v["excluded"], true);
+
+    let funcs = tool_once(13, "functions", json!({"binary": bin, "db": db}));
+    assert_eq!(funcs.as_array().expect("array").len(), 1);
 
     assert_eq!(
         std::fs::read(dir.join("m.bin")).expect("reread"),

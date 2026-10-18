@@ -46,7 +46,11 @@ use crate::loader::strings::StringHit;
 /// the FNV-1a hash, so same bytes opened under different
 /// raw options never share cached layouts and old snapshots re-analyze
 /// rather than synthesizing clean diagnostics.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// Version 7 adds the `func_seeds` table plus the `seeds_hash` snapshot
+/// identity (see [`FuncSeed`]): user-defined function seeds persist
+/// across opens and join analysis on every open.
+pub const SCHEMA_VERSION: u32 = 7;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -62,6 +66,8 @@ pub const MAX_SNAPSHOT_XREFS: usize = 3_000_000;
 pub const MAX_SNAPSHOT_STRINGS: usize = 3_000_000;
 /// Cap on stored annotation rows (user-created; 10k is 100x typical use).
 pub const MAX_SNAPSHOT_ANNOTATIONS: usize = 10_000;
+/// Cap on stored user-seed rows (user-created; mirrors annotations).
+pub const MAX_SNAPSHOT_SEEDS: usize = 10_000;
 /// Cap on cached diagnostic rows (mirrors analysis [`MAX_DIAGNOSTICS`](crate::analysis::MAX_DIAGNOSTICS)).
 pub const MAX_SNAPSHOT_DIAGNOSTICS: usize = 100_000;
 /// Cap on cached inferred-edge rows (mirrors analysis [`MAX_INFERRED_EDGES`](crate::analysis::MAX_INFERRED_EDGES)).
@@ -78,6 +84,7 @@ const BLOCKS: TableDefinition<String, String> = TableDefinition::new("blocks");
 const XREFS: TableDefinition<String, String> = TableDefinition::new("xrefs");
 const STRINGS: TableDefinition<u64, String> = TableDefinition::new("strings");
 const ANNOTATIONS: TableDefinition<u64, String> = TableDefinition::new("annotations");
+const FUNC_SEEDS: TableDefinition<u64, String> = TableDefinition::new("func_seeds");
 const DIAGNOSTICS: TableDefinition<String, String> = TableDefinition::new("diagnostics");
 
 /// Deterministic 64-bit FNV-1a hash of the binary bytes.
@@ -349,6 +356,16 @@ pub struct BinaryMeta {
     /// carrying same-mapping annotations forward.
     #[serde(default)]
     pub analysis_rev: Option<u32>,
+    /// Hash of the active user-seed set the snapshot was taken over.
+    ///
+    /// Computed by [`seeds_hash`] over the non-excluded rows: a change
+    /// (define/undefine) re-analyzes and rewrites the snapshot, so
+    /// derived rows always match the stored seeds. Defaults to zero so
+    /// pre-v7 snapshots without the field still decode; such snapshots
+    /// never hit the cache (their schema version mismatches) and
+    /// re-analyze instead.
+    #[serde(default)]
+    pub seeds_hash: u64,
     /// Whether discovery produced more diagnostics than the record cap.
     ///
     /// Defaults to false so pre-v4 snapshots without the field still
@@ -388,8 +405,8 @@ impl BinaryMeta {
     /// [`BinaryMeta::binary_path`] is display-only: opening the same file as
     /// `./a` versus `/abs/a` must take the single-row fast path, not force a
     /// full-snapshot fallback. Every other field (hash, SHA-256, size, arch,
-    /// format, entry, mapping, revisions, truncation flags) still gates the
-    /// fast path.
+    /// format, entry, mapping, revisions, seed identity, truncation flags)
+    /// still gates the fast path.
     #[must_use]
     pub fn fast_write_eq(&self, other: &Self) -> bool {
         self.version == other.version
@@ -407,15 +424,16 @@ impl BinaryMeta {
             && self.diagnostics_omitted == other.diagnostics_omitted
             && self.inferred_truncated == other.inferred_truncated
             && self.inferred_omitted == other.inferred_omitted
+            && self.seeds_hash == other.seeds_hash
     }
 }
 
-/// Whether stale annotations plausibly belong to the current binary.
+/// Whether stale user rows plausibly belong to the current binary.
 ///
 /// True when the stored snapshot names the same host path, or when the
 /// stored arch, format, and entry all match the freshly loaded binary.
 /// Otherwise the sidecar was reused for an unrelated binary and its
-/// renames/comments must be dropped rather than carried by address.
+/// renames/comments/seeds must be dropped rather than carried by address.
 #[must_use]
 pub fn stale_carry_plausible(
     stored: &BinaryMeta,
@@ -446,6 +464,14 @@ pub struct FunctionRecord {
     /// revision mismatches) and re-analyze instead.
     #[serde(default)]
     pub reasons: Vec<crate::analysis::DiscoveryReason>,
+    /// Canonical decode-arch override, if the function decoded under a
+    /// user seed mode rather than the project arch.
+    ///
+    /// Defaults to `None` (project arch) so rows written before seed
+    /// modes still decode; such snapshots never hit the cache (their
+    /// analysis revision mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 /// One basic-block row: address range, per-instruction boundaries, and
@@ -494,6 +520,53 @@ impl Annotation {
         self.name.as_deref().is_none_or(str::is_empty)
             && self.comment.as_deref().is_none_or(str::is_empty)
     }
+}
+
+/// One user-defined function seed at one address.
+///
+/// `define-func` inserts (or re-activates) a row; `undefine-func` marks it
+/// excluded. Excluded rows never seed analysis but are kept as data, so an
+/// agent's "this isn't a function" verdict survives reloads and transfers.
+/// Stored only in the project DB; the analyzed binary is never modified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuncSeed {
+    /// Decode-mode override (`None` = project arch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::analysis::SeedMode>,
+    /// Whether the address is excluded from seeding (kept as data).
+    #[serde(default)]
+    pub excluded: bool,
+}
+
+/// Snapshot identity of the active user-seed set.
+///
+/// Deterministic FNV-1a over the sorted non-excluded rows (`addr` plus
+/// mode); excluded rows are kept as data but never seed analysis, so they
+/// stay out of the identity. Stored in [`BinaryMeta::seeds_hash`]:
+/// derived snapshot rows always match the stored seeds because every
+/// seed change re-analyzes before saving.
+#[must_use]
+pub fn seeds_hash(seeds: &BTreeMap<u64, FuncSeed>) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for (&addr, seed) in seeds {
+        if seed.excluded {
+            continue;
+        }
+        for b in addr.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(PRIME);
+        }
+        let m = match seed.mode {
+            None => 0,
+            Some(crate::analysis::SeedMode::Arm) => 1,
+            Some(crate::analysis::SeedMode::Thumb) => 2,
+        };
+        h ^= m;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 /// Agent-facing project summary; always JSON-serializable (M6 CLI/MCP).
@@ -633,7 +706,8 @@ pub struct Loaded {
     pub meta: BinaryMeta,
     /// Disassembler target the snapshot was taken as.
     pub arch: Arch,
-    /// Cached function layouts (entry, name, callees, block ranges, reasons).
+    /// Cached function layouts (entry, name, callees, block ranges,
+    /// reasons, decode-arch overrides).
     pub functions: Vec<FunctionLayout>,
     /// Cached callgraph edges as `(caller, callee)` pairs.
     pub call_edges: Vec<(u64, u64)>,
@@ -645,6 +719,8 @@ pub struct Loaded {
     pub diagnostics: Vec<crate::analysis::Diagnostic>,
     /// Annotations keyed by address.
     pub annotations: BTreeMap<u64, Annotation>,
+    /// User-defined function seeds keyed by address (excluded rows kept).
+    pub seeds: BTreeMap<u64, FuncSeed>,
 }
 
 impl Loaded {
@@ -765,10 +841,11 @@ fn check_annotation_text(ann: &Annotation) -> Result<()> {
 
 /// Pre-write row-count budget check so [`save`] never writes a snapshot
 /// that [`load`] would reject. Counts mirror the analysis caps plus the
-/// annotation cap.
+/// annotation and seed caps.
 fn check_analysis_budgets(
     analysis: &Analysis,
     annotations: &BTreeMap<u64, Annotation>,
+    seeds: &BTreeMap<u64, FuncSeed>,
 ) -> Result<()> {
     if analysis.functions.len() > MAX_SNAPSHOT_FUNCTIONS {
         return Err(Error::Limit("snapshot functions exceed cap".to_string()));
@@ -800,6 +877,9 @@ fn check_analysis_budgets(
     if live > MAX_SNAPSHOT_ANNOTATIONS {
         return Err(Error::Limit("snapshot annotations exceed cap".to_string()));
     }
+    if seeds.len() > MAX_SNAPSHOT_SEEDS {
+        return Err(Error::Limit("snapshot func seeds exceed cap".to_string()));
+    }
     for ann in annotations.values() {
         if !ann.is_empty() {
             check_annotation_text(ann)?;
@@ -817,6 +897,7 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
         "xrefs" => wtxn.delete_table(XREFS),
         "strings" => wtxn.delete_table(STRINGS),
         "annotations" => wtxn.delete_table(ANNOTATIONS),
+        "func_seeds" => wtxn.delete_table(FUNC_SEEDS),
         "diagnostics" => wtxn.delete_table(DIAGNOSTICS),
         _ => return Err(Error::Storage(format!("unknown table {table}"))),
     };
@@ -827,12 +908,13 @@ fn delete_if_exists(wtxn: &redb::WriteTransaction, table: &str) -> Result<()> {
     }
 }
 
-/// Count live (non-empty) annotation rows inside a write transaction.
+/// Count live user rows (non-empty annotations plus all seed rows) inside
+/// a write transaction.
 ///
 /// Used by writers to decide whether overwriting a mapping-incompatible
 /// snapshot would drop user data. Corrupt rows error rather than reading
 /// as empty.
-fn live_annotations_in_wtxn(wtxn: &redb::WriteTransaction) -> Result<usize> {
+fn live_user_rows_in_wtxn(wtxn: &redb::WriteTransaction) -> Result<usize> {
     let t = wtxn
         .open_table(ANNOTATIONS)
         .map_err(|e| Error::Storage(format!("open annotations: {e}")))?;
@@ -847,6 +929,17 @@ fn live_annotations_in_wtxn(wtxn: &redb::WriteTransaction) -> Result<usize> {
         if !ann.is_empty() {
             live += 1;
         }
+    }
+    let t = wtxn
+        .open_table(FUNC_SEEDS)
+        .map_err(|e| Error::Storage(format!("open func_seeds: {e}")))?;
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?
+    {
+        let (_, v) = row.map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?;
+        let _: FuncSeed = decode(&v.value())?;
+        live += 1;
     }
     Ok(live)
 }
@@ -927,7 +1020,7 @@ pub fn save_annotation(
         };
         let persisted: BinaryMeta = decode(&row.value())?;
         if persisted.mapping != meta.mapping {
-            let live = live_annotations_in_wtxn(&wtxn)?;
+            let live = live_user_rows_in_wtxn(&wtxn)?;
             if live > 0 {
                 let expected = meta.mapping.clone().unwrap_or(StoredMapping::Auto);
                 match persisted.mapping {
@@ -1023,7 +1116,7 @@ pub fn save_annotation_batch(
         };
         let persisted: BinaryMeta = decode(&row.value())?;
         if persisted.mapping != meta.mapping {
-            let live = live_annotations_in_wtxn(&wtxn)?;
+            let live = live_user_rows_in_wtxn(&wtxn)?;
             if live > 0 {
                 let expected = meta.mapping.clone().unwrap_or(StoredMapping::Auto);
                 match persisted.mapping {
@@ -1061,11 +1154,11 @@ pub fn save_annotation_batch(
 
 /// Refuse to overwrite a populated snapshot under an incompatible mapping.
 ///
-/// Reads the existing `binaries` row plus live annotations inside the same
+/// Reads the existing `binaries` row plus live user rows inside the same
 /// write transaction the caller will commit, so a concurrent mapping change
 /// cannot slip past the check. A fresh DB (no version marker or binary row)
 /// never conflicts; an incompatible or ambiguous legacy mapping with live
-/// annotations errors, while an empty sidecar overwrites freely.
+/// annotations or seeds errors, while an empty sidecar overwrites freely.
 fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) -> Result<()> {
     let version: Option<String> = {
         let t = wtxn
@@ -1096,7 +1189,7 @@ fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) ->
     if persisted.mapping == meta.mapping {
         return Ok(());
     }
-    let live = live_annotations_in_wtxn(wtxn)?;
+    let live = live_user_rows_in_wtxn(wtxn)?;
     if live == 0 {
         return Ok(());
     }
@@ -1107,27 +1200,28 @@ fn reject_mapping_overwrite(wtxn: &redb::WriteTransaction, meta: &BinaryMeta) ->
     }
 }
 
-/// Persist `meta`, `analysis`, and `annotations` to `db` in one transaction.
+/// Persist `meta`, `analysis`, `annotations`, and `seeds` to `db` in one transaction.
 ///
-/// Clears all eight tables first so a smaller re-analysis leaves no stale
+/// Clears all nine tables first so a smaller re-analysis leaves no stale
 /// rows. Row counts are checked against the snapshot budgets before
 /// committing, so a snapshot that [`load`] could not read back is never
 /// written. Only block layouts persist; instructions re-decode on open.
 /// Never touches the analyzed binary. Overwriting a populated sidecar under
 /// an incompatible (or ambiguous legacy) mapping errors instead of dropping
-/// annotations; use a separate DB path for the new mapping.
+/// user rows; use a separate DB path for the new mapping.
 ///
 /// # Errors
 /// [`Error::Limit`] when row budgets are exceeded,
 /// [`Error::Storage`] on any `redb` or encoding failure, and on mapping
-/// conflicts holding live annotations.
+/// conflicts holding live user rows.
 pub fn save(
     db: &Database,
     meta: &BinaryMeta,
     analysis: &Analysis,
     annotations: &BTreeMap<u64, Annotation>,
+    seeds: &BTreeMap<u64, FuncSeed>,
 ) -> Result<()> {
-    check_analysis_budgets(analysis, annotations)?;
+    check_analysis_budgets(analysis, annotations, seeds)?;
     let wtxn = db
         .begin_write()
         .map_err(|e| Error::Storage(format!("begin write: {e}")))?;
@@ -1140,6 +1234,7 @@ pub fn save(
         "xrefs",
         "strings",
         "annotations",
+        "func_seeds",
         "diagnostics",
     ] {
         delete_if_exists(&wtxn, t)?;
@@ -1186,6 +1281,7 @@ pub fn save(
                 name: f.name.clone(),
                 calls: f.calls.clone(),
                 reasons: f.reasons.clone(),
+                arch: f.arch.clone(),
             };
             t.insert(f.entry, json(&rec)?)
                 .map_err(|e| Error::Storage(format!("write functions: {e}")))?;
@@ -1242,6 +1338,15 @@ pub fn save(
     }
     {
         let mut t = wtxn
+            .open_table(FUNC_SEEDS)
+            .map_err(|e| Error::Storage(format!("open func_seeds: {e}")))?;
+        for (&addr, seed) in seeds {
+            t.insert(addr, json(seed)?)
+                .map_err(|e| Error::Storage(format!("write func_seeds: {e}")))?;
+        }
+    }
+    {
+        let mut t = wtxn
             .open_table(DIAGNOSTICS)
             .map_err(|e| Error::Storage(format!("open diagnostics: {e}")))?;
         for d in &analysis.diagnostics.records {
@@ -1284,19 +1389,25 @@ fn read_meta_row(rtxn: &redb::ReadTransaction) -> Result<Option<BinaryMeta>> {
     Ok(Some(decode(&row.value())?))
 }
 
-/// Current snapshot identity plus annotations, without decoding layouts.
+/// Current snapshot identity plus user rows from one read transaction:
+/// metadata, annotations, and function seeds.
+pub type MetaState = (
+    BinaryMeta,
+    BTreeMap<u64, Annotation>,
+    BTreeMap<u64, FuncSeed>,
+);
+
+/// Current snapshot identity plus user rows, without decoding layouts.
 ///
-/// Used by annotation-write fallbacks to merge one batch on top of rows
-/// another process wrote in between: returns `None` on a fresh DB.
-/// A missing annotations table reads as empty; corrupt rows still error so
-/// user data is never silently dropped.
+/// Used by write fallbacks to merge one batch on top of rows another
+/// process wrote in between: returns `None` on a fresh DB.
+/// Missing `annotations`/`func_seeds` tables read as empty; corrupt rows
+/// still error so user data is never silently dropped.
 ///
 /// # Errors
-/// [`Error::Storage`] on unreadable metadata or corrupt annotation rows.
-/// [`Error::Limit`] when annotation budgets are exceeded.
-pub fn load_meta_and_annotations(
-    db: &Database,
-) -> Result<Option<(BinaryMeta, BTreeMap<u64, Annotation>)>> {
+/// [`Error::Storage`] on unreadable metadata or corrupt user rows.
+/// [`Error::Limit`] when row budgets are exceeded.
+pub fn load_meta_and_annotations(db: &Database) -> Result<Option<MetaState>> {
     let rtxn = db
         .begin_read()
         .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
@@ -1304,7 +1415,8 @@ pub fn load_meta_and_annotations(
         return Ok(None);
     };
     let annotations = read_annotations_or_empty(&rtxn)?;
-    Ok(Some((meta, annotations)))
+    let seeds = read_func_seeds_or_empty(&rtxn)?;
+    Ok(Some((meta, annotations, seeds)))
 }
 
 /// Persisted derived rows (`functions`/block layouts, call edges, xrefs,
@@ -1397,6 +1509,7 @@ fn read_snapshot_parts(rtxn: &redb::ReadTransaction) -> Result<SnapshotParts> {
             calls: rec.calls.clone(),
             blocks,
             reasons,
+            arch: rec.arch.clone(),
         });
         call_edges.extend(rec.calls.into_iter().map(|c| (entry, c)));
     }
@@ -1470,6 +1583,57 @@ fn read_diagnostics(rtxn: &redb::ReadTransaction) -> Result<Vec<crate::analysis:
     Ok(diagnostics)
 }
 
+/// Decode stored seed rows, reading a missing table as empty.
+///
+/// Snapshots carry seeds forward even when the sidecar has no seeds table
+/// (fresh or partially written DBs); a corrupt row still errors, since
+/// silently dropping user seeds would lose the `define-func` intent a
+/// re-analysis keeps. Row counts are capped so a forged sidecar fails fast
+/// with [`Error::Limit`].
+fn read_func_seeds_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, FuncSeed>> {
+    let t = match rtxn.open_table(FUNC_SEEDS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
+        Err(e) => return Err(Error::Storage(format!("open func_seeds: {e}"))),
+    };
+    let mut seeds: BTreeMap<u64, FuncSeed> = BTreeMap::new();
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?
+    {
+        let (k, v) = row.map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?;
+        let raw = v.value();
+        if seeds.len() >= MAX_SNAPSHOT_SEEDS {
+            return Err(Error::Limit("snapshot func seeds exceed cap".to_string()));
+        }
+        seeds.insert(k.value(), decode(&raw)?);
+    }
+    Ok(seeds)
+}
+
+/// Decode every stored seed row.
+///
+/// A missing table or an undecodable row is corruption and errors. Row
+/// counts are capped so a forged sidecar fails fast with [`Error::Limit`].
+fn read_func_seeds(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u64, FuncSeed>> {
+    let t = rtxn
+        .open_table(FUNC_SEEDS)
+        .map_err(|e| Error::Storage(format!("open func_seeds: {e}")))?;
+    let mut seeds: BTreeMap<u64, FuncSeed> = BTreeMap::new();
+    for row in t
+        .iter()
+        .map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?
+    {
+        let (k, v) = row.map_err(|e| Error::Storage(format!("read func_seeds: {e}")))?;
+        let raw = v.value();
+        if seeds.len() >= MAX_SNAPSHOT_SEEDS {
+            return Err(Error::Limit("snapshot func seeds exceed cap".to_string()));
+        }
+        seeds.insert(k.value(), decode(&raw)?);
+    }
+    Ok(seeds)
+}
+
 /// Decode every stored annotation, skipping empty rows.
 ///
 /// A missing table or an undecodable row is corruption and errors. Row
@@ -1540,17 +1704,19 @@ fn read_annotations_or_empty(rtxn: &redb::ReadTransaction) -> Result<BTreeMap<u6
 #[derive(Debug)]
 pub enum Snapshot {
     /// Stored hash, mapping, and revisions match on the current schema:
-    /// cached layouts plus annotations. The caller re-decodes instructions
-    /// from the binary via [`rebuild`](crate::analysis::rebuild).
+    /// cached layouts plus annotations and seeds. The caller re-decodes
+    /// instructions from the binary via [`rebuild`](crate::analysis::rebuild).
     Hit(Box<Loaded>),
     /// Stored hash, mapping, analysis revision, or schema version differs:
-    /// metadata plus annotations only; the derived
+    /// metadata plus annotations and seeds only; the derived
     /// `functions`/`blocks`/`xrefs`/`strings` tables were never opened.
     Stale {
         /// Snapshot metadata (row 0 of `binaries`).
         meta: BinaryMeta,
         /// Annotations keyed by address.
         annotations: BTreeMap<u64, Annotation>,
+        /// User-defined function seeds keyed by address.
+        seeds: BTreeMap<u64, FuncSeed>,
     },
     /// No snapshot yet (fresh file, missing `meta` table, or no version row).
     Miss,
@@ -1578,10 +1744,10 @@ pub enum Snapshot {
 /// against a sidecar written for a large one costs no decoding proportional
 /// to the discarded rows. A version, content, or revision mismatch under the
 /// same mapping returns [`Snapshot::Stale`] with the stored annotations and
-/// the binary re-analyzes. A legacy snapshot whose mapping cannot be
+/// seeds and the binary re-analyzes. A legacy snapshot whose mapping cannot be
 /// established is rebuilt, never trusted. A mapping mismatch (or an
 /// ambiguous legacy mapping) over a populated annotation sidecar errors
-/// with a separate-DB message instead of carrying annotations across address
+/// with a separate-DB message instead of carrying user rows across address
 /// spaces or silently dropping them. Metadata and rows come from one read
 /// transaction, so a concurrent writer cannot interleave a metadata row
 /// from one snapshot with rows from another.
@@ -1595,20 +1761,20 @@ pub enum Snapshot {
 /// only gate analysis decoding. What is still validated on the stale path:
 /// the `meta` version marker, the `binaries` row (missing/undecodable rows
 /// error, as without metadata no hash comparison is possible), and every
-/// annotation row (a corrupt annotation errors because annotations carry
-/// over into the re-analysis when [`stale_carry_plausible`] holds; a missing
-/// annotations table reads as empty).
+/// annotation and seed row (corrupt user rows error because they carry
+/// over into the re-analysis when [`stale_carry_plausible`] holds; missing
+/// tables read as empty).
 /// A full identity match keeps the exact [`load`] validation:
 /// unknown arch/format, and any corrupt or missing table error.
 ///
-/// Callers filter stale annotations with [`stale_carry_plausible`]:
+/// Callers filter stale user rows with [`stale_carry_plausible`]:
 /// [`load_cached`] itself returns the stored rows so one read transaction
 /// stays coherent (see its coherence test); [`Project::open`](crate::Project::open)
 /// drops implausible rows and reports them via its stale warning.
 ///
 /// # Errors
-/// [`Error::Storage`] on unreadable metadata, on corrupt annotations, on
-/// mapping conflicts holding live annotations, and — for full identity
+/// [`Error::Storage`] on unreadable metadata, on corrupt user rows, on
+/// mapping conflicts holding live user rows, and — for full identity
 /// matches only — on corrupt derived rows, missing tables, or unknown
 /// arch/format values. [`Error::Limit`] when snapshot row
 /// budgets are exceeded (forged sidecar).
@@ -1628,36 +1794,40 @@ pub fn load_cached(
     };
     if meta.version != SCHEMA_VERSION {
         let annotations = read_annotations_or_empty(&rtxn)?;
-        if !annotations.is_empty() {
+        let seeds = read_func_seeds_or_empty(&rtxn)?;
+        let live = annotations.len() + seeds.len();
+        if live > 0 {
             match meta.mapping.clone() {
-                None => return Err(legacy_ambiguous(annotations.len(), meta.version)),
+                None => return Err(legacy_ambiguous(live, meta.version)),
                 Some(stored) if &stored != expected_mapping => {
-                    return Err(mapping_conflict(
-                        &stored,
-                        annotations.len(),
-                        expected_mapping,
-                    ));
+                    return Err(mapping_conflict(&stored, live, expected_mapping));
                 }
                 Some(_) => {}
             }
         }
-        return Ok(Snapshot::Stale { meta, annotations });
+        return Ok(Snapshot::Stale {
+            meta,
+            annotations,
+            seeds,
+        });
     }
     if meta.mapping.as_ref() != Some(expected_mapping) {
         let annotations = read_annotations_or_empty(&rtxn)?;
-        if !annotations.is_empty() {
+        let seeds = read_func_seeds_or_empty(&rtxn)?;
+        let live = annotations.len() + seeds.len();
+        if live > 0 {
             match meta.mapping.clone() {
                 Some(stored) => {
-                    return Err(mapping_conflict(
-                        &stored,
-                        annotations.len(),
-                        expected_mapping,
-                    ));
+                    return Err(mapping_conflict(&stored, live, expected_mapping));
                 }
-                None => return Err(legacy_ambiguous(annotations.len(), meta.version)),
+                None => return Err(legacy_ambiguous(live, meta.version)),
             }
         }
-        return Ok(Snapshot::Stale { meta, annotations });
+        return Ok(Snapshot::Stale {
+            meta,
+            annotations,
+            seeds,
+        });
     }
     if meta.content_hash != expected_hash
         || meta.content_sha256 != expected_sha256
@@ -1665,12 +1835,18 @@ pub fn load_cached(
         || meta.analysis_rev != Some(ANALYSIS_REVISION)
     {
         let annotations = read_annotations_or_empty(&rtxn)?;
-        return Ok(Snapshot::Stale { meta, annotations });
+        let seeds = read_func_seeds_or_empty(&rtxn)?;
+        return Ok(Snapshot::Stale {
+            meta,
+            annotations,
+            seeds,
+        });
     }
     let arch = parse_arch(&meta.arch)?;
     parse_format(&meta.format)?;
     let parts = read_snapshot_parts(&rtxn)?;
     let annotations = read_annotations(&rtxn)?;
+    let seeds = read_func_seeds(&rtxn)?;
     Ok(Snapshot::Hit(Box::new(Loaded {
         meta,
         arch,
@@ -1680,6 +1856,7 @@ pub fn load_cached(
         strings: parts.strings,
         diagnostics: parts.diagnostics,
         annotations,
+        seeds,
     })))
 }
 
@@ -1713,6 +1890,7 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
     parse_format(&meta.format)?;
     let parts = read_snapshot_parts(&rtxn)?;
     let annotations = read_annotations(&rtxn)?;
+    let seeds = read_func_seeds(&rtxn)?;
     Ok(Some(Loaded {
         meta,
         arch,
@@ -1722,6 +1900,7 @@ pub fn load(db: &Database) -> Result<Option<Loaded>> {
         strings: parts.strings,
         diagnostics: parts.diagnostics,
         annotations,
+        seeds,
     }))
 }
 

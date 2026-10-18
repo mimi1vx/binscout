@@ -32,7 +32,9 @@ These stability guarantees hold across wire revisions:
   `--db PATH` on the CLI or the `db` parameter on MCP tools). `load`
   opens and saves a snapshot; every other read command opens without
   saving and never creates a sidecar; `rename`/`comment` persist
-  immediately. Failed validations never write.
+  immediately, as do `define-func`/`undefine-func` (which re-analyze
+  first so derived rows match the stored seeds). Failed validations
+  never write.
 - MCP tools return one JSON document as text per call; failures are
   tool errors, never silent empty results. Calls serialize behind one
   lock because `redb` allows a single open handle per file per process.
@@ -159,7 +161,8 @@ After — `func` is a bounded summary. `blocks`/`insns` are counts,
 `calls` is a count (not the unbounded target array),
 `inferred_edges` counts provenance-marked indirect-jump resolutions in
 that function, and `reasons` is the sorted, deduplicated discovery
-vocabulary (`entry`, `export`, `symbol`, `direct-call`, `prologue`).
+vocabulary (`entry`, `export`, `symbol`, `direct-call`, `prologue`,
+`user` — the last for agent-defined seeds, see `define-func` below).
 The redundant `containing_entry` twin is dropped; any interior address
 still snaps to the canonical `entry`:
 
@@ -463,25 +466,57 @@ capped at 16 MiB serialized:
 ```json
 {"revision": 1, "sha256": "…64 hex…", "size": 3,
  "mapping": {"mode": "auto"},
- "annotations": [{"addr": 4198400, "rename": "main"}]}
+ "annotations": [{"addr": 4198400, "rename": "main"}],
+ "func_seeds": [{"addr": 4198404, "excluded": false}]}
 ```
 
 Rows sort by address and only nonempty annotations appear; unset
-fields are omitted (no nulls). Host paths and analysis snapshots are
+fields are omitted (no nulls). Seed rows export in `func_seeds`,
+including excluded rows (`excluded: true`; the row's `mode`, if any,
+is `"arm"` or `"thumb"`). Host paths and analysis snapshots are
 excluded. Under explicit raw mapping the document records
 `"mapping": {"mode": "explicit", "arch": "x86_64", "base": 4194304,
 "entry": null}`. Import validates the whole document before a single
 atomic write: identity (`sha256` + `size` + `mapping`) must match
 exactly, duplicate addresses and oversized documents are rejected,
-`rename` targets must be known function entries while comments keep
-the any-address contract. Default merge fails on differing existing
-field values (equal values are idempotent); `--overwrite` replaces
-supplied fields only, absent fields leave existing values alone, and
-empty strings clear. Untouched annotations remain; a failure in the
-last row leaves the DB unchanged. Import returns merge counts:
+`rename` targets must be known function entries while comments and
+seed rows keep the any-address contract (seed modes are restricted to
+32-bit ARM projects). Importing changed seeds re-analyzes before
+saving, so derived rows match the stored seeds. Default merge fails on
+differing existing field values (equal values are idempotent);
+`--overwrite` replaces supplied fields only, absent fields leave
+existing values alone, and empty strings clear. Untouched annotations
+remain; a failure in the last row leaves the DB unchanged. Import
+returns merge counts:
 
 ```json
-{"rows": 1, "changed": 0}
+{"rows": 2, "changed": 1}
+```
+
+### `define-func` / `undefine-func`
+
+```sh
+binscout define-func B ADDR [--mode arm|thumb]
+binscout undefine-func B ADDR
+```
+
+MCP tools `define_func` (`binary`, `db`?, `raw`?, `addr`, `mode`?)
+and `undefine_func` (`binary`, `db`?, `raw`?, `addr`). `define-func`
+asserts "there is code at `ADDR`" (shellcode, firmware vectors,
+obfuscated code, missed callbacks): the address joins the
+authoritative seed set with the `user` discovery reason, and the
+project re-analyzes immediately so the function materializes when the
+bytes decode. `undefine-func` asserts "this isn't a function": the
+address is excluded from seeding (kept as data) and the project
+re-analyzes. Both accept any address — undecodable seeds are inert,
+never errors — and both persist a full snapshot rewrite at once, so
+the stored seeds hash always matches the derived rows. `--mode`
+selects the 32-bit ARM decode for the seed's function (`thumb`
+decodes Thumb code inside an `arm32` project and vice versa); other
+architectures reject it. On success both print the seed row:
+
+```json
+{"addr": 4198404, "addr_hex": "0x401004", "mode": "thumb", "excluded": false}
 ```
 
 ### Type-hint comments (hint only, no type system)
@@ -575,9 +610,9 @@ Library variants and their surfaces:
 Validation rules: bad addresses, unknown xref/diagnostic kinds,
 overlong or uncompilable string patterns, malformed byte-search
 patterns, unmapped or over-cap (`> 1 MiB`) decode/byte ranges, unknown
-functions/blocks, rename of a non-entry, over-8 KiB annotation text,
-raw-option misuse, and annotation identity/conflict failures all
-error as above without writing. Clipping a limit to 1024 rows,
+functions/blocks, rename of a non-entry, seed modes off 32-bit ARM,
+over-8 KiB annotation text, raw-option misuse, and annotation identity/conflict
+failures all error as above without writing. Clipping a limit to 1024 rows,
 paging past the end, and zero limits are normal pages, not errors.
 Non-numeric `--offset`/`--limit` values never reach validation:
 `clap` rejects them on stderr with exit 2.

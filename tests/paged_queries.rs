@@ -96,7 +96,15 @@ fn build_functions(n: usize) -> BTreeMap<u64, binscout::analysis::Function> {
         };
         map.insert(
             entry,
-            binscout::analysis::Function::from_parts(entry, name, blocks, &[], Vec::new(), &[]),
+            binscout::analysis::Function::from_parts(
+                entry,
+                name,
+                blocks,
+                &[],
+                Vec::new(),
+                &[],
+                None,
+            ),
         );
     }
     map
@@ -125,6 +133,7 @@ fn build_blocks_analysis(n_blocks: usize) -> Analysis {
             &[],
             Vec::new(),
             &[],
+            None,
         ),
     );
     Analysis::from_parts(

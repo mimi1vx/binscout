@@ -60,6 +60,24 @@ pub struct AnnotationRow {
     pub comment: Option<String>,
 }
 
+/// One portable function-seed row: an agent-asserted code address plus an
+/// optional 32-bit ARM decode mode.
+///
+/// Exported for every stored [`crate::db::FuncSeed`], including excluded
+/// rows: exclusion is analyst data ("this isn't a function") and must
+/// survive transfers. Rows sort by address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuncSeedRow {
+    /// Asserted code address (any address, like comments).
+    pub addr: u64,
+    /// Decode-mode override (`"arm"`/`"thumb"`; absent = project arch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::analysis::SeedMode>,
+    /// Whether the address is excluded from seeding (kept as data).
+    #[serde(default)]
+    pub excluded: bool,
+}
+
 /// Portable annotation set for one binary under one loader mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotationDocument {
@@ -73,6 +91,12 @@ pub struct AnnotationDocument {
     pub mapping: StoredMapping,
     /// Non-empty rows, sorted by address.
     pub annotations: Vec<AnnotationRow>,
+    /// Stored function seeds, sorted by address (excluded rows included).
+    ///
+    /// Defaults to empty so documents written before seed transfer still
+    /// import; the format revision is unchanged (additive field).
+    #[serde(default)]
+    pub func_seeds: Vec<FuncSeedRow>,
 }
 
 /// Marker prefix of a structured type-hint comment (see [`TypeHint`]).
@@ -140,8 +164,14 @@ pub struct TypeField {
 ///     Annotation { name: None, comment: Some(comment.clone()) },
 /// );
 /// let text =
-///     build_document(&sha, bytes.len() as u64, &StoredMapping::Auto, &annotations)
-///         .expect("export");
+///     build_document(
+///         &sha,
+///         bytes.len() as u64,
+///         &StoredMapping::Auto,
+///         &annotations,
+///         &BTreeMap::new(),
+///     )
+///     .expect("export");
 /// let doc = parse_document(&text).expect("parse");
 /// let changes = validate_document(
 ///     &doc,
@@ -310,16 +340,19 @@ pub struct ImportSummary {
     pub changed: usize,
 }
 
-/// Serialize `annotations` to a capped interchange document.
+/// Serialize `annotations` and `seeds` to a capped interchange document.
 ///
-/// Rows come out sorted by address (the map's order) with empty rows and
-/// empty fields dropped. Pure read: no sidecar or binary is touched.
+/// Rows come out sorted by address (the maps' order) with empty
+/// annotation rows and empty fields dropped; every seed row (including
+/// excluded ones) is exported. Pure read: no sidecar or binary is touched.
 ///
 /// # Errors
 /// [`Error::Limit`] when a field exceeds
 /// [`MAX_ANNOTATION_BYTES`](crate::db::MAX_ANNOTATION_BYTES), when live rows
-/// exceed [`MAX_SNAPSHOT_ANNOTATIONS`](crate::db::MAX_SNAPSHOT_ANNOTATIONS),
-/// or when the serialized document exceeds [`MAX_TRANSFER_BYTES`]
+/// exceed [`MAX_SNAPSHOT_ANNOTATIONS`](crate::db::MAX_SNAPSHOT_ANNOTATIONS)
+/// or stored seeds exceed
+/// [`MAX_SNAPSHOT_SEEDS`](crate::db::MAX_SNAPSHOT_SEEDS), or when the
+/// serialized document exceeds [`MAX_TRANSFER_BYTES`]
 /// (explicit failure, never truncation); [`Error::Storage`] on encoding
 /// failure.
 pub fn build_document(
@@ -327,6 +360,7 @@ pub fn build_document(
     size: u64,
     mapping: &StoredMapping,
     annotations: &BTreeMap<u64, Annotation>,
+    seeds: &BTreeMap<u64, crate::db::FuncSeed>,
 ) -> Result<String> {
     let mut rows = Vec::new();
     for (&addr, ann) in annotations {
@@ -364,6 +398,14 @@ pub fn build_document(
         size,
         mapping: mapping.clone(),
         annotations: rows,
+        func_seeds: seeds
+            .iter()
+            .map(|(&addr, s)| FuncSeedRow {
+                addr,
+                mode: s.mode,
+                excluded: s.excluded,
+            })
+            .collect(),
     };
     let text = serde_json::to_string(&doc)
         .map_err(|e| Error::Storage(format!("encode annotation document: {e}")))?;
@@ -542,6 +584,92 @@ pub fn apply_changes(
             }
             None => {
                 annotations.remove(&addr);
+            }
+        }
+    }
+}
+
+/// Validate a document's seed rows against the open project and merge them
+/// over `current`, returning the per-address changes to persist.
+///
+/// Modes are only meaningful on 32-bit ARM projects (`Arm32`/`Thumb`):
+/// any other project rejects a supplied mode with [`Error::Invalid`].
+/// Default (`overwrite == false`) fails when an existing row differs in
+/// mode or exclusion; `overwrite == true` replaces whole rows. Excluded
+/// rows never seed analysis but persist as data. Pure: `current` is never
+/// mutated, letting callers commit first and update memory only on success.
+///
+/// # Errors
+/// [`Error::Invalid`] on duplicate addresses and default-mode conflicts;
+/// [`Error::Limit`] past the seed row budget.
+pub fn validate_seed_rows(
+    rows: &[FuncSeedRow],
+    project_arch: crate::disasm::Arch,
+    current: &BTreeMap<u64, crate::db::FuncSeed>,
+    overwrite: bool,
+) -> Result<BTreeMap<u64, Option<crate::db::FuncSeed>>> {
+    use crate::disasm::Arch;
+    let arm = matches!(project_arch, Arch::Arm32 | Arch::Thumb);
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        if !seen.insert(row.addr) {
+            return Err(Error::Invalid(format!(
+                "duplicate func seed address {:#x}",
+                row.addr
+            )));
+        }
+        if row.mode.is_some() && !arm {
+            return Err(Error::Invalid(format!(
+                "func seed mode at {:#x} needs a 32-bit ARM project (arch {})",
+                row.addr,
+                crate::db::arch_name(project_arch),
+            )));
+        }
+    }
+    let mut changes: BTreeMap<u64, Option<crate::db::FuncSeed>> = BTreeMap::new();
+    let mut total = current.len();
+    for row in rows {
+        let next = crate::db::FuncSeed {
+            mode: row.mode,
+            excluded: row.excluded,
+        };
+        match current.get(&row.addr) {
+            Some(existing) if *existing == next => {}
+            Some(_) if !overwrite => {
+                return Err(Error::Invalid(format!(
+                    "func seed conflict at {:#x} (import with overwrite to replace)",
+                    row.addr
+                )));
+            }
+            None => {
+                total += 1;
+                if total > db::MAX_SNAPSHOT_SEEDS {
+                    return Err(Error::Limit("func seed import exceeds cap".to_string()));
+                }
+                changes.insert(row.addr, Some(next));
+            }
+            Some(_) => {
+                changes.insert(row.addr, Some(next));
+            }
+        }
+    }
+    Ok(changes)
+}
+
+/// Apply validated seed `changes` to `seeds` (`None` deletes the row).
+///
+/// Call only after the backing transaction commits, so memory tracks the DB.
+pub fn apply_seed_changes(
+    seeds: &mut BTreeMap<u64, crate::db::FuncSeed>,
+    changes: &BTreeMap<u64, Option<crate::db::FuncSeed>>,
+) {
+    for (&addr, next) in changes {
+        match next {
+            Some(seed) => {
+                seeds.insert(addr, *seed);
+            }
+            None => {
+                seeds.remove(&addr);
             }
         }
     }

@@ -29,7 +29,14 @@ fn full_save_reference(
     meta_template: &db::BinaryMeta,
 ) -> db::Loaded {
     let db_handle = db::open_db(ref_db).expect("open ref db");
-    db::save(&db_handle, meta_template, analysis, annotations).expect("ref full save");
+    db::save(
+        &db_handle,
+        meta_template,
+        analysis,
+        annotations,
+        &BTreeMap::new(),
+    )
+    .expect("ref full save");
     drop(db_handle);
     let db_handle = db::open_db(ref_db).expect("reopen ref db");
     db::load(&db_handle)
@@ -249,6 +256,7 @@ fn fresh_db_bootstraps_full_snapshot() {
             diagnostics_omitted: 0,
             inferred_truncated: false,
             inferred_omitted: 0,
+            seeds_hash: 0,
         };
         let ann = Annotation {
             name: Some("probe".to_string()),

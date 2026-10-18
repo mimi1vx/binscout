@@ -689,6 +689,7 @@ fn save_rejects_oversize_annotations_before_writing() {
         diagnostics_omitted: 0,
         inferred_truncated: false,
         inferred_omitted: 0,
+        seeds_hash: 0,
     };
     let mut annotations = BTreeMap::new();
     annotations.insert(
@@ -699,7 +700,14 @@ fn save_rejects_oversize_annotations_before_writing() {
         },
     );
     let database = db::open_db(&db_path).expect("open db");
-    let err = db::save(&database, &meta, proj.analysis(), &annotations).unwrap_err();
+    let err = db::save(
+        &database,
+        &meta,
+        proj.analysis(),
+        &annotations,
+        proj.func_seeds(),
+    )
+    .unwrap_err();
     assert!(
         is_limit(&err),
         "save with oversize annotation must be Limit, got {err:?}"

@@ -284,6 +284,20 @@ pub enum Cmd {
         #[arg(long)]
         comment: Option<String>,
     },
+    /// Define a user function seed at `addr` ("there is code here") and
+    /// re-analyze immediately. Any address is accepted; undecodable seeds
+    /// are inert. Persists to the sidecar; the binary is untouched.
+    DefineFunc {
+        binary: PathBuf,
+        addr: String,
+        /// 32-bit ARM decode mode: `arm` or `thumb` (other arches reject it).
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Exclude the function seed at `addr` ("this isn't a function") and
+    /// re-analyze immediately. The row is kept as data. Persists to the
+    /// sidecar; the binary is untouched.
+    UndefineFunc { binary: PathBuf, addr: String },
     /// Search mapped file bytes for a byte pattern, paged.
     SearchBytes {
         binary: PathBuf,
@@ -533,6 +547,12 @@ impl Cli {
                 rename.as_deref(),
                 comment.as_deref(),
             ),
+            Cmd::DefineFunc { binary, addr, mode } => {
+                define_func(&binary, db, raw_opts, fat_arch, &addr, mode.as_deref())
+            }
+            Cmd::UndefineFunc { binary, addr } => {
+                undefine_func(&binary, db, raw_opts, fat_arch, &addr)
+            }
             Cmd::SearchBytes {
                 binary,
                 pattern,
@@ -1000,6 +1020,34 @@ fn annotate(
     let addr = binscout::parse_addr(addr)?;
     p.annotate(addr, rename, comment)?;
     Ok(p.annotation_json(addr))
+}
+
+fn define_func(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    addr: &str,
+    mode: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    let mut p = open(binary, db, raw, fat_arch)?;
+    let addr = binscout::parse_addr(addr)?;
+    let mode = mode.map(binscout::analysis::SeedMode::parse).transpose()?;
+    p.define_func(addr, mode)?;
+    Ok(p.seed_json(addr))
+}
+
+fn undefine_func(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    addr: &str,
+) -> binscout::error::Result<serde_json::Value> {
+    let mut p = open(binary, db, raw, fat_arch)?;
+    let addr = binscout::parse_addr(addr)?;
+    p.undefine_func(addr)?;
+    Ok(p.seed_json(addr))
 }
 
 #[allow(

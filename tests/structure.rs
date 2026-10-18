@@ -92,7 +92,7 @@ fn empty_function_structures_to_warning_only() {
     use std::collections::BTreeMap;
     let functions = BTreeMap::from([(
         0x1000u64,
-        Function::from_parts(0x1000, None, BTreeMap::new(), &[], vec![], &[]),
+        Function::from_parts(0x1000, None, BTreeMap::new(), &[], vec![], &[], None),
     )]);
     let a = Analysis::from_parts(
         Arch::X86_64,
