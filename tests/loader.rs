@@ -130,6 +130,51 @@ fn minimal_macho() -> Vec<u8> {
     f
 }
 
+/// LC_MAIN Mach-O with a spec-correct file-offset entry: `__TEXT` maps at
+/// VA `0x10000` from file offset `0xD0`, and `entryoff` is that file offset
+/// (`object` 0.40 `entry()` returns it raw, so the loader must translate it
+/// to the VA itself).
+fn macho_lc_main() -> Vec<u8> {
+    const ENTRY_VA: u64 = 0x10000;
+    let seg_cmd = 72 + 80;
+    let main_cmd = 24usize;
+    let head_end = 32 + seg_cmd + main_cmd;
+    assert_eq!(head_end, 0xD0, "entry file offset must differ from its VA");
+    let mut f = vec![0u8; head_end];
+    put32(&mut f, 0, 0xFEED_FACF);
+    put32(&mut f, 4, 0x0100_0007); // x86-64
+    put32(&mut f, 8, 3);
+    put32(&mut f, 12, 2); // MH_EXECUTE
+    put32(&mut f, 16, 2); // ncmds
+    put32(&mut f, 20, (seg_cmd + main_cmd) as u32);
+    let c = 32;
+    put32(&mut f, c, 0x19); // LC_SEGMENT_64
+    put32(&mut f, c + 4, seg_cmd as u32);
+    f[c + 8..c + 14].copy_from_slice(b"__TEXT");
+    put64(&mut f, c + 24, ENTRY_VA);
+    put64(&mut f, c + 32, 0x1000);
+    put64(&mut f, c + 40, head_end as u64);
+    put64(&mut f, c + 48, 4);
+    put32(&mut f, c + 56, 5);
+    put32(&mut f, c + 60, 5);
+    put32(&mut f, c + 64, 1);
+    let s = c + 72;
+    f[s..s + 6].copy_from_slice(b"__text");
+    f[s + 16..s + 22].copy_from_slice(b"__TEXT");
+    put64(&mut f, s + 32, ENTRY_VA);
+    put64(&mut f, s + 40, 4);
+    put32(&mut f, s + 48, head_end as u32);
+    put32(&mut f, s + 52, 2);
+    put32(&mut f, s + 64, 0x8000_0400);
+    let c = 32 + seg_cmd;
+    put32(&mut f, c, 0x8000_0028); // LC_MAIN
+    put32(&mut f, c + 4, main_cmd as u32);
+    put64(&mut f, c + 8, head_end as u64); // entryoff: file offset per spec
+    put64(&mut f, c + 16, 0);
+    f.extend_from_slice(&[0x90, 0x90, 0xC3, 0x90]);
+    f
+}
+
 #[test]
 fn elf_loads_segment_and_entry() {
     let bin = load(&minimal_elf()).expect("synthetic ELF must load");
@@ -179,6 +224,27 @@ fn macho_loads_segment_and_section() {
     assert_eq!(bin.sections.len(), 1);
     assert_eq!(bin.sections[0].name, "__text");
     assert_eq!(&bin.sections[0].data, &[0x90, 0x90, 0xC3, 0x90]);
+}
+
+#[test]
+fn macho_lc_main_entryoff_translates_to_va() {
+    // `entryoff` is file offset 0xD0, not VA 0x10000: the loader maps it
+    // through `__TEXT` so the entry seeds real code.
+    let bytes = macho_lc_main();
+    let bin = load(&bytes).expect("LC_MAIN Mach-O must load");
+    assert_eq!(bin.format, BinaryFormat::MachO);
+    assert_eq!(bin.arch, Arch::X86_64);
+    assert_eq!(bin.entry, Some(0x10000));
+
+    // End to end: the project opens with the VA entry, and analysis seeds
+    // a function there (a raw file offset would miss every segment).
+    let dir = common::tmpdir("macho-lc-main");
+    let path = common::write_bin(&dir, "lc-main-macho", &bytes);
+    let db = common::temp_db(&dir, "lc-main-macho");
+    let p = binscout::Project::open_with_db(&path, &db).expect("LC_MAIN image must open");
+    assert_eq!(p.binary().entry, Some(0x10000));
+    assert!(p.analysis().functions.contains_key(&0x10000));
+    common::cleanup(&dir);
 }
 
 #[test]

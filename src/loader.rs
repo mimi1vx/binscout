@@ -617,7 +617,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
 
     let entry = match file.entry() {
         0 => None,
-        e => Some(e),
+        e => Some(macho_entry_va(&file, bytes, format, e)),
     };
 
     let mut imports = Vec::new();
@@ -702,6 +702,86 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         exports,
         symbols,
     })
+}
+
+/// Map a Mach-O `LC_MAIN` file-offset entry to its VA.
+///
+/// `object` 0.40 `entry()` returns `LC_MAIN.entryoff` raw, but the spec
+/// defines it as a file (`__TEXT`) offset, so real `LC_MAIN` binaries would
+/// seed a bogus entry. Translate through the segment map; anything else
+/// (other formats, `LC_UNIXTHREAD` images with no `LC_MAIN`, unmapped
+/// offsets) keeps the reported value.
+fn macho_entry_va(file: &object::File<'_>, bytes: &[u8], format: BinaryFormat, raw: u64) -> u64 {
+    if format != BinaryFormat::MachO {
+        return raw;
+    }
+    let Some(entryoff) = macho_lc_main_entryoff(bytes) else {
+        return raw;
+    };
+    for seg in file.segments() {
+        let (off, size) = seg.file_range();
+        if size > 0
+            && entryoff >= off
+            && entryoff - off < size
+            && let Some(va) = seg.address().checked_add(entryoff - off)
+        {
+            return va;
+        }
+    }
+    raw
+}
+
+/// `LC_MAIN.entryoff` from thin Mach-O `bytes`, or `None` when absent or
+/// truncated.
+///
+/// Bounds-checked walk mirroring [`macho_has_chained_fixups`]: hostile
+/// `ncmds` cannot loop, and anything unreadable vetoes (the caller keeps
+/// the reported entry value).
+fn macho_lc_main_entryoff(bytes: &[u8]) -> Option<u64> {
+    const LC_MAIN: u32 = 0x8000_0028;
+    const MAX_COMMANDS: u32 = 4096;
+    if bytes.len() < 32 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let header: usize = match magic {
+        0xFEED_FACE => 28,
+        0xFEED_FACF => 32,
+        _ => return None,
+    };
+    let ncmds = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    if ncmds > MAX_COMMANDS {
+        return None;
+    }
+    let mut off = header;
+    for _ in 0..ncmds {
+        if off.saturating_add(8) > bytes.len() {
+            return None;
+        }
+        let cmd = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let cmdsize = u32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        if cmdsize < 8 {
+            return None;
+        }
+        if cmd == LC_MAIN {
+            if off.saturating_add(24) > bytes.len() {
+                return None;
+            }
+            return Some(u64::from_le_bytes(
+                bytes[off + 8..off + 16].try_into().ok()?,
+            ));
+        }
+        off = off.saturating_add(cmdsize as usize);
+        if off > bytes.len() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Derive Mach-O stub entry addresses in import order, or `None` on any doubt.
