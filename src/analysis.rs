@@ -23,6 +23,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::OnceLock;
 
+use memchr::{memchr2, memchr3};
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 
@@ -2091,6 +2092,21 @@ enum CandMatch {
     X86,
 }
 
+/// Next offset at or after `from` (below `limit`) holding a possible x86
+/// prologue first byte: `0x48`/`0xF3` on x86-64, `0x89`/`0x83`/`0x81` on
+/// x86-32 (see [`prologue_patterns`]). SIMD scan via `memchr`; every
+/// [`CandStream::match_at`] hit starts with one of these bytes, so skipped
+/// offsets cannot match and the yielded candidates are unchanged.
+fn next_x86_first_byte(arch: Arch, data: &[u8], from: usize, limit: usize) -> Option<usize> {
+    let hay = data.get(from..limit)?;
+    let rel = match arch {
+        Arch::X86_64 => memchr2(0x48, 0xF3, hay)?,
+        Arch::X86_32 => memchr3(0x89, 0x83, 0x81, hay)?,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+    };
+    Some(from + rel)
+}
+
 /// One executable segment's prologue candidates in ascending address order.
 ///
 /// Streams pattern matches without materializing them: offsets are visited
@@ -2154,8 +2170,20 @@ impl<'a> CandStream<'a> {
                     self.cur = 0;
                     continue;
                 }
-                let off = self.cur;
-                self.cur += self.stride;
+                let off = if matches!(self.kind, CandMatch::X86) {
+                    let Some(hit) =
+                        next_x86_first_byte(self.arch, self.data, self.cur, self.data.len())
+                    else {
+                        self.cur = self.data.len();
+                        continue;
+                    };
+                    self.cur = hit + 1;
+                    hit
+                } else {
+                    let off = self.cur;
+                    self.cur += self.stride;
+                    off
+                };
                 if off + self.min_width > self.data.len() {
                     self.cur = self.data.len();
                     continue;
@@ -2179,8 +2207,19 @@ impl<'a> CandStream<'a> {
                     self.phase = 2;
                     continue;
                 }
-                let off = self.cur;
-                self.cur += self.stride;
+                let off = if matches!(self.kind, CandMatch::X86) {
+                    let Some(hit) = next_x86_first_byte(self.arch, self.data, self.cur, self.split)
+                    else {
+                        self.cur = self.split;
+                        continue;
+                    };
+                    self.cur = hit + 1;
+                    hit
+                } else {
+                    let off = self.cur;
+                    self.cur += self.stride;
+                    off
+                };
                 if off + self.min_width > self.data.len() {
                     self.cur = self.split;
                     continue;

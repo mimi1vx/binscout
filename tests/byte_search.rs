@@ -496,3 +496,49 @@ fn search_never_writes() {
     assert_eq!(std::fs::read(&bin).expect("reread"), before);
     common::cleanup(&dir);
 }
+
+#[test]
+fn common_first_byte_matches_reference() {
+    // Reported slow path at CI scale: a `c3`-heavy blob where first-literal
+    // anchoring verifies at almost every offset. The rarest-literal anchor
+    // must report exactly the brute-force hits, including mid-pattern and
+    // trailing anchors plus `00`-first patterns.
+    let dir = common::tmpdir("bs-anchor");
+    let mut bytes = vec![0xC3u8; 64 * 1024];
+    for at in [0usize, 100, 4096, 65526] {
+        bytes[at + 3] = 0x90;
+    }
+    for i in 0..4096 {
+        bytes[0x8000 + i] = 0x00;
+    }
+    bytes[0x8000 + 7] = 0x90;
+    bytes[0x8000 + 1000] = 0x48;
+    bytes[0x8000 + 1001] = 0x89;
+    bytes[0x8000 + 1002] = 0xE5;
+    let base = 0x1000u64;
+    let p = open_raw(&dir, "anchor.bin", &bytes, base);
+    for pat_str in [
+        "c3 c3 c3 90",
+        "00 00 90",
+        "?? c3 ?? 90",
+        "ff ff 90",
+        "48 89 e5",
+        "00 ?? 48 89",
+    ] {
+        let pat = parse_ref(pat_str);
+        let want = reference(&bytes, base, &pat, None);
+        let page = p
+            .search_bytes(pat_str, None, None, 0, 10000)
+            .expect("search");
+        assert_eq!(page.total, want.len(), "total for {pat_str:?}");
+        let got: Vec<u64> = page.items.iter().map(|m| m.addr).collect();
+        assert_eq!(got, want, "addresses for {pat_str:?}");
+        for (m, w) in page.items.iter().zip(want.iter()) {
+            assert_eq!(m.addr, *w);
+            assert_eq!(m.file_off, Some(w - base));
+            assert!(m.section.is_none());
+            assert_eq!(m.len, pat.len());
+        }
+    }
+    common::cleanup(&dir);
+}

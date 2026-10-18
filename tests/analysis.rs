@@ -78,6 +78,28 @@ fn prologue_scan_finds_unreachable_function() {
 }
 
 #[test]
+fn prologue_scan_on_ret_heavy_blob_seeds_only_real_prologues() {
+    // Reported slow path at CI scale: 64 KiB of `ret` holds no x86 prologue
+    // first byte, so the streaming scan skips it and seeds only the planted
+    // prologues (plus the base-fallback function).
+    let mut b = vec![0xC3u8; 64 * 1024];
+    let p1 = 0x1000usize;
+    b[p1..p1 + 5].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0xC3]);
+    let p2 = 0x2000usize;
+    b[p2..p2 + 4].copy_from_slice(&[0x48, 0x89, 0xE5, 0xC3]);
+    let p3 = 0x3000usize;
+    b[p3..p3 + 5].copy_from_slice(&[0xF3, 0x0F, 0x1E, 0xFA, 0xC3]);
+    let base = 0x3000u64;
+    let a = x64(&b, base, None);
+    let mut got: Vec<u64> = a.functions.keys().copied().collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        [base, base + p1 as u64, base + p2 as u64, base + p3 as u64]
+    );
+}
+
+#[test]
 fn rip_relative_load_links_string_ref() {
     // lea rdi,[rip+5] | ret | nop*4 | "test!\0"  (target 0x4007+5 = 0x400c)
     let mut b = vec![0x48, 0x8D, 0x3D, 0x05, 0x00, 0x00, 0x00, 0xC3];

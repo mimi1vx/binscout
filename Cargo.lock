@@ -102,6 +102,7 @@ dependencies = [
  "clap",
  "cpp_demangle",
  "iced-x86",
+ "memchr",
  "memmap2",
  "msvc-demangler",
  "object",

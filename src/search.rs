@@ -8,11 +8,71 @@
 
 use crate::error::{Error, Result};
 use crate::loader::{BinaryFormat, LoadedBinary};
+use memchr::memchr;
 
 /// Cap on pattern length in bytes.
 pub const MAX_PATTERN_BYTES: usize = 4096;
 /// Cap on unique file-backed mapped bytes scanned per request.
 pub const MAX_SCAN_BYTES: u64 = crate::loader::MAX_MAPPED_BYTES;
+
+/// Expected-frequency cost per byte for anchor selection: higher means the
+/// byte is expected more often in mapped binaries, so the lowest-cost
+/// literal is the rarest anchor. Padding and terminator bytes (`00 FF CC
+/// C3 90`) cost most, hot x86 opcode bytes next, ASCII text mid, and all
+/// other (control/high) bytes share the rare baseline.
+const ANCHOR_COST: [u16; 256] = {
+    let mut t = [10u16; 256];
+    t[0x00] = 250;
+    t[0xFF] = 240;
+    t[0xCC] = 230;
+    t[0xC3] = 220;
+    t[0x90] = 200;
+    t[0x48] = 150;
+    t[0x89] = 150;
+    t[0x8B] = 150;
+    t[0xE8] = 150;
+    t[0x55] = 140;
+    t[0x8D] = 130;
+    t[0x83] = 130;
+    t[0x81] = 130;
+    t[0xEC] = 130;
+    t[0xE5] = 130;
+    t[0xF3] = 120;
+    t[0x0F] = 120;
+    t[0x1E] = 120;
+    t[0xFA] = 120;
+    t[0xE9] = 110;
+    t[0xEB] = 110;
+    t[0x74] = 110;
+    t[0x75] = 110;
+    t[0x5D] = 110;
+    t[0xC9] = 110;
+    t[0xC2] = 110;
+    let mut b = 0x20;
+    while b <= 0x7E {
+        t[b] = 50;
+        b += 1;
+    }
+    t
+};
+
+/// Rarest literal in `pattern` as `(index, byte)`; ties keep the earliest
+/// index. Every pattern holds at least one literal (see
+/// [`BytePattern::parse`]).
+fn rarest_anchor(pattern: &[Option<u8>]) -> (usize, u8) {
+    let mut best: Option<(usize, u8)> = None;
+    for (i, tok) in pattern.iter().enumerate() {
+        let Some(b) = tok else { continue };
+        let better = match best {
+            None => true,
+            Some((bi, bb)) => (ANCHOR_COST[*b as usize], i) < (ANCHOR_COST[bb as usize], bi),
+        };
+        if better {
+            best = Some((i, *b));
+        }
+    }
+    best.expect("pattern holds a literal")
+}
 
 /// Parsed search pattern: literal bytes plus `??` wildcards.
 ///
@@ -185,16 +245,8 @@ fn run_limited(
     }
     pieces.sort_by_key(|p| p.0);
 
-    let anchor = pattern
-        .bytes
-        .iter()
-        .position(Option::is_some)
-        .map(|k| (k, pattern.bytes[k].unwrap_or(0)));
-    let Some((k, byte)) = anchor else {
-        return Err(Error::Invalid(
-            "search pattern needs at least one literal byte".to_string(),
-        ));
-    };
+    let anchor = rarest_anchor(pattern.bytes());
+    let (k, byte) = anchor;
     let m = pattern.len();
 
     let mut total = 0usize;
@@ -280,7 +332,7 @@ fn scan_piece(
     }
     let mut i = 0usize;
     while i + m <= hay.len() {
-        let Some(j) = hay[i + anchor_idx..].iter().position(|&b| b == anchor) else {
+        let Some(j) = memchr(anchor, &hay[i + anchor_idx..]) else {
             break;
         };
         i += j;
