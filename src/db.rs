@@ -1372,11 +1372,7 @@ fn check_analysis_budgets(
     if analysis.diagnostics.records.len() > MAX_SNAPSHOT_DIAGNOSTICS {
         return Err(Error::Limit("snapshot diagnostics exceed cap".to_string()));
     }
-    let inferred: usize = analysis
-        .functions
-        .values()
-        .map(|f| f.inferred_edges().len())
-        .sum();
+    let inferred: usize = analysis.functions.values().map(|f| f.inferred_len()).sum();
     if inferred > MAX_SNAPSHOT_INFERRED_EDGES {
         return Err(Error::Limit(
             "snapshot inferred edges exceed cap".to_string(),
