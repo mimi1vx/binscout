@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 32 tools, and call every one against fixtures.
+//! list the 33 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_thirty_two_tools() {
+fn handshake_lists_thirty_three_tools() {
     let lines = vec![
         req(
             1,
@@ -112,6 +112,7 @@ fn handshake_lists_thirty_two_tools() {
             "annotation",
             "annotations_export",
             "annotations_import",
+            "batch",
             "block_insns",
             "blocks",
             "bytes",
@@ -143,7 +144,7 @@ fn handshake_lists_thirty_two_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 32 tools"
+        "exactly the 33 tools"
     );
     let search = tools
         .iter()
