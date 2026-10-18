@@ -1,12 +1,12 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 32 tools, and call every one against fixtures.
+//! list the 33 tools, and call every one against fixtures.
 
 mod common;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
@@ -112,6 +112,7 @@ fn handshake_lists_thirty_three_tools() {
             "annotation",
             "annotations_export",
             "annotations_import",
+            "batch",
             "block_insns",
             "blocks",
             "bytes",
@@ -144,7 +145,7 @@ fn handshake_lists_thirty_three_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 33 tools"
+        "exactly the 35 tools"
     );
     let search = tools
         .iter()
@@ -375,18 +376,14 @@ fn all_tools_return_json_over_stdio() {
 
     let structure: Value = serde_json::from_str(tool_text(by_id[&30])).expect("structure json");
     assert_eq!(structure["entry"], 0);
-    assert!(
-        structure["structure"]["loops"]
-            .as_array()
-            .expect("loops")
-            .is_empty()
-    );
-    assert!(
-        structure["structure"]["ifs"]
-            .as_array()
-            .expect("ifs")
-            .is_empty()
-    );
+    assert!(structure["structure"]["loops"]
+        .as_array()
+        .expect("loops")
+        .is_empty());
+    assert!(structure["structure"]["ifs"]
+        .as_array()
+        .expect("ifs")
+        .is_empty());
     assert!(
         structure["structure"]["warning"]
             .as_str()

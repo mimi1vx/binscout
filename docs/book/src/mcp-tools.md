@@ -1,8 +1,9 @@
 # MCP tools
 
-`binscout-mcp` serves 32 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 35 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
-`binary_a`/`binary_b` plus optional `db_a`/`db_b`) and returns one JSON
+`binary_a`/`binary_b` plus optional `db_a`/`db_b`; `batch` takes one
+envelope plus a list of read-only ops) and returns one JSON
 document as text; failures are tool errors. Attach it to any MCP client:
 
 ```json
@@ -49,6 +50,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
 | `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |
+| `batch` | binary, db?/raw?/fat_arch?, ops (1–32) | Up to 32 read-only ops over one open project, run in order; returns `{"results": [{"ok"} \| {"error"}]}` with per-op limits unchanged and total output capped at 1 MiB (see below) |
 
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
 `code`, `data`, `string`, `import`, and `inferred-code`
@@ -62,8 +64,50 @@ handle mutex, so calls on different binaries proceed concurrently while
 calls sharing a binary or sidecar serialize (`redb` allows a single open
 handle per file per process).
 
-## Raw mapping and inferred edges
+## Batch
 
+One MCP round trip for the `func` → `cfg` → `pseudo` → `xrefs`
+per-function loop: the envelope opens the binary once and every op runs
+in order under that entry lock, so results come back positionally in
+`results`:
+
+```json
+{"binary": "fw.elf", "ops": [
+  {"tool": "func", "params": {"addr": "0x401000"}},
+  {"tool": "xrefs", "params": {"to": "0x402000"}},
+  {"tool": "func", "params": {"addr": "0xdead"}}
+]}
+```
+
+```json
+{"results": [
+  {"ok": {"entry": 4198400, "entry_hex": "0x401000", "blocks": 1, "insns": 3, "calls": 0}},
+  {"ok": {"total": 0, "xrefs": []}},
+  {"error": "not found: no function contains 0xdead"}
+]}
+```
+
+Rules:
+
+- Ops carry only tool-specific parameters: the envelope owns the binary
+  identity, so `binary`/`db`/`raw`/`fat_arch` (and `diff`'s `binary_a`
+  and friends) are rejected inside `params`. (`ir_coverage` takes
+  `arch` plus optional `addr`/`len`; the binary always comes from the
+  envelope.)
+- Read-only tools only: `load`, `rename`, `comment`, `define_func`,
+  `undefine_func`, and `annotations_import` are rejected per op (writes
+  stay explicit top-level calls), as are the two-binary `diff`,
+  nested `batch`, and unknown names. Per-op failures are `{"error"}`
+  elements with the same message text the single tool would report;
+  only envelope misuse (empty or over-32 op lists, open failures) is a
+  tool error.
+- Per-op row and range limits apply unchanged; the sum of the
+  compact-serialized results caps at 1 MiB. The op that would overflow
+  returns a limit error and every later op returns a skipped error, so
+  a 32-wide `cfg` fan-out degrades from the tail instead of failing
+  the call.
+
+## Raw mapping and inferred edges
 Every binary-taking tool accepts an optional `raw` object
 (`arch`/`base`/`entry?`) with the same rules as the CLI flags:
 `arch` and `base` are required in raw mode, and raw-only options

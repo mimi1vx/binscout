@@ -671,6 +671,17 @@ fn open(
     binscout::open_mapped(binary, db, raw, fat_arch)
 }
 
+/// Open for loader-only commands: cache hits skip instruction re-decode
+/// (see [`binscout::Project::open_loader_only`]).
+fn open_loader(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<binscout::LoaderOpened> {
+    binscout::open_mapped_loader_only(binary, db, raw, fat_arch)
+}
+
 fn opt_addr(s: Option<&str>) -> binscout::error::Result<Option<u64>> {
     s.map(binscout::parse_addr).transpose()
 }
@@ -681,14 +692,22 @@ fn load(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw, fat_arch)?;
-    // Cache hit: the open replayed the stored snapshot (content, mapping,
-    // and revision already verified equal), so rewriting every table would
-    // only churn free pages. Misses and stale opens still save below.
-    if !p.snapshot_fresh() {
-        p.save()?;
+    match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => {
+            // Cache hit: the open replayed the stored snapshot, so there is
+            // nothing to save.
+            Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
+        }
+        binscout::LoaderOpened::Fresh(p) => {
+            // Stale or missing snapshot: same skip as before, so repeat
+            // loads on an unchanged binary neither rewrite tables nor grow
+            // free pages. Misses and stale opens still save below.
+            if !p.snapshot_fresh() {
+                p.save()?;
+            }
+            Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
+        }
     }
-    Ok(serde_json::to_value(p.project_info()).expect("project_info serializes"))
 }
 
 fn functions_filter(
@@ -837,13 +856,20 @@ fn bytes(
     as_view: &str,
     endian: &str,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw, fat_arch)?;
-    let view = p.bytes_view(
-        binscout::parse_addr(addr)?,
-        len,
-        binscout::parse_bytes_as(as_view)?,
-        binscout::parse_bytes_endian(endian)?,
-    )?;
+    let view = match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.bytes_view(
+            binscout::parse_addr(addr)?,
+            len,
+            binscout::parse_bytes_as(as_view)?,
+            binscout::parse_bytes_endian(endian)?,
+        )?,
+        binscout::LoaderOpened::Fresh(p) => p.bytes_view(
+            binscout::parse_addr(addr)?,
+            len,
+            binscout::parse_bytes_as(as_view)?,
+            binscout::parse_bytes_endian(endian)?,
+        )?,
+    };
     Ok(serde_json::to_value(view).expect("bytes view serializes"))
 }
 
@@ -968,7 +994,38 @@ fn strings(
     decode: Option<binscout::loader::strings::DecodeSpec>,
     envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw, fat_arch)?;
+    match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => strings_from_loader(&p, filter, decode, envelope),
+        binscout::LoaderOpened::Fresh(p) => strings_from_project(&p, filter, decode, envelope),
+    }
+}
+
+fn strings_from_loader(
+    p: &binscout::LoaderProject,
+    filter: &binscout::analysis::StringsFilter,
+    decode: Option<binscout::loader::strings::DecodeSpec>,
+    envelope: bool,
+) -> binscout::error::Result<serde_json::Value> {
+    if envelope {
+        let page = match decode {
+            Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
+            None => p.query_strings_envelope(filter)?,
+        };
+        return Ok(serde_json::to_value(page).expect("strings envelope serializes"));
+    }
+    let rows = match decode {
+        Some(spec) => p.query_strings_decoded(filter, spec)?,
+        None => p.query_strings(filter)?,
+    };
+    Ok(serde_json::to_value(rows).expect("strings serialize"))
+}
+
+fn strings_from_project(
+    p: &binscout::Project,
+    filter: &binscout::analysis::StringsFilter,
+    decode: Option<binscout::loader::strings::DecodeSpec>,
+    envelope: bool,
+) -> binscout::error::Result<serde_json::Value> {
     if envelope {
         let page = match decode {
             Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
@@ -989,7 +1046,10 @@ fn symbols(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db, raw, fat_arch)?.symbols_json())
+    Ok(match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.symbols_json(),
+        binscout::LoaderOpened::Fresh(p) => p.symbols_json(),
+    })
 }
 
 fn stack_strings(
@@ -1010,7 +1070,10 @@ fn sections(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(open(binary, db, raw, fat_arch)?.sections_json())
+    Ok(match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.sections_json(),
+        binscout::LoaderOpened::Fresh(p) => p.sections_json(),
+    })
 }
 
 fn ir(
@@ -1052,7 +1115,10 @@ fn stats(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    open(binary, db, raw, fat_arch)?.stats_json()
+    match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.stats_json(),
+        binscout::LoaderOpened::Fresh(p) => p.stats_json(),
+    }
 }
 
 fn headers(
@@ -1061,7 +1127,10 @@ fn headers(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    open(binary, db, raw, fat_arch)?.headers_json()
+    match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.headers_json(),
+        binscout::LoaderOpened::Fresh(p) => p.headers_json(),
+    }
 }
 
 fn flirt_hints(
@@ -1136,7 +1205,7 @@ fn search_bytes(
     offset: usize,
     limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    let p = open(binary, db, raw, fat_arch)?;
+    let opened = open_loader(binary, db, raw, fat_arch)?;
     let range = range
         .map(|pair| match &pair[..] {
             [lo, hi] => Ok((binscout::parse_addr(lo)?, binscout::parse_addr(hi)?)),
@@ -1145,7 +1214,14 @@ fn search_bytes(
             )),
         })
         .transpose()?;
-    let page = p.search_bytes(pattern, section, range, offset, limit)?;
+    let page = match opened {
+        binscout::LoaderOpened::Cached(p) => {
+            p.search_bytes(pattern, section, range, offset, limit)?
+        }
+        binscout::LoaderOpened::Fresh(p) => {
+            p.search_bytes(pattern, section, range, offset, limit)?
+        }
+    };
     Ok(serde_json::to_value(page).expect("search_bytes page serializes"))
 }
 
@@ -1155,7 +1231,10 @@ fn annotations_export(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
-    let doc = open(binary, db, raw, fat_arch)?.export_annotations()?;
+    let doc = match open_loader(binary, db, raw, fat_arch)? {
+        binscout::LoaderOpened::Cached(p) => p.export_annotations()?,
+        binscout::LoaderOpened::Fresh(p) => p.export_annotations()?,
+    };
     serde_json::from_str(&doc)
         .map_err(|e| binscout::error::Error::Storage(format!("encode annotation document: {e}")))
 }

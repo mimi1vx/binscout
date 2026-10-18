@@ -811,7 +811,8 @@ pub struct Analysis {
     /// sidecar stores rows in `from` order and the index rebuilds on open).
     to_index: OnceLock<Vec<u32>>,
     /// PLT-stub/import-thunk sites: `jmp [slot]` address to `imports`
-    /// index (x86 PE/ELF only; see [`import_slots`]).
+    /// index on x86 PE/ELF (see [`import_slots`]), stub-entry address to
+    /// `imports` index on Mach-O (see `macho_import_stubs`).
     pub import_stubs: BTreeMap<u64, usize>,
     /// Extracted strings sorted by address.
     pub strings: Vec<StringHit>,
@@ -1292,7 +1293,9 @@ pub fn rebuild(
         // instructions need the same import tags and stub map `analyze`
         // applies, so cached opens answer identically to fresh ones.
         let slots = import_slots(bin);
-        let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+        let stubs: BTreeMap<u64, usize> = if bin.format == BinaryFormat::MachO {
+            macho_import_stubs(bin)
+        } else if matches!(arch, Arch::X86_64 | Arch::X86_32) {
             collect_stubs(
                 analysis
                     .functions
@@ -1832,7 +1835,7 @@ impl Analysis {
         filter: &StringsFilter,
         decode: strings::DecodeSpec,
     ) -> Result<Vec<StringHit>> {
-        let hits = self.decoded_hits(bin, &decode);
+        let hits = decoded_string_hits(bin, decode);
         filter_string_hits(&hits, filter)
     }
 
@@ -1846,66 +1849,73 @@ impl Analysis {
         filter: &StringsFilter,
         decode: strings::DecodeSpec,
     ) -> Result<usize> {
-        let hits = self.decoded_hits(bin, &decode);
+        let hits = decoded_string_hits(bin, decode);
         count_string_hits(&hits, filter)
     }
+}
 
-    /// Decoded-view hits over a per-segment decoded copy, section-tagged
-    /// exactly like [`analyze`].
-    ///
-    /// Shared by [`Analysis::strings_decoded_view`] and
-    /// [`Analysis::strings_decoded_count`] so the count and the page agree
-    /// on the underlying rows.
-    fn decoded_hits(&self, bin: &LoadedBinary, decode: &strings::DecodeSpec) -> Vec<StringHit> {
-        let mut hits: Vec<StringHit> = Vec::new();
-        for seg in &bin.segments {
-            // Base64 is detection, not a byte transform: scan the raw
-            // segment for blobs instead of decoding a transformed copy.
-            if matches!(decode, strings::DecodeSpec::Base64) {
-                for mut h in strings::extract_base64(
-                    &seg.data,
-                    strings::DEFAULT_MIN_LEN,
-                    strings::DEFAULT_MAX_HITS,
-                    Some(seg.vaddr),
-                ) {
-                    let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
-                    h.section = section;
-                    h.executable = executable;
-                    hits.push(h);
-                }
-                continue;
-            }
-            let decoded = decode.apply(&seg.data);
-            for mut h in strings::extract(
-                &decoded,
+/// Decoded-view hits over a per-segment decoded copy, section-tagged
+/// exactly like [`analyze`].
+///
+/// Free of `self` (only the binary matters), so the loader-only open
+/// serves `strings --decode` without a decoded analysis; the count and
+/// the page agree on the underlying rows via the shared filter helpers.
+pub(crate) fn decoded_string_hits(
+    bin: &LoadedBinary,
+    decode: strings::DecodeSpec,
+) -> Vec<StringHit> {
+    let mut hits: Vec<StringHit> = Vec::new();
+    for seg in &bin.segments {
+        // Base64 is detection, not a byte transform: scan the raw
+        // segment for blobs instead of decoding a transformed copy.
+        if matches!(decode, strings::DecodeSpec::Base64) {
+            for mut h in strings::extract_base64(
+                &seg.data,
                 strings::DEFAULT_MIN_LEN,
                 strings::DEFAULT_MAX_HITS,
                 Some(seg.vaddr),
             ) {
-                // Same tagging as `analyze`: sections win, raw blobs and
-                // unmapped hits inherit the segment's flags.
                 let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
                 h.section = section;
                 h.executable = executable;
                 hits.push(h);
             }
+            continue;
         }
-        hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
-        hits
+        let decoded = decode.apply(&seg.data);
+        for mut h in strings::extract(
+            &decoded,
+            strings::DEFAULT_MIN_LEN,
+            strings::DEFAULT_MAX_HITS,
+            Some(seg.vaddr),
+        ) {
+            // Same tagging as `analyze`: sections win, raw blobs and
+            // unmapped hits inherit the segment's flags.
+            let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
+            h.section = section;
+            h.executable = executable;
+            hits.push(h);
+        }
     }
+    hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
+    hits
 }
 
 /// Filter stored or decoded-view string hits, then page.
 ///
 /// Shared by [`Analysis::strings_page_filtered`] and
-/// [`Analysis::strings_decoded_view`] so the `strings --decode` view keeps
-/// the default-view semantics (executable-memory hiding, lazy pattern
-/// compile, filter-before-page).
+/// [`Analysis::strings_decoded_view`] (plus the loader-only open, which
+/// filters stored snapshot rows without a decoded analysis) so the
+/// `strings --decode` view keeps the default-view semantics
+/// (executable-memory hiding, lazy pattern compile, filter-before-page).
 ///
 /// # Errors
 /// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
 /// expression fails to compile.
-fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<StringHit>> {
+pub(crate) fn filter_string_hits(
+    hits: &[StringHit],
+    filter: &StringsFilter,
+) -> Result<Vec<StringHit>> {
     let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
     // Compiled once, lazily at the first row reaching pattern evaluation:
     // a malformed/overlong pattern errors only when a row survives the
@@ -1969,7 +1979,7 @@ fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<
 /// # Errors
 /// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
 /// expression fails to compile.
-fn count_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<usize> {
+pub(crate) fn count_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<usize> {
     let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
     // Compiled once, lazily at the first row reaching pattern evaluation:
     // a malformed/overlong pattern errors only when a row survives the
@@ -3194,6 +3204,26 @@ pub fn import_index(
     None
 }
 
+/// Mach-O stub map: stub-entry VA to `imports` index, for direct calls.
+///
+/// Mach-O loader addresses are code stubs (unlike PE/ELF data slots), so
+/// [`import_slots`] stays empty for Mach-O; direct `bl`/`call` targets
+/// resolve through this map instead (see [`import_index`]). First import
+/// wins on duplicate addresses; the loader never double-maps, so this is
+/// a backstop for direct API use.
+fn macho_import_stubs(bin: &LoadedBinary) -> BTreeMap<u64, usize> {
+    let mut stubs = BTreeMap::new();
+    if bin.format != BinaryFormat::MachO {
+        return stubs;
+    }
+    for (i, imp) in bin.imports.iter().enumerate() {
+        if let Some(addr) = imp.address {
+            stubs.entry(addr).or_insert(i);
+        }
+    }
+    stubs
+}
+
 /// PLT-stub/import-thunk sites from decoded rows: `jmp [slot]` address
 /// to `imports` index (x86 only; snapshot rebuilds run the same
 /// predicate over re-decoded rows).
@@ -3383,9 +3413,13 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     // Import call sites: the slot map comes from loader-resolved
     // addresses (PE IAT / ELF GOT); stub sites come from decoded
     // `jmp [slot]` shapes, CET `endbr` preludes included (see
-    // `collect_stubs`). Calls through slots are callers, not stubs.
+    // `collect_stubs`), or on Mach-O straight from the loader's stub-entry
+    // addresses (see `macho_import_stubs`). Calls through slots are
+    // callers, not stubs.
     let slots = import_slots(bin);
-    let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+    let stubs: BTreeMap<u64, usize> = if bin.format == BinaryFormat::MachO {
+        macho_import_stubs(bin)
+    } else if matches!(arch, Arch::X86_64 | Arch::X86_32) {
         collect_stubs(
             decoded.iter().map(|(&va, d)| {
                 (

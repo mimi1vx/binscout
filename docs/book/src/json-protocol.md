@@ -38,6 +38,11 @@ These stability guarantees hold across wire revisions:
 - MCP tools return one JSON document as text per call; failures are
   tool errors, never silent empty results. Calls serialize behind one
   lock because `redb` allows a single open handle per file per process.
+  The `batch` tool is the exception that proves the rule: it still
+  returns one document, but per-op failures are `{"error"}` elements of
+  its `results` array (same message text the single tool would report)
+  while only envelope misuse stays a tool error. See
+  [MCP tools](mcp-tools.md).
 
 ## Addresses
 

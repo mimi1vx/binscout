@@ -1,4 +1,4 @@
-//! binscout MCP server: 32 tools over a cached [`Project`].
+//! binscout MCP server: 35 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -48,6 +48,17 @@ pub struct RawParams {
 /// up resident analysis. In-flight calls keep their `Arc` alive past
 /// eviction, so eviction never invalidates a running query.
 const CACHE_CAPACITY: usize = 4;
+
+/// Max ops in one `batch` call: one screen of agent round
+/// trips (e.g. `func`/`cfg`/`pseudo`/`xrefs` for eight functions) over a
+/// single open. Larger asks split into consecutive batches.
+pub const MAX_BATCH_OPS: usize = 32;
+
+/// Cap over the compact-serialized per-op `batch` results
+/// (1 MiB): per-op row/range limits still apply, and this bounds the
+/// total document an agent must absorb. The op that would overflow and
+/// every later op return errors instead of values (see the tool docs).
+pub const MAX_BATCH_BYTES: usize = 1 << 20;
 
 /// Identity of one cached project: canonical binary path, resolved sidecar
 /// path, and loader mapping description. File identity (length plus mtime)
@@ -731,6 +742,493 @@ pub struct DiffParams {
     /// Fat Mach-O slice selection, applied to both binaries (the two-builds
     /// case shares one selection); required for fat containers.
     pub fat_arch: Option<String>,
+}
+
+/// One operation inside a `batch` call: a read-only tool
+/// name plus its tool-specific parameters (as an object, without the
+/// batch envelope identity: `binary`/`db`/`raw`/`fat_arch` live on
+/// [`BatchParams`] and are rejected inside `params`).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchOp {
+    /// Read-only tool name (`func`, `cfg`, `pseudo`, `xrefs`, ...).
+    pub tool: String,
+    /// Tool-specific parameters object (e.g. `{"addr": "0x401000"}`).
+    pub params: serde_json::Value,
+}
+
+/// Parameters for the `batch` tool: up to [`MAX_BATCH_OPS`] read-only ops
+/// over one open project.
+///
+/// The envelope opens the binary once; every op runs in order under that
+/// entry lock and returns its own element of the `results` array, so one
+/// round trip replaces the `func`/`cfg`/`pseudo`/`xrefs` per-function loop.
+/// Write tools (`load`, `rename`, `comment`, `define_func`,
+/// `undefine_func`, `annotations_import`) stay explicit top-level calls
+/// and are rejected per op, as is the two-binary `diff`.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchParams {
+    /// Path to the analyzed binary (shared by every op).
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// 1..=[`MAX_BATCH_OPS`] ops, run in order over the single open.
+    pub ops: Vec<BatchOp>,
+}
+
+// Per-op parameter shapes: subsets of the top-level tool params without
+// the envelope identity. Serde rejects mistyped fields per op; the
+// envelope keys are rejected separately in [`run_batch_op`] so a smuggled
+// `binary` can never silently read another file.
+#[derive(serde::Deserialize)]
+struct BatchAddr {
+    addr: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchBlocks {
+    addr: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchBlockInsns {
+    addr: String,
+    block: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchDiagnostics {
+    kind: Option<String>,
+    func: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchRange {
+    addr: String,
+    len: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchBytes {
+    addr: String,
+    len: usize,
+    r#as: Option<String>,
+    endian: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchFunctions {
+    query: Option<String>,
+    caller: Option<String>,
+    callee: Option<String>,
+    range_lo: Option<String>,
+    range_hi: Option<String>,
+    range_start: Option<String>,
+    range_end: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    envelope: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchXrefs {
+    to: Option<String>,
+    from: Option<String>,
+    kind: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchStrings {
+    start: Option<usize>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    envelope: Option<bool>,
+    pattern: Option<String>,
+    min_len: Option<usize>,
+    section: Option<String>,
+    include_code: Option<bool>,
+    decode: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchCallgraph {
+    addr: String,
+    depth: Option<usize>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchSearchBytes {
+    pattern: String,
+    section: Option<String>,
+    range_start: Option<String>,
+    range_end: Option<String>,
+    range_lo: Option<String>,
+    range_hi: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchFlirt {
+    addr: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct BatchIrCoverage {
+    arch: String,
+    addr: Option<String>,
+    len: Option<usize>,
+}
+
+/// Deserialize one op's params, naming the op on type errors.
+fn parse_op<T: serde::de::DeserializeOwned>(
+    tool: &str,
+    params: &serde_json::Value,
+) -> Result<T, String> {
+    serde_json::from_value(params.clone()).map_err(|e| format!("op {tool:?}: invalid params: {e}"))
+}
+
+/// Invalid-argument message text out of a core error (the single-tool
+/// surface maps these to `invalid_params` with the same text).
+fn invalid_msg(e: crate::error::Error) -> String {
+    match e {
+        crate::error::Error::Invalid(msg) => msg,
+        other => other.to_string(),
+    }
+}
+
+/// Run one batch op against an already-open project.
+///
+/// Mirrors the matching single tool's validation and query (per-op row
+/// and range limits apply unchanged); the only differences are the
+/// envelope-owned identity and the string error, which becomes the op's
+/// `{"error": ...}` element instead of a tool error.
+#[allow(
+    clippy::too_many_lines,
+    reason = "batch dispatch: one small arm per read tool"
+)]
+fn run_batch_op(
+    proj: &Project,
+    tool: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let obj = params
+        .as_object()
+        .ok_or_else(|| format!("op {tool:?}: params must be an object"))?;
+    for key in [
+        "binary", "db", "raw", "fat_arch", "binary_a", "binary_b", "db_a", "db_b",
+    ] {
+        if obj.contains_key(key) {
+            return Err(format!(
+                "op {tool:?}: params must not carry {key:?}; the batch envelope owns the binary identity"
+            ));
+        }
+    }
+    match tool {
+        "project_info" => {
+            Ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
+        }
+        "symbols" => Ok(proj.symbols_json()),
+        "sections" => Ok(proj.sections_json()),
+        "stats" => proj.stats_json().map_err(|e| e.to_string()),
+        "headers" => proj.headers_json().map_err(|e| e.to_string()),
+        "annotations_export" => {
+            let doc = proj.export_annotations().map_err(|e| e.to_string())?;
+            serde_json::from_str(&doc).map_err(|e| format!("encode annotation document: {e}"))
+        }
+        "func" | "cfg" | "structure" | "pseudo" | "annotation" => {
+            let a: BatchAddr = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            match tool {
+                "annotation" => Ok(proj.annotation_json(addr)),
+                "func" => proj
+                    .func_meta(addr)
+                    .map_err(|e| e.to_string())
+                    .map(|m| serde_json::to_value(m).expect("func_meta serializes")),
+                "cfg" => proj.cfg_of(addr).map_err(|e| e.to_string()),
+                "structure" => proj.structure_of(addr).map_err(|e| e.to_string()),
+                _ => proj.pseudo_of(addr).map_err(|e| e.to_string()),
+            }
+        }
+        "blocks" => {
+            let a: BatchBlocks = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            proj.func_blocks_page(addr, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+                .map_err(|e| e.to_string())
+                .map(|page| serde_json::to_value(page).expect("blocks page serializes"))
+        }
+        "block_insns" => {
+            let a: BatchBlockInsns = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            let block = parse_addr(&a.block).map_err(|e| e.to_string())?;
+            proj.func_block_insns_page(addr, block, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+                .map_err(|e| e.to_string())
+                .map(|page| serde_json::to_value(page).expect("block_insns page serializes"))
+        }
+        "diagnostics" => {
+            let a: BatchDiagnostics = parse_op(tool, params)?;
+            let kind = a
+                .kind
+                .as_deref()
+                .map(crate::parse_diagnostic_kind)
+                .transpose()
+                .map_err(invalid_msg)?;
+            let func = a
+                .func
+                .map(|v| parse_addr(&v))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            proj.query_diagnostics(kind, func, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+                .map_err(|e| e.to_string())
+                .map(|page| serde_json::to_value(page).expect("diagnostics page serializes"))
+        }
+        "disasm" | "ir" => {
+            let a: BatchRange = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            if tool == "disasm" {
+                proj.disasm_at(addr, a.len)
+                    .map_err(|e| e.to_string())
+                    .map(|v| serde_json::to_value(v).expect("partial disasm serializes"))
+            } else {
+                proj.ir_at(addr, a.len).map_err(|e| e.to_string())
+            }
+        }
+        "bytes" => {
+            let a: BatchBytes = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            let as_ = a
+                .r#as
+                .as_deref()
+                .map(crate::parse_bytes_as)
+                .transpose()
+                .map_err(invalid_msg)?
+                .unwrap_or(crate::BytesAs::U8);
+            let endian = a
+                .endian
+                .as_deref()
+                .map(crate::parse_bytes_endian)
+                .transpose()
+                .map_err(invalid_msg)?
+                .unwrap_or(crate::BytesEndian::Le);
+            proj.bytes_view(addr, a.len, as_, endian)
+                .map_err(|e| e.to_string())
+                .map(|v| serde_json::to_value(v).expect("bytes view serializes"))
+        }
+        "functions" => {
+            let a: BatchFunctions = parse_op(tool, params)?;
+            if a.range_start.is_some() {
+                eprintln!("warning: functions range_start is deprecated, use range_lo");
+            }
+            if a.range_end.is_some() {
+                eprintln!("warning: functions range_end is deprecated, use range_hi");
+            }
+            let lo = a.range_lo.or(a.range_start);
+            let hi = a.range_hi.or(a.range_end);
+            let filter = FunctionFilter {
+                query: a.query,
+                caller: a
+                    .caller
+                    .map(|v| parse_addr(&v))
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+                callee: a
+                    .callee
+                    .map(|v| parse_addr(&v))
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
+                range: match (lo, hi) {
+                    (None, None) => None,
+                    (Some(lo), Some(hi)) => Some((
+                        parse_addr(&lo).map_err(|e| e.to_string())?,
+                        parse_addr(&hi).map_err(|e| e.to_string())?,
+                    )),
+                    _ => {
+                        return Err("range_lo and range_hi must be given together".to_string());
+                    }
+                },
+            };
+            if a.envelope.unwrap_or(false) {
+                Ok(serde_json::to_value(proj.functions_envelope(
+                    &filter,
+                    a.offset.unwrap_or(0),
+                    a.limit.unwrap_or(50),
+                ))
+                .expect("functions envelope serializes"))
+            } else {
+                Ok(serde_json::Value::Array(proj.functions_filtered(
+                    &filter,
+                    a.offset.unwrap_or(0),
+                    a.limit.unwrap_or(50),
+                )))
+            }
+        }
+        "xrefs" => {
+            let a: BatchXrefs = parse_op(tool, params)?;
+            let kind = a
+                .kind
+                .as_deref()
+                .map(parse_xref_kind)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let to =
+                a.to.map(|v| parse_addr(&v))
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+            let from = a
+                .from
+                .map(|v| parse_addr(&v))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let (total, rows) =
+                proj.query_xrefs_page(to, from, kind, a.offset.unwrap_or(0), a.limit.unwrap_or(50));
+            Ok(serde_json::json!({ "total": total, "xrefs": rows }))
+        }
+        "strings" => {
+            let a: BatchStrings = parse_op(tool, params)?;
+            if a.offset.is_some() {
+                eprintln!("warning: strings offset is deprecated, use start");
+            }
+            let decode = a
+                .decode
+                .as_deref()
+                .map(crate::loader::strings::parse_decode_spec)
+                .transpose()
+                .map_err(invalid_msg)?;
+            let filter = crate::analysis::StringsFilter {
+                pattern: a.pattern,
+                min_len: a.min_len,
+                section: a.section,
+                include_code: a.include_code.unwrap_or(false),
+                start: a.start.or(a.offset).unwrap_or(0),
+                limit: a.limit.unwrap_or(50),
+            };
+            if a.envelope.unwrap_or(false) {
+                let page = match decode {
+                    Some(spec) => proj.query_strings_decoded_envelope(&filter, spec),
+                    None => proj.query_strings_envelope(&filter),
+                }
+                .map_err(invalid_msg)?;
+                Ok(serde_json::to_value(page).expect("strings envelope serializes"))
+            } else {
+                let rows = match decode {
+                    Some(spec) => proj.query_strings_decoded(&filter, spec),
+                    None => proj.query_strings(&filter),
+                }
+                .map_err(invalid_msg)?;
+                Ok(serde_json::to_value(rows).expect("strings serialize"))
+            }
+        }
+        "stack_strings" => {
+            Ok(serde_json::to_value(proj.stack_strings()).expect("stack strings serialize"))
+        }
+        "callees" | "callers" => {
+            let a: BatchCallgraph = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            let depth = a.depth.unwrap_or(crate::analysis::MAX_CALL_DEPTH);
+            let page = if tool == "callees" {
+                proj.callees_page(addr, depth, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+            } else {
+                proj.callers_page(addr, depth, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+            }
+            .map_err(invalid_msg)?;
+            Ok(serde_json::to_value(page).expect("callgraph page serializes"))
+        }
+        "slice" => {
+            let a: BatchCallgraph = parse_op(tool, params)?;
+            let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
+            proj.slice_page(
+                addr,
+                a.depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
+                a.offset.unwrap_or(0),
+                a.limit.unwrap_or(50),
+            )
+            .map_err(invalid_msg)
+            .map(|page| serde_json::to_value(page).expect("slice page serializes"))
+        }
+        "search_bytes" => {
+            let a: BatchSearchBytes = parse_op(tool, params)?;
+            if a.range_lo.is_some() {
+                eprintln!("warning: search_bytes range_lo is deprecated, use range_start");
+            }
+            if a.range_hi.is_some() {
+                eprintln!("warning: search_bytes range_hi is deprecated, use range_end");
+            }
+            let lo = a.range_start.or(a.range_lo);
+            let hi = a.range_end.or(a.range_hi);
+            let range = match (lo, hi) {
+                (None, None) => None,
+                (Some(lo), Some(hi)) => Some((
+                    parse_addr(&lo).map_err(|e| e.to_string())?,
+                    parse_addr(&hi).map_err(|e| e.to_string())?,
+                )),
+                _ => {
+                    return Err("range_start and range_end must be given together".to_string());
+                }
+            };
+            proj.search_bytes(
+                &a.pattern,
+                a.section.as_deref(),
+                range,
+                a.offset.unwrap_or(0),
+                a.limit.unwrap_or(50),
+            )
+            .map_err(invalid_msg)
+            .map(|page| serde_json::to_value(page).expect("search_bytes page serializes"))
+        }
+        "flirt_hints" => {
+            let a: BatchFlirt = parse_op(tool, params)?;
+            let addr = a
+                .addr
+                .map(|v| parse_addr(&v))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            proj.query_flirt_hints(addr, a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+                .map_err(|e| e.to_string())
+                .map(|page| serde_json::to_value(page).expect("flirt hints page serializes"))
+        }
+        "ir_coverage" => {
+            let a: BatchIrCoverage = parse_op(tool, params)?;
+            let arch = crate::parse_raw_arch(&a.arch).map_err(|e| e.to_string())?;
+            match (a.addr, a.len) {
+                (None, None) => Ok(crate::ir_coverage(arch)),
+                (Some(addr_s), Some(len)) => {
+                    let addr = parse_addr(&addr_s).map_err(|e| e.to_string())?;
+                    proj.ir_coverage_at(arch, addr, len).map_err(invalid_msg)
+                }
+                _ => Err(
+                    "op \"ir_coverage\": addr and len must be given together (binary comes from the batch envelope)"
+                        .to_string(),
+                ),
+            }
+        }
+        "load" | "rename" | "comment" | "define_func" | "undefine_func" | "annotations_import" => {
+            Err(format!(
+                "batch rejects write tool {tool:?}: run it as a top-level call to keep writes explicit"
+            ))
+        }
+        "diff" => Err(
+            "batch rejects \"diff\": it opens two binaries; call it as a top-level tool"
+                .to_string(),
+        ),
+        "batch" => Err("batch ops cannot nest".to_string()),
+        other => Err(format!("unknown batch op tool {other:?}")),
+    }
 }
 
 /// MCP server handler; tools share one project cache.
@@ -1688,6 +2186,47 @@ impl BinscoutMcp {
             ok(serde_json::to_value(report).expect("diff report serializes"))
         }
     }
+
+    #[tool(
+        name = "batch",
+        description = "Run up to 32 read-only ops over one open project: the envelope binary/db/raw/fat_arch applies to every op, ops run in order under a single open, and the result is {results: [{ok} | {error}]} with per-op limits unchanged and total output capped at 1 MiB (write tools and diff are rejected per op)"
+    )]
+    async fn batch(&self, p: Parameters<BatchParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        if p.ops.is_empty() || p.ops.len() > MAX_BATCH_OPS {
+            return Err(ErrorData::invalid_params(
+                format!("batch holds 1..={MAX_BATCH_OPS} ops, got {}", p.ops.len()),
+                None,
+            ));
+        }
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        // Sequential under one entry lock: deterministic order, one open,
+        // no concurrent mutation mid-batch. Error elements count toward
+        // the cap like values so the accounting stays uniform.
+        let mut results = Vec::with_capacity(p.ops.len());
+        let mut bytes = 0usize;
+        let mut capped = false;
+        for op in &p.ops {
+            if capped {
+                results.push(serde_json::json!({"error": "skipped: batch output cap exceeded"}));
+                continue;
+            }
+            let element = match run_batch_op(&proj, &op.tool, &op.params) {
+                Ok(v) => serde_json::json!({"ok": v}),
+                Err(msg) => serde_json::json!({"error": msg}),
+            };
+            let size = serde_json::to_string(&element).map_or(0, |s| s.len());
+            if bytes + size > MAX_BATCH_BYTES {
+                capped = true;
+                results.push(serde_json::json!({"error": format!("limit exceeded: batch output exceeds {MAX_BATCH_BYTES} bytes; remaining ops skipped")}));
+                continue;
+            }
+            bytes += size;
+            results.push(element);
+        }
+        ok(serde_json::json!({ "results": results }))
+    }
 }
 
 #[cfg(test)]
@@ -1825,6 +2364,54 @@ mod tests {
             state.entries.keys().all(|k| k.binary != first_key),
             "least-recently-used entry must evict"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batch_dispatch_ok_and_rejections() {
+        let dir = scratch("batch");
+        let bin = write_blob(&dir, "a.bin", 0x90);
+        let db = dir.join("a.redb");
+        let (binary, db_s) = open_params(&bin, &db);
+        let mcp = BinscoutMcp::new();
+        let entry = mcp
+            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .expect("open");
+        let proj = entry.lock_project();
+        let run = |tool: &str, params: serde_json::Value| run_batch_op(&proj, tool, &params);
+
+        let v = run("func", serde_json::json!({"addr": "0x0"})).expect("func op");
+        assert_eq!(v["entry"], 0);
+        let v = run("project_info", serde_json::json!({})).expect("project_info op");
+        assert_eq!(v["format"], "raw");
+
+        let e = run("nope", serde_json::json!({})).expect_err("unknown op");
+        assert!(e.contains("unknown batch op"), "{e}");
+        for w in [
+            "load",
+            "rename",
+            "comment",
+            "define_func",
+            "undefine_func",
+            "annotations_import",
+        ] {
+            let e = run(w, serde_json::json!({"addr": "0x0"})).expect_err("write rejected");
+            assert!(e.contains("explicit"), "{w}: {e}");
+        }
+        let e = run("diff", serde_json::json!({})).expect_err("diff rejected");
+        assert!(e.contains("two binaries"), "{e}");
+        let e = run("batch", serde_json::json!({})).expect_err("nesting rejected");
+        assert!(e.contains("cannot nest"), "{e}");
+        let e = run(
+            "func",
+            serde_json::json!({"addr": "0x0", "binary": "other"}),
+        )
+        .expect_err("identity smuggling");
+        assert!(e.contains("envelope"), "{e}");
+        let e = run("func", serde_json::Value::Null).expect_err("non-object params");
+        assert!(e.contains("must be an object"), "{e}");
+        let e = run("func", serde_json::json!({"addr": "0xdead"})).expect_err("unknown func");
+        assert!(e.contains("not found"), "{e}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
