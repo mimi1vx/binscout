@@ -773,6 +773,47 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     cleanup(&dir);
 }
 
+// Xref rows carry listing context; `strings` with `with_xrefs` lists
+// referrers per string in one call.
+#[test]
+fn xrefs_carry_context_and_strings_with_xrefs() {
+    let dir = tmpdir("mcp-xref-ctx");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let va = common::builders::BASIC_STRING_VA;
+    let hex = format!("{va:#x}");
+
+    let v = tool_once(
+        10,
+        "xrefs",
+        json!({"binary": bin, "db": db, "to": hex, "kind": "string"}),
+    );
+    assert_eq!(v["total"], 2);
+    for row in v["xrefs"].as_array().expect("xrefs array") {
+        assert_eq!(row["from_func"], common::builders::BASIC_ENTRY_VA);
+        assert_eq!(row["from_func_name"], common::builders::BASIC_EXPORT);
+        assert_eq!(row["to_name"], Value::Null);
+        assert_eq!(row["to_string"], common::builders::BASIC_STRING);
+    }
+
+    let v = tool_once(
+        11,
+        "strings",
+        json!({"binary": bin, "db": db, "pattern": "SAVE"}),
+    );
+    assert!(v[0].get("xrefs").is_none(), "flag off omits the list: {v}");
+
+    let v = tool_once(
+        12,
+        "strings",
+        json!({"binary": bin, "db": db, "pattern": "SAVE", "with_xrefs": true}),
+    );
+    let refs = v[0]["xrefs"].as_array().expect("xrefs list");
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0]["from_func_name"], common::builders::BASIC_EXPORT);
+    cleanup(&dir);
+}
+
 // O2/A10: annotation round-trip lock-in over MCP. Rename and comment share
 // one function entry so each tool's `annotation_json` response point-queries
 // the other's field (there is no dedicated annotate-read tool). Every step

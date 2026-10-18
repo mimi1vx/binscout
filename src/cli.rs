@@ -227,6 +227,11 @@ pub enum Cmd {
         /// Show strings in executable memory (hidden by default).
         #[arg(long)]
         include_code: bool,
+        /// Include the bounded referencing-instruction list per string
+        /// (capped at 64 refs per row), so one call replaces the
+        /// `strings` then `xrefs --to --kind string` round-trip.
+        #[arg(long)]
+        with_xrefs: bool,
         /// Decode-and-display view over an in-memory transform:
         /// `xor:<byte>`, `add:<byte>`, or `rot:<0-7>` (byte is `0x`-hex or
         /// decimal). Reveals single-byte-obfuscated text with original
@@ -457,6 +462,7 @@ impl Cli {
                 min_len,
                 section,
                 include_code,
+                with_xrefs,
                 decode,
             } => {
                 if offset.is_some() {
@@ -484,6 +490,7 @@ impl Cli {
                         start: start.or(offset).unwrap_or(0),
                         limit,
                     },
+                    with_xrefs,
                     decode,
                 )
             }
@@ -888,7 +895,7 @@ fn xrefs(
     let p = open(binary, db, raw, fat_arch)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
-    let (total, rows) = p.query_xrefs_page(to, from, kind, offset, limit);
+    let (total, rows) = p.query_xref_rows_page(to, from, kind, offset, limit);
     Ok(serde_json::json!({ "total": total, "xrefs": rows }))
 }
 
@@ -898,12 +905,13 @@ fn strings(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
     filter: &binscout::analysis::StringsFilter,
+    with_xrefs: bool,
     decode: Option<binscout::loader::strings::DecodeSpec>,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch)?;
     let rows = match decode {
-        Some(spec) => p.query_strings_decoded(filter, spec)?,
-        None => p.query_strings(filter)?,
+        Some(spec) => p.query_strings_decoded_rows(filter, spec, with_xrefs)?,
+        None => p.query_strings_rows(filter, with_xrefs)?,
     };
     Ok(serde_json::to_value(rows).expect("strings serialize"))
 }

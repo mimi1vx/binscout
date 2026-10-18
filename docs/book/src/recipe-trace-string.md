@@ -37,7 +37,9 @@ $ binscout strings fw.exe --decode xor:0x42 --pattern SAVE
 ```
 
 MCP: `strings` (`binary`, `pattern?`, `min_len?`, `section?`,
-`include_code?`, `decode?`, `start?`, `limit?`).
+`include_code?`, `decode?`, `with_xrefs?`, `start?`, `limit?`).
+`--with-xrefs` skips step 2 for the common case: each string row
+carries its referencing instructions directly.
 
 ## 2. Find who references it
 
@@ -48,7 +50,10 @@ $ binscout xrefs fw.exe --to 0x402100 --kind string
 `xrefs` filters by `--to` / `--from` / `--kind` (`code`, `data`,
 `string`, `import`, `inferred-code`, case-insensitive) and pages behind a
 `{"total", "xrefs"}` envelope. Rows carry `from` / `from_hex`,
-`to` / `to_hex`, and `kind`. A string typically has `string`-kind
+`to` / `to_hex`, and `kind`, plus listing context: `from_func` /
+`from_func_hex` with its rename-resolved `from_func_name`,
+`to_name` (function or import display name), and `to_string` (the
+string preview on `string`-kind rows). A string typically has `string`-kind
 rows from the referencing instructions (the `pe32-basic.exe`
 fixture references its `SAVE%d.GAM is invalid` marker twice from
 `.text`) plus `data`-kind rows where the address is materialized.

@@ -302,6 +302,10 @@ pub struct StringsParams {
     /// single-byte-obfuscated text with original offsets; never writes the
     /// binary.
     pub decode: Option<String>,
+    /// Include the bounded referencing-instruction list per string
+    /// (capped at 64 refs per row), so one call replaces the `strings`
+    /// then `xrefs` round-trip.
+    pub with_xrefs: Option<bool>,
 }
 
 /// Parameters for the `functions` tool: paged list with optional filters.
@@ -1151,7 +1155,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "xrefs",
-        description = "Cross-references filtered by to/from address and kind, paged with total match count"
+        description = "Cross-references filtered by to/from address and kind, paged with total match count; rows carry the containing function (from_func/from_func_name), the target display name (to_name), and the string preview for string-kind rows (to_string)"
     )]
     async fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1171,13 +1175,13 @@ impl BinscoutMcp {
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
         let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
         let (total, rows) =
-            proj.query_xrefs_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
+            proj.query_xref_rows_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
         ok(serde_json::json!({ "total": total, "xrefs": rows }))
     }
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>. With with_xrefs, each row carries its bounded referencing-instruction list"
     )]
     async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1195,7 +1199,7 @@ impl BinscoutMcp {
             })?;
         // Cloned before the move into the open; the decode error above keeps
         // its pre-open precedence.
-        let (pattern, min_len, section, include_code, start, offset, limit) = (
+        let (pattern, min_len, section, include_code, start, offset, limit, with_xrefs) = (
             p.pattern.clone(),
             p.min_len,
             p.section.clone(),
@@ -1203,6 +1207,7 @@ impl BinscoutMcp {
             p.start,
             p.offset,
             p.limit,
+            p.with_xrefs,
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
@@ -1214,9 +1219,10 @@ impl BinscoutMcp {
             start: start.or(offset).unwrap_or(0),
             limit: limit.unwrap_or(50),
         };
+        let with_xrefs = with_xrefs.unwrap_or(false);
         let rows = match decode {
-            Some(spec) => proj.query_strings_decoded(&filter, spec),
-            None => proj.query_strings(&filter),
+            Some(spec) => proj.query_strings_decoded_rows(&filter, spec, with_xrefs),
+            None => proj.query_strings_rows(&filter, with_xrefs),
         }
         .map_err(|e| match e {
             crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),

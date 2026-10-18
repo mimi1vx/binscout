@@ -171,8 +171,12 @@ still snaps to the canonical `entry`:
 
 Explicitly unchanged in this contract (no style churn): the bare-array
 `functions` list with `--offset`/`--limit`; the `{"total", "xrefs"}`
-`xrefs` envelope; the bare-array `strings` list with
-`--start`/`--limit` (`--offset` stays a deprecated alias that warns);
+`xrefs` envelope shape (rows gain the additive `from_func`/
+`from_func_hex`/`from_func_name`/`to_name`/`to_string` context fields,
+no existing field changes); the bare-array `strings` list with
+`--start`/`--limit` (`--offset` stays a deprecated alias that warns;
+`--with-xrefs` adds the bounded per-row `xrefs` reference list, omitted
+without the flag);
 `symbols` exports keep their shape while imports carry additive
 `address`/`address_hex` (the call pointer: the Mach-O `__stubs` entry,
 the PE IAT slot, the ELF GOT slot named by `.rela.plt`/`.rel.plt`
@@ -392,6 +396,57 @@ a warning, distinguishable from a genuine `NOP`. With a range, it
 adds per-range `decoded`/`lifted`/`unlifted` counts from actual lift
 results plus a bounded mnemonic summary. (`ARCH` is positional on the
 CLI because `--arch` is the global raw-mapping flag.)
+
+### `xrefs`
+
+```sh
+binscout xrefs B [--to ADDR] [--from ADDR] [--kind KIND] [--offset N] [--limit N]
+```
+
+MCP tool `xrefs` (`binary`, `db`?, `raw`?, `to`?, `from`?, `kind?`,
+`offset?`, `limit?`). `kind` is one of `code`, `data`, `string`,
+`import`, `inferred-code` (case-insensitive); anything else is an
+`Invalid` error. Filtering precedes pagination behind the
+`{"total", "xrefs"}` envelope; an offset past the end is a normal
+empty page. Every row carries the stored triple (`from`/`from_hex`,
+`to`/`to_hex`, `kind`) plus additive listing context, so agents skip
+the follow-up lookups: `from_func`/`from_func_hex` (the entry of the
+function containing `from`, null when in no function) with its
+rename-resolved `from_func_name`, `to_name` (the rename-resolved
+display name of the target: function or import; code targets fall back
+to `func@0x...`, unresolvable data targets stay null), and `to_string`
+(the truncated string preview, only for `string`-kind rows). The
+context builds once per call and rows reuse the sorted xref storage
+plus binary searches, so per-page work scales with the page.
+
+```sh
+$ binscout xrefs fw.exe --to 0x402100 --kind string
+{"total": 2, "xrefs": [
+  {"from": 4198400, "from_hex": "0x401000", "kind": "String", "to": 4202496, "to_hex": "0x402100",
+   "from_func": 4198400, "from_func_hex": "0x401000", "from_func_name": "main",
+   "to_name": null, "to_string": "SAVE%d.GAM is invalid"}]}
+```
+
+### `strings`
+
+```sh
+binscout strings B [--pattern P] [--min-len N] [--section S] [--include-code] [--with-xrefs] [--decode SPEC] [--start N] [--limit N]
+```
+
+MCP tool `strings` (`binary`, `db`?, `raw`?, `pattern`?, `min_len`?,
+`section`?, `include_code`?, `decode`?, `with_xrefs`?, `start`?,
+`limit`?). Without `--with-xrefs` rows are the bare string hits
+(`offset`, `vaddr`/`vaddr_hex`, `encoding`, `value`, `section`,
+`executable`); with it, every row additionally carries `xrefs`: the
+instructions referring to that string's start, each with
+`from`/`from_hex`, `kind`, and the containing function
+(`from_func`/`from_func_hex` plus its rename-resolved
+`from_func_name`). The list is the same rows
+`xrefs --to <vaddr> --kind string` reports, capped at 64 refs per row
+in `(from, kind)` order, so one call replaces the `strings` then
+`xrefs --to --kind string` round-trip. `--decode` and `--with-xrefs`
+compose: decoded hits keep their original offsets, and references
+resolve against the original xref set at the same addresses.
 
 ### `search-bytes`
 
