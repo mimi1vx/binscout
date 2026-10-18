@@ -1911,16 +1911,16 @@ fn loader_only_open_matches_full_open() {
             binscout::loader::strings::parse_decode_spec("xor:0x42").expect("decode spec parses");
         assert_eq!(
             loader
-                .query_strings_decoded(filter, decode)
+                .query_strings_decoded(filter, decode.clone())
                 .expect("loader decoded"),
-            full.query_strings_decoded(filter, decode)
+            full.query_strings_decoded(filter, decode.clone())
                 .expect("full decoded"),
             "strings --decode"
         );
         assert_eq!(
             serde_json::to_value(
                 loader
-                    .query_strings_decoded_envelope(filter, decode)
+                    .query_strings_decoded_envelope(filter, decode.clone())
                     .expect("loader decoded envelope")
             )
             .expect("envelope serializes"),
