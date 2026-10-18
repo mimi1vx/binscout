@@ -46,7 +46,7 @@
 //! list caps at the shared 1024-row page budget (`summary.truncated` tells
 //! when a cap bit).
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -281,9 +281,29 @@ fn func_range(func: &Function) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
+/// Xref counts for one function address range.
+///
+/// `froms` holds the `from` endpoint of every xref in storage order
+/// (`xrefs` sort by `(from, kind, to)`, so it runs non-decreasing) and
+/// `tos` every `to` endpoint sorted ascending; both counts then resolve
+/// with two binary searches over the half-open `[lo, hi)` range instead
+/// of scanning every xref. A function without blocks has no range and
+/// holds no xrefs.
+fn xref_shape(froms: &[u64], tos: &[u64], range: Option<(u64, u64)>) -> (usize, usize) {
+    let Some((lo, hi)) = range else {
+        return (0, 0);
+    };
+    let out = froms.partition_point(|&from| from < hi) - froms.partition_point(|&from| from < lo);
+    let inn = tos.partition_point(|&to| to < hi) - tos.partition_point(|&to| to < lo);
+    (out, inn)
+}
+
 /// Fingerprint every function in one project, ordered by entry.
 fn fingerprints(project: &Project) -> Vec<Fingerprint> {
     let analysis = project.analysis();
+    let froms: Vec<u64> = analysis.xrefs.iter().map(|x| x.from).collect();
+    let mut tos: Vec<u64> = analysis.xrefs.iter().map(|x| x.to).collect();
+    tos.sort_unstable();
     analysis
         .functions
         .values()
@@ -304,17 +324,7 @@ fn fingerprints(project: &Project) -> Vec<Fingerprint> {
                     ops.push(b';');
                 }
             }
-            let range = func_range(f);
-            let in_range = |addr: u64| range.is_some_and(|(lo, hi)| addr >= lo && addr < hi);
-            let (mut xrefs_out, mut xrefs_in) = (0usize, 0usize);
-            for x in &analysis.xrefs {
-                if in_range(x.from) {
-                    xrefs_out += 1;
-                }
-                if in_range(x.to) {
-                    xrefs_in += 1;
-                }
-            }
+            let (xrefs_out, xrefs_in) = xref_shape(&froms, &tos, func_range(f));
             Fingerprint {
                 entry: f.entry,
                 name: f.name.clone(),
@@ -425,33 +435,42 @@ pub fn diff_projects(a: &Project, b: &Project) -> DiffReport {
         }
     }
 
-    // Pass 4: fuzzy IR similarity with equal callgraph shape.
-    let mut rest_b: Vec<usize> = fb
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !used_b[*j])
-        .map(|(j, _)| j)
-        .collect::<Vec<_>>();
+    // Pass 4: fuzzy IR similarity with equal callgraph shape. The
+    // remaining B side buckets by shape so each A only compares
+    // against shape-equal candidates; pairings mark `used_b` in place
+    // instead of shifting a live vector per match.
+    let mut buckets: HashMap<(usize, usize, usize, usize), Vec<usize>> = HashMap::new();
+    for (j, f) in fb.iter().enumerate() {
+        if !used_b[j] {
+            buckets
+                .entry((f.calls_out, f.callers_in, f.xrefs_out, f.xrefs_in))
+                .or_default()
+                .push(j);
+        }
+    }
     let mut final_a: Vec<usize> = Vec::new();
     for &i in &rest_a {
+        let key = (
+            fa[i].calls_out,
+            fa[i].callers_in,
+            fa[i].xrefs_out,
+            fa[i].xrefs_in,
+        );
         let mut best: Option<(usize, f64)> = None;
-        for &j in &rest_b {
-            if fa[i].calls_out != fb[j].calls_out
-                || fa[i].callers_in != fb[j].callers_in
-                || fa[i].xrefs_out != fb[j].xrefs_out
-                || fa[i].xrefs_in != fb[j].xrefs_in
-            {
-                continue;
-            }
-            let sim = ir_similarity(&fa[i].histogram, &fb[j].histogram);
-            if sim >= FUZZY_SIMILARITY_THRESHOLD && best.is_none_or(|(_, s)| sim > s) {
-                best = Some((j, sim));
+        if let Some(cands) = buckets.get(&key) {
+            for &j in cands {
+                if used_b[j] {
+                    continue;
+                }
+                let sim = ir_similarity(&fa[i].histogram, &fb[j].histogram);
+                if sim >= FUZZY_SIMILARITY_THRESHOLD && best.is_none_or(|(_, s)| sim > s) {
+                    best = Some((j, sim));
+                }
             }
         }
         match best {
             Some((j, sim)) => {
                 used_b[j] = true;
-                rest_b.retain(|&k| k != j);
                 changed.push(changed_row(&fa[i], &fb[j], MatchReason::Fuzzy, Some(sim)));
             }
             None => final_a.push(i),
@@ -460,7 +479,12 @@ pub fn diff_projects(a: &Project, b: &Project) -> DiffReport {
 
     changed.sort_by_key(|c| (c.entry_a, c.entry_b));
     let mut removed: Vec<FuncRow> = final_a.iter().map(|&i| func_row(a, &fa[i])).collect();
-    let mut added: Vec<FuncRow> = rest_b.iter().map(|&j| func_row(b, &fb[j])).collect();
+    let mut added: Vec<FuncRow> = fb
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !used_b[*j])
+        .map(|(j, _)| func_row(b, &fb[j]))
+        .collect();
     removed.sort_by_key(|r| r.entry);
     added.sort_by_key(|r| r.entry);
 
@@ -528,7 +552,8 @@ fn changed_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{N_OPS, ir_similarity};
+    use super::{N_OPS, ir_similarity, xref_shape};
+    use crate::analysis::{Xref, XrefKind};
 
     fn hist(pairs: &[(usize, usize)]) -> [usize; N_OPS] {
         let mut h = [0usize; N_OPS];
@@ -569,5 +594,56 @@ mod tests {
         let sim = ir_similarity(&a, &b);
         assert!((sim - 5.0 / 6.0).abs() < 1e-9, "got {sim}");
         assert!(sim >= super::FUZZY_SIMILARITY_THRESHOLD);
+    }
+
+    /// Brute-force oracle for [`xref_shape`]: the old per-function scan.
+    fn brute(xrefs: &[Xref], range: Option<(u64, u64)>) -> (usize, usize) {
+        let in_range = |addr: u64| range.is_some_and(|(lo, hi)| addr >= lo && addr < hi);
+        let mut out = 0;
+        let mut inn = 0;
+        for x in xrefs {
+            out += usize::from(in_range(x.from));
+            inn += usize::from(in_range(x.to));
+        }
+        (out, inn)
+    }
+
+    #[test]
+    fn xref_shape_matches_scan_on_boundaries_and_gaps() {
+        // Duplicate endpoints, shared `from`s, and endpoints landing
+        // exactly on range edges pin the half-open semantics.
+        let xrefs = [
+            (0x1000, 0x2000),
+            (0x1000, 0x2005),
+            (0x1004, 0x1000),
+            (0x1010, 0x3000),
+            (0x2000, 0x1004),
+        ]
+        .map(|(from, to)| Xref {
+            from,
+            to,
+            kind: XrefKind::Code,
+        });
+        let mut froms: Vec<u64> = xrefs.iter().map(|x| x.from).collect();
+        froms.sort_unstable();
+        let mut tos: Vec<u64> = xrefs.iter().map(|x| x.to).collect();
+        tos.sort_unstable();
+        for range in [
+            None,
+            Some((0x1000, 0x1000)),
+            Some((0x1000, 0x1001)),
+            Some((0x1000, 0x1010)),
+            Some((0x1000, 0x1011)),
+            Some((0x1004, 0x2000)),
+            Some((0x0, u64::MAX)),
+            Some((0x4000, 0x5000)),
+        ] {
+            assert_eq!(
+                xref_shape(&froms, &tos, range),
+                brute(&xrefs, range),
+                "{range:?}"
+            );
+        }
+        assert_eq!(xref_shape(&[], &[], Some((0, 10))), (0, 0));
     }
 }

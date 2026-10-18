@@ -227,6 +227,114 @@ fn diff_match_threshold_is_documented_value() {
     assert_eq!(binscout::diff::FUZZY_SIMILARITY_THRESHOLD, 0.8);
 }
 
+/// Caller plus leaf on both sides; the caller is byte-identical while
+/// the leaves differ by one `nop` (5 shared ops of 6: similarity 5/6).
+/// Only the fuzzy pass can pair the leaves, and both carry one
+/// incoming call xref, so the pass runs on real non-zero xref shapes.
+fn fuzzy_caller_blob(leaf: &[u8]) -> Vec<u8> {
+    let mut b = vec![
+        0x55, 0x48, 0x89, 0xE5, 0xE8, 0x0B, 0x00, 0x00, 0x00, 0x5D, 0xC3,
+    ];
+    b.extend([0x90; 9]);
+    b.extend_from_slice(leaf);
+    b
+}
+
+#[test]
+fn lib_diff_fuzzy_pairs_leaf_with_extra_nop() {
+    // Framed `xor eax,eax` leaf vs the same leaf plus `nop`: bytes and
+    // IR both differ and raw blobs carry no names, so only the fuzzy
+    // pass (similarity 5/6 >= 0.8, equal empty shapes) can pair them.
+    let dir = tmpdir("diff-fuzzy-leaf");
+    let a = write_bin(
+        &dir,
+        "a.bin",
+        &[0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3],
+    );
+    let b = write_bin(
+        &dir,
+        "b.bin",
+        &[0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x90, 0x5D, 0xC3],
+    );
+    let pa = binscout::Project::open_with_db(&a, &temp_db(&dir, "a")).expect("open a");
+    let pb = binscout::Project::open_with_db(&b, &temp_db(&dir, "b")).expect("open b");
+    assert_eq!(pa.analysis().functions.len(), 1, "fixture A shape");
+    assert_eq!(pb.analysis().functions.len(), 1, "fixture B shape");
+
+    let r = binscout::diff::diff_projects(&pa, &pb);
+    assert_eq!(r.summary.matched, 0);
+    assert_eq!(r.summary.added, 0);
+    assert_eq!(r.summary.removed, 0);
+    assert_eq!(r.changed.len(), 1);
+    let c = &r.changed[0];
+    assert_eq!((c.entry_a, c.entry_b), (0, 0));
+    assert_eq!(c.reason, binscout::diff::MatchReason::Fuzzy);
+    let sim = c.similarity.expect("fuzzy records similarity");
+    assert!((sim - 5.0 / 6.0).abs() < 1e-9, "got {sim}");
+    assert_ne!(c.bytes_hash_a, c.bytes_hash_b);
+    assert_ne!(c.ir_hash_a, c.ir_hash_b);
+    cleanup(&dir);
+}
+
+#[test]
+fn lib_diff_fuzzy_pairs_called_leaf_with_extra_nop() {
+    let dir = tmpdir("diff-fuzzy-caller");
+    let leaf_a = [0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3];
+    let leaf_b = [0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x90, 0x5D, 0xC3];
+    let a = write_bin(&dir, "a.bin", &fuzzy_caller_blob(&leaf_a));
+    let b = write_bin(&dir, "b.bin", &fuzzy_caller_blob(&leaf_b));
+    let pa = binscout::Project::open_with_db(&a, &temp_db(&dir, "a")).expect("open a");
+    let pb = binscout::Project::open_with_db(&b, &temp_db(&dir, "b")).expect("open b");
+    assert_eq!(pa.analysis().functions.len(), 2, "fixture A shape");
+    assert_eq!(pb.analysis().functions.len(), 2, "fixture B shape");
+
+    let r = binscout::diff::diff_projects(&pa, &pb);
+    assert_eq!(
+        r.summary,
+        binscout::diff::DiffSummary {
+            matched: 1,
+            changed: 1,
+            added: 0,
+            removed: 0,
+            truncated: false,
+        }
+    );
+    assert_eq!(r.changed.len(), 1);
+    let c = &r.changed[0];
+    assert_eq!((c.entry_a, c.entry_b), (0x14, 0x14));
+    assert_eq!(c.reason, binscout::diff::MatchReason::Fuzzy);
+    let sim = c.similarity.expect("fuzzy records similarity");
+    assert!((sim - 5.0 / 6.0).abs() < 1e-9, "got {sim}");
+    cleanup(&dir);
+}
+
+#[test]
+fn lib_diff_large_identical_pair_matches_all() {
+    // 2000 identical frame stubs: the binary-search xref counts and the
+    // hash passes at scale, with nothing escaping to the fuzzy pass.
+    const N: usize = 2000;
+    const STUB: &[u8] = &[0x55, 0x48, 0x89, 0xE5, 0xC3];
+    let dir = tmpdir("diff-scale");
+    let mut blob = Vec::with_capacity(N * STUB.len());
+    for _ in 0..N {
+        blob.extend_from_slice(STUB);
+    }
+    let a = write_bin(&dir, "a.bin", &blob);
+    let b = write_bin(&dir, "b.bin", &blob);
+    let pa = binscout::Project::open_with_db(&a, &temp_db(&dir, "a")).expect("open a");
+    let pb = binscout::Project::open_with_db(&b, &temp_db(&dir, "b")).expect("open b");
+    assert_eq!(pa.analysis().functions.len(), N, "fixture A shape");
+    assert_eq!(pb.analysis().functions.len(), N, "fixture B shape");
+
+    let r = binscout::diff::diff_projects(&pa, &pb);
+    assert_eq!(r.summary.matched, N);
+    assert_eq!(r.summary.changed, 0);
+    assert_eq!(r.summary.added, 0);
+    assert_eq!(r.summary.removed, 0);
+    assert!(!r.summary.truncated);
+    cleanup(&dir);
+}
+
 #[test]
 fn lib_diff_summary_counts_survive_truncation() {
     // Side A holds one bare `ret`; side B holds 1500 identical frame
