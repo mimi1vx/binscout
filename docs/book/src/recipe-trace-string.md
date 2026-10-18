@@ -29,11 +29,15 @@ $ binscout strings fw.exe --pattern SAVE --min-len 6
 For single-byte-obfuscated text, `--decode xor:<byte>`, `add:<byte>`,
 or `rot:<0-7>` (`0x`-hex or decimal byte) re-extracts over a
 read-only in-memory transform with original offsets; the binary is
-never written.
+never written. Rolling multi-byte keys (`--decode xor:0x<HEXKEY>`
+with 4+ hex digits) and base64-blob plaintext (`--decode base64`)
+work the same way.
 
 ```sh
 $ binscout strings fw.exe --pattern "regex:GAM.*invalid"
 $ binscout strings fw.exe --decode xor:0x42 --pattern SAVE
+$ binscout strings fw.exe --decode xor:0xDEADBEEF --pattern SAVE
+$ binscout strings fw.exe --decode base64 --pattern token
 ```
 
 MCP: `strings` (`binary`, `pattern?`, `min_len?`, `section?`,

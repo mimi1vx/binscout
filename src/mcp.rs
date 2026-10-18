@@ -302,8 +302,10 @@ pub struct StringsParams {
     /// Show strings in executable memory (hidden by default).
     pub include_code: Option<bool>,
     /// Decode-and-display view over an in-memory transform: `xor:<byte>`,
-    /// `add:<byte>`, or `rot:<0-7>` (byte is `0x`-hex or decimal). Reveals
-    /// single-byte-obfuscated text with original offsets; never writes the
+    /// `xor:0x<HEXKEY>` (4+ hex digits, rolling multi-byte key),
+    /// `add:<byte>`, `rot:<0-7>` (byte is `0x`-hex or decimal), or bare
+    /// `base64` (reports base64 blobs' plaintext). Reveals
+    /// obfuscated text with original offsets; never writes the
     /// binary.
     pub decode: Option<String>,
 }
@@ -1270,7 +1272,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>. offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only obfuscated view: xor:<byte>, xor:0x<HEXKEY> (rolling multi-byte key), add:<byte>, rot:<0-7>, or bare base64 (blob plaintext). offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total"
     )]
     async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1328,6 +1330,17 @@ impl BinscoutMcp {
             other => ErrorData::internal_error(other.to_string(), None),
         })?;
         ok(serde_json::to_value(rows).expect("strings serialize"))
+    }
+
+    #[tool(
+        name = "stack_strings",
+        description = "Recovered stack-constructed strings: runs of mov [rsp/rbp+off], imm within one block, reassembled with function and address; read-only, never writes the binary or the sidecar"
+    )]
+    async fn stack_strings(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        ok(serde_json::to_value(entry.lock_project().stack_strings())
+            .expect("stack strings serialize"))
     }
 
     #[tool(

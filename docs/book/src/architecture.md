@@ -15,8 +15,13 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   base/architecture mapping goes through `open_raw`, exposed as CLI
   `--raw --arch ARCH --base ADDR [--entry ADDR]` and the MCP `raw`
   object on every binary-taking tool. Produces
-  segments, sections, imports/exports, and printable strings (ASCII plus
-  UTF-16LE/BE over the ASCII subset). Inputs over 512 MiB are rejected
+  segments, sections, imports/exports, and printable strings (ASCII,
+  UTF-16LE/BE over the ASCII subset, UTF-8 runs holding non-ASCII text,
+  and script-consistent UTF-16LE runs over non-ASCII BMP letters with
+  degenerate-run and ASCII-shadow guards). `strings --decode`
+  re-extracts over a read-only view: single-byte `xor`/`add`/`rot`,
+  rolling multi-byte `xor:0x<HEXKEY>`, or bare `base64` blob-plaintext
+  detection. Inputs over 512 MiB are rejected
   before parsing.
 - **Disassembler** (`disasm`): x86_64 and 32-bit x86 via iced-x86, AArch64,
   32-bit ARM, and Thumb via yaxpeax-arm. Each instruction becomes an `Insn` with its bytes,

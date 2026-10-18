@@ -113,13 +113,14 @@ fn spans_of(a: &binscout::analysis::Analysis) -> Vec<(u64, u64)> {
         .strings
         .iter()
         .filter_map(|h| {
-            h.vaddr.map(|v| {
-                let len = match h.encoding {
-                    Encoding::Ascii => h.value.len() as u64,
-                    Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
-                };
-                (v, v.wrapping_add(len))
-            })
+            // Mirrors `analyze`: xref spans cover the classic passes
+            // only, so the oracle and the engine agree on string refs.
+            let len = match h.encoding {
+                Encoding::Ascii => h.value.len() as u64,
+                Encoding::Utf16Le | Encoding::Utf16Be => h.value.len() as u64 * 2,
+                Encoding::Utf8 | Encoding::Utf16LeBmp | Encoding::Base64 => return None,
+            };
+            h.vaddr.map(|v| (v, v.wrapping_add(len)))
         })
         .collect();
     spans.sort_by_key(|&(s, _)| s);

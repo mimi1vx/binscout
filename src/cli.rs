@@ -234,9 +234,11 @@ pub enum Cmd {
         #[arg(long)]
         include_code: bool,
         /// Decode-and-display view over an in-memory transform:
-        /// `xor:<byte>`, `add:<byte>`, or `rot:<0-7>` (byte is `0x`-hex or
-        /// decimal). Reveals single-byte-obfuscated text with original
-        /// offsets; never writes the binary.
+        /// `xor:<byte>`, `xor:0x<HEXKEY>` (4+ hex digits, rolling
+        /// multi-byte key), `add:<byte>`, `rot:<0-7>` (byte is `0x`-hex
+        /// or decimal), or bare `base64` (reports base64 blobs'
+        /// plaintext). Reveals obfuscated text with original offsets;
+        /// never writes the binary.
         #[arg(long)]
         decode: Option<String>,
         /// Wrap matches in the protocol-1 page envelope with an exact
@@ -245,6 +247,11 @@ pub enum Cmd {
         #[arg(long)]
         envelope: bool,
     },
+    /// Recovered stack-constructed strings: runs of
+    /// `mov [rsp/rbp+off], imm` within one block, reassembled with
+    /// function and address. Read-only: never writes the binary or
+    /// the sidecar.
+    StackStrings { binary: PathBuf },
     /// Imports and exports.
     Symbols { binary: PathBuf },
     /// Section table: name, virtual address, in-memory and file sizes,
@@ -523,6 +530,7 @@ impl Cli {
                 )
             }
             Cmd::Symbols { binary } => symbols(&binary, db, raw_opts, fat_arch),
+            Cmd::StackStrings { binary } => stack_strings(&binary, db, raw_opts, fat_arch),
             Cmd::Sections { binary } => sections(&binary, db, raw_opts, fat_arch),
             Cmd::Ir { binary, addr, len } => ir(&binary, db, raw_opts, fat_arch, &addr, len),
             Cmd::IrCoverage {
@@ -982,6 +990,18 @@ fn symbols(
     fat_arch: Option<&str>,
 ) -> binscout::error::Result<serde_json::Value> {
     Ok(open(binary, db, raw, fat_arch)?.symbols_json())
+}
+
+fn stack_strings(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    Ok(
+        serde_json::to_value(open(binary, db, raw, fat_arch)?.stack_strings())
+            .expect("stack strings serialize"),
+    )
 }
 
 fn sections(

@@ -1098,6 +1098,9 @@ fn encoding_code(enc: crate::loader::strings::Encoding) -> u8 {
         crate::loader::strings::Encoding::Ascii => 0,
         crate::loader::strings::Encoding::Utf16Le => 1,
         crate::loader::strings::Encoding::Utf16Be => 2,
+        crate::loader::strings::Encoding::Utf8 => 3,
+        crate::loader::strings::Encoding::Utf16LeBmp => 4,
+        crate::loader::strings::Encoding::Base64 => 5,
     }
 }
 
@@ -1107,6 +1110,9 @@ fn decode_encoding(v: u8) -> Result<crate::loader::strings::Encoding> {
         0 => Ok(crate::loader::strings::Encoding::Ascii),
         1 => Ok(crate::loader::strings::Encoding::Utf16Le),
         2 => Ok(crate::loader::strings::Encoding::Utf16Be),
+        3 => Ok(crate::loader::strings::Encoding::Utf8),
+        4 => Ok(crate::loader::strings::Encoding::Utf16LeBmp),
+        5 => Ok(crate::loader::strings::Encoding::Base64),
         _ => Err(Error::Storage(format!("decode row: bad encoding {v}"))),
     }
 }
