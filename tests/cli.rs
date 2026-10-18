@@ -1755,3 +1755,182 @@ fn closed_stdout_pipe_exits_quietly_without_panic() {
     assert!(!stderr.contains("panicked"), "no panic on stderr: {stderr}");
     cleanup(&dir);
 }
+
+/// Loader-only opens skip instruction re-decode on a cache hit while
+/// producing byte-identical JSON (rsdbg-5tk.3).
+///
+/// Warms the sidecar through a full open (plus one rename/comment so the
+/// annotation export is non-trivial), then compares every loader-only
+/// command's output between a full [`binscout::Project`] open and the
+/// [`binscout::LoaderOpened::Cached`] view.
+#[test]
+fn loader_only_open_matches_full_open() {
+    let dir = tmpdir("loader-only");
+    // 64 x86-64 prologue bodies with zero padding, two strings, and a
+    // distinctive byte pattern for search-bytes.
+    let mut blob = Vec::new();
+    for _ in 0..64 {
+        blob.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0x5d, 0xc3]);
+        blob.extend_from_slice(&[0u8; 250]);
+    }
+    let string_base = blob.len() as u64;
+    blob.extend_from_slice(b"loader-only-golden\x00second-string-here\x00");
+    blob.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let bin = write_bin(&dir, "loader.bin", &blob);
+    let db = temp_db(&dir, "loader");
+
+    // Warm the sidecar through a full open; the rename/comment also
+    // exercises the annotation export with live rows.
+    {
+        let mut full = binscout::Project::open_with_db(&bin, &db).expect("fixture must open");
+        assert_eq!(
+            full.project_info().functions,
+            64,
+            "prologue scan finds every body"
+        );
+        full.rename_function(0x0, "entry_fn")
+            .expect("rename base function");
+        full.set_comment(0x0, "loader probe")
+            .expect("comment base function");
+        full.save().expect("warm the sidecar");
+    }
+
+    let full = binscout::Project::open_with_db(&bin, &db).expect("reopen must hit");
+    assert!(full.snapshot_fresh(), "second open replays the snapshot");
+    let loader = match binscout::open_mapped_loader_only(&bin, Some(&db), None, None)
+        .expect("loader-only open")
+    {
+        binscout::LoaderOpened::Cached(p) => p,
+        binscout::LoaderOpened::Fresh(_) => panic!("warmed sidecar must hit"),
+    };
+    assert!(loader.snapshot_fresh(), "loader hit is fresh");
+
+    assert_eq!(loader.sections_json(), full.sections_json(), "sections");
+    assert_eq!(loader.symbols_json(), full.symbols_json(), "symbols");
+    assert_eq!(
+        serde_json::to_value(loader.stats_json().expect("loader stats")).expect("stats serializes"),
+        serde_json::to_value(full.stats_json().expect("full stats")).expect("stats serializes"),
+        "stats"
+    );
+    assert_eq!(
+        serde_json::to_value(loader.project_info()).expect("loader info serializes"),
+        serde_json::to_value(full.project_info()).expect("full info serializes"),
+        "project_info"
+    );
+    assert_eq!(
+        loader.headers_json().expect("loader headers"),
+        full.headers_json().expect("full headers"),
+        "headers"
+    );
+    assert_eq!(
+        loader.export_annotations().expect("loader export"),
+        full.export_annotations().expect("full export"),
+        "annotations-export"
+    );
+
+    let as_u8 = binscout::BytesAs::U8;
+    let as_cstr = binscout::BytesAs::CStr;
+    let le = binscout::BytesEndian::Le;
+    for (addr, len, as_view) in [(0u64, 16usize, as_u8), (string_base, 32usize, as_cstr)] {
+        assert_eq!(
+            serde_json::to_value(
+                loader
+                    .bytes_view(addr, len, as_view, le)
+                    .expect("loader bytes")
+            )
+            .expect("bytes serializes"),
+            serde_json::to_value(full.bytes_view(addr, len, as_view, le).expect("full bytes"))
+                .expect("bytes serializes"),
+            "bytes at {addr:#x}"
+        );
+    }
+    assert_eq!(
+        loader
+            .bytes_view(u64::MAX, 16, as_u8, le)
+            .unwrap_err()
+            .to_string(),
+        full.bytes_view(u64::MAX, 16, as_u8, le)
+            .unwrap_err()
+            .to_string(),
+        "bytes error envelope"
+    );
+
+    for (pattern, section, range) in [
+        ("de ad be ef", None, None),
+        ("de ad ?? ef", None, Some((0u64, blob.len() as u64))),
+    ] {
+        assert_eq!(
+            serde_json::to_value(
+                loader
+                    .search_bytes(pattern, section, range, 0, 50)
+                    .expect("loader search")
+            )
+            .expect("search serializes"),
+            serde_json::to_value(
+                full.search_bytes(pattern, section, range, 0, 50)
+                    .expect("full search")
+            )
+            .expect("search serializes"),
+            "search-bytes {pattern:?}"
+        );
+    }
+    assert_eq!(
+        loader
+            .search_bytes("zz", None, None, 0, 50)
+            .unwrap_err()
+            .to_string(),
+        full.search_bytes("zz", None, None, 0, 50)
+            .unwrap_err()
+            .to_string(),
+        "search-bytes error envelope"
+    );
+
+    let plain = binscout::analysis::StringsFilter::default();
+    let patterned = binscout::analysis::StringsFilter {
+        pattern: Some("loader".to_string()),
+        ..binscout::analysis::StringsFilter::default()
+    };
+    for filter in [&plain, &patterned] {
+        assert_eq!(
+            loader.query_strings(filter).expect("loader strings"),
+            full.query_strings(filter).expect("full strings"),
+            "strings"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                loader
+                    .query_strings_envelope(filter)
+                    .expect("loader envelope")
+            )
+            .expect("envelope serializes"),
+            serde_json::to_value(full.query_strings_envelope(filter).expect("full envelope"))
+                .expect("envelope serializes"),
+            "strings envelope"
+        );
+        let decode =
+            binscout::loader::strings::parse_decode_spec("xor:0x42").expect("decode spec parses");
+        assert_eq!(
+            loader
+                .query_strings_decoded(filter, decode)
+                .expect("loader decoded"),
+            full.query_strings_decoded(filter, decode)
+                .expect("full decoded"),
+            "strings --decode"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                loader
+                    .query_strings_decoded_envelope(filter, decode)
+                    .expect("loader decoded envelope")
+            )
+            .expect("envelope serializes"),
+            serde_json::to_value(
+                full.query_strings_decoded_envelope(filter, decode)
+                    .expect("full decoded envelope")
+            )
+            .expect("envelope serializes"),
+            "strings --decode envelope"
+        );
+    }
+    cleanup(&dir);
+}
