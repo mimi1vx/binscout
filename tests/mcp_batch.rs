@@ -106,10 +106,11 @@ fn batch_fan_out_matches_single_calls_with_ordered_errors() {
         op("xrefs", json!({})),
         op("func", json!({"addr": "0xdead"})),
         op("strings", json!({})),
+        op("stack_strings", json!({})),
     ];
     let batch = tool_once(10, "batch", json!({"binary": b(), "db": d(), "ops": ops}));
     let results = batch["results"].as_array().expect("results array");
-    assert_eq!(results.len(), 7);
+    assert_eq!(results.len(), 8);
     for (i, r) in results.iter().enumerate() {
         if i == 5 {
             assert!(
@@ -134,6 +135,7 @@ fn batch_fan_out_matches_single_calls_with_ordered_errors() {
         ),
         tool_once(15, "xrefs", json!({"binary": b(), "db": d()})),
         tool_once(16, "strings", json!({"binary": b(), "db": d()})),
+        tool_once(17, "stack_strings", json!({"binary": b(), "db": d()})),
     ];
     for (i, single) in singles.iter().enumerate() {
         let at = if i < 5 { i } else { i + 1 };
