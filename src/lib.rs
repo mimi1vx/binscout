@@ -18,6 +18,7 @@ pub mod stackstrings;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
 use crate::error::{Error, Result};
 use crate::flirt::FlirtHint;
 use crate::loader::strings::{Encoding, StringHit};
-use crate::loader::{LoadedBinary, RawOptions, load_raw, load_with_slice};
+use crate::loader::{LoadedBinary, RawOptions, load_raw, load_raw_vec, load_with_slice};
 use crate::search::{ByteMatch, BytePattern};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
@@ -231,6 +232,13 @@ fn reject_db_is_binary(binary: &Path, db_path: &Path) -> Result<()> {
 /// analysis revision before any layout replay (see `db::load_cached`), and
 /// the read-only open itself costs nothing proportional to the file. Reads
 /// never save and never create the sidecar.
+///
+/// SHA-256 is computed only for a tentative match: the cheap identity
+/// (schema version, content hash, size, mapping, analysis revision) is
+/// checked against the stored row first, and only an agreement pays for the
+/// wide hash that confirms the hit. `sha256` is empty when no sidecar
+/// agrees, and the project computes it on first use (see
+/// [`Project::ensure_sha256`]).
 struct OpenInputs {
     bytes: Vec<u8>,
     hash: u64,
@@ -238,6 +246,33 @@ struct OpenInputs {
     size: u64,
     mapping: db::StoredMapping,
     cached: Option<db::Snapshot>,
+}
+
+/// Cheap snapshot identity without the wide hash: mirrors the
+/// [`db::load_cached`] gates before its SHA-256 comparison, so a `true`
+/// here means the stored row is worth confirming with SHA-256.
+fn snapshot_fast_matches(
+    meta: &db::BinaryMeta,
+    hash: u64,
+    size: u64,
+    mapping: &db::StoredMapping,
+) -> bool {
+    meta.version == db::SCHEMA_VERSION
+        && meta.content_hash == hash
+        && meta.size == size
+        && meta.mapping.as_ref() == Some(mapping)
+        && meta.analysis_rev == Some(db::ANALYSIS_REVISION)
+}
+
+/// Cache a computed SHA-256 digest, or defer it: an empty digest means the
+/// open skipped the wide hash (no tentative snapshot match) and the project
+/// computes it on first use (see [`Project::ensure_sha256`]).
+fn cache_sha256(sha256: String) -> OnceLock<String> {
+    if sha256.is_empty() {
+        OnceLock::new()
+    } else {
+        OnceLock::from(sha256)
+    }
 }
 
 fn read_open_inputs(
@@ -251,18 +286,33 @@ fn read_open_inputs(
     // accumulation, so a growing file cannot slip past a stat cap.
     let bytes = read_input_bytes(binary)?;
     let hash = db::content_hash(&bytes);
-    let sha256 = crate::annotations::sha256_hex(&bytes);
     let size = bytes.len() as u64;
     let mapping = mapping_for(raw, fat_arch)?;
-    let cached = if db_path.exists() {
+    let (cached, sha256) = if db_path.exists() {
         match db::open_db_read_only(db_path) {
-            Ok(db) => Some(db::load_cached(&db, hash, &sha256, size, &mapping)?),
+            Ok(db) => {
+                // Metadata first: only a cheap-identity agreement pays for
+                // SHA-256. An empty digest never confirms a hit (stored rows
+                // always carry a real one), so the mismatch path below
+                // reproduces the stale/error outcomes exactly.
+                let tentative = match db::read_meta(&db)? {
+                    Some(meta) => snapshot_fast_matches(&meta, hash, size, &mapping),
+                    None => false,
+                };
+                let sha256 = if tentative {
+                    crate::annotations::sha256_hex(&bytes)
+                } else {
+                    String::new()
+                };
+                let snap = db::load_cached(&db, hash, &sha256, size, &mapping)?;
+                (Some(snap), sha256)
+            }
             // Raced with a concurrent sidecar deletion: read as absent.
-            Err(_) if !db_path.exists() => None,
+            Err(_) if !db_path.exists() => (None, String::new()),
             Err(e) => return Err(e),
         }
     } else {
-        None
+        (None, String::new())
     };
     Ok(OpenInputs {
         bytes,
@@ -818,7 +868,7 @@ impl LoaderProject {
                 let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
-                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "file_off": s.file_off, "file_size": s.file_size,
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })
@@ -994,11 +1044,11 @@ fn bytes_at_in(bin: &LoadedBinary, va: u64, len: usize) -> Result<Vec<u8>> {
 /// [`Project::file_off_of`] core, shared with the loader-only open).
 fn file_off_of_in(bin: &LoadedBinary, va: u64) -> Option<u64> {
     for sec in &bin.sections {
-        if sec.data.is_empty() || va < sec.vaddr {
+        if sec.file_size == 0 || va < sec.vaddr {
             continue;
         }
         let d = va - sec.vaddr;
-        if d < sec.data.len() as u64 {
+        if d < sec.file_size {
             return sec.file_off.checked_add(d);
         }
     }
@@ -1020,11 +1070,11 @@ fn file_off_of_in(bin: &LoadedBinary, va: u64) -> Option<u64> {
 /// [`Project::section_of`] core, shared with the loader-only open).
 fn section_of_in(bin: &LoadedBinary, va: u64) -> Option<&str> {
     for sec in &bin.sections {
-        if sec.data.is_empty() || va < sec.vaddr {
+        if sec.file_size == 0 || va < sec.vaddr {
             continue;
         }
         let d = va - sec.vaddr;
-        if d < sec.data.len() as u64 {
+        if d < sec.file_size {
             return Some(sec.name.as_str());
         }
     }
@@ -1107,7 +1157,7 @@ pub struct Project {
     path: PathBuf,
     db_path: PathBuf,
     content_hash: u64,
-    content_sha256: String,
+    content_sha256: OnceLock<String>,
     size: u64,
     binary: LoadedBinary,
     analysis: Analysis,
@@ -1248,7 +1298,15 @@ impl Project {
         } = inputs;
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
-                let loaded = reload_binary(&bytes, raw, fat_arch)?;
+                // A hit always confirms SHA-256 up front; recompute
+                // defensively if it ever arrives empty rather than caching a
+                // wrong identity.
+                let sha256 = if sha256.is_empty() {
+                    crate::annotations::sha256_hex(&bytes)
+                } else {
+                    sha256
+                };
+                let loaded = reload_binary(bytes, raw, fat_arch)?;
                 let db::Loaded {
                     functions,
                     xrefs,
@@ -1328,7 +1386,7 @@ impl Project {
 
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
-                let loaded = reload_binary(&bytes, raw, fat_arch)?;
+                let loaded = reload_binary(bytes, raw, fat_arch)?;
                 let db::Loaded {
                     arch,
                     functions,
@@ -1359,7 +1417,7 @@ impl Project {
                     path: binary.to_path_buf(),
                     db_path: db_path.to_path_buf(),
                     content_hash: hash,
-                    content_sha256: sha256,
+                    content_sha256: cache_sha256(sha256),
                     size,
                     binary: loaded,
                     analysis,
@@ -1432,9 +1490,16 @@ impl Project {
         seeds: BTreeMap<u64, crate::db::FuncSeed>,
     ) -> Result<Self> {
         let mapping = mapping_for(raw, fat_arch)?;
-        let loaded = match raw {
-            Some(opts) => load_raw(&bytes, opts)?,
-            None => load_or_raw(&bytes, fat_arch)?,
+        let loaded = if let Some(opts) = raw {
+            // Move the read buffer into the raw segment: no second copy.
+            load_raw_vec(bytes, opts)?
+        } else {
+            let loaded = load_or_raw(&bytes, fat_arch)?;
+            // The loader owns its bytes from here on (segments hold the
+            // file-backed ranges, sections are metadata over them); drop
+            // the read buffer so containers hold the input once.
+            drop(bytes);
+            loaded
         };
         let user = active_user_seeds(&seeds);
         let analysis = analyze_with_seeds(&loaded, &user)?;
@@ -1468,7 +1533,7 @@ impl Project {
             path: binary.to_path_buf(),
             db_path: db_path.to_path_buf(),
             content_hash: hash,
-            content_sha256: sha256,
+            content_sha256: cache_sha256(sha256),
             size,
             binary: loaded,
             analysis,
@@ -1511,7 +1576,7 @@ impl Project {
         annotations: &BTreeMap<u64, Annotation>,
         seeds: &BTreeMap<u64, crate::db::FuncSeed>,
     ) -> Result<()> {
-        db::save(db, &self.meta(), &self.analysis, annotations, seeds)?;
+        db::save(db, &self.meta()?, &self.analysis, annotations, seeds)?;
         db.compact()
             .map_err(|e| Error::Storage(format!("compact {}: {e}", self.db_path.display())))?;
         self.snapshot_fresh.store(true, Ordering::Relaxed);
@@ -1519,16 +1584,19 @@ impl Project {
     }
 
     /// Snapshot identity for `seeds` under the current analysis counts.
+    ///
+    /// # Errors
+    /// Same as [`Project::ensure_sha256`].
     fn meta_for(
         &self,
         analysis: &Analysis,
         seeds: &BTreeMap<u64, crate::db::FuncSeed>,
-    ) -> BinaryMeta {
-        BinaryMeta {
+    ) -> Result<BinaryMeta> {
+        Ok(BinaryMeta {
             version: db::SCHEMA_VERSION,
             binary_path: self.path.display().to_string(),
             content_hash: self.content_hash,
-            content_sha256: self.content_sha256.clone(),
+            content_sha256: self.ensure_sha256()?.to_owned(),
             size: self.size,
             arch: db::arch_name(self.binary.arch).to_string(),
             format: db::format_name(self.binary.format).to_string(),
@@ -1542,11 +1610,14 @@ impl Project {
             diagnostics_omitted: analysis.diagnostics.omitted,
             inferred_truncated: analysis.diagnostics.inferred_truncated,
             inferred_omitted: analysis.diagnostics.inferred_omitted,
-        }
+        })
     }
 
     /// Snapshot identity for the in-memory analysis and seeds.
-    fn meta(&self) -> BinaryMeta {
+    ///
+    /// # Errors
+    /// Same as [`Project::ensure_sha256`].
+    fn meta(&self) -> Result<BinaryMeta> {
         self.meta_for(&self.analysis, &self.func_seeds)
     }
 
@@ -1591,7 +1662,7 @@ impl Project {
         let ann = self.annotations.get(&addr).filter(|a| !a.is_empty());
         let fast = {
             let db = db::open_db(&self.db_path)?;
-            db::save_annotation(&db, &self.meta(), addr, ann)?
+            db::save_annotation(&db, &self.meta()?, addr, ann)?
         };
         match fast {
             db::AnnotationSave::Fast => Ok(()),
@@ -1634,7 +1705,7 @@ impl Project {
         };
         db::save(
             &db,
-            &self.meta_for(&analysis, &merged_seeds),
+            &self.meta_for(&analysis, &merged_seeds)?,
             &analysis,
             &merged_ann,
             &merged_seeds,
@@ -1670,12 +1741,12 @@ impl Project {
         BTreeMap<u64, Annotation>,
         BTreeMap<u64, crate::db::FuncSeed>,
     )> {
+        let ours = self.meta()?;
         let base = match db::load_meta_and_annotations(db)? {
             Some((persisted_meta, annotations, seeds)) => {
-                if persisted_meta.mapping != self.meta().mapping {
+                if persisted_meta.mapping != ours.mapping {
                     None
                 } else {
-                    let ours = self.meta();
                     let plausible = persisted_meta.fast_write_eq(&ours)
                         || db::stale_carry_plausible(
                             &persisted_meta,
@@ -1778,7 +1849,7 @@ impl Project {
             "entry": entry,
             "entry_hex": entry_hex,
             "content_hash": self.content_hash,
-            "content_sha256": self.content_sha256,
+            "content_sha256": self.ensure_sha256()?,
             "size": self.size,
             "db_size": db_size,
             "functions": s.functions,
@@ -1813,11 +1884,8 @@ impl Project {
     /// past the input budget (see [`crate::loader::MAX_INPUT_BYTES`]).
     pub fn headers_json(&self) -> Result<serde_json::Value> {
         let bytes = read_input_bytes(&self.path)?;
-        Ok(crate::headers::headers_of(
-            &bytes,
-            &self.binary,
-            &self.content_sha256,
-        ))
+        let sha256 = self.sha256_for(&bytes)?;
+        Ok(crate::headers::headers_of(&bytes, &self.binary, sha256))
     }
 
     /// Path of the analyzed binary.
@@ -1844,11 +1912,53 @@ impl Project {
     /// [`Project::export_annotations`]); the 64-bit
     /// [`Project::content_hash`] only detects "binary changed, re-analyze".
     /// Together with [`Project::size`] it gates the snapshot cache in
-    /// [`db::load_cached`], so an FNV-1a collision cannot replay another
+    /// [`db::load_cached`], so a hash collision cannot replay another
     /// binary's layouts.
+    ///
+    /// Empty when the open skipped the wide hash (no tentative snapshot
+    /// match) and nothing has needed it yet; use
+    /// [`Project::ensure_sha256`] for the computed digest.
     #[must_use]
     pub fn content_sha256(&self) -> &str {
-        &self.content_sha256
+        self.content_sha256.get().map_or("", String::as_str)
+    }
+
+    /// Hex SHA-256 of the binary bytes, computing it on first use.
+    ///
+    /// Opens with no tentative snapshot match skip the wide hash; the first
+    /// save, export, import check, or stats call re-reads the input and
+    /// hashes it, caching the digest. The re-read is guarded by the content
+    /// hash plus size taken at open, so a file replaced since open errors
+    /// instead of snapshotting one binary's analysis under another
+    /// binary's identity.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] when the binary cannot be re-read or no longer
+    /// matches the opened identity.
+    pub fn ensure_sha256(&self) -> Result<&str> {
+        let bytes = read_input_bytes(&self.path)?;
+        self.sha256_for(&bytes)
+    }
+
+    /// [`Project::ensure_sha256`] over already-read `bytes`: guards them
+    /// against the opened identity, then caches and returns the digest.
+    ///
+    /// Lets [`Project::headers_json`] hash the single re-read it already
+    /// does instead of reading the file twice.
+    ///
+    /// # Errors
+    /// Same as [`Project::ensure_sha256`], minus the re-read.
+    fn sha256_for(&self, bytes: &[u8]) -> Result<&str> {
+        if db::content_hash(bytes) != self.content_hash || bytes.len() as u64 != self.size {
+            return Err(Error::Storage(format!(
+                "binary changed since open: {}",
+                self.path.display()
+            )));
+        }
+        let digest = self
+            .content_sha256
+            .get_or_init(|| crate::annotations::sha256_hex(bytes));
+        Ok(digest.as_str())
     }
 
     /// Stale annotations dropped for an unrelated sidecar on open.
@@ -2153,7 +2263,7 @@ impl Project {
         changes.insert(addr, next);
         let fast = {
             let db = db::open_db(&self.db_path)?;
-            db::save_annotation_batch(&db, &self.meta(), &changes)?
+            db::save_annotation_batch(&db, &self.meta()?, &changes)?
         };
         match fast {
             db::AnnotationSave::Fast => {
@@ -2324,7 +2434,7 @@ impl Project {
     /// [`Error::Storage`] on encoding failure.
     pub fn export_annotations(&self) -> Result<String> {
         crate::annotations::build_document(
-            &self.content_sha256,
+            self.ensure_sha256()?,
             self.size,
             &self.mapping,
             &self.annotations,
@@ -2364,7 +2474,7 @@ impl Project {
         let is_function = |addr: u64| self.analysis.functions.contains_key(&addr);
         let changes = crate::annotations::validate_document(
             &doc,
-            &self.content_sha256,
+            self.ensure_sha256()?,
             self.size,
             &self.mapping,
             &is_function,
@@ -2387,7 +2497,7 @@ impl Project {
         if seed_changes.is_empty() {
             let fast = {
                 let db = db::open_db(&self.db_path)?;
-                db::save_annotation_batch(&db, &self.meta(), &changes)?
+                db::save_annotation_batch(&db, &self.meta()?, &changes)?
             };
             match fast {
                 db::AnnotationSave::Fast => {
@@ -2432,11 +2542,11 @@ impl Project {
     #[must_use]
     pub fn va_of_file_off(&self, off: u64) -> Option<u64> {
         for sec in &self.binary.sections {
-            if sec.data.is_empty() || off < sec.file_off {
+            if sec.file_size == 0 || off < sec.file_off {
                 continue;
             }
             let d = off - sec.file_off;
-            if d < sec.data.len() as u64 {
+            if d < sec.file_size {
                 return sec.vaddr.checked_add(d);
             }
         }
@@ -3297,7 +3407,7 @@ impl Project {
                 let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
-                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "file_off": s.file_off, "file_size": s.file_size,
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })
@@ -3656,13 +3766,13 @@ pub fn parse_bytes_endian(s: &str) -> Result<BytesEndian> {
 /// Raw blobs need their mapping options again; containers re-parse with the
 /// same fat slice selection.
 fn reload_binary(
-    bytes: &[u8],
+    bytes: Vec<u8>,
     raw: Option<RawOptions>,
     fat_arch: Option<&str>,
 ) -> Result<LoadedBinary> {
     match raw {
-        Some(opts) => load_raw(bytes, opts),
-        None => load_or_raw(bytes, fat_arch),
+        Some(opts) => load_raw_vec(bytes, opts),
+        None => load_or_raw(&bytes, fat_arch),
     }
 }
 
@@ -3696,8 +3806,12 @@ fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
         _ => Error::Storage(format!("read {}: {e}", path.display())),
     })?;
     let cap = crate::loader::MAX_INPUT_BYTES;
+    // One allocation for the common case: the stat size is only a capacity
+    // hint (a growing file still hits the checked cap chunk by chunk), and
+    // sparse files merely reserve address space until bytes are written.
+    let hint = meta.len().min(cap);
     let mut reader = file;
-    read_stream_capped(&mut reader, cap, &path.display().to_string())
+    read_stream_capped(&mut reader, cap, &path.display().to_string(), hint)
 }
 
 /// Accumulate a stream with checked growth against `cap`.
@@ -3705,9 +3819,16 @@ fn read_input_bytes(path: &Path) -> Result<Vec<u8>> {
 /// Split from [`read_input_bytes`] so the exact/over boundary and
 /// mid-read growth are unit-testable without a 512 MiB file: every chunk
 /// extends the total with [`checked_add`](u64::checked_add) and rejects
-/// past `cap` with [`Error::Limit`].
-fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+/// past `cap` with [`Error::Limit`]. `hint` preallocates once (the stat
+/// size from [`read_input_bytes`]); later chunks grow amortized instead of
+/// reallocating per 64 KiB chunk.
+fn read_stream_capped(
+    reader: &mut impl std::io::Read,
+    cap: u64,
+    label: &str,
+    hint: u64,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(hint.min(cap) as usize);
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let n = std::io::Read::read(reader, &mut chunk)
@@ -3719,7 +3840,7 @@ fn read_stream_capped(reader: &mut impl std::io::Read, cap: u64, label: &str) ->
             .checked_add(n as u64)
             .filter(|m| *m <= cap)
             .ok_or_else(|| Error::Limit("input exceeds 512 MiB".to_string()))?;
-        out.reserve_exact(n);
+        out.reserve(n);
         out.extend_from_slice(&chunk[..n]);
         debug_assert_eq!(out.len() as u64, next);
     }
@@ -3814,10 +3935,10 @@ mod tests {
     fn stream_cap_exact_passes_over_fails() {
         let exact = vec![0x41u8; 16];
         let mut cur = std::io::Cursor::new(exact.clone());
-        let got = read_stream_capped(&mut cur, 16, "t").expect("exact cap passes");
+        let got = read_stream_capped(&mut cur, 16, "t", 0).expect("exact cap passes");
         assert_eq!(got, exact);
         let mut cur = std::io::Cursor::new(vec![0x41u8; 17]);
-        let err = read_stream_capped(&mut cur, 16, "t").unwrap_err();
+        let err = read_stream_capped(&mut cur, 16, "t", 0).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "got {err:?}");
     }
 
@@ -3840,10 +3961,20 @@ mod tests {
             }
         }
         let mut g = Growing { left: 25 };
-        let err = read_stream_capped(&mut g, 16, "g").unwrap_err();
+        let err = read_stream_capped(&mut g, 16, "g", 0).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "got {err:?}");
         let mut g = Growing { left: 16 };
-        let got = read_stream_capped(&mut g, 16, "g").expect("exact growth passes");
+        let got = read_stream_capped(&mut g, 16, "g", 0).expect("exact growth passes");
         assert_eq!(got.len(), 16);
+    }
+
+    /// A correct capacity hint avoids reallocations entirely.
+    #[test]
+    fn stream_capped_preallocates_once() {
+        let input = vec![0x43u8; 1024];
+        let mut cur = std::io::Cursor::new(input.clone());
+        let got = read_stream_capped(&mut cur, 2048, "h", 1024).expect("hinted read");
+        assert_eq!(got, input);
+        assert_eq!(got.capacity(), 1024);
     }
 }

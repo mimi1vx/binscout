@@ -284,23 +284,66 @@ fn guid_dashed(b: &[u8; 16]) -> String {
 ///
 /// For NUL-terminated strings and blobs of unknown length use
 /// [`pe_rva_tail`], which returns the bounded tail instead.
-fn pe_rva(
-    sections: &[crate::loader::Section],
-    image_base: u64,
-    rva: u32,
-    len: usize,
-) -> Option<&[u8]> {
+/// Exactly `len` file-backed bytes at `va` within one segment, if any.
+fn seg_bytes(segments: &[crate::loader::Segment], va: u64, len: usize) -> Option<&[u8]> {
+    for seg in segments {
+        let Some(off) = va.checked_sub(seg.vaddr) else {
+            continue;
+        };
+        let Ok(off) = usize::try_from(off) else {
+            continue;
+        };
+        let Some(end) = off.checked_add(len) else {
+            continue;
+        };
+        if end <= seg.data.len() {
+            return seg.data.get(off..end);
+        }
+    }
+    None
+}
+
+/// File-backed tail at `va` within one segment, if any.
+fn seg_tail(segments: &[crate::loader::Segment], va: u64) -> Option<&[u8]> {
+    for seg in segments {
+        let Some(off) = va.checked_sub(seg.vaddr) else {
+            continue;
+        };
+        let Ok(off) = usize::try_from(off) else {
+            continue;
+        };
+        if let Some(tail) = seg.data.get(off..)
+            && !tail.is_empty()
+        {
+            return Some(tail);
+        }
+    }
+    None
+}
+
+/// Map a PE RVA to exactly `len` file bytes through the section map.
+///
+/// Same two-pass base probe as before (`vaddr == image_base + rva` first,
+/// then a VA-shaped table); the section only bounds the range, the bytes
+/// come from the segment store, so sections stay metadata-only.
+fn pe_rva(bin: &LoadedBinary, image_base: u64, rva: u32, len: usize) -> Option<&[u8]> {
     let rva = u64::from(rva);
     for base in [image_base, 0] {
-        for sec in sections {
+        for sec in &bin.sections {
             let Some(start) = sec.vaddr.checked_sub(base) else {
                 continue;
             };
             if rva < start {
                 continue;
             }
-            let delta = (rva - start) as usize;
-            if let Some(s) = sec.data.get(delta..delta.saturating_add(len))
+            let off = rva - start;
+            if off.saturating_add(len as u64) > sec.file_size {
+                continue;
+            }
+            let Some(va) = sec.vaddr.checked_add(off) else {
+                continue;
+            };
+            if let Some(s) = seg_bytes(&bin.segments, va, len)
                 && s.len() == len
             {
                 return Some(s);
@@ -315,23 +358,24 @@ fn pe_rva(
 /// Same section map as [`pe_rva`], but for strings and blobs whose exact
 /// length is unknown upfront: callers bound the tail with [`cstr_at`] or an
 /// explicit length check instead of requiring the full span file-backed.
-fn pe_rva_tail(
-    sections: &[crate::loader::Section],
-    image_base: u64,
-    rva: u32,
-    maxlen: usize,
-) -> Option<&[u8]> {
+fn pe_rva_tail(bin: &LoadedBinary, image_base: u64, rva: u32, maxlen: usize) -> Option<&[u8]> {
     let rva = u64::from(rva);
     for base in [image_base, 0] {
-        for sec in sections {
+        for sec in &bin.sections {
             let Some(start) = sec.vaddr.checked_sub(base) else {
                 continue;
             };
             if rva < start {
                 continue;
             }
-            let delta = (rva - start) as usize;
-            if let Some(s) = sec.data.get(delta..)
+            let off = rva - start;
+            if off >= sec.file_size {
+                continue;
+            }
+            let Some(va) = sec.vaddr.checked_add(off) else {
+                continue;
+            };
+            if let Some(s) = seg_tail(&bin.segments, va)
                 && !s.is_empty()
             {
                 return Some(&s[..s.len().min(maxlen)]);
@@ -368,13 +412,13 @@ fn subsystem_name(sub: u16) -> &'static str {
 /// A function RVA landing inside the export directory itself is a
 /// forwarder string, not code. Returns at most [`MAX_FORWARDERS`] rows.
 fn pe_forwarders(
-    sections: &[crate::loader::Section],
+    bin: &LoadedBinary,
     image_base: u64,
     dir_rva: u32,
     dir_size: u32,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
-    let Some(dir) = pe_rva(sections, image_base, dir_rva, 40) else {
+    let Some(dir) = pe_rva(bin, image_base, dir_rva, 40) else {
         return out;
     };
     let num_names = le32(dir, 24).unwrap_or(0).min(4096);
@@ -393,26 +437,25 @@ fn pe_forwarders(
             continue;
         };
         let (Some(name_rva), Some(ord_idx)) = (
-            pe_rva(sections, image_base, nr_off, 4).and_then(|s| le32(s, 0)),
-            pe_rva(sections, image_base, or_off, 2).and_then(|s| le16(s, 0)),
+            pe_rva(bin, image_base, nr_off, 4).and_then(|s| le32(s, 0)),
+            pe_rva(bin, image_base, or_off, 2).and_then(|s| le16(s, 0)),
         ) else {
             continue;
         };
         let Some(fr_off) = addr_funcs.checked_add(4 * u32::from(ord_idx)) else {
             continue;
         };
-        let Some(func_rva) = pe_rva(sections, image_base, fr_off, 4).and_then(|s| le32(s, 0))
-        else {
+        let Some(func_rva) = pe_rva(bin, image_base, fr_off, 4).and_then(|s| le32(s, 0)) else {
             continue;
         };
         if func_rva < dir_rva || func_rva.wrapping_sub(dir_rva) >= dir_size {
             continue;
         }
         let (Some(name), Some(fwd)) = (
-            pe_rva_tail(sections, image_base, name_rva, MAX_HEADER_STR + 1)
+            pe_rva_tail(bin, image_base, name_rva, MAX_HEADER_STR + 1)
                 .and_then(|s| cstr_at(s, 0, MAX_HEADER_STR))
                 .map(lossy),
-            pe_rva_tail(sections, image_base, func_rva, MAX_HEADER_STR + 1)
+            pe_rva_tail(bin, image_base, func_rva, MAX_HEADER_STR + 1)
                 .and_then(|s| cstr_at(s, 0, MAX_HEADER_STR))
                 .map(lossy),
         ) else {
@@ -424,11 +467,7 @@ fn pe_forwarders(
 }
 
 /// Parse the CodeView RSDS record behind debug-directory entry `i`.
-fn pe_pdb(
-    sections: &[crate::loader::Section],
-    image_base: u64,
-    entry: &[u8],
-) -> Option<serde_json::Value> {
+fn pe_pdb(bin: &LoadedBinary, image_base: u64, entry: &[u8]) -> Option<serde_json::Value> {
     if entry.len() < 28 || le32(entry, 12).unwrap_or(0) != 2 {
         return None;
     }
@@ -437,7 +476,7 @@ fn pe_pdb(
     if size < 25 {
         return None;
     }
-    let raw = pe_rva_tail(sections, image_base, rva, size)?;
+    let raw = pe_rva_tail(bin, image_base, rva, size)?;
     if raw.len() < 25 {
         return None;
     }
@@ -460,14 +499,10 @@ fn pe_pdb(
 /// and parses the fixed info behind the first data entry. Returns
 /// `(present, version)`: `present` is true when the version resource
 /// exists even if the fixed info fails to parse.
-fn pe_version_info(
-    sections: &[crate::loader::Section],
-    image_base: u64,
-    dir_rva: u32,
-) -> (bool, Option<String>) {
-    let dir_at = |rva: u32| pe_rva(sections, image_base, rva, 16);
+fn pe_version_info(bin: &LoadedBinary, image_base: u64, dir_rva: u32) -> (bool, Option<String>) {
+    let dir_at = |rva: u32| pe_rva(bin, image_base, rva, 16);
     let entry_at = |rva: u32, idx: u32| {
-        pe_rva(sections, image_base, rva, 16 + 8 * (idx as usize + 1))
+        pe_rva(bin, image_base, rva, 16 + 8 * (idx as usize + 1))
             .and_then(|d| d.get(16 + 8 * idx as usize..16 + 8 * idx as usize + 8))
     };
     let Some(dir) = dir_at(dir_rva) else {
@@ -519,12 +554,12 @@ fn pe_version_info(
     } else {
         dir_rva.wrapping_add(lang_off)
     };
-    let Some(de) = pe_rva(sections, image_base, lang_rva, 16) else {
+    let Some(de) = pe_rva(bin, image_base, lang_rva, 16) else {
         return (true, None);
     };
     let data_rva = le32(de, 0).unwrap_or(0);
     let data_size = le32(de, 4).unwrap_or(0).min(MAX_VERSION_BLOB as u32) as usize;
-    let Some(blob) = pe_rva_tail(sections, image_base, data_rva, data_size.min(256)) else {
+    let Some(blob) = pe_rva_tail(bin, image_base, data_rva, data_size.min(256)) else {
         return (true, None);
     };
     // `VS_VERSION_INFO`: wLength, wValueLength, wType, UTF-16 key, pad to
@@ -636,7 +671,6 @@ fn pe_headers(bytes: &[u8], loaded: &LoadedBinary) -> Option<serde_json::Value> 
         Ok(FileKind::Pe64) => PeFile64::parse(bytes).ok().map(Pe::P64),
         _ => None,
     }?;
-    let sections = &loaded.sections;
     // Borrow the parsed headers once per variant.
     macro_rules! fields {
         ($p:expr) => {{
@@ -700,15 +734,14 @@ fn pe_headers(bytes: &[u8], loaded: &LoadedBinary) -> Option<serde_json::Value> 
     let pdb = debug_dir.and_then(|(rva, size)| {
         let count = (size / 28).min(MAX_DEBUG_ENTRIES as u32);
         (0..count).find_map(|i| {
-            pe_rva(sections, image_base, rva + 28 * i, 28)
-                .and_then(|e| pe_pdb(sections, image_base, e))
+            pe_rva(loaded, image_base, rva + 28 * i, 28).and_then(|e| pe_pdb(loaded, image_base, e))
         })
     });
     let (ver_present, ver_version) = resource_dir
-        .map(|(rva, _)| pe_version_info(sections, image_base, rva))
+        .map(|(rva, _)| pe_version_info(loaded, image_base, rva))
         .unwrap_or((false, None));
     let forwarders = export_dir
-        .map(|(rva, size)| pe_forwarders(sections, image_base, rva, size))
+        .map(|(rva, size)| pe_forwarders(loaded, image_base, rva, size))
         .unwrap_or_default();
     Some(serde_json::json!({
         "timestamp": timestamp,
@@ -1461,17 +1494,36 @@ mod tests {
         assert_eq!(macho_headers(b"nope", crate::disasm::Arch::X86_64), None);
     }
 
-    /// One file-backed section at `rva` under `image_base`.
-    fn section_at(image_base: u64, rva: u32, data: Vec<u8>) -> crate::loader::Section {
-        crate::loader::Section {
-            name: ".rsrc".to_string(),
-            vaddr: image_base + u64::from(rva),
-            size: data.len() as u64,
-            file_off: 0,
-            data,
-            readable: true,
-            writable: false,
-            executable: false,
+    /// One file-backed section at `rva` under `image_base`, with its bytes
+    /// in a covering segment like the loader maps PE sections.
+    fn bin_at(image_base: u64, rva: u32, data: Vec<u8>) -> LoadedBinary {
+        let vaddr = image_base + u64::from(rva);
+        let file_size = data.len() as u64;
+        LoadedBinary {
+            format: BinaryFormat::Pe,
+            arch: crate::disasm::Arch::X86_32,
+            entry: None,
+            segments: vec![crate::loader::Segment {
+                vaddr,
+                mem_size: file_size,
+                data,
+                readable: true,
+                writable: false,
+                executable: false,
+            }],
+            sections: vec![crate::loader::Section {
+                name: ".rsrc".to_string(),
+                vaddr,
+                size: file_size,
+                file_off: 0,
+                file_size,
+                readable: true,
+                writable: false,
+                executable: false,
+            }],
+            imports: Vec::new(),
+            exports: Vec::new(),
+            symbols: Vec::new(),
         }
     }
 
@@ -1514,8 +1566,8 @@ mod tests {
         put32(&mut r, fixed, 0xFEEF_04BD);
         put32(&mut r, fixed + 8, (1 << 16) | 2);
         put32(&mut r, fixed + 12, (3 << 16) | 4);
-        let secs = [section_at(BASE, RVA, r)];
-        let (present, version) = pe_version_info(&secs, BASE, RVA);
+        let bin = bin_at(BASE, RVA, r);
+        let (present, version) = pe_version_info(&bin, BASE, RVA);
         assert!(present);
         assert_eq!(version.as_deref(), Some("1.2.3.4"));
     }
@@ -1534,8 +1586,8 @@ mod tests {
         entry[20..24].copy_from_slice(&0x3000u32.to_le_bytes());
         let mut data = vec![0u8; 0x100];
         data[..blob.len()].copy_from_slice(&blob);
-        let secs = [section_at(BASE, 0x3000, data)];
-        let pdb = pe_pdb(&secs, BASE, &entry).expect("pdb");
+        let bin = bin_at(BASE, 0x3000, data);
+        let pdb = pe_pdb(&bin, BASE, &entry).expect("pdb");
         assert_eq!(pdb["path"], "C:\\b\\x.pdb");
         assert_eq!(pdb["guid"], "00010203-0405-0607-0809-0a0b0c0d0e0f");
         assert_eq!(pdb["age"], 7);
@@ -1559,8 +1611,8 @@ mod tests {
         s[0x120..0x122].copy_from_slice(&0u16.to_le_bytes());
         s[100..100 + 14].copy_from_slice(b"otherdll.func\0");
         s[0x130..0x130 + 9].copy_from_slice(b"myexport\0");
-        let secs = [section_at(BASE, DIR, s)];
-        let out = pe_forwarders(&secs, BASE, DIR, 200);
+        let bin = bin_at(BASE, DIR, s);
+        let out = pe_forwarders(&bin, BASE, DIR, 200);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["name"], "myexport");
         assert_eq!(out[0]["forward"], "otherdll.func");

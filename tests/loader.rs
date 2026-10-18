@@ -207,7 +207,10 @@ fn pe_loads_section_and_entry() {
     assert_eq!(bin.sections[0].name, ".text");
     // PE addresses are flat VAs (ImageBase + RVA).
     assert_eq!(bin.sections[0].vaddr, 0x0001_4000_1000);
-    assert_eq!(&bin.sections[0].data[..3], &[0x90, 0x90, 0xC3]);
+    // Raw size is 0x200 but the virtual size is 3, and `object` reports
+    // the clamped prefix, same as the old owned copy.
+    assert_eq!(bin.sections[0].file_size, 3);
+    assert_eq!(&common::section_bytes(&bin, 0)[..3], &[0x90, 0x90, 0xC3]);
     assert!(bin.sections[0].executable);
     assert!(bin.imports.is_empty());
     assert!(bin.exports.is_empty());
@@ -223,7 +226,7 @@ fn macho_loads_segment_and_section() {
     assert_eq!(bin.segments[0].vaddr, 0x1000);
     assert_eq!(bin.sections.len(), 1);
     assert_eq!(bin.sections[0].name, "__text");
-    assert_eq!(&bin.sections[0].data, &[0x90, 0x90, 0xC3, 0x90]);
+    assert_eq!(common::section_bytes(&bin, 0), &[0x90, 0x90, 0xC3, 0x90]);
 }
 
 #[test]
@@ -264,7 +267,7 @@ fn coff_loads_section_at_zero_with_no_entry() {
     assert_eq!(bin.sections.len(), 1);
     assert_eq!(bin.sections[0].name, ".text");
     assert_eq!(bin.sections[0].vaddr, 0);
-    assert_eq!(&bin.sections[0].data, &[0x90, 0x90, 0xC3]);
+    assert_eq!(common::section_bytes(&bin, 0), &[0x90, 0x90, 0xC3]);
     assert!(bin.sections[0].executable);
     // `object` exposes no COFF import/export tables.
     assert!(bin.imports.is_empty());
@@ -274,6 +277,39 @@ fn coff_loads_section_at_zero_with_no_entry() {
         insns.iter().map(|i| i.mnem.as_str()).collect::<Vec<_>>(),
         ["nop", "nop", "ret"]
     );
+}
+
+#[test]
+fn sections_resolve_through_segment_bytes() {
+    // Sections are metadata-only: every file-backed section range must be
+    // covered by a segment's file-backed prefix at the same VA, or byte
+    // consumers (headers, file offsets, search attribution) silently miss.
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("elf", minimal_elf()),
+        ("pe", minimal_pe()),
+        ("macho", minimal_macho()),
+        ("coff", common::fixture_bytes(builders::COFF_NAME)),
+        ("pe32-basic", common::fixture_bytes(builders::BASIC_NAME)),
+        ("le", common::fixture_bytes(builders::LE_NAME)),
+    ];
+    for (name, bytes) in &cases {
+        let bin = load(bytes).unwrap_or_else(|e| panic!("{name} must load: {e:?}"));
+        assert!(
+            !bin.segments.is_empty(),
+            "{name} must map at least one segment"
+        );
+        for (i, sec) in bin.sections.iter().enumerate() {
+            if sec.file_size == 0 {
+                continue;
+            }
+            assert_eq!(
+                common::section_bytes(&bin, i).len(),
+                sec.file_size as usize,
+                "{name} section {} must resolve its full file-backed range",
+                sec.name
+            );
+        }
+    }
 }
 
 #[test]

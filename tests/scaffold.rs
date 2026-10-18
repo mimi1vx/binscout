@@ -97,14 +97,14 @@ fn pe32_basic_loads_with_expected_shape() {
     );
     // Ground truth for X2/A4: the marker string sits at its VA and `.text`
     // holds exactly two LE32 occurrences (the two `push imm32`).
-    let rdata = &bin.sections[1].data;
+    let rdata = common::section_bytes(&bin, 1);
     let off = builders::BASIC_STRING_RDATA_OFF;
     assert_eq!(
         &rdata[off..off + builders::BASIC_STRING.len()],
         builders::BASIC_STRING.as_bytes()
     );
     let refs = common::le32_refs(
-        &bin.sections[0].data,
+        common::section_bytes(&bin, 0),
         builders::TEXT_VA,
         builders::BASIC_STRING_VA,
     );

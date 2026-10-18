@@ -281,8 +281,8 @@ fn allowed_ranges(
         let mut iv: Vec<(u64, u64)> = binary
             .sections
             .iter()
-            .filter(|s| s.name == name && !s.data.is_empty())
-            .map(|s| (s.vaddr, s.vaddr.saturating_add(s.data.len() as u64)))
+            .filter(|s| s.name == name && s.file_size != 0)
+            .map(|s| (s.vaddr, s.vaddr.saturating_add(s.file_size)))
             .collect();
         if !binary.sections.iter().any(|s| s.name == name) {
             return Err(Error::NotFound(format!("no section {name:?}")));
@@ -364,11 +364,11 @@ fn scan_piece(
 /// Section name plus file offset for `addr`, if attributable.
 fn attribute(binary: &LoadedBinary, addr: u64, seg_vaddr: u64) -> (Option<u64>, Option<String>) {
     for sec in &binary.sections {
-        if sec.data.is_empty() || addr < sec.vaddr {
+        if sec.file_size == 0 || addr < sec.vaddr {
             continue;
         }
         let d = addr - sec.vaddr;
-        if d < sec.data.len() as u64 {
+        if d < sec.file_size {
             return (sec.file_off.checked_add(d), Some(sec.name.clone()));
         }
     }
@@ -549,7 +549,7 @@ mod tests {
                 vaddr: 0x400010,
                 size: 0x100,
                 file_off: 0,
-                data: Vec::new(),
+                file_size: 0,
                 readable: true,
                 writable: true,
                 executable: false,

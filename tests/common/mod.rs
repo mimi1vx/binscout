@@ -131,3 +131,26 @@ pub fn le32_refs(code: &[u8], code_base: u64, target: u64) -> Vec<u64> {
     }
     out
 }
+
+/// File-backed bytes of section `idx`, resolved through the segment store
+/// the way every consumer reads them now that sections are metadata-only:
+/// the covering segment's slice at the section's VA. Panics when no
+/// segment covers the section's file-backed range.
+#[must_use]
+pub fn section_bytes(bin: &binscout::loader::LoadedBinary, idx: usize) -> &[u8] {
+    let sec = &bin.sections[idx];
+    let seg = bin
+        .segments
+        .iter()
+        .find(|s| {
+            s.vaddr <= sec.vaddr
+                && sec
+                    .vaddr
+                    .saturating_sub(s.vaddr)
+                    .saturating_add(sec.file_size)
+                    <= s.data.len() as u64
+        })
+        .expect("section must be covered by a segment");
+    let off = (sec.vaddr - seg.vaddr) as usize;
+    &seg.data[off..off + sec.file_size as usize]
+}

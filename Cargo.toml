@@ -17,7 +17,6 @@ clap = { version = "4.5", features = ["derive"] }
 cpp_demangle = "0.5"
 iced-x86 = "1.21"
 memchr = "2"
-memmap2 = "0.9"
 msvc-demangler = "0.11"
 object = "0.40"
 petgraph = "0.8"
@@ -30,5 +29,6 @@ serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 yaxpeax-arch = "0.3"
 yaxpeax-arm = "0.5"
