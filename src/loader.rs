@@ -466,6 +466,17 @@ pub fn raw_entry_alignment(arch: Arch) -> u64 {
 /// outside the mapped range, or a mode-misaligned entry;
 /// [`Error::Limit`] when the blob exceeds [`MAX_MAPPED_BYTES`].
 pub fn load_raw(bytes: &[u8], opts: RawOptions) -> Result<LoadedBinary> {
+    load_raw_vec(bytes.to_vec(), opts)
+}
+
+/// [`load_raw`] taking ownership of the input: the segment reuses the
+/// caller's allocation instead of copying it, so a raw open holds the input
+/// once. Open paths prefer this; the borrowing form stays for callers that
+/// only hold a slice.
+///
+/// # Errors
+/// Same as [`load_raw`].
+pub fn load_raw_vec(bytes: Vec<u8>, opts: RawOptions) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty raw input".to_string()));
     }
@@ -500,8 +511,8 @@ pub fn load_raw(bytes: &[u8], opts: RawOptions) -> Result<LoadedBinary> {
         entry: opts.entry,
         segments: vec![Segment {
             vaddr: opts.base,
-            mem_size: bytes.len() as u64,
-            data: bytes.to_vec(),
+            mem_size: len,
+            data: bytes,
             readable: true,
             writable: true,
             executable: true,

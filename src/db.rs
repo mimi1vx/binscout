@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::analysis::{Analysis, FunctionLayout, Xref};
 use crate::disasm::Arch;
@@ -55,7 +56,7 @@ use crate::loader::strings::StringHit;
 /// Schema version stored under `meta["version"]`.
 ///
 /// Version 6 strengthens cache identity with SHA-256 plus size alongside
-/// the FNV-1a hash, so same bytes opened under different
+/// the content hash, so same bytes opened under different
 /// raw options never share cached layouts and old snapshots re-analyze
 /// rather than synthesizing clean diagnostics.
 ///
@@ -69,7 +70,11 @@ use crate::loader::strings::StringHit;
 /// twins, per-instruction JSON objects, and `format!`-built keys are gone.
 /// Old sidecars stay readable as stale (the stale path never opens derived
 /// tables), so they re-analyze instead of erroring.
-pub const SCHEMA_VERSION: u32 = 8;
+///
+/// Version 9 replaces the FNV-1a content hash with xxh3-64 (see
+/// [`content_hash`]): v8 snapshots miss on the version gate and re-analyze,
+/// so the hash change never replays stale layouts.
+pub const SCHEMA_VERSION: u32 = 9;
 /// Revision of the analysis engine covered by cached snapshots.
 ///
 /// Re-exported from [`crate::analysis`] so cache identity has one source:
@@ -111,20 +116,15 @@ const ANNOTATIONS: TableDefinition<u64, String> = TableDefinition::new("annotati
 const FUNC_SEEDS: TableDefinition<u64, String> = TableDefinition::new("func_seeds");
 const DIAGNOSTICS: TableDefinition<(u64, u8), ()> = TableDefinition::new("diagnostics");
 
-/// Deterministic 64-bit FNV-1a hash of the binary bytes.
+/// Deterministic 64-bit xxh3 hash of the binary bytes.
 ///
 /// Non-cryptographic: it only detects "binary changed, re-analyze", it is not
 /// a tamper check. Deterministic across processes, unlike `DefaultHasher`.
+/// Single pass at memory bandwidth (gigabytes per second), so opens hash
+/// once up front instead of byte-at-a-time.
 #[must_use]
 pub fn content_hash(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut h = OFFSET;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(PRIME);
-    }
-    h
+    xxh3_64(bytes)
 }
 
 /// Sidecar DB path for a binary: `foo.exe` -> `foo.exe.rsdbg.redb`.
@@ -342,7 +342,7 @@ pub struct BinaryMeta {
     pub content_hash: u64,
     /// Hex SHA-256 of the file contents.
     ///
-    /// Strengthens [`BinaryMeta::content_hash`] (FNV-1a-64) against
+    /// Strengthens [`BinaryMeta::content_hash`] (xxh3-64) against
     /// collisions: cache identity compares both plus [`BinaryMeta::size`].
     /// Defaults to empty so pre-v6 snapshots without the field still
     /// decode; such snapshots never hit the cache (empty never equals a
@@ -752,6 +752,22 @@ pub fn open_db_read_only(path: &Path) -> Result<redb::ReadOnlyDatabase> {
     redb::Database::builder()
         .open_read_only(path)
         .map_err(|e| Error::Storage(format!("open db: {e}")))
+}
+
+/// Read only the snapshot identity row of `db`.
+///
+/// Lets open paths check the cheap identity (version, content hash, size,
+/// mapping, analysis revision) before paying for a SHA-256 over the input:
+/// only a tentative match needs the wide hash to confirm the cache hit.
+/// Accepts any readable handle, like [`load_cached`].
+///
+/// # Errors
+/// [`Error::Storage`] on unreadable or undecodable metadata.
+pub fn read_meta(db: &impl ReadableDatabase) -> Result<Option<BinaryMeta>> {
+    let rtxn = db
+        .begin_read()
+        .map_err(|e| Error::Storage(format!("begin read: {e}")))?;
+    read_meta_row(&rtxn)
 }
 
 fn json<T: Serialize>(v: &T) -> Result<String> {
@@ -2205,9 +2221,9 @@ pub enum Snapshot {
 /// loader mapping — auto, explicit raw arch/base/entry, or fat slice arch
 /// (`expected_mapping`) — and the analysis revision: layouts replay only when
 /// all agree with the stored snapshot on the current
-/// [`SCHEMA_VERSION`]. The 64-bit FNV-1a hash is a fast pre-check; the
+/// [`SCHEMA_VERSION`]. The 64-bit xxh3 hash is a fast pre-check; the
 /// SHA-256 plus size is the collision-resistant gate, so a constructed
-/// FNV collision cannot replay another binary's layouts. A mapping mismatch
+/// hash collision cannot replay another binary's layouts. A mapping mismatch
 /// never reuses layouts, even when the bytes are identical; auto and
 /// explicit opens never alias.
 ///
