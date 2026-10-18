@@ -637,11 +637,17 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         )?);
     }
 
-    if format == BinaryFormat::MachO
-        && let Some(stubs) = macho_stub_addresses(bytes, &imports)
-    {
-        for (imp, addr) in imports.iter_mut().zip(stubs) {
-            imp.address = Some(addr);
+    if format == BinaryFormat::MachO {
+        if let Some(stubs) = macho_stub_addresses(bytes, &imports) {
+            for (imp, addr) in imports.iter_mut().zip(stubs) {
+                imp.address = Some(addr);
+            }
+        } else if let Some(stubs) = macho_chained_stub_addresses(bytes, &imports) {
+            for (imp, addr) in imports.iter_mut().zip(stubs) {
+                if let Some(addr) = addr {
+                    imp.address = Some(addr);
+                }
+            }
         }
     }
 
@@ -893,6 +899,339 @@ fn macho_stub_addresses(bytes: &[u8], imports: &[ImportRef]) -> Option<Vec<u64>>
         return None;
     }
     Some(addrs)
+}
+
+/// Stub decode shapes for [`macho_chained_stub_addresses`].
+#[derive(Clone, Copy)]
+enum ChainedStubArch {
+    Aarch64,
+    X86_64,
+    X86_32,
+}
+
+/// Derive Mach-O stub entry addresses through `LC_DYLD_CHAINED_FIXUPS`
+/// binds, or `None` on any doubt.
+///
+/// Modern arm64/x86_64 macOS images (macOS 12+) bind through chained fixups
+/// instead of the `LC_DYSYMTAB` indirect table, so [`macho_stub_addresses`]
+/// vetoes them. This path recovers the same `import.address` stub mapping
+/// without the indirect table:
+/// 1. Walk the load commands for the chained-fixups payload offset/size,
+///    the segments (`vmaddr`/`fileoff`/`filesize`, in command order), and
+///    the `__stubs`/`__auth_stubs` sections (same name/segment/type guards
+///    as the classic path, but a non-conforming section is skipped rather
+///    than vetoing the whole mapping).
+/// 2. Parse the payload with the `object` crate's chained-fixups walker and
+///    collect every bind fixup as slot VA (`vmaddr + chain offset`) to
+///    import-table ordinal. All pointer formats the walker supports resolve
+///    here (`DYLD_CHAINED_PTR_64`, `_64_OFFSET`, `_32`, and the `ARM64E*`
+///    family); authenticated binds map by ordinal like plain ones — pointer
+///    signing is never verified, only read. Rebase fixups are ignored.
+/// 3. Translate ordinals to `imports` positions by replaying the table in
+///    order while skipping `BIND_SPECIAL_DYLIB_SELF` entries, exactly as
+///    `object`'s own import iterator does; a surviving count mismatch
+///    vetoes the mapping.
+/// 4. Decode each stub entry's first instructions to the GOT slot it loads
+///    (arm64 `adrp` + 64-bit `ldr`, x86-64 `jmp [rip+disp]`, x86-32 absolute
+///    `jmp [addr]`; see [`chained_stub_slot`]) and assign the entry address
+///    to that slot's import.
+///
+/// Mapping is per-stub best-effort: entries that fail to decode, load an
+/// unbound slot, or point outside the import table leave their import at
+/// `None` (data-only binds with no stub, the real-`/bin/ls` shape, stay
+/// `None` rather than vetoing the mapped ones). Two whole-mapping vetoes
+/// remain: zero mapped stubs, and two stubs resolving to one import
+/// (ambiguous, never guessed).
+///
+/// Out of scope: 32-bit ARM stubs (no chained-fixups ARM32/Thumb shape is
+/// decoded — old 32-bit images still use the indirect table), stubs whose
+/// slot load is not the entry's first instruction pair, and ObjC fixups
+/// (which are rebases, not binds).
+fn macho_chained_stub_addresses(bytes: &[u8], imports: &[ImportRef]) -> Option<Vec<Option<u64>>> {
+    use object::read::macho::{DyldChainedFixups, Fixup};
+    const LC_SEGMENT: u32 = 0x1;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+    const SECTION_TYPE: u32 = 0xff;
+    const S_SYMBOL_STUBS: u32 = 0x8;
+    const MAX_COMMANDS: u32 = 4096;
+    // `object` cputypes for the stub shapes decoded below.
+    const CPU_TYPE_I386: u32 = 7;
+    const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+    const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+    if imports.is_empty() || imports.len() > MAX_IMPORTS {
+        return None;
+    }
+    if !is_thin_le_macho(bytes) {
+        return None;
+    }
+    if macho_has_chained_fixups(bytes) != Some(true) {
+        return None;
+    }
+    let is64 = bytes
+        .get(0..4)
+        .is_some_and(|m| m == 0xFEED_FACFu32.to_le_bytes());
+    let stub_arch = match bytes.get(4..8) {
+        Some(m) if m == CPU_TYPE_ARM64.to_le_bytes() => ChainedStubArch::Aarch64,
+        Some(m) if m == CPU_TYPE_X86_64.to_le_bytes() => ChainedStubArch::X86_64,
+        Some(m) if m == CPU_TYPE_I386.to_le_bytes() => ChainedStubArch::X86_32,
+        _ => return None,
+    };
+    let get32 = |off: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(b))
+    };
+    let get64 = |off: usize| -> Option<u64> {
+        let b: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+        Some(u64::from_le_bytes(b))
+    };
+    let ncmds = get32(16)?;
+    if ncmds > MAX_COMMANDS {
+        return None;
+    }
+    // Segments in command order (the chain walk indexes them positionally),
+    // stub sections, and the fixups payload range.
+    let mut segments: Vec<(u64, usize, usize)> = Vec::new();
+    let mut sections: Vec<(u64, u64, u64)> = Vec::new();
+    let mut chained: Option<(usize, usize)> = None;
+    let mut off = if is64 { 32usize } else { 28usize };
+    for _ in 0..ncmds {
+        let base = off;
+        let cmd = get32(base)?;
+        let cmdsize = get32(base + 4)? as usize;
+        if cmdsize < 8 || base.checked_add(cmdsize)? > bytes.len() {
+            return None;
+        }
+        match cmd {
+            LC_DYLD_CHAINED_FIXUPS => {
+                if chained.is_some() {
+                    return None;
+                }
+                chained = Some((get32(base + 8)? as usize, get32(base + 12)? as usize));
+            }
+            LC_SEGMENT | LC_SEGMENT_64 => {
+                if (cmd == LC_SEGMENT_64) != is64 {
+                    return None;
+                }
+                let (vmaddr, fileoff, filesize, nsects, sect_off, sect_len) = if is64 {
+                    (
+                        get64(base + 24)?,
+                        get32(base + 40)? as usize,
+                        get32(base + 48)? as usize,
+                        get32(base + 64)? as usize,
+                        base + 72,
+                        80usize,
+                    )
+                } else {
+                    (
+                        u64::from(get32(base + 24)?),
+                        get32(base + 32)? as usize,
+                        get32(base + 36)? as usize,
+                        get32(base + 48)? as usize,
+                        base + 56,
+                        68usize,
+                    )
+                };
+                if nsects.checked_mul(sect_len)?.checked_add(sect_off - base)? > cmdsize {
+                    return None;
+                }
+                let seg_name_end = bytes
+                    .get(base + 8..base + 24)?
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(16);
+                let seg_name = bytes.get(base + 8..base + 8 + seg_name_end)?;
+                segments.push((vmaddr, fileoff, filesize));
+                for s in 0..nsects {
+                    let sec = sect_off + s * sect_len;
+                    let name_end = bytes
+                        .get(sec..sec + 16)?
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(16);
+                    let name = bytes.get(sec..sec + name_end)?;
+                    if name != b"__stubs" && name != b"__auth_stubs" {
+                        continue;
+                    }
+                    if !seg_name.starts_with(b"__TEXT") {
+                        continue;
+                    }
+                    let (addr, size) = if is64 {
+                        (get64(sec + 32)?, get64(sec + 40)?)
+                    } else {
+                        (u64::from(get32(sec + 32)?), u64::from(get32(sec + 36)?))
+                    };
+                    let flags_off = if is64 { sec + 64 } else { sec + 56 };
+                    let flags = get32(flags_off)?;
+                    let stride = get32(flags_off + 8)?;
+                    if flags & SECTION_TYPE != S_SYMBOL_STUBS || stride == 0 {
+                        continue;
+                    }
+                    let stride = u64::from(stride);
+                    if size == 0 || size % stride != 0 {
+                        continue;
+                    }
+                    let min_insn: u64 = match stub_arch {
+                        ChainedStubArch::Aarch64 => 8,
+                        ChainedStubArch::X86_64 | ChainedStubArch::X86_32 => 6,
+                    };
+                    if stride < min_insn {
+                        continue;
+                    }
+                    sections.push((addr, size / stride, stride));
+                }
+            }
+            _ => {}
+        }
+        off = base + cmdsize;
+    }
+    let (dataoff, datasize) = chained?;
+    let payload = bytes.get(dataoff..dataoff.checked_add(datasize)?)?;
+    let endian = object::LittleEndian;
+    let fixups = DyldChainedFixups::parse(endian, payload).ok()?;
+    // Ordinal to `imports` position: replay the table in order, skipping
+    // self-dylib entries exactly as `object`'s import iterator does.
+    let mut ordinal_to_import: Vec<Option<usize>> = Vec::new();
+    let mut next_import = 0usize;
+    let mut table = fixups.imports(endian).ok()?;
+    loop {
+        match table.next() {
+            Err(_) => return None,
+            Ok(None) => break,
+            Ok(Some(entry)) => {
+                if entry.dylib == object::macho::BIND_SPECIAL_DYLIB_SELF {
+                    ordinal_to_import.push(None);
+                } else {
+                    ordinal_to_import.push(Some(next_import));
+                    next_import += 1;
+                }
+            }
+        }
+    }
+    if next_import != imports.len() {
+        return None;
+    }
+    // Slot VA to import-table ordinal over every segment's chains. A dead
+    // chain tail keeps the binds already walked (each is exact on its own);
+    // only the bind count is capped.
+    let mut slot_ordinal: HashMap<u64, u32> = HashMap::new();
+    let text_base = segments.first().map(|s| s.0).unwrap_or(0);
+    let mut seg_starts = fixups.segments(endian).ok()?;
+    loop {
+        let seg = match seg_starts.next() {
+            Err(_) | Ok(None) => break,
+            Ok(Some(seg)) => seg,
+        };
+        let Some(&(vmaddr, fileoff, filesize)) = segments.get(seg.index() as usize) else {
+            continue;
+        };
+        let Some(seg_data) = bytes.get(fileoff..fileoff.checked_add(filesize)?) else {
+            continue;
+        };
+        let mut chain = seg.fixups(endian, text_base, seg_data);
+        while let Ok(Some((chain_off, fix))) = chain.next() {
+            let Fixup::Bind(bind) = fix else { continue };
+            if slot_ordinal.len() >= MAX_IMPORTS {
+                return None;
+            }
+            slot_ordinal
+                .entry(vmaddr.wrapping_add(chain_off))
+                .or_insert(bind.ordinal);
+        }
+    }
+    if slot_ordinal.is_empty() {
+        return None;
+    }
+    let file_bytes_at = |va: u64, len: usize| -> Option<&[u8]> {
+        for &(vmaddr, fileoff, filesize) in &segments {
+            let end = vmaddr.checked_add(filesize as u64)?;
+            if va >= vmaddr && va.checked_add(len as u64)? <= end {
+                let start = fileoff.checked_add((va - vmaddr) as usize)?;
+                return bytes.get(start..start.checked_add(len)?);
+            }
+        }
+        None
+    };
+    let mut addrs: Vec<Option<u64>> = vec![None; imports.len()];
+    let mut mapped = 0usize;
+    for (base_addr, count, stride) in sections {
+        for i in 0..count {
+            let va = base_addr.checked_add(i.checked_mul(stride)?)?;
+            let need = match stub_arch {
+                ChainedStubArch::Aarch64 => 8,
+                ChainedStubArch::X86_64 | ChainedStubArch::X86_32 => 6,
+            };
+            let Some(code) = file_bytes_at(va, need) else {
+                continue;
+            };
+            let Some(slot) = chained_stub_slot(code, stub_arch, va) else {
+                continue;
+            };
+            let Some(&ordinal) = slot_ordinal.get(&slot) else {
+                continue;
+            };
+            let Some(&imp) = ordinal_to_import
+                .get(ordinal as usize)
+                .and_then(|o| o.as_ref())
+            else {
+                continue;
+            };
+            if addrs[imp].is_some() {
+                return None;
+            }
+            addrs[imp] = Some(va);
+            mapped += 1;
+        }
+    }
+    if mapped == 0 { None } else { Some(addrs) }
+}
+
+/// GOT slot a chained-fixups stub entry loads, if its first instructions
+/// match one known shape.
+///
+/// arm64 entries start with `adrp Rd, page` plus a 64-bit unsigned-offset
+/// `ldr` off the same register (the classic `__stubs` 12-byte and the
+/// authenticated `__auth_stubs` `adrp`/`ldr`/`braa` entries share this
+/// prefix; the trailing branch is never inspected, so PAC branches need no
+/// special handling). x86-64 entries are `jmp [rip+disp32]`; x86-32 entries
+/// are absolute `jmp [addr32]`. Anything else (including 32-bit `ldr` forms,
+/// pre-indexed loads, and multi-instruction page math) is `None`.
+fn chained_stub_slot(code: &[u8], arch: ChainedStubArch, va: u64) -> Option<u64> {
+    match arch {
+        ChainedStubArch::Aarch64 => {
+            let w0 = u32::from_le_bytes(code.get(0..4)?.try_into().ok()?);
+            let w1 = u32::from_le_bytes(code.get(4..8)?.try_into().ok()?);
+            if w0 & 0x9F00_0000 != 0x9000_0000 {
+                return None;
+            }
+            if w1 & 0xFFC0_0000 != 0xF940_0000 {
+                return None;
+            }
+            if (w1 >> 5) & 31 != w0 & 31 {
+                return None;
+            }
+            let imm12 = u64::from((w1 >> 10) & 0xFFF);
+            let off21 = ((w0 >> 5) & 0x7_FFFF) << 2 | ((w0 >> 29) & 3);
+            let signed = ((off21 << 11) as i32 >> 11) as i64;
+            let page = (va & !0xFFF).wrapping_add((signed << 12) as u64);
+            Some(page.wrapping_add(imm12 * 8))
+        }
+        ChainedStubArch::X86_64 => {
+            if code.get(0..2) != Some(&[0xFF, 0x25][..]) {
+                return None;
+            }
+            let disp = i32::from_le_bytes(code.get(2..6)?.try_into().ok()?) as i64;
+            Some(va.wrapping_add(6).wrapping_add(disp as u64))
+        }
+        ChainedStubArch::X86_32 => {
+            if code.get(0..2) != Some(&[0xFF, 0x25][..]) {
+                return None;
+            }
+            Some(u64::from(u32::from_le_bytes(
+                code.get(2..6)?.try_into().ok()?,
+            )))
+        }
+    }
 }
 
 /// IAT slot virtual addresses in import order, or `None` on any doubt.
@@ -1736,6 +2075,50 @@ mod tests {
         assert_eq!(bin.sections.len(), 1);
         assert_eq!(bin.sections[0].name, "obj1");
         assert_eq!(bin.sections[0].data, [0x90, 0x90, 0xC3]);
+    }
+
+    #[test]
+    fn chained_stub_slot_decodes_known_shapes() {
+        // arm64: adrp x16, 0x11000 from 0x10008 (page imm 1), then
+        // ldr x16, [x16, #8].
+        let arm = [0x10u8, 0x00, 0x00, 0xB0, 0x10, 0x06, 0x40, 0xF9];
+        assert_eq!(
+            chained_stub_slot(&arm, ChainedStubArch::Aarch64, 0x10008),
+            Some(0x11008)
+        );
+        // x86-64: jmp [rip+0xFF2] lands on 0x11000.
+        let x64 = [0xFFu8, 0x25, 0xF2, 0x0F, 0x00, 0x00];
+        assert_eq!(
+            chained_stub_slot(&x64, ChainedStubArch::X86_64, 0x10008),
+            Some(0x11000)
+        );
+        // x86-32: absolute jmp [0x11000].
+        let x32 = [0xFFu8, 0x25, 0x00, 0x10, 0x01, 0x00];
+        assert_eq!(
+            chained_stub_slot(&x32, ChainedStubArch::X86_32, 0),
+            Some(0x11000)
+        );
+        // Rejections: non-adrp first word, 32-bit ldr, base-register
+        // mismatch (ldr x16, [x17]), truncated input.
+        let ret = [0xC0u8, 0x03, 0x5F, 0xD6, 0x10, 0x02, 0x40, 0xF9];
+        assert_eq!(
+            chained_stub_slot(&ret, ChainedStubArch::Aarch64, 0x10008),
+            None
+        );
+        let ldr32 = [0x10u8, 0x00, 0x00, 0xB0, 0x10, 0x02, 0x40, 0xB9];
+        assert_eq!(
+            chained_stub_slot(&ldr32, ChainedStubArch::Aarch64, 0x10008),
+            None
+        );
+        let mismatch = [0x10u8, 0x00, 0x00, 0xB0, 0x30, 0x02, 0x40, 0xF9];
+        assert_eq!(
+            chained_stub_slot(&mismatch, ChainedStubArch::Aarch64, 0x10008),
+            None
+        );
+        assert_eq!(
+            chained_stub_slot(&[0xFF, 0x25], ChainedStubArch::X86_64, 0),
+            None
+        );
     }
 
     #[test]

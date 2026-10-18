@@ -811,7 +811,8 @@ pub struct Analysis {
     /// sidecar stores rows in `from` order and the index rebuilds on open).
     to_index: OnceLock<Vec<u32>>,
     /// PLT-stub/import-thunk sites: `jmp [slot]` address to `imports`
-    /// index (x86 PE/ELF only; see [`import_slots`]).
+    /// index on x86 PE/ELF (see [`import_slots`]), stub-entry address to
+    /// `imports` index on Mach-O (see `macho_import_stubs`).
     pub import_stubs: BTreeMap<u64, usize>,
     /// Extracted strings sorted by address.
     pub strings: Vec<StringHit>,
@@ -1292,7 +1293,9 @@ pub fn rebuild(
         // instructions need the same import tags and stub map `analyze`
         // applies, so cached opens answer identically to fresh ones.
         let slots = import_slots(bin);
-        let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+        let stubs: BTreeMap<u64, usize> = if bin.format == BinaryFormat::MachO {
+            macho_import_stubs(bin)
+        } else if matches!(arch, Arch::X86_64 | Arch::X86_32) {
             collect_stubs(
                 analysis
                     .functions
@@ -3183,6 +3186,26 @@ pub fn import_index(
     None
 }
 
+/// Mach-O stub map: stub-entry VA to `imports` index, for direct calls.
+///
+/// Mach-O loader addresses are code stubs (unlike PE/ELF data slots), so
+/// [`import_slots`] stays empty for Mach-O; direct `bl`/`call` targets
+/// resolve through this map instead (see [`import_index`]). First import
+/// wins on duplicate addresses; the loader never double-maps, so this is
+/// a backstop for direct API use.
+fn macho_import_stubs(bin: &LoadedBinary) -> BTreeMap<u64, usize> {
+    let mut stubs = BTreeMap::new();
+    if bin.format != BinaryFormat::MachO {
+        return stubs;
+    }
+    for (i, imp) in bin.imports.iter().enumerate() {
+        if let Some(addr) = imp.address {
+            stubs.entry(addr).or_insert(i);
+        }
+    }
+    stubs
+}
+
 /// PLT-stub/import-thunk sites from decoded rows: `jmp [slot]` address
 /// to `imports` index (x86 only; snapshot rebuilds run the same
 /// predicate over re-decoded rows).
@@ -3372,9 +3395,13 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     // Import call sites: the slot map comes from loader-resolved
     // addresses (PE IAT / ELF GOT); stub sites come from decoded
     // `jmp [slot]` shapes, CET `endbr` preludes included (see
-    // `collect_stubs`). Calls through slots are callers, not stubs.
+    // `collect_stubs`), or on Mach-O straight from the loader's stub-entry
+    // addresses (see `macho_import_stubs`). Calls through slots are
+    // callers, not stubs.
     let slots = import_slots(bin);
-    let stubs: BTreeMap<u64, usize> = if matches!(arch, Arch::X86_64 | Arch::X86_32) {
+    let stubs: BTreeMap<u64, usize> = if bin.format == BinaryFormat::MachO {
+        macho_import_stubs(bin)
+    } else if matches!(arch, Arch::X86_64 | Arch::X86_32) {
         collect_stubs(
             decoded.iter().map(|(&va, d)| {
                 (
