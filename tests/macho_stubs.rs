@@ -690,14 +690,12 @@ fn macho_chained(cputype: u32, text: &[u8; 8], stubs: &[u8], stride: u32) -> Vec
     put32(&mut f, c + 8, link_off as u32);
     put32(&mut f, c + 12, payload_len as u32);
 
-    // LC_MAIN so the image has an entry point at __text. Note: the spec
-    // defines entryoff as a file offset, but `object` 0.40 reports it raw
-    // as the entry VA, so the fixture stores the VA to exercise the entry
-    // seed path (a real-spec value would need an LC_UNIXTHREAD pc).
+    // LC_MAIN so the image has an entry point at __text: entryoff is the
+    // spec file offset of main, which the loader translates to CHAINED_TEXT.
     c += chained_cmd;
     put32(&mut f, c, 0x8000_0028);
     put32(&mut f, c + 4, main_cmd as u32);
-    put64(&mut f, c + 8, CHAINED_TEXT);
+    put64(&mut f, c + 8, text_off as u64);
     put64(&mut f, c + 16, 0);
 
     // Bodies.
