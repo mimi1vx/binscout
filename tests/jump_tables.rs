@@ -241,6 +241,10 @@ fn non_executable_target_stays_unresolved() {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -536,6 +540,10 @@ fn non_executable_table_entry_stays_unresolved() {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -620,6 +628,10 @@ fn cross_function_table_entry_stays_unresolved() {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -712,6 +724,10 @@ fn container_table_stays_unresolved_by_design() {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(
@@ -769,6 +785,10 @@ fn container_format_stays_unresolved_by_design() {
         imports: Vec::new(),
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(

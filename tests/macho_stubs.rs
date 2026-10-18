@@ -470,6 +470,10 @@ fn stub_binary(stub_addrs: [Option<u64>; 2]) -> LoadedBinary {
         imports,
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     }
 }
 

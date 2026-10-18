@@ -273,6 +273,10 @@ fn stub_binary(prefix: &[u8]) -> LoadedBinary {
         }],
         exports: Vec::new(),
         symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     }
 }
 

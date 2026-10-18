@@ -291,6 +291,10 @@ fn table_binary() -> LoadedBinary {
                 demangled: None,
             },
         ],
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
     }
 }
 

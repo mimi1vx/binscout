@@ -472,6 +472,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         };
         let spanning = BytePattern::parse("AA AA BB BB").expect("parse");
         let (total, _) = run(&bin, &spanning, None, None, 0, 100).expect("scan");
@@ -517,6 +521,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         };
         let (total, _) = run(
             &bin,
@@ -557,6 +565,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         };
         let pat = BytePattern::parse("90").expect("parse");
         let (total, _) = run(&bin, &pat, Some(".bss"), None, 0, 10).expect("bss filter");

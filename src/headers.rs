@@ -1481,6 +1481,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         };
         assert_eq!(elf_headers(b"MZ garbage"), None);
         let v = headers_of(b"nope", &loaded, "00");
@@ -1524,6 +1528,10 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            pdata_funcs: Vec::new(),
+            tls_callbacks: Vec::new(),
+            init_funcs: Vec::new(),
+            func_starts: Vec::new(),
         }
     }
 
