@@ -45,7 +45,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 8;
+pub const ANALYSIS_REVISION: u32 = 9;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -195,6 +195,74 @@ pub enum DiscoveryReason {
     /// Prologue-scan hit outside round-one reached code.
     #[serde(alias = "Prologue")]
     Prologue,
+    /// User-defined seed from `define-func`: an agent asserted there is
+    /// code at this address (shellcode, firmware vectors, obfuscated
+    /// code, missed callbacks).
+    #[serde(alias = "User")]
+    User,
+}
+
+/// Decode mode of one user-defined function seed (`define-func --mode`).
+///
+/// Only meaningful on 32-bit ARM projects (`Arm32`/`Thumb`): `Thumb`
+/// decodes the seed's function as Thumb instead of masking the
+/// interworking bit and decoding as ARM. On other architectures the
+/// mode is rejected at the project boundary and coerced away here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeedMode {
+    /// Decode as 32-bit ARM.
+    Arm,
+    /// Decode as Thumb.
+    Thumb,
+}
+
+impl SeedMode {
+    /// Canonical flag spelling (`arm`/`thumb`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Arm => "arm",
+            Self::Thumb => "thumb",
+        }
+    }
+
+    /// Disassembler target this mode decodes with.
+    #[must_use]
+    pub fn arch(self) -> Arch {
+        match self {
+            Self::Arm => Arch::Arm32,
+            Self::Thumb => Arch::Thumb,
+        }
+    }
+
+    /// Parse a `--mode`/`mode` value (case-insensitive, trimmed).
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] for anything but `arm`/`thumb`.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "arm" => Ok(Self::Arm),
+            "thumb" => Ok(Self::Thumb),
+            _ => Err(Error::Invalid(format!(
+                "unknown seed mode: {s:?} (expected one of arm, thumb)"
+            ))),
+        }
+    }
+}
+
+/// One user-defined function seed: an agent-asserted code address plus an
+/// optional 32-bit ARM decode-mode override.
+///
+/// `mode` is `None` for the default decode (project arch with the usual
+/// ARM Thumb-bit normalization); `excluded` rows never reach analysis
+/// (see [`crate::db::FuncSeed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserSeed {
+    /// Seed address (canonical: Thumb bit cleared on 32-bit ARM).
+    pub addr: u64,
+    /// Decode-mode override, if any.
+    pub mode: Option<SeedMode>,
 }
 
 /// What an analysis diagnostic records.
@@ -415,6 +483,14 @@ pub struct Function {
     /// Evidence, not confidence: coexisting [`DiscoveryReason`]s record
     /// every seed path that reached this entry.
     pub reasons: BTreeSet<DiscoveryReason>,
+    /// Decode-arch override for this function, if it differs from the
+    /// project arch.
+    ///
+    /// Set when a user seed decoded this entry under an explicit
+    /// [`SeedMode`] (Thumb code in an `Arm32` project or vice versa);
+    /// `None` means the project arch. Persisted per function so snapshot
+    /// reload re-decodes identical bytes.
+    pub decode_arch: Option<Arch>,
 }
 
 impl Function {
@@ -482,6 +558,9 @@ impl Function {
     /// `inferred` are the provenance-marked inferred pairs, replayed with
     /// the same unknown-endpoint drop as `edges`. `reasons` may arrive in
     /// any order with duplicates and are stored sorted and deduplicated.
+    /// `decode_arch` is the per-function decode override (`None` means the
+    /// project arch); callers replaying a snapshot pass the persisted
+    /// value so mixed-mode functions re-decode identically.
     #[must_use]
     pub fn from_parts(
         entry: u64,
@@ -490,6 +569,7 @@ impl Function {
         edges: &[(u64, u64)],
         reasons: Vec<DiscoveryReason>,
         inferred: &[(u64, u64)],
+        decode_arch: Option<Arch>,
     ) -> Self {
         let mut cfg = DiGraphMap::new();
         for &start in blocks.keys() {
@@ -513,6 +593,7 @@ impl Function {
             cfg,
             inferred: inferred_set,
             reasons: reasons.into_iter().collect(),
+            decode_arch,
         }
     }
 }
@@ -918,12 +999,16 @@ impl Analysis {
     ///
     /// Read-only [`Function::structure`] over the direct CFG plus the M3
     /// lift: syntactic loops and ifs with the [`STRUCTURE_WARNING`]
-    /// marker. `None` for an unknown entry (callers snap addresses with
+    /// marker. Decodes control ops with the function's own decode arch
+    /// when a user seed mode overrode it. `None` for an unknown entry
+    /// (callers snap addresses with
     /// [`Analysis::containing_function`] first, as
     /// [`crate::Project::structure_of`] does).
     #[must_use]
     pub fn structure_of(&self, entry: u64) -> Option<FuncStructure> {
-        self.functions.get(&entry).map(|f| f.structure(self.arch))
+        self.functions
+            .get(&entry)
+            .map(|f| f.structure(f.decode_arch.unwrap_or(self.arch)))
     }
 
     /// All callgraph edges as `(caller, callee)` pairs.
@@ -1042,6 +1127,15 @@ pub struct FunctionLayout {
     /// revision mismatches) and re-analyze instead.
     #[serde(default)]
     pub reasons: Vec<DiscoveryReason>,
+    /// Canonical decode-arch override (`"arm32"`/`"thumb"`), if the
+    /// function decoded under a user seed mode rather than the project
+    /// arch.
+    ///
+    /// Defaults to `None` (project arch) so older rows still decode;
+    /// such snapshots never hit the cache (their analysis revision
+    /// mismatches) and re-analyze instead.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 /// Flatten an analysis into persistable layouts.
@@ -1092,6 +1186,10 @@ pub fn layout(analysis: &Analysis) -> Vec<FunctionLayout> {
                 calls,
                 blocks,
                 reasons: f.reason_list(),
+                arch: match f.decode_arch {
+                    Some(a) if a != analysis.arch => Some(crate::db::arch_name(a).to_string()),
+                    _ => None,
+                },
             }
         })
         .collect()
@@ -1143,6 +1241,12 @@ pub fn rebuild(
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
         let mut edges: Vec<(u64, u64)> = Vec::new();
         let mut inferred: Vec<(u64, u64)> = Vec::new();
+        let func_arch = f
+            .arch
+            .as_deref()
+            .map(crate::db::parse_arch)
+            .transpose()?
+            .unwrap_or(arch);
         for b in &f.blocks {
             let len = b.end.wrapping_sub(b.start);
             ranged = ranged
@@ -1154,7 +1258,7 @@ pub fn rebuild(
                         b.start
                     ))
                 })?;
-            blocks.insert(b.start, decode_block(arch, &space, b)?);
+            blocks.insert(b.start, decode_block(func_arch, &space, b)?);
             edges.extend(b.succs.iter().map(|s| (b.start, *s)));
             inferred.extend(b.inferred_succs.iter().map(|s| (b.start, *s)));
         }
@@ -1167,6 +1271,7 @@ pub fn rebuild(
                 &edges,
                 f.reasons.clone(),
                 &inferred,
+                (func_arch != arch).then_some(func_arch),
             ),
         );
     }
@@ -1925,6 +2030,9 @@ fn decode_one(arch: Arch, space: &AddrSpace, va: u64) -> Result<Option<Insn>> {
 struct Decoded {
     insn: Insn,
     flow: Flow,
+    /// Disassembler target this address decoded with: the project arch,
+    /// or a user seed's explicit [`SeedMode`] propagated along its walk.
+    arch: Arch,
 }
 
 /// Normalize a seed address for `arch`, clearing the ARM Thumb
@@ -1958,14 +2066,24 @@ fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr
 }
 
 /// Seed addresses from the entry point, exports, symbol-table entries,
-/// and Mach-O stub entries resolving to executable code. When none exists
-/// (raw blobs, stripped objects), the first executable byte seeds analysis
-/// so some function is always found.
+/// and Mach-O stub entries resolving to executable code, plus user
+/// seeds from `define-func`. When none exists (raw blobs, stripped
+/// objects), the first executable byte seeds analysis so some function
+/// is always found.
 ///
 /// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
 /// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
 /// the odd address (a queued discovery address never decoded as given).
-fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<Diagnostic>) {
+/// User seeds carry an explicit [`SeedMode`] instead: `Thumb` decodes as
+/// Thumb (bit cleared, no diagnostic), `Arm` masks silently. Same-address
+/// seeds under different arches both queue; the walk decodes first-wins
+/// from a stably address-sorted stack, so an explicit user mode wins over
+/// the project-arch seed.
+fn authoritative_seeds(
+    space: &AddrSpace,
+    bin: &LoadedBinary,
+    user: &[UserSeed],
+) -> (Vec<(u64, Arch)>, Vec<Diagnostic>) {
     let mut seeds: Vec<u64> = Vec::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
     if let Some(entry) = bin.entry
@@ -2011,7 +2129,43 @@ fn authoritative_seeds(space: &AddrSpace, bin: &LoadedBinary) -> (Vec<u64>, Vec<
     }
     seeds.sort_unstable();
     seeds.dedup();
-    (seeds, diags)
+    let mut paired: Vec<(u64, Arch)> = seeds.into_iter().map(|a| (a, bin.arch)).collect();
+    // User seeds join the authoritative set with their explicit decode
+    // mode: an agent assertion that there is code at an address the
+    // loader never seeded (shellcode, firmware vectors, obfuscated code,
+    // missed callbacks). Modes only apply on 32-bit ARM; elsewhere the
+    // project arch decodes (the project boundary rejects modes there, so
+    // this is a backstop for direct API use, never a silent success).
+    let mixed = matches!(bin.arch, Arch::Arm32 | Arch::Thumb);
+    for s in user {
+        if paired.len() >= MAX_SEEDS {
+            break;
+        }
+        let seed_arch = match (mixed, s.mode) {
+            (true, Some(m)) => m.arch(),
+            _ => bin.arch,
+        };
+        let addr = match (bin.arch, s.mode) {
+            (Arch::Arm32, Some(SeedMode::Thumb)) => s.addr & !1,
+            (Arch::Arm32, _) => normalize_arm_seed(bin.arch, s.addr).0,
+            _ => s.addr,
+        };
+        if space.code_bytes(addr).is_none() {
+            continue;
+        }
+        if matches!((bin.arch, s.mode), (Arch::Arm32, None))
+            && normalize_arm_seed(bin.arch, s.addr).1
+        {
+            diags.push(Diagnostic {
+                addr: s.addr,
+                kind: DiagnosticKind::DecodeFailure,
+            });
+        }
+        paired.push((addr, seed_arch));
+    }
+    paired.sort_by_key(|(a, _)| *a);
+    paired.dedup();
+    (paired, diags)
 }
 
 /// Prologue-scan hits outside `reached` that decode. These seed the second
@@ -2248,8 +2402,11 @@ fn is_arm_push_lr(word: u32) -> bool {
 }
 
 /// Recursive-descent worklist state shared across seed rounds.
+///
+/// The project arch rides on each queued seed (see [`Walker::run`]), so
+/// the walker itself holds no arch: mixed-mode walks decode each address
+/// with its own seed's arch.
 struct Walker<'a> {
-    arch: Arch,
     space: &'a AddrSpace<'a>,
     decoded: BTreeMap<u64, Decoded>,
     jump_targets: BTreeSet<u64>,
@@ -2267,9 +2424,8 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn new(arch: Arch, space: &'a AddrSpace<'a>) -> Self {
+    fn new(space: &'a AddrSpace<'a>) -> Self {
         Self {
-            arch,
             space,
             decoded: BTreeMap::new(),
             jump_targets: BTreeSet::new(),
@@ -2283,6 +2439,12 @@ impl<'a> Walker<'a> {
 
     /// Decode from `seeds`, following direct branches, calls, and fallthrough.
     ///
+    /// Each seed carries its decode arch: the project arch, or a user
+    /// seed's explicit [`SeedMode`]. Direct successors inherit the
+    /// address's arch, so one Thumb seed walks Thumb code even inside an
+    /// ARM32 project; an address decoded under one arch is never
+    /// re-decoded under another (first wins).
+    ///
     /// Records bounded evidence while walking: executable bytes at a queued
     /// address that do not decode become [`DiagnosticKind::DecodeFailure`],
     /// and decoded branches/calls without a direct target become unresolved
@@ -2294,10 +2456,10 @@ impl<'a> Walker<'a> {
     /// sites (re-inserts of already-known sites are not repeated), so
     /// [`resolve_indirect_jumps`] can queue continuations without rescanning
     /// the whole diagnostic set.
-    fn run(&mut self, seeds: Vec<u64>) -> Result<Vec<u64>> {
+    fn run(&mut self, seeds: Vec<(u64, Arch)>) -> Result<Vec<u64>> {
         let mut stack = seeds;
         let mut fresh_jumps: Vec<u64> = Vec::new();
-        while let Some(va) = stack.pop() {
+        while let Some((va, item_arch)) = stack.pop() {
             if self.decoded.contains_key(&va) {
                 continue;
             }
@@ -2309,7 +2471,7 @@ impl<'a> Walker<'a> {
             let Some(bytes) = self.space.code_bytes(va).filter(|b| !b.is_empty()) else {
                 continue;
             };
-            let insn = match crate::disasm::disasm_first(self.arch, bytes, va) {
+            let insn = match crate::disasm::disasm_first(item_arch, bytes, va) {
                 Ok(Some(insn)) => insn,
                 Ok(None) => continue,
                 Err(Error::Invalid(_)) => {
@@ -2321,7 +2483,7 @@ impl<'a> Walker<'a> {
                 }
                 Err(e) => return Err(e),
             };
-            let flow = flow_of(self.arch, &insn);
+            let flow = flow_of(item_arch, &insn);
             // Thumb IT predication: the decoder prints no condition suffix
             // inside an IT block, so a predicated `bx lr` (or `pop {.., pc}`)
             // lifts as an unconditional return. Downgrade predicated
@@ -2329,7 +2491,7 @@ impl<'a> Walker<'a> {
             // indirect-jump diagnostic and the fallthrough stays reachable.
             // The stored `Insn` keeps its faithful decode; only the flow is
             // predicated (edge building reuses it below).
-            let opens_it = if self.arch == Arch::Thumb {
+            let opens_it = if item_arch == Arch::Thumb {
                 crate::disasm::it_block_len(&insn.mnem)
             } else {
                 None
@@ -2372,33 +2534,40 @@ impl<'a> Walker<'a> {
             }
             let next = va.wrapping_add(u64::from(insn.size));
             match flow {
-                Flow::Seq => stack.push(next),
+                Flow::Seq => stack.push((next, item_arch)),
                 Flow::Branch { target } => {
                     if let Some(t) = target {
                         self.jump_targets.insert(t);
-                        stack.push(t);
+                        stack.push((t, item_arch));
                     }
                 }
                 Flow::CBranch { target } => {
                     if let Some(t) = target {
                         self.jump_targets.insert(t);
-                        stack.push(t);
+                        stack.push((t, item_arch));
                     }
                     self.fallthroughs.insert(next);
-                    stack.push(next);
+                    stack.push((next, item_arch));
                 }
                 Flow::Call { target } => {
                     if let Some(t) = target {
                         self.jump_targets.insert(t);
                         self.call_targets.insert(t);
-                        stack.push(t);
+                        stack.push((t, item_arch));
                     }
                     self.fallthroughs.insert(next);
-                    stack.push(next);
+                    stack.push((next, item_arch));
                 }
                 Flow::Ret => {}
             }
-            self.decoded.insert(va, Decoded { insn, flow });
+            self.decoded.insert(
+                va,
+                Decoded {
+                    insn,
+                    flow,
+                    arch: item_arch,
+                },
+            );
         }
         Ok(fresh_jumps)
     }
@@ -2727,7 +2896,7 @@ fn resolve_indirect_jumps(
                 continue;
             }
             pairs.push((site, target));
-            for fresh in walk.run(vec![target])? {
+            for fresh in walk.run(vec![(target, arch)])? {
                 if !processed.contains(&fresh) {
                     pending.insert(fresh);
                 }
@@ -2749,7 +2918,7 @@ fn resolve_indirect_jumps(
             for slot in &table.slots {
                 slots.push((site, *slot));
             }
-            for fresh in walk.run(table.targets)? {
+            for fresh in walk.run(table.targets.iter().map(|&t| (t, arch)).collect())? {
                 if !processed.contains(&fresh) {
                     pending.insert(fresh);
                 }
@@ -2914,20 +3083,35 @@ fn collect_stubs<'a>(
 /// # Errors
 /// [`Error::Limit`] when instruction, function, or seed caps are exceeded.
 pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
+    analyze_with_seeds(bin, &[])
+}
+
+/// Run recursive descent with user-defined function seeds, and build
+/// functions, CFGs, callgraph, and xrefs.
+///
+/// `user` holds the active (non-excluded) `define-func` rows: each joins
+/// the authoritative seed set with its [`SeedMode`] decode arch, and
+/// entries it reaches gain [`DiscoveryReason::User`]. Undecodable seeds
+/// are inert (no function, no error), exactly like any other seed that
+/// fails to decode.
+///
+/// # Errors
+/// [`Error::Limit`] when instruction, function, or seed caps are exceeded.
+pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analysis> {
     let arch = bin.arch;
     let space = AddrSpace::new(bin);
 
     // Pass A: recursive descent over a plain VA worklist. Round one starts
-    // from entry/exports (or the segment base); round two picks up prologue
-    // hits in code round one never reached. Both rounds' seeds become
-    // entries; incidental pattern matches inside reached code do not.
-    let mut walk = Walker::new(arch, &space);
-    let (seeds1, seed_diags) = authoritative_seeds(&space, bin);
+    // from entry/exports/user seeds (or the segment base); round two picks
+    // up prologue hits in code round one never reached. Both rounds' seeds
+    // become entries; incidental pattern matches inside reached code do not.
+    let mut walk = Walker::new(&space);
+    let (seeds1, seed_diags) = authoritative_seeds(&space, bin, user);
     walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
     let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
     let seeds2 = prologue_seeds(arch, &space, &round1)?;
-    walk.run(seeds2.clone())?;
+    walk.run(seeds2.iter().map(|&a| (a, arch)).collect())?;
 
     if walk.decoded.is_empty() {
         let diagnostics = Diagnostics::collect(walk.diagnostics.into_iter().collect(), false, 0);
@@ -2947,7 +3131,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     // targets. Round-one hits are excluded by construction: `seeds2` only
     // holds prologue matches outside round-one code.
     let mut entries: BTreeSet<u64> = BTreeSet::new();
-    for s in seeds1.iter().chain(seeds2.iter()) {
+    for s in seeds1.iter().map(|(a, _)| a).chain(seeds2.iter()) {
         if walk.decoded.contains_key(s) {
             entries.insert(*s);
         }
@@ -2967,11 +3151,11 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
     }
     // Discovery provenance: every seed path that reached an entry.
     // `seeds1` holds the entry point, exports, symbol-table addresses,
-    // or the fallback base; `seeds2` holds prologue hits; `call_targets`
-    // holds direct calls. A fallback base that is neither entry nor
-    // export still counts as `Entry`: it seeded analysis as the entry
-    // point.
-    let seeds1_set: BTreeSet<u64> = seeds1.iter().copied().collect();
+    // user seeds, or the fallback base; `seeds2` holds prologue hits;
+    // `call_targets` holds direct calls. A fallback base that is neither
+    // entry nor export still counts as `Entry`: it seeded analysis as the
+    // entry point.
+    let seeds1_set: BTreeSet<u64> = seeds1.iter().map(|(a, _)| *a).collect();
     let seeds2_set: BTreeSet<u64> = seeds2.iter().copied().collect();
     // Normalized like the seeds: an odd ARM export address and its masked
     // seed are the same function.
@@ -2982,6 +3166,13 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         .collect();
     let entry_norm = bin.entry.map(|e| normalize_arm_seed(arch, e).0);
     let symbol_addrs: BTreeSet<u64> = bin.symbols.iter().map(|s| s.address).collect();
+    let user_set: BTreeSet<u64> = user
+        .iter()
+        .map(|s| match (arch, s.mode) {
+            (Arch::Arm32, _) => normalize_arm_seed(arch, s.addr).0,
+            _ => s.addr,
+        })
+        .collect();
     let mut reasons: BTreeMap<u64, BTreeSet<DiscoveryReason>> = BTreeMap::new();
     for e in &entries {
         let mut r = BTreeSet::new();
@@ -2999,6 +3190,9 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
         if seeds2_set.contains(e) {
             r.insert(DiscoveryReason::Prologue);
+        }
+        if user_set.contains(e) {
+            r.insert(DiscoveryReason::User);
         }
         if r.is_empty() && seeds1_set.contains(e) {
             r.insert(DiscoveryReason::Entry);
@@ -3156,6 +3350,7 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
                 cfg: DiGraphMap::new(),
                 inferred: BTreeSet::new(),
                 reasons: reasons.remove(e).unwrap_or_default(),
+                decode_arch: None,
             },
         );
     }
@@ -3169,6 +3364,14 @@ pub fn analyze(bin: &LoadedBinary) -> Result<Analysis> {
         }
     }
     functions.retain(|_, f| !f.blocks.is_empty());
+
+    // Per-function decode arch: the arch the entry decoded with, when it
+    // differs from the project arch (a user seed mode). Persisted per
+    // function so snapshot reload re-decodes identical bytes.
+    for (entry, f) in functions.iter_mut() {
+        let entry_arch = decoded.get(entry).map(|d| d.arch).unwrap_or(arch);
+        f.decode_arch = (entry_arch != arch).then_some(entry_arch);
+    }
 
     // Inferred edges: attribute each resolved `(site, target)` to its
     // site/target blocks, recording the edge only when attribution confirms
@@ -3713,14 +3916,15 @@ mod tests {
         )
         .expect("raw loads");
         let space = AddrSpace::new(&bin);
-        let mut walk = Walker::new(Arch::X86_32, &space);
-        let seeds = authoritative_seeds(&space, &bin).0;
+        let mut walk = Walker::new(&space);
+        let seeds = authoritative_seeds(&space, &bin, &[]).0;
         walk.run(seeds.clone()).expect("round one walks");
         let round1: BTreeSet<u64> = walk.decoded.keys().copied().collect();
         let seeds2 = prologue_seeds(Arch::X86_32, &space, &round1).expect("prologue scans");
-        walk.run(seeds2.clone()).expect("round two walks");
+        walk.run(seeds2.iter().map(|&a| (a, Arch::X86_32)).collect())
+            .expect("round two walks");
         let mut entries: BTreeSet<u64> = BTreeSet::new();
-        for s in seeds.iter().chain(seeds2.iter()) {
+        for s in seeds.iter().map(|(a, _)| a).chain(seeds2.iter()) {
             if walk.decoded.contains_key(s) {
                 entries.insert(*s);
             }

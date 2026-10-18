@@ -263,8 +263,9 @@ fn mapping_conflict_with_annotations_errors_without_writes() {
         diagnostics_omitted: q.analysis().diagnostics.omitted,
         inferred_truncated: q.analysis().diagnostics.inferred_truncated,
         inferred_omitted: q.analysis().diagnostics.inferred_omitted,
+        seeds_hash: 0,
     };
-    let err = db::save(&hog, &meta, q.analysis(), q.annotations()).unwrap_err();
+    let err = db::save(&hog, &meta, q.analysis(), q.annotations(), q.func_seeds()).unwrap_err();
     assert!(
         err.to_string().contains("separate --db"),
         "save must refuse cross-mapping overwrite: {err:?}"

@@ -268,7 +268,7 @@ fn build_slice_analysis() -> Analysis {
         }
         functions.insert(
             entry,
-            Function::from_parts(entry, None, blocks, &edges, Vec::new(), &[]),
+            Function::from_parts(entry, None, blocks, &edges, Vec::new(), &[], None),
         );
     }
     insn_addrs.push(0x9000);

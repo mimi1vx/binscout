@@ -9,23 +9,27 @@ itself is only ever read.
 On open, the stored content hash, loader mapping (auto versus
 explicit raw arch/base/entry), and analysis revision are compared
 against the request; a mismatch means the snapshot is discarded and
-the binary re-analyzes. Annotations carry over by address when the
-mapping is unchanged. A sidecar holding annotations opened under an
-incompatible mapping fails with a separate-DB error instead of
-remapping them. A sidecar written by an older schema version (current
-version 5, analysis revision 5) behaves the same way: annotations
-carry over and the binary re-analyzes. Row values are JSON.
+the binary re-analyzes. Annotations and user seeds carry over by address
+when the mapping is unchanged. A sidecar holding annotations or seeds
+opened under an incompatible mapping fails with a separate-DB error
+instead of remapping them. A sidecar written by an older schema version (current
+version 7, analysis revision 9) behaves the same way: annotations and
+seeds carry over and the binary re-analyzes. Row values are JSON.
+User seeds hash into the snapshot identity (`seeds_hash` in the
+metadata): every seed change re-analyzes before saving, so derived rows
+always match the stored seeds.
 
 | Table | Key | Value |
 |---|---|---|
-| `meta` | string | schema version, path, hash, size, arch, format, entry, mapping, analysis revision |
+| `meta` | string | schema version, path, hash, size, arch, format, entry, mapping, analysis revision, seed identity |
 | `binaries` | `0` | snapshot metadata |
-| `functions` | entry address | function row (name, callees, discovery reasons, inferred successors) |
+| `functions` | entry address | function row (name, callees, discovery reasons, decode-arch override, inferred successors) |
 | `blocks` | block key | block row (address range, successors, inferred successors) |
 | `xrefs` | xref key | cross-reference row (direct, `import`, and `inferred-code` kinds) |
 | `strings` | row index | extracted-string row |
 | `diagnostics` | record key | provenance row (unresolved indirect sites, decode failures) |
 | `annotations` | address | rename and/or comment |
+| `func_seeds` | address | user function seed (decode mode, excluded flag) |
 
 Block rows store address ranges plus per-instruction boundaries, not
 rendered instructions: the open path re-decodes each recorded address

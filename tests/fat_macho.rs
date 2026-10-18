@@ -395,8 +395,16 @@ fn bootstrap_slice(
         diagnostics_omitted: analysis.diagnostics.omitted,
         inferred_truncated: analysis.diagnostics.inferred_truncated,
         inferred_omitted: analysis.diagnostics.inferred_omitted,
+        seeds_hash: 0,
     };
-    db::save(&handle, &meta, &analysis, &annotations).expect("save slice snapshot");
+    db::save(
+        &handle,
+        &meta,
+        &analysis,
+        &annotations,
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("save slice snapshot");
     (db_path, hash, sha256)
 }
 

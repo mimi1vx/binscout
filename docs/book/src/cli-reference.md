@@ -46,6 +46,8 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `flirt-hints` | `binscout flirt-hints fw.elf [--addr 0x400000]` | FLIRT-like library hints (read-only): corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `--addr` keeps only the containing function's hints; suggested names stay hints, querying never writes a sidecar |
 | `stats` | `binscout stats fw.elf` | storage stats: binary size, sidecar DB size, analysis counts |
 | `annotate` | `binscout annotate fw.elf 0x400000 --rename main --comment "entry"` | read/write annotation at an address |
+| `define-func` | `binscout define-func fw.elf 0x401000 [--mode thumb]` | assert "there is code here": store a user function seed and re-analyze so the function materializes; any address accepted, undecodable seeds inert; `--mode arm`/`thumb` selects the 32-bit ARM decode (other arches reject it) |
+| `undefine-func` | `binscout undefine-func fw.elf 0x401000` | assert "this isn't a function": exclude the seed and re-analyze; the row is kept as data |
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, sha256, size, mapping, sorted rows); read-only, never creates a sidecar |
 | `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns row/change counts, default fails on conflicts |
 | `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; per-side `--db-a`/`--db-b` instead of the global `--db`, the global `--raw` mapping or `--fat-arch` selection (if any) applies to both |
@@ -57,6 +59,11 @@ additionally requires its block to be a block start belonging to that
 function. `annotate` without flags reads; `--rename ""` clears
 the rename, omitting `--comment` leaves the comment alone. `rename` only
 accepts known function entries; `comment` accepts any address.
+`define-func`/`undefine-func` persist a seed row and re-analyze
+immediately (printing `{"addr", "addr_hex", "mode", "excluded"}`), so the
+snapshot's derived rows always match its stored seeds; the seed set joins
+analysis with the `user` discovery reason (see [JSON
+protocol](json-protocol.md)).
 Structured struct-layout hints (`type-hint:{...}`, see [JSON
 protocol](json-protocol.md)) pass through `--comment` opaquely, e.g.
 `--comment 'type-hint:{"kind":"struct","name":"Foo","size":24,"fields":[]}'`.

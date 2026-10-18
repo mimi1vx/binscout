@@ -1,4 +1,4 @@
-//! binscout MCP server: 29 tools over a cached [`Project`].
+//! binscout MCP server: 31 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -9,7 +9,7 @@
 //! analysis or sidecar replay) while repeat calls only stat the binary and
 //! reuse the entry while its length and mtime agree. A changed file reopens
 //! outside any lock and replaces the entry. Reads never save; the sidecar
-//! is written solely by `load` and the annotation setters, exactly like
+//! is written solely by `load` and the annotation/seed setters, exactly like
 //! the CLI.
 //!
 //! Tool bodies are `async` and run the open inside
@@ -535,6 +535,40 @@ pub struct CommentParams {
     pub addr: String,
     /// Comment text (empty string clears).
     pub comment: String,
+}
+
+/// Parameters for the `define_func` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DefineFuncParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Seed address (`0x`-hex or decimal string, any address accepted).
+    pub addr: String,
+    /// 32-bit ARM decode mode: `arm` or `thumb` (other arches reject it).
+    pub mode: Option<String>,
+}
+
+/// Parameters for the `undefine_func` tool.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UndefineFuncParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Seed address (`0x`-hex or decimal string, any address accepted).
+    pub addr: String,
 }
 
 /// Parameters for the `search_bytes` tool: bounded byte-pattern search.
@@ -1338,6 +1372,50 @@ impl BinscoutMcp {
         proj.set_comment(addr, &comment)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         ok(proj.annotation_json(addr))
+    }
+
+    #[tool(
+        name = "define_func",
+        description = "Define a user function seed at any address (binary untouched) and re-analyze so the function materializes when the bytes decode; optional 32-bit ARM decode mode arm/thumb"
+    )]
+    async fn define_func(&self, p: Parameters<DefineFuncParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (addr_s, mode_s) = (p.addr.clone(), p.mode.clone());
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let mode = mode_s
+            .as_deref()
+            .map(crate::analysis::SeedMode::parse)
+            .transpose()
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
+        proj.define_func(addr, mode)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        ok(proj.seed_json(addr))
+    }
+
+    #[tool(
+        name = "undefine_func",
+        description = "Exclude a function seed at any address (binary untouched) and re-analyze; the row is kept as data"
+    )]
+    async fn undefine_func(&self, p: Parameters<UndefineFuncParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let db_mutex = self.db_lock(&entry.key.db);
+        let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        proj.undefine_func(addr)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        ok(proj.seed_json(addr))
     }
 
     #[tool(

@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
-    Analysis, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref, XrefKind, analyze,
-    diagnostic_detail, import_index, import_slots,
+    Analysis, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref, XrefKind,
+    analyze_with_seeds, diagnostic_detail, import_index, import_slots,
 };
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
@@ -507,8 +507,9 @@ struct EnrichCtx<'a> {
 /// Opened analysis project: binary plus its cached analysis and annotations.
 ///
 /// The binary file is only ever read; all persistence (analysis snapshot,
-/// renames, comments) goes to the `redb` sidecar at [`Project::db_path`],
-/// written solely by [`Project::save`] and the annotation setters.
+/// renames, comments, function seeds) goes to the `redb` sidecar at
+/// [`Project::db_path`], written solely by [`Project::save`] and the
+/// annotation/seed setters.
 #[derive(Debug)]
 pub struct Project {
     path: PathBuf,
@@ -518,7 +519,12 @@ pub struct Project {
     size: u64,
     binary: LoadedBinary,
     analysis: Analysis,
+    /// Seed identity the in-memory analysis was taken over (see
+    /// [`db::seeds_hash`]): the fallback writers re-analyze when merged
+    /// seeds diverge from this instead of saving stale layouts.
+    analysis_seeds_hash: u64,
     annotations: BTreeMap<u64, Annotation>,
+    func_seeds: BTreeMap<u64, crate::db::FuncSeed>,
     mapping: db::StoredMapping,
     stale_annotations_dropped: usize,
     stale_warning: Option<String>,
@@ -655,6 +661,7 @@ impl Project {
                     strings,
                     diagnostics,
                     annotations,
+                    seeds,
                     meta,
                 } = *hit;
                 let analysis = crate::analysis::rebuild(
@@ -680,7 +687,9 @@ impl Project {
                     size,
                     binary: loaded,
                     analysis,
+                    analysis_seeds_hash: meta.seeds_hash,
                     annotations,
+                    func_seeds: seeds,
                     mapping,
                     stale_annotations_dropped: 0,
                     stale_warning: None,
@@ -689,6 +698,7 @@ impl Project {
             Some(db::Snapshot::Stale {
                 meta: stale_meta,
                 annotations,
+                seeds,
             }) => Self::reanalyze(
                 binary,
                 db_path,
@@ -700,6 +710,7 @@ impl Project {
                 size,
                 Some(stale_meta),
                 annotations,
+                seeds,
             ),
             Some(db::Snapshot::Miss) | None => Self::reanalyze(
                 binary,
@@ -712,22 +723,23 @@ impl Project {
                 size,
                 None,
                 BTreeMap::new(),
+                BTreeMap::new(),
             ),
         }
     }
 
-    /// Re-analyze `bytes` from scratch, carrying `annotations` forward when plausible.
+    /// Re-analyze `bytes` from scratch, carrying user rows forward when plausible.
     ///
-    /// Stale sidecars keep user renames and comments by address only when
-    /// [`db::stale_carry_plausible`] holds (same path or same
+    /// Stale sidecars keep user renames, comments, and seeds by address only
+    /// when [`db::stale_carry_plausible`] holds (same path or same
     /// arch/format/entry); otherwise the rows belong to an unrelated binary
     /// and are dropped with a stale warning. The derived analysis always
     /// comes from the current bytes, never from storage. A mapping mismatch
-    /// over populated annotations never reaches this path:
+    /// over populated user rows never reaches this path:
     /// [`db::load_cached`] errors first.
     #[allow(
         clippy::too_many_arguments,
-        reason = "open plumbing: paths plus raw/fat mapping, content, and annotations"
+        reason = "open plumbing: paths plus raw/fat mapping, content, and user rows"
     )]
     fn reanalyze(
         binary: &Path,
@@ -740,18 +752,20 @@ impl Project {
         size: u64,
         stale_meta: Option<db::BinaryMeta>,
         annotations: BTreeMap<u64, Annotation>,
+        seeds: BTreeMap<u64, crate::db::FuncSeed>,
     ) -> Result<Self> {
         let mapping = mapping_for(raw, fat_arch)?;
         let loaded = match raw {
             Some(opts) => load_raw(&bytes, opts)?,
             None => load_or_raw(&bytes, fat_arch)?,
         };
-        let analysis = analyze(&loaded)?;
+        let user = active_user_seeds(&seeds);
+        let analysis = analyze_with_seeds(&loaded, &user)?;
         let current_path = binary.display().to_string();
         let current_arch = db::arch_name(loaded.arch).to_string();
         let current_format = db::format_name(loaded.format).to_string();
         let current_entry = loaded.entry;
-        let (annotations, stale_annotations_dropped, stale_warning) = match stale_meta {
+        let (annotations, seeds, stale_annotations_dropped, stale_warning) = match stale_meta {
             Some(stored)
                 if !db::stale_carry_plausible(
                     &stored,
@@ -761,7 +775,7 @@ impl Project {
                     current_entry,
                 ) =>
             {
-                let n = annotations.len();
+                let n = annotations.len() + seeds.len();
                 let warning = if n > 0 {
                     Some(format!(
                         "dropped {n} stale annotation(s): sidecar was written for unrelated binary (path/arch/format/entry mismatch); not carried"
@@ -769,9 +783,9 @@ impl Project {
                 } else {
                     None
                 };
-                (BTreeMap::new(), n, warning)
+                (BTreeMap::new(), BTreeMap::new(), n, warning)
             }
-            _ => (annotations, 0, None),
+            _ => (annotations, seeds, 0, None),
         };
         Ok(Self {
             path: binary.to_path_buf(),
@@ -781,7 +795,9 @@ impl Project {
             size,
             binary: loaded,
             analysis,
+            analysis_seeds_hash: db::seeds_hash(&seeds),
             annotations,
+            func_seeds: seeds,
             mapping,
             stale_annotations_dropped,
             stale_warning,
@@ -796,11 +812,22 @@ impl Project {
     /// [`Error::Storage`] on any `redb` or encoding failure.
     pub fn save(&self) -> Result<()> {
         let db = db::open_db(&self.db_path)?;
-        db::save(&db, &self.meta(), &self.analysis, &self.annotations)?;
+        db::save(
+            &db,
+            &self.meta(),
+            &self.analysis,
+            &self.annotations,
+            &self.func_seeds,
+        )?;
         Ok(())
     }
 
-    fn meta(&self) -> BinaryMeta {
+    /// Snapshot identity for `seeds` under the current analysis counts.
+    fn meta_for(
+        &self,
+        analysis: &Analysis,
+        seeds: &BTreeMap<u64, crate::db::FuncSeed>,
+    ) -> BinaryMeta {
         BinaryMeta {
             version: db::SCHEMA_VERSION,
             binary_path: self.path.display().to_string(),
@@ -814,11 +841,17 @@ impl Project {
             reason: None,
             mapping: Some(self.mapping.clone()),
             analysis_rev: Some(db::ANALYSIS_REVISION),
-            diagnostics_truncated: self.analysis.diagnostics.truncated,
-            diagnostics_omitted: self.analysis.diagnostics.omitted,
-            inferred_truncated: self.analysis.diagnostics.inferred_truncated,
-            inferred_omitted: self.analysis.diagnostics.inferred_omitted,
+            seeds_hash: db::seeds_hash(seeds),
+            diagnostics_truncated: analysis.diagnostics.truncated,
+            diagnostics_omitted: analysis.diagnostics.omitted,
+            inferred_truncated: analysis.diagnostics.inferred_truncated,
+            inferred_omitted: analysis.diagnostics.inferred_omitted,
         }
+    }
+
+    /// Snapshot identity for the in-memory analysis and seeds.
+    fn meta(&self) -> BinaryMeta {
+        self.meta_for(&self.analysis, &self.func_seeds)
     }
 
     /// Loader mapping this project was opened with (auto vs explicit raw).
@@ -835,65 +868,127 @@ impl Project {
     /// Tries [`db::save_annotation`](crate::db::save_annotation) first: when
     /// the sidecar holds a snapshot for this binary and mapping, only the
     /// `annotations` row changes. Otherwise (fresh DB or same-mapping
-    /// content mismatch) rewrites the full snapshot. The fallback merges
-    /// the single changed row onto the sidecar's current annotations when
+    /// content mismatch) rewrites the full snapshot, re-analyzing first
+    /// when the seeds diverged. The fallback merges
+    /// the single changed row onto the sidecar's current user rows when
     /// the stored lineage is plausible (see [`db::stale_carry_plausible`),
     /// so rows another process wrote in between are kept; an unrelated
     /// sidecar is replaced with the in-memory state instead. A populated
     /// sidecar under an incompatible mapping errors instead of
     /// overwriting.
-    fn persist_annotation(&self, addr: u64) -> Result<()> {
-        let db = db::open_db(&self.db_path)?;
+    fn persist_annotation(&mut self, addr: u64) -> Result<()> {
         let ann = self.annotations.get(&addr).filter(|a| !a.is_empty());
-        match db::save_annotation(&db, &self.meta(), addr, ann)? {
+        let fast = {
+            let db = db::open_db(&self.db_path)?;
+            db::save_annotation(&db, &self.meta(), addr, ann)?
+        };
+        match fast {
             db::AnnotationSave::Fast => Ok(()),
             db::AnnotationSave::NeedsFull => {
-                let merged = self.merged_fallback_annotations(&db, [(addr, ann.cloned())])?;
-                db::save(&db, &self.meta(), &self.analysis, &merged)?;
-                Ok(())
+                let changes = BTreeMap::from([(addr, ann.cloned())]);
+                self.persist_merged(changes, BTreeMap::new())
             }
         }
     }
 
-    /// Merge fallback annotations for a full-snapshot rewrite.
+    /// Merge pending changes over the sidecar state, re-analyze when the
+    /// seeds diverged, save, and adopt the merged seeds.
     ///
-    /// Reads the sidecar's current annotations and, when the stored lineage
-    /// is plausible for this project, applies `changes` (`None` deletes) on
-    /// top so concurrent rows survive. Otherwise (fresh DB or unrelated
-    /// sidecar) falls back to the in-memory annotations with `changes`
-    /// applied. Single-row and batch write paths share this helper.
-    fn merged_fallback_annotations(
+    /// Reads the sidecar's current user rows and, when the stored lineage
+    /// is plausible for this project, applies `ann_changes` and
+    /// `seed_changes` on top so concurrent rows survive. Otherwise (fresh
+    /// DB or unrelated sidecar) falls back to the in-memory rows with the
+    /// changes applied. When the merged seeds differ from the seeds the
+    /// in-memory analysis was taken over
+    /// ([`Project`](Self::analysis_seeds_hash)), the analysis is rebuilt
+    /// from the current bytes before saving, so derived rows always match
+    /// the stored seeds. Memory adopts the merged seeds (and the rebuilt
+    /// analysis, if any); annotations keep the existing apply-changes
+    /// semantics. A populated sidecar under an incompatible mapping errors
+    /// from the save instead of overwriting.
+    fn persist_merged(
+        &mut self,
+        ann_changes: BTreeMap<u64, Option<Annotation>>,
+        seed_changes: BTreeMap<u64, Option<crate::db::FuncSeed>>,
+    ) -> Result<()> {
+        let db = db::open_db(&self.db_path)?;
+        let (merged_ann, merged_seeds) =
+            self.merged_fallback_state(&db, &ann_changes, &seed_changes)?;
+        let merged_hash = db::seeds_hash(&merged_seeds);
+        let analysis = if merged_hash != self.analysis_seeds_hash {
+            let user = active_user_seeds(&merged_seeds);
+            analyze_with_seeds(&self.binary, &user)?
+        } else {
+            self.analysis.clone()
+        };
+        db::save(
+            &db,
+            &self.meta_for(&analysis, &merged_seeds),
+            &analysis,
+            &merged_ann,
+            &merged_seeds,
+        )?;
+        crate::annotations::apply_changes(&mut self.annotations, &ann_changes);
+        // Seeds adopt the merged map wholesale: the saved analysis was
+        // taken over exactly these rows.
+        self.func_seeds = merged_seeds;
+        if merged_hash != self.analysis_seeds_hash {
+            self.analysis = analysis;
+            self.analysis_seeds_hash = merged_hash;
+        }
+        Ok(())
+    }
+
+    /// Merge fallback user rows for a full-snapshot rewrite.
+    ///
+    /// Reads the sidecar's current annotations and seeds and, when the
+    /// stored lineage is plausible for this project, applies `ann_changes`
+    /// (`None` deletes) and `seed_changes` on top so concurrent rows
+    /// survive. Otherwise (fresh DB or unrelated sidecar) falls back to the
+    /// in-memory rows with the changes applied. Annotation and seed write
+    /// paths share this helper.
+    fn merged_fallback_state(
         &self,
         db: &redb::Database,
-        changes: impl IntoIterator<Item = (u64, Option<Annotation>)>,
-    ) -> Result<BTreeMap<u64, Annotation>> {
-        let changes: BTreeMap<u64, Option<Annotation>> = changes.into_iter().collect();
-        let Some((persisted_meta, mut current)) = db::load_meta_and_annotations(db)? else {
-            let mut full = self.annotations.clone();
-            crate::annotations::apply_changes(&mut full, &changes);
-            return Ok(full);
+        ann_changes: &BTreeMap<u64, Option<Annotation>>,
+        seed_changes: &BTreeMap<u64, Option<crate::db::FuncSeed>>,
+    ) -> Result<(
+        BTreeMap<u64, Annotation>,
+        BTreeMap<u64, crate::db::FuncSeed>,
+    )> {
+        let base = match db::load_meta_and_annotations(db)? {
+            Some((persisted_meta, annotations, seeds)) => {
+                if persisted_meta.mapping != self.meta().mapping {
+                    None
+                } else {
+                    let ours = self.meta();
+                    let plausible = persisted_meta.fast_write_eq(&ours)
+                        || db::stale_carry_plausible(
+                            &persisted_meta,
+                            &ours.binary_path,
+                            &ours.arch,
+                            &ours.format,
+                            ours.entry,
+                        );
+                    plausible.then_some((annotations, seeds))
+                }
+            }
+            None => None,
         };
-        if persisted_meta.mapping != self.meta().mapping {
-            let mut full = self.annotations.clone();
-            crate::annotations::apply_changes(&mut full, &changes);
-            return Ok(full);
+        match base {
+            Some((mut annotations, mut seeds)) => {
+                crate::annotations::apply_changes(&mut annotations, ann_changes);
+                crate::annotations::apply_seed_changes(&mut seeds, seed_changes);
+                Ok((annotations, seeds))
+            }
+            None => {
+                let mut annotations = self.annotations.clone();
+                crate::annotations::apply_changes(&mut annotations, ann_changes);
+                let mut seeds = self.func_seeds.clone();
+                crate::annotations::apply_seed_changes(&mut seeds, seed_changes);
+                Ok((annotations, seeds))
+            }
         }
-        let ours = self.meta();
-        let plausible = persisted_meta.fast_write_eq(&ours)
-            || db::stale_carry_plausible(
-                &persisted_meta,
-                &ours.binary_path,
-                &ours.arch,
-                &ours.format,
-                ours.entry,
-            );
-        if !plausible {
-            let mut full = self.annotations.clone();
-            crate::annotations::apply_changes(&mut full, &changes);
-            return Ok(full);
-        }
-        crate::annotations::apply_changes(&mut current, &changes);
-        Ok(current)
     }
 
     /// Agent-facing summary; always JSON-serializable.
@@ -1317,18 +1412,129 @@ impl Project {
         }
         let mut changes = BTreeMap::new();
         changes.insert(addr, next);
-        let db = db::open_db(&self.db_path)?;
-        match db::save_annotation_batch(&db, &self.meta(), &changes)? {
-            db::AnnotationSave::Fast => {}
+        let fast = {
+            let db = db::open_db(&self.db_path)?;
+            db::save_annotation_batch(&db, &self.meta(), &changes)?
+        };
+        match fast {
+            db::AnnotationSave::Fast => {
+                crate::annotations::apply_changes(&mut self.annotations, &changes);
+            }
             db::AnnotationSave::NeedsFull => {
-                let owned: BTreeMap<u64, Option<Annotation>> =
-                    changes.iter().map(|(&k, v)| (k, v.clone())).collect();
-                let full = self.merged_fallback_annotations(&db, owned)?;
-                db::save(&db, &self.meta(), &self.analysis, &full)?;
+                self.persist_merged(changes, BTreeMap::new())?;
             }
         }
-        crate::annotations::apply_changes(&mut self.annotations, &changes);
         Ok(())
+    }
+
+    /// Define a user function seed at `addr`.
+    ///
+    /// Records the agent assertion "there is code at `addr`" (shellcode,
+    /// firmware vectors, obfuscated code, missed callbacks) and
+    /// re-analyzes immediately so the function materializes when the bytes
+    /// decode. Any address is accepted, like [`Project::set_comment`];
+    /// undecodable seeds are inert (no function, no error). Defining an
+    /// excluded address re-activates it. Persists immediately via a full
+    /// snapshot rewrite carrying the new seeds hash.
+    ///
+    /// `mode` selects the 32-bit ARM decode (`Arm`/`Thumb`) and is
+    /// rejected on other architectures; `None` decodes with the project
+    /// arch. The binary is never modified.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `mode` is set on a non-32-bit-ARM project,
+    /// [`Error::Limit`] past the seed row budget or analysis budgets,
+    /// [`Error::Storage`] when the snapshot cannot be persisted.
+    pub fn define_func(
+        &mut self,
+        addr: u64,
+        mode: Option<crate::analysis::SeedMode>,
+    ) -> Result<()> {
+        self.check_seed_mode(mode)?;
+        let mut seeds = self.func_seeds.clone();
+        if !seeds.contains_key(&addr) && seeds.len() >= crate::db::MAX_SNAPSHOT_SEEDS {
+            return Err(Error::Limit("func seeds exceed cap".to_string()));
+        }
+        seeds.insert(
+            addr,
+            crate::db::FuncSeed {
+                mode,
+                excluded: false,
+            },
+        );
+        let mut changes = BTreeMap::new();
+        changes.insert(addr, seeds.get(&addr).copied());
+        self.persist_merged(BTreeMap::new(), changes)
+    }
+
+    /// Undefine the function seed at `addr`.
+    ///
+    /// Records the agent assertion "this isn't a function": the address is
+    /// excluded from seeding and re-analysis drops the function unless
+    /// another seed path still reaches it. The row is kept as data (not
+    /// deleted), so the verdict survives reloads and transfers. Any
+    /// address is accepted, even one never defined. Persists immediately
+    /// via a full snapshot rewrite. The binary is never modified.
+    ///
+    /// # Errors
+    /// [`Error::Limit`] past analysis budgets, [`Error::Storage`] when the
+    /// snapshot cannot be persisted.
+    pub fn undefine_func(&mut self, addr: u64) -> Result<()> {
+        let mode = self.func_seeds.get(&addr).and_then(|s| s.mode);
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            addr,
+            Some(crate::db::FuncSeed {
+                mode,
+                excluded: true,
+            }),
+        );
+        self.persist_merged(BTreeMap::new(), changes)
+    }
+
+    /// Reject a seed decode mode outside 32-bit ARM projects.
+    fn check_seed_mode(&self, mode: Option<crate::analysis::SeedMode>) -> Result<()> {
+        if mode.is_some()
+            && !matches!(
+                self.binary.arch,
+                crate::disasm::Arch::Arm32 | crate::disasm::Arch::Thumb
+            )
+        {
+            return Err(Error::Invalid(format!(
+                "func seed mode needs a 32-bit ARM project (arch {})",
+                crate::db::arch_name(self.binary.arch),
+            )));
+        }
+        Ok(())
+    }
+
+    /// All user-defined function seeds keyed by address.
+    #[must_use]
+    pub fn func_seeds(&self) -> &BTreeMap<u64, crate::db::FuncSeed> {
+        &self.func_seeds
+    }
+
+    /// Seed row at `addr` as JSON (`mode`/`excluded`, with `addr` twins).
+    ///
+    /// Absent rows report `mode: null, excluded: false`, mirroring
+    /// [`Project::annotation_json`].
+    #[must_use]
+    pub fn seed_json(&self, addr: u64) -> serde_json::Value {
+        let (addr_json, addr_hex) = addr_pair(addr);
+        match self.func_seeds.get(&addr) {
+            Some(s) => serde_json::json!({
+                "addr": addr_json,
+                "addr_hex": addr_hex,
+                "mode": s.mode.map(|m| m.as_str()),
+                "excluded": s.excluded,
+            }),
+            None => serde_json::json!({
+                "addr": addr_json,
+                "addr_hex": addr_hex,
+                "mode": null,
+                "excluded": false,
+            }),
+        }
     }
 
     /// Store a structured struct-layout/sizeof hint at `addr`.
@@ -1364,16 +1570,18 @@ impl Project {
         }
     }
 
-    /// Export renames and comments as a portable JSON interchange document.
+    /// Export renames, comments, and function seeds as a portable JSON
+    /// interchange document.
     ///
     /// The document carries the format revision, the binary's SHA-256 plus
-    /// size, the effective loader mapping, and the sorted non-empty rows;
+    /// size, the effective loader mapping, the sorted non-empty annotation
+    /// rows, and the sorted seed rows (excluded rows included);
     /// host paths and analysis snapshots are excluded. Strictly read-only:
     /// no sidecar is created or modified. Fails explicitly past the
     /// interchange size cap instead of emitting an unimportable document.
     ///
     /// # Errors
-    /// [`Error::Limit`] past annotation or document budgets,
+    /// [`Error::Limit`] past annotation, seed, or document budgets,
     /// [`Error::Storage`] on encoding failure.
     pub fn export_annotations(&self) -> Result<String> {
         crate::annotations::build_document(
@@ -1381,29 +1589,33 @@ impl Project {
             self.size,
             &self.mapping,
             &self.annotations,
+            &self.func_seeds,
         )
     }
 
     /// Import a document from [`Project::export_annotations`] atomically.
     ///
     /// The whole document is validated before a single transaction:
-    /// identity, mapping, duplicates, budgets, rename targets, and merge
-    /// conflicts. On success the changes persist in one transaction (an
-    /// annotation-only batch write, or a full snapshot rewrite when no
-    /// matching snapshot exists) and memory updates only after the commit;
-    /// on any failure the DB and the in-memory annotations are unchanged.
+    /// identity, mapping, duplicates, budgets, rename targets, seed modes,
+    /// and merge conflicts. On success the changes persist in one
+    /// transaction (an annotation-only batch write, or a full snapshot
+    /// rewrite when no matching snapshot exists or the seeds changed, with
+    /// a re-analysis first so derived rows match the stored seeds) and
+    /// memory updates only after the commit; on any failure the DB and the
+    /// in-memory rows are unchanged.
     /// Default (`overwrite == false`) fails on differing existing field
     /// values while equal values and fills of absent fields succeed;
     /// `overwrite == true` replaces supplied fields only (absent fields
     /// untouched, empty strings clear). Rows outside the document remain.
     /// Rename targets must be known function entries; comments keep the
-    /// any-address contract.
+    /// any-address contract, as do seed rows (with seed modes restricted
+    /// to 32-bit ARM projects).
     ///
     /// # Errors
-    /// [`Error::Invalid`] on malformed documents, duplicates, and
-    /// default-mode conflicts; [`Error::Storage`] on identity/mapping
-    /// mismatches; [`Error::NotFound`] on unknown rename targets;
-    /// [`Error::Limit`] past input/field/row budgets.
+    /// [`Error::Invalid`] on malformed documents, duplicates, bad seed
+    /// modes, and default-mode conflicts; [`Error::Storage`] on
+    /// identity/mapping mismatches; [`Error::NotFound`] on unknown rename
+    /// targets; [`Error::Limit`] past input/field/row budgets.
     pub fn import_annotations(
         &mut self,
         document: &str,
@@ -1420,22 +1632,34 @@ impl Project {
             &self.annotations,
             overwrite,
         )?;
+        let seed_changes = crate::annotations::validate_seed_rows(
+            &doc.func_seeds,
+            self.binary.arch,
+            &self.func_seeds,
+            overwrite,
+        )?;
         let summary = crate::annotations::ImportSummary {
-            rows: doc.annotations.len(),
-            changed: changes.len(),
+            rows: doc.annotations.len() + doc.func_seeds.len(),
+            changed: changes.len() + seed_changes.len(),
         };
-        if !changes.is_empty() {
-            let db = db::open_db(&self.db_path)?;
-            match db::save_annotation_batch(&db, &self.meta(), &changes)? {
-                db::AnnotationSave::Fast => {}
+        if changes.is_empty() && seed_changes.is_empty() {
+            return Ok(summary);
+        }
+        if seed_changes.is_empty() {
+            let fast = {
+                let db = db::open_db(&self.db_path)?;
+                db::save_annotation_batch(&db, &self.meta(), &changes)?
+            };
+            match fast {
+                db::AnnotationSave::Fast => {
+                    crate::annotations::apply_changes(&mut self.annotations, &changes);
+                }
                 db::AnnotationSave::NeedsFull => {
-                    let owned: BTreeMap<u64, Option<Annotation>> =
-                        changes.iter().map(|(&k, v)| (k, v.clone())).collect();
-                    let merged = self.merged_fallback_annotations(&db, owned)?;
-                    db::save(&db, &self.meta(), &self.analysis, &merged)?;
+                    self.persist_merged(changes, BTreeMap::new())?;
                 }
             }
-            crate::annotations::apply_changes(&mut self.annotations, &changes);
+        } else {
+            self.persist_merged(changes, seed_changes)?;
         }
         Ok(summary)
     }
@@ -2582,6 +2806,18 @@ pub fn addr_pair(addr: u64) -> (u64, String) {
 #[must_use]
 pub fn opt_addr_pair(addr: Option<u64>) -> (Option<u64>, Option<String>) {
     (addr, addr.map(addr_hex))
+}
+
+/// Active user seeds for analysis: non-excluded rows as [`UserSeed`]s.
+///
+/// Excluded rows are kept as data but never seed analysis; `None` modes
+/// decode with the project arch.
+fn active_user_seeds(seeds: &BTreeMap<u64, crate::db::FuncSeed>) -> Vec<crate::analysis::UserSeed> {
+    seeds
+        .iter()
+        .filter(|(_, s)| !s.excluded)
+        .map(|(&addr, s)| crate::analysis::UserSeed { addr, mode: s.mode })
+        .collect()
 }
 
 /// Parse a CLI/MCP address: `0x`-prefixed hex or plain decimal.
