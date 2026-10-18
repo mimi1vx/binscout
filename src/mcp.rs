@@ -1,4 +1,4 @@
-//! binscout MCP server: 35 tools over a cached [`Project`].
+//! binscout MCP server: 36 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -742,6 +742,37 @@ pub struct DiffParams {
     /// Fat Mach-O slice selection, applied to both binaries (the two-builds
     /// case shares one selection); required for fat containers.
     pub fat_arch: Option<String>,
+    /// First row of each of `added`/`removed`/`changed` to return.
+    pub offset: Option<usize>,
+    /// Max rows per list (clipped to the 1024-row budget).
+    pub limit: Option<usize>,
+    /// Embed the side-B rename transfer document (side-A renames mapped
+    /// through the pairing, ready for `annotations_import`).
+    pub transfer_renames: Option<bool>,
+}
+
+/// Parameters for the `diff_func` tool: block-level delta between two
+/// functions, one from each binary.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DiffFuncParams {
+    /// Path of the first (baseline) binary.
+    pub binary_a: String,
+    /// Path of the second (new) binary.
+    pub binary_b: String,
+    /// Function address on side A (snaps to the containing entry).
+    pub addr_a: String,
+    /// Function address on side B (snaps to the containing entry).
+    pub addr_b: String,
+    /// Explicit project DB path for side A.
+    pub db_a: Option<String>,
+    /// Explicit project DB path for side B.
+    pub db_b: Option<String>,
+    /// Optional explicit raw mapping, applied to both binaries (the
+    /// two-builds case shares one mapping).
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection, applied to both binaries (the two-builds
+    /// case shares one selection); required for fat containers.
+    pub fat_arch: Option<String>,
 }
 
 /// One operation inside a `batch` call: a read-only tool
@@ -1222,8 +1253,8 @@ fn run_batch_op(
                 "batch rejects write tool {tool:?}: run it as a top-level call to keep writes explicit"
             ))
         }
-        "diff" => Err(
-            "batch rejects \"diff\": it opens two binaries; call it as a top-level tool"
+        "diff" | "diff_func" => Err(
+            "batch rejects two-binary diff tools: they open two binaries; call them as top-level tools"
                 .to_string(),
         ),
         "batch" => Err("batch ops cannot nest".to_string()),
@@ -2146,11 +2177,14 @@ impl BinscoutMcp {
 
     #[tool(
         name = "diff",
-        description = "Function-level diff between two binaries: byte-identical pairs are matched, content-matched pairs are changed (with the match reason), the rest is added (only in B) / removed (only in A). Both projects open read-only, never creating or modifying a sidecar"
+        description = "Function-level diff between two binaries: byte-identical pairs are matched, content-matched pairs are changed (with the match reason; neighbours of matched pairs propagate BinDiff-style), the rest is added (only in B) / removed (only in A). Each list pages under the protocol-1 envelope via offset/limit; transfer_renames embeds the side-B rename document for annotations_import. Both projects open read-only, never creating or modifying a sidecar"
     )]
     async fn diff(&self, p: Parameters<DiffParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         raw_options(p.raw.as_ref())?;
+        let offset = p.offset.unwrap_or(0);
+        let limit = p.limit.unwrap_or(50);
+        let transfer = p.transfer_renames.unwrap_or(false);
         // Both sides open concurrently on the blocking pool; each lands on
         // its own cache entry (same binary twice shares one). Guards take
         // in pointer order below, so opposite-side concurrent diffs cannot
@@ -2170,21 +2204,84 @@ impl BinscoutMcp {
             )
         );
         let (entry_a, entry_b) = (entry_a?, entry_b?);
-        if Arc::ptr_eq(&entry_a, &entry_b) {
+        let report = if Arc::ptr_eq(&entry_a, &entry_b) {
             let proj = entry_a.lock_project();
-            let report = crate::diff::diff_projects(&proj, &proj);
-            ok(serde_json::to_value(report).expect("diff report serializes"))
+            let mut report = crate::diff::diff_projects_page(&proj, &proj, offset, limit);
+            if transfer {
+                report.transfer = Some(
+                    crate::diff::transfer_renames(&proj, &proj)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                );
+            }
+            report
         } else if Arc::as_ptr(&entry_a) < Arc::as_ptr(&entry_b) {
             let a = entry_a.lock_project();
             let b = entry_b.lock_project();
-            let report = crate::diff::diff_projects(&a, &b);
-            ok(serde_json::to_value(report).expect("diff report serializes"))
+            let mut report = crate::diff::diff_projects_page(&a, &b, offset, limit);
+            if transfer {
+                report.transfer = Some(
+                    crate::diff::transfer_renames(&a, &b)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                );
+            }
+            report
         } else {
             let b = entry_b.lock_project();
             let a = entry_a.lock_project();
-            let report = crate::diff::diff_projects(&a, &b);
-            ok(serde_json::to_value(report).expect("diff report serializes"))
-        }
+            let mut report = crate::diff::diff_projects_page(&a, &b, offset, limit);
+            if transfer {
+                report.transfer = Some(
+                    crate::diff::transfer_renames(&a, &b)
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+                );
+            }
+            report
+        };
+        ok(serde_json::to_value(report).expect("diff report serializes"))
+    }
+
+    #[tool(
+        name = "diff_func",
+        description = "Block- and instruction-level delta between two functions, one from each binary: blocks match by hash then by position, and every matched block carries a bounded instruction edit script. Both addresses snap to their containing entries. Both projects open read-only, never creating or modifying a sidecar"
+    )]
+    async fn diff_func(&self, p: Parameters<DiffFuncParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        raw_options(p.raw.as_ref())?;
+        let addr_a = crate::parse_addr(&p.addr_a)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let addr_b = crate::parse_addr(&p.addr_b)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        let (entry_a, entry_b) = tokio::join!(
+            self.open_owned(
+                p.binary_a.clone(),
+                p.db_a.clone(),
+                p.raw.clone(),
+                p.fat_arch.clone(),
+            ),
+            self.open_owned(
+                p.binary_b.clone(),
+                p.db_b.clone(),
+                p.raw.clone(),
+                p.fat_arch.clone(),
+            )
+        );
+        let (entry_a, entry_b) = (entry_a?, entry_b?);
+        let report = if Arc::ptr_eq(&entry_a, &entry_b) {
+            let proj = entry_a.lock_project();
+            crate::diff::diff_func(&proj, addr_a, &proj, addr_b)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        } else if Arc::as_ptr(&entry_a) < Arc::as_ptr(&entry_b) {
+            let a = entry_a.lock_project();
+            let b = entry_b.lock_project();
+            crate::diff::diff_func(&a, addr_a, &b, addr_b)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        } else {
+            let b = entry_b.lock_project();
+            let a = entry_a.lock_project();
+            crate::diff::diff_func(&a, addr_a, &b, addr_b)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        };
+        ok(serde_json::to_value(report).expect("func diff report serializes"))
     }
 
     #[tool(

@@ -368,6 +368,38 @@ pub enum Cmd {
         /// Explicit project DB path for side B (default: side-B sidecar).
         #[arg(long)]
         db_b: Option<PathBuf>,
+        /// First row of each of `added`/`removed`/`changed` to return.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Max rows per list (clipped to the 1024-row budget).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Embed the side-B rename transfer document (side-A renames mapped
+        /// through the pairing, ready for `annotations-import`).
+        #[arg(long)]
+        transfer_renames: bool,
+    },
+    /// Block- and instruction-level delta between two functions, one from
+    /// each binary: blocks match by hash then by position, and every
+    /// matched block carries a bounded instruction edit script. Both
+    /// projects open read-only: never creates or modifies a sidecar. The
+    /// global `--raw` mapping or `--fat-arch` selection (if any) applies
+    /// to both binaries; use `--db-a`/`--db-b` instead of the global `--db`.
+    DiffFunc {
+        /// First (baseline) binary.
+        binary_a: PathBuf,
+        /// Second (new) binary.
+        binary_b: PathBuf,
+        /// Function address on side A (snaps to the containing entry).
+        addr_a: String,
+        /// Function address on side B (snaps to the containing entry).
+        addr_b: String,
+        /// Explicit project DB path for side A (default: side-A sidecar).
+        #[arg(long)]
+        db_a: Option<PathBuf>,
+        /// Explicit project DB path for side B (default: side-B sidecar).
+        #[arg(long)]
+        db_b: Option<PathBuf>,
     },
 }
 
@@ -614,9 +646,33 @@ impl Cli {
                 binary_b,
                 db_a,
                 db_b,
+                offset,
+                limit,
+                transfer_renames,
             } => bindiff(
                 &binary_a,
                 &binary_b,
+                db,
+                db_a.as_deref(),
+                db_b.as_deref(),
+                raw_opts,
+                fat_arch,
+                offset,
+                limit,
+                transfer_renames,
+            ),
+            Cmd::DiffFunc {
+                binary_a,
+                binary_b,
+                addr_a,
+                addr_b,
+                db_a,
+                db_b,
+            } => diff_func(
+                &binary_a,
+                &binary_b,
+                &addr_a,
+                &addr_b,
                 db,
                 db_a.as_deref(),
                 db_b.as_deref(),
@@ -1261,6 +1317,10 @@ fn annotations_import(
 /// global `--raw` mapping or `--fat-arch` selection (if any) applies to both
 /// binaries: the two-builds case shares one mapping. Neither project is
 /// saved, so no sidecar is ever created or modified.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn bindiff(
     binary_a: &std::path::Path,
     binary_b: &std::path::Path,
@@ -1269,6 +1329,9 @@ fn bindiff(
     db_b: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
+    offset: usize,
+    limit: usize,
+    transfer_renames: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     if global_db.is_some() {
         return Err(binscout::error::Error::Invalid(
@@ -1277,8 +1340,47 @@ fn bindiff(
     }
     let a = binscout::open_mapped(binary_a, db_a, raw, fat_arch)?;
     let b = binscout::open_mapped(binary_b, db_b, raw, fat_arch)?;
-    let report = binscout::diff::diff_projects(&a, &b);
+    let mut report = binscout::diff::diff_projects_page(&a, &b, offset, limit);
+    if transfer_renames {
+        report.transfer = Some(binscout::diff::transfer_renames(&a, &b)?);
+    }
     Ok(serde_json::to_value(report).expect("diff report serializes"))
+}
+
+/// Block-level delta between two functions, read-only on both sides.
+///
+/// Takes `--db-a`/`--db-b` like [`bindiff`] and rejects the global `--db`
+/// for the same reason; neither project is saved, so no sidecar is ever
+/// created or modified.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
+fn diff_func(
+    binary_a: &std::path::Path,
+    binary_b: &std::path::Path,
+    addr_a: &str,
+    addr_b: &str,
+    global_db: Option<&std::path::Path>,
+    db_a: Option<&std::path::Path>,
+    db_b: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    if global_db.is_some() {
+        return Err(binscout::error::Error::Invalid(
+            "diff-func takes --db-a/--db-b, not the global --db".to_string(),
+        ));
+    }
+    let a = binscout::open_mapped(binary_a, db_a, raw, fat_arch)?;
+    let b = binscout::open_mapped(binary_b, db_b, raw, fat_arch)?;
+    let report = binscout::diff::diff_func(
+        &a,
+        binscout::parse_addr(addr_a)?,
+        &b,
+        binscout::parse_addr(addr_b)?,
+    )?;
+    Ok(serde_json::to_value(report).expect("func diff report serializes"))
 }
 
 /// Read an interchange document with a hard pre-parse budget.

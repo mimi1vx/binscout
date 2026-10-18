@@ -49,7 +49,8 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `search_bytes` | binary, pattern, section?/range_start?/range_end?, offset?/limit? | Paged `??`-wildcard byte-pattern matches ordered by virtual address (`range_start` + `range_end` bound the half-open `[lo, hi)` range; `range_lo`/`range_hi` are deprecated aliases, warning on stderr); scans cap at 256 MiB of mapped bytes with an explicit `Limit` error |
 | `annotations_export` | binary | Emit the portable annotation interchange document; read-only, never creates a sidecar |
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
-| `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |
+| `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch?, offset?/limit?, transfer_renames? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason, plus BinDiff-style neighbour propagation); each list pages under the protocol-1 envelope; `transfer_renames` embeds the side-B rename document for `annotations_import`; both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |
+| `diff_func` | binary_a, binary_b, addr_a, addr_b, db_a?/db_b?, raw?/fat_arch? | Block- and instruction-level delta between two functions (blocks match by hash then by position, each matched block carries a bounded edit script); addresses snap to their containing entries; read-only like `diff` |
 | `batch` | binary, db?/raw?/fat_arch?, ops (1–32) | Up to 32 read-only ops over one open project, run in order; returns `{"results": [{"ok"} \| {"error"}]}` with per-op limits unchanged and total output capped at 1 MiB (see below) |
 
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
@@ -96,7 +97,8 @@ Rules:
   envelope.)
 - Read-only tools only: `load`, `rename`, `comment`, `define_func`,
   `undefine_func`, and `annotations_import` are rejected per op (writes
-  stay explicit top-level calls), as are the two-binary `diff`,
+  stay explicit top-level calls), as are the two-binary `diff` and
+  `diff_func`,
   nested `batch`, and unknown names. Per-op failures are `{"error"}`
   elements with the same message text the single tool would report;
   only envelope misuse (empty or over-32 op lists, open failures) is a
