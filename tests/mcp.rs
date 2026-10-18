@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 29 tools, and call every one against fixtures.
+//! list the 32 tools, and call every one against fixtures.
 
 mod common;
 
@@ -83,7 +83,7 @@ fn tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn handshake_lists_thirty_one_tools() {
+fn handshake_lists_thirty_two_tools() {
     let lines = vec![
         req(
             1,
@@ -125,6 +125,7 @@ fn handshake_lists_thirty_one_tools() {
             "flirt_hints",
             "func",
             "functions",
+            "headers",
             "ir",
             "ir_coverage",
             "load",
@@ -141,7 +142,7 @@ fn handshake_lists_thirty_one_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 31 tools"
+        "exactly the 32 tools"
     );
     let search = tools
         .iter()
@@ -299,9 +300,10 @@ fn all_tools_return_json_over_stdio() {
             "diff",
             json!({"binary_a": b(), "binary_b": b(), "db_a": d(), "db_b": d()}),
         ),
+        call(33, "headers", json!({"binary": b(), "db": d()})),
     ];
     let resps = session(&lines);
-    assert_eq!(resps.len(), 24, "{resps:?}");
+    assert_eq!(resps.len(), 25, "{resps:?}");
     let by_id: std::collections::HashMap<u64, &Value> = resps
         .iter()
         .map(|r| (r["id"].as_u64().expect("numeric id"), r))
@@ -309,6 +311,12 @@ fn all_tools_return_json_over_stdio() {
 
     let info: Value = serde_json::from_str(tool_text(by_id[&10])).expect("project_info json");
     assert_eq!(info["format"], "raw");
+
+    let headers: Value = serde_json::from_str(tool_text(by_id[&33])).expect("headers json");
+    assert_eq!(headers["format"], "raw");
+    assert_eq!(headers["md5"].as_str().expect("md5").len(), 32);
+    assert_eq!(headers["sha256"].as_str().expect("sha256").len(), 64);
+    assert!(headers["pe"].is_null());
 
     let funcs: Value = serde_json::from_str(tool_text(by_id[&11])).expect("functions json");
     assert_eq!(funcs.as_array().expect("array").len(), 1);

@@ -8,6 +8,7 @@ pub mod diff;
 pub mod disasm;
 pub mod error;
 pub mod flirt;
+pub mod headers;
 pub mod ir;
 pub mod loader;
 pub mod mcp;
@@ -1126,6 +1127,28 @@ impl Project {
             "inferred_omitted": self.analysis.diagnostics.inferred_omitted,
             "analysis_revision": crate::analysis::ANALYSIS_REVISION,
         }))
+    }
+
+    /// On-demand header metadata: triage staples plus file hashes.
+    ///
+    /// Re-reads the binary file and parses its container headers via
+    /// [`crate::headers::headers_of`] (PE mitigations/Rich/imphash/PDB,
+    /// ELF interpreter/needed/RELRO/NX/PIE, Mach-O load commands/codesign,
+    /// plus `sha256` and `md5`). Computed on demand, never persisted:
+    /// reads never save or create the sidecar, and unparseable inputs
+    /// degrade to `null` fields rather than errors. See
+    /// `docs/book/src/json-protocol.md` for the shape.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] when the binary cannot be re-read, [`Error::Limit`]
+    /// past the input budget (see [`crate::loader::MAX_INPUT_BYTES`]).
+    pub fn headers_json(&self) -> Result<serde_json::Value> {
+        let bytes = read_input_bytes(&self.path)?;
+        Ok(crate::headers::headers_of(
+            &bytes,
+            &self.binary,
+            &self.content_sha256,
+        ))
     }
 
     /// Path of the analyzed binary.
