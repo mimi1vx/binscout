@@ -1051,3 +1051,74 @@ fn relative_vs_absolute_path_takes_fast_path() {
     );
     common::cleanup(&dir);
 }
+
+#[test]
+fn snapshot_fresh_tracks_hit_and_save() {
+    // The hit flag `load` consults: miss on first open, set by `save`,
+    // set on reopen of unchanged bytes, cleared on stale content.
+    let dir = common::tmpdir("fresh-flag");
+    let bytes = small_elf();
+    let bin = common::write_bin(&dir, "f.bin", &bytes);
+    let db = common::temp_db(&dir, "f");
+
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    assert!(!p.snapshot_fresh(), "fresh open is a miss");
+    assert!(!db.exists(), "open must not save");
+    p.save().expect("save");
+    assert!(p.snapshot_fresh(), "save marks the snapshot fresh");
+    drop(p);
+
+    let q = Project::open_with_db(&bin, &db).expect("reopen");
+    assert!(q.snapshot_fresh(), "reopen of unchanged bytes is a hit");
+    assert_same_analysis(q.analysis(), &fresh_analysis(&bytes));
+    drop(q);
+
+    let new_bytes = patched(bytes);
+    std::fs::write(&bin, &new_bytes).expect("patch fixture");
+    let r = Project::open_with_db(&bin, &db).expect("stale open");
+    assert!(!r.snapshot_fresh(), "stale open must save again");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn repeat_cli_load_leaves_sidecar_untouched() {
+    // Repeat `load` on an unchanged binary must skip the full rewrite, so
+    // the sidecar size stays stable and the output is identical across
+    // loads (free pages never accumulate because nothing is rewritten).
+    let dir = common::tmpdir("repeat-load");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME);
+    let db = common::temp_db(&dir, "repeat");
+    let bin_s = bin.display().to_string();
+    let db_s = db.display().to_string();
+
+    let mut sizes = Vec::new();
+    let mut first: Option<String> = None;
+    for i in 0..3 {
+        let out = std::process::Command::new(common::binscout_bin())
+            .args(["--db", db_s.as_str(), "load", bin_s.as_str()])
+            .output()
+            .expect("spawn binscout");
+        assert!(out.status.success(), "load {i} failed: {out:?}");
+        let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim_end()).expect("stdout is one JSON value");
+        assert!(v.get("error").is_none(), "load {i} errored: {v}");
+        let canon = serde_json::to_string(&v).expect("reserialize");
+        match &first {
+            None => first = Some(canon),
+            Some(prev) => assert_eq!(&canon, prev, "load {i} output differs"),
+        }
+        sizes.push(std::fs::metadata(&db).expect("sidecar").len());
+    }
+    assert_eq!(sizes.len(), 3);
+    assert_eq!(
+        sizes[1], sizes[0],
+        "second load must not rewrite: {sizes:?}"
+    );
+    assert_eq!(sizes[2], sizes[0], "third load must not rewrite: {sizes:?}");
+
+    // The sidecar holds a fresh snapshot: a library open hits it.
+    let q = Project::open_with_db(&bin, &db).expect("reopen");
+    assert!(q.snapshot_fresh(), "CLI loads must leave a fresh snapshot");
+    common::cleanup(&dir);
+}

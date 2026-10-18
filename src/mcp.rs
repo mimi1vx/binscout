@@ -859,8 +859,11 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let proj = entry.lock_project();
-        proj.save()
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        // Same skip as CLI `load`: a fresh snapshot needs no rewrite.
+        if !proj.snapshot_fresh() {
+            proj.save()
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        }
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
 

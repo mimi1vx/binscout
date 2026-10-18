@@ -16,6 +16,7 @@ pub mod search;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -522,6 +523,11 @@ pub struct Project {
     mapping: db::StoredMapping,
     stale_annotations_dropped: usize,
     stale_warning: Option<String>,
+    /// Whether the sidecar already holds this exact snapshot: set when the
+    /// open replayed a cache hit, or after a full rewrite (see
+    /// [`Project::snapshot_fresh`]). Atomic so [`Project::save`] can mark
+    /// the snapshot fresh through `&self` while `Project` stays `Send + Sync`.
+    snapshot_fresh: AtomicBool,
 }
 
 impl Project {
@@ -684,6 +690,7 @@ impl Project {
                     mapping,
                     stale_annotations_dropped: 0,
                     stale_warning: None,
+                    snapshot_fresh: AtomicBool::new(true),
                 })
             }
             Some(db::Snapshot::Stale {
@@ -785,18 +792,42 @@ impl Project {
             mapping,
             stale_annotations_dropped,
             stale_warning,
+            snapshot_fresh: AtomicBool::new(false),
         })
     }
 
-    /// Persist the analysis snapshot and annotations to the sidecar DB.
+    /// Persist the analysis snapshot and annotations to the sidecar DB,
+    /// then reclaim the free pages the full rewrite leaves behind.
     ///
     /// Only ever writes [`Project::db_path`]; the binary is untouched.
+    /// Rewriting every table and re-inserting identical rows still strands
+    /// free pages, so the compaction runs on every full rewrite; repeat
+    /// `load`s skip [`Project::save`] entirely while
+    /// [`Project::snapshot_fresh`] holds.
     ///
     /// # Errors
-    /// [`Error::Storage`] on any `redb` or encoding failure.
+    /// [`Error::Storage`] on any `redb`, encoding, or compaction failure.
     pub fn save(&self) -> Result<()> {
-        let db = db::open_db(&self.db_path)?;
-        db::save(&db, &self.meta(), &self.analysis, &self.annotations)?;
+        let mut db = db::open_db(&self.db_path)?;
+        self.persist_full(&mut db, &self.annotations)
+    }
+
+    /// Rewrite the full snapshot through an open handle, compact, and mark
+    /// the snapshot fresh.
+    ///
+    /// Shared by [`Project::save`] and the annotation-write fallbacks that
+    /// must rewrite every table when the sidecar holds no matching
+    /// snapshot. `db` stays open across the call so the single-handle rule
+    /// holds, and the flag records that the sidecar now matches memory.
+    fn persist_full(
+        &self,
+        db: &mut redb::Database,
+        annotations: &BTreeMap<u64, Annotation>,
+    ) -> Result<()> {
+        db::save(db, &self.meta(), &self.analysis, annotations)?;
+        db.compact()
+            .map_err(|e| Error::Storage(format!("compact {}: {e}", self.db_path.display())))?;
+        self.snapshot_fresh.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -830,6 +861,21 @@ impl Project {
         &self.mapping
     }
 
+    /// Whether the sidecar already holds this exact snapshot.
+    ///
+    /// True when the open replayed a cache hit — [`db::load_cached`]
+    /// matched content hash plus SHA-256 and size, loader mapping, and
+    /// analysis revision before any layout replay, so the persisted rows
+    /// equal the in-memory state — or after [`Project::save`] rewrote and
+    /// compacted it. `load` skips its `save` while this holds, so repeat
+    /// loads on an unchanged binary neither rewrite tables nor grow free
+    /// pages. Single-row annotation writes keep the sidecar in sync without
+    /// clearing this; full-rewrite fallbacks re-mark it on commit.
+    #[must_use]
+    pub fn snapshot_fresh(&self) -> bool {
+        self.snapshot_fresh.load(Ordering::Relaxed)
+    }
+
     /// Persist one changed annotation row, falling back to a full snapshot.
     ///
     /// Tries [`db::save_annotation`](crate::db::save_annotation) first: when
@@ -843,13 +889,13 @@ impl Project {
     /// sidecar under an incompatible mapping errors instead of
     /// overwriting.
     fn persist_annotation(&self, addr: u64) -> Result<()> {
-        let db = db::open_db(&self.db_path)?;
+        let mut db = db::open_db(&self.db_path)?;
         let ann = self.annotations.get(&addr).filter(|a| !a.is_empty());
         match db::save_annotation(&db, &self.meta(), addr, ann)? {
             db::AnnotationSave::Fast => Ok(()),
             db::AnnotationSave::NeedsFull => {
                 let merged = self.merged_fallback_annotations(&db, [(addr, ann.cloned())])?;
-                db::save(&db, &self.meta(), &self.analysis, &merged)?;
+                self.persist_full(&mut db, &merged)?;
                 Ok(())
             }
         }
@@ -1317,14 +1363,14 @@ impl Project {
         }
         let mut changes = BTreeMap::new();
         changes.insert(addr, next);
-        let db = db::open_db(&self.db_path)?;
+        let mut db = db::open_db(&self.db_path)?;
         match db::save_annotation_batch(&db, &self.meta(), &changes)? {
             db::AnnotationSave::Fast => {}
             db::AnnotationSave::NeedsFull => {
                 let owned: BTreeMap<u64, Option<Annotation>> =
                     changes.iter().map(|(&k, v)| (k, v.clone())).collect();
                 let full = self.merged_fallback_annotations(&db, owned)?;
-                db::save(&db, &self.meta(), &self.analysis, &full)?;
+                self.persist_full(&mut db, &full)?;
             }
         }
         crate::annotations::apply_changes(&mut self.annotations, &changes);
@@ -1425,14 +1471,14 @@ impl Project {
             changed: changes.len(),
         };
         if !changes.is_empty() {
-            let db = db::open_db(&self.db_path)?;
+            let mut db = db::open_db(&self.db_path)?;
             match db::save_annotation_batch(&db, &self.meta(), &changes)? {
                 db::AnnotationSave::Fast => {}
                 db::AnnotationSave::NeedsFull => {
                     let owned: BTreeMap<u64, Option<Annotation>> =
                         changes.iter().map(|(&k, v)| (k, v.clone())).collect();
                     let merged = self.merged_fallback_annotations(&db, owned)?;
-                    db::save(&db, &self.meta(), &self.analysis, &merged)?;
+                    self.persist_full(&mut db, &merged)?;
                 }
             }
             crate::annotations::apply_changes(&mut self.annotations, &changes);
