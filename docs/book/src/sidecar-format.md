@@ -13,8 +13,11 @@ the binary re-analyzes. Annotations and user seeds carry over by address
 when the mapping is unchanged. A sidecar holding annotations or seeds
 opened under an incompatible mapping fails with a separate-DB error
 instead of remapping them. A sidecar written by an older schema version (current
-version 7, analysis revision 9) behaves the same way: annotations and
-seeds carry over and the binary re-analyzes. Row values are JSON.
+version 8, analysis revision 10) behaves the same way: annotations and
+seeds carry over and the binary re-analyzes. Metadata, annotations, and
+user seeds persist as JSON rows; derived rows (functions, xrefs, strings)
+persist as chunked compact binary blobs with integer chunk keys, while
+diagnostics stay key-only rows with tuple keys.
 User seeds hash into the snapshot identity (`seeds_hash` in the
 metadata): every seed change re-analyzes before saving, so derived rows
 always match the stored seeds.
@@ -23,18 +26,21 @@ always match the stored seeds.
 |---|---|---|
 | `meta` | string | schema version, path, hash, size, arch, format, entry, mapping, analysis revision, seed identity |
 | `binaries` | `0` | snapshot metadata |
-| `functions` | entry address | function row (name, callees, discovery reasons, decode-arch override, inferred successors) |
-| `blocks` | block key | block row (address range, successors, inferred successors) |
-| `xrefs` | xref key | cross-reference row (direct, `import`, and `inferred-code` kinds) |
-| `strings` | row index | extracted-string row |
-| `diagnostics` | record key | provenance row (unresolved indirect sites, decode failures) |
+| `functions` | entry address | function row (name, callees, discovery reasons, decode-arch override) plus its block layouts (address range plus per-instruction sizes, successors, inferred successors) |
+| `xrefs` | chunk index | cross-reference blob chunk (fixed `(from, kind, to)` entries: direct, `import`, and `inferred-code` kinds) |
+| `strings` | chunk index | extracted-string blob chunk |
+| `diagnostics` | `(addr, kind)` | key-only provenance row (unresolved indirect sites, decode failures) |
 | `annotations` | address | rename and/or comment |
 | `func_seeds` | address | user function seed (decode mode, excluded flag) |
 
-Block rows store address ranges plus per-instruction boundaries, not
+Block layouts store address ranges plus per-instruction sizes, not
 rendered instructions: the open path re-decodes each recorded address
 from the binary, so snapshots stay small no matter how large the
-disassembly grows.
+disassembly grows. Function bodies pack a function with its blocks so no
+per-block key repeats the entry address. Xrefs and strings pack many
+entries per small chunked blob row, holding row visits to the dozens on
+cache-hit opens; only diagnostics stay key-only, holding the whole row in
+the key.
 
 Delete the sidecar to drop cached analysis and annotations; it is rebuilt
 on the next `load`.

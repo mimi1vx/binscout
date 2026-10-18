@@ -415,11 +415,19 @@ fn analysis_tables_untouched_by_fast_path() {
 
     const META: TableDefinition<&str, String> = TableDefinition::new("meta");
     const BINARIES: TableDefinition<u64, String> = TableDefinition::new("binaries");
-    const FUNCTIONS: TableDefinition<u64, String> = TableDefinition::new("functions");
-    const BLOCKS: TableDefinition<String, String> = TableDefinition::new("blocks");
-    const XREFS: TableDefinition<String, String> = TableDefinition::new("xrefs");
-    const STRINGS: TableDefinition<u64, String> = TableDefinition::new("strings");
+    const FUNCTIONS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("functions");
+    const XREFS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("xrefs");
+    const STRINGS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("strings");
     const ANNOTATIONS: TableDefinition<u64, String> = TableDefinition::new("annotations");
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push(char::from_digit(u32::from(*b >> 4), 16).expect("hex"));
+            s.push(char::from_digit(u32::from(*b & 0x0f), 16).expect("hex"));
+        }
+        s
+    }
 
     fn dump(path: &Path) -> BTreeMap<String, BTreeMap<String, String>> {
         let db = redb::Database::open(path).expect("open for dump");
@@ -450,25 +458,19 @@ fn analysis_tables_untouched_by_fast_path() {
             .expect("iter")
         {
             let (k, v) = row.expect("row");
-            m.insert(k.value().to_string(), v.value());
+            m.insert(k.value().to_string(), hex(&v.value()));
         }
         out.insert("functions".to_string(), m);
         let mut m = BTreeMap::new();
-        for row in rtxn.open_table(BLOCKS).expect("bl").iter().expect("iter") {
-            let (k, v) = row.expect("row");
-            m.insert(k.value(), v.value());
-        }
-        out.insert("blocks".to_string(), m);
-        let mut m = BTreeMap::new();
         for row in rtxn.open_table(XREFS).expect("xr").iter().expect("iter") {
             let (k, v) = row.expect("row");
-            m.insert(k.value(), v.value());
+            m.insert(k.value().to_string(), hex(&v.value()));
         }
         out.insert("xrefs".to_string(), m);
         let mut m = BTreeMap::new();
         for row in rtxn.open_table(STRINGS).expect("st").iter().expect("iter") {
             let (k, v) = row.expect("row");
-            m.insert(k.value().to_string(), v.value());
+            m.insert(k.value().to_string(), hex(&v.value()));
         }
         out.insert("strings".to_string(), m);
         let mut m = BTreeMap::new();
@@ -496,28 +498,14 @@ fn analysis_tables_untouched_by_fast_path() {
 
     p.rename_function(entry, "untouched").expect("rename");
     let after_rename = dump(&db);
-    for t in [
-        "meta",
-        "binaries",
-        "functions",
-        "blocks",
-        "xrefs",
-        "strings",
-    ] {
+    for t in ["meta", "binaries", "functions", "xrefs", "strings"] {
         assert_eq!(before[t], after_rename[t], "table {t} rewritten by rename");
     }
     assert_ne!(before["annotations"], after_rename["annotations"]);
 
     p.set_comment(string_va, "note").expect("comment");
     let after_comment = dump(&db);
-    for t in [
-        "meta",
-        "binaries",
-        "functions",
-        "blocks",
-        "xrefs",
-        "strings",
-    ] {
+    for t in ["meta", "binaries", "functions", "xrefs", "strings"] {
         assert_eq!(
             after_rename[t], after_comment[t],
             "table {t} rewritten by comment"
@@ -526,14 +514,7 @@ fn analysis_tables_untouched_by_fast_path() {
 
     p.set_comment(string_va, "").expect("clear");
     let after_clear = dump(&db);
-    for t in [
-        "meta",
-        "binaries",
-        "functions",
-        "blocks",
-        "xrefs",
-        "strings",
-    ] {
+    for t in ["meta", "binaries", "functions", "xrefs", "strings"] {
         assert_eq!(
             after_comment[t], after_clear[t],
             "table {t} rewritten by clear"
