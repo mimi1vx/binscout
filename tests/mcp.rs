@@ -109,6 +109,7 @@ fn handshake_lists_thirty_two_tools() {
     assert_eq!(
         names,
         vec![
+            "annotation",
             "annotations_export",
             "annotations_import",
             "block_insns",

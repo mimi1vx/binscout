@@ -285,10 +285,14 @@ pub struct StringsParams {
     pub fat_arch: Option<String>,
     /// Rows to skip after filtering.
     pub start: Option<usize>,
-    /// Deprecated alias of `start`.
+    /// Deprecated alias of `start` (warns on stderr).
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+    /// Wrap matches in the protocol-1 page envelope with an exact `total`
+    /// (opt-in preview of the planned strings-shape migration; default
+    /// stays a bare array).
+    pub envelope: Option<bool>,
     /// Case-sensitive substring, or `regex:`-prefixed expression.
     pub pattern: Option<String>,
     /// Keep strings with at least this many characters.
@@ -323,13 +327,26 @@ pub struct FunctionsParams {
     /// Keep functions called by the function containing this address.
     pub callee: Option<String>,
     /// Keep functions with entry at or above this address (needs range_hi).
+    /// Inclusive bounds (`entry >= lo && entry <= hi`).
     pub range_lo: Option<String>,
     /// Keep functions with entry at or below this address (needs range_lo).
+    /// Inclusive bounds (`entry >= lo && entry <= hi`).
     pub range_hi: Option<String>,
+    /// Deprecated alias of `range_lo` (inclusive semantics, warns on
+    /// stderr). `range_lo` wins when both are given.
+    pub range_start: Option<String>,
+    /// Deprecated alias of `range_hi` (inclusive semantics, warns on
+    /// stderr). `range_hi` wins when both are given.
+    pub range_end: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
+    /// Wrap matches in the protocol-1 page envelope with an exact `total`
+    /// and compact `calls_count` rows (opt-in preview of the planned
+    /// functions-shape migration; default stays a bare array with the
+    /// full `calls` target array).
+    pub envelope: Option<bool>,
 }
 
 /// Parameters for single-address tools (`func`, `cfg`, `structure`, `pseudo`).
@@ -587,10 +604,18 @@ pub struct SearchBytesParams {
     pub pattern: String,
     /// Keep matches fully inside this section (e.g. `.text`).
     pub section: Option<String>,
-    /// Range start (`0x`-hex or decimal, needs range_end).
+    /// Range start (`0x`-hex or decimal, needs range_end). Half-open
+    /// `[lo, hi)` over match virtual addresses.
     pub range_start: Option<String>,
-    /// Range end (`0x`-hex or decimal, needs range_start).
+    /// Range end (`0x`-hex or decimal, needs range_start). Half-open
+    /// `[lo, hi)` over match virtual addresses.
     pub range_end: Option<String>,
+    /// Deprecated alias of `range_start` (half-open semantics, warns on
+    /// stderr). `range_start` wins when both are given.
+    pub range_lo: Option<String>,
+    /// Deprecated alias of `range_end` (half-open semantics, warns on
+    /// stderr). `range_end` wins when both are given.
+    pub range_hi: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -903,28 +928,50 @@ impl BinscoutMcp {
 
     #[tool(
         name = "functions",
-        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit"
+        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit. Range is inclusive (entry >= lo and <= hi); range_start/range_end are deprecated aliases of range_lo/range_hi. envelope:true wraps matches in the protocol-1 page envelope with an exact total and compact calls_count rows"
     )]
     async fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
+        if p.range_start.is_some() {
+            eprintln!("warning: functions range_start is deprecated, use range_lo");
+        }
+        if p.range_end.is_some() {
+            eprintln!("warning: functions range_end is deprecated, use range_hi");
+        }
         // Cloned before the move into the open so filter errors keep their
         // post-open precedence (a missing binary still reports first).
-        let (query, caller, callee, range_lo, range_hi, offset, limit) = (
+        let (
+            query,
+            caller,
+            callee,
+            range_lo,
+            range_hi,
+            alias_lo,
+            alias_hi,
+            offset,
+            limit,
+            envelope,
+        ) = (
             p.query.clone(),
             p.caller.clone(),
             p.callee.clone(),
             p.range_lo.clone(),
             p.range_hi.clone(),
+            p.range_start.clone(),
+            p.range_end.clone(),
             p.offset,
             p.limit,
+            p.envelope.unwrap_or(false),
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
+        let lo = range_lo.or(alias_lo);
+        let hi = range_hi.or(alias_hi);
         let filter = FunctionFilter {
             query,
             caller: opt_addr(caller)?,
             callee: opt_addr(callee)?,
-            range: match (range_lo, range_hi) {
+            range: match (lo, hi) {
                 (None, None) => None,
                 (Some(lo), Some(hi)) => Some((
                     parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
@@ -938,8 +985,17 @@ impl BinscoutMcp {
                 }
             },
         };
-        let rows = proj.functions_filtered(&filter, offset.unwrap_or(0), limit.unwrap_or(50));
-        ok(serde_json::Value::Array(rows))
+        if envelope {
+            ok(serde_json::to_value(proj.functions_envelope(
+                &filter,
+                offset.unwrap_or(0),
+                limit.unwrap_or(50),
+            ))
+            .expect("functions envelope serializes"))
+        } else {
+            let rows = proj.functions_filtered(&filter, offset.unwrap_or(0), limit.unwrap_or(50));
+            ok(serde_json::Value::Array(rows))
+        }
     }
 
     #[tool(
@@ -1214,7 +1270,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only single-byte-obfuscated view: xor:<byte>, add:<byte>, or rot:<0-7>. offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total"
     )]
     async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1232,7 +1288,7 @@ impl BinscoutMcp {
             })?;
         // Cloned before the move into the open; the decode error above keeps
         // its pre-open precedence.
-        let (pattern, min_len, section, include_code, start, offset, limit) = (
+        let (pattern, min_len, section, include_code, start, offset, limit, envelope) = (
             p.pattern.clone(),
             p.min_len,
             p.section.clone(),
@@ -1240,6 +1296,7 @@ impl BinscoutMcp {
             p.start,
             p.offset,
             p.limit,
+            p.envelope.unwrap_or(false),
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
@@ -1251,6 +1308,17 @@ impl BinscoutMcp {
             start: start.or(offset).unwrap_or(0),
             limit: limit.unwrap_or(50),
         };
+        if envelope {
+            let page = match decode {
+                Some(spec) => proj.query_strings_decoded_envelope(&filter, spec),
+                None => proj.query_strings_envelope(&filter),
+            }
+            .map_err(|e| match e {
+                crate::error::Error::Invalid(msg) => ErrorData::invalid_params(msg, None),
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
+            return ok(serde_json::to_value(page).expect("strings envelope serializes"));
+        }
         let rows = match decode {
             Some(spec) => proj.query_strings_decoded(&filter, spec),
             None => proj.query_strings(&filter),
@@ -1392,6 +1460,20 @@ impl BinscoutMcp {
     }
 
     #[tool(
+        name = "annotation",
+        description = "Read the annotation at one address (rename/comment with addr twins; nulls when unset). Read-only: never creates or modifies the sidecar; CLI `annotate` without flags parity"
+    )]
+    async fn annotation(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let addr_s = p.addr.clone();
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let addr =
+            parse_addr(&addr_s).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+        ok(proj.annotation_json(addr))
+    }
+
+    #[tool(
         name = "define_func",
         description = "Define a user function seed at any address (binary untouched) and re-analyze so the function materializes when the bytes decode; optional 32-bit ARM decode mode arm/thumb"
     )]
@@ -1437,21 +1519,31 @@ impl BinscoutMcp {
 
     #[tool(
         name = "search_bytes",
-        description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count"
+        description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count. Range is half-open [lo, hi) over match virtual addresses; range_lo/range_hi are deprecated aliases of range_start/range_end"
     )]
     async fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let (pattern, section, range_start, range_end, offset, limit) = (
+        if p.range_lo.is_some() {
+            eprintln!("warning: search_bytes range_lo is deprecated, use range_start");
+        }
+        if p.range_hi.is_some() {
+            eprintln!("warning: search_bytes range_hi is deprecated, use range_end");
+        }
+        let (pattern, section, range_start, range_end, alias_lo, alias_hi, offset, limit) = (
             p.pattern.clone(),
             p.section.clone(),
             p.range_start.clone(),
             p.range_end.clone(),
+            p.range_lo.clone(),
+            p.range_hi.clone(),
             p.offset,
             p.limit,
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let range = match (range_start, range_end) {
+        let lo = range_start.or(alias_lo);
+        let hi = range_end.or(alias_hi);
+        let range = match (lo, hi) {
             (None, None) => None,
             (Some(lo), Some(hi)) => Some((
                 parse_addr(&lo).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,

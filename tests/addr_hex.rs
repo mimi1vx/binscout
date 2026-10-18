@@ -11,12 +11,13 @@ use serde_json::{Value, json};
 use common::{builders, cleanup, open_test_project, tmpdir};
 
 /// Address fields and their required hex twins (`null` matches `null`).
-const PAIRS: [(&str, &str); 13] = [
+const PAIRS: [(&str, &str); 14] = [
     ("addr", "addr_hex"),
     ("from", "from_hex"),
     ("to", "to_hex"),
     ("entry", "entry_hex"),
     ("containing_entry", "containing_entry_hex"),
+    ("query_addr", "query_addr_hex"),
     ("start", "start_hex"),
     ("end", "end_hex"),
     ("branch_target", "branch_target_hex"),
@@ -149,6 +150,12 @@ fn every_addr_has_matching_hex() {
         "func-mid",
     );
     check_value(&p.cfg_of(entry).expect("cfg"), "cfg");
+    check_value(&p.structure_of(entry).expect("structure"), "structure");
+    check_value(&p.pseudo_of(entry).expect("pseudo"), "pseudo");
+    check_value(
+        &p.func_detail(entry + 1).expect("mid-function snap"),
+        "func-mid",
+    );
     check_value(
         &serde_json::to_value(p.disasm_at(entry, 16).expect("disasm")).expect("json"),
         "disasm",

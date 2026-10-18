@@ -173,9 +173,13 @@ still snaps to the canonical `entry`:
 ```
 
 Explicitly unchanged in this contract (no style churn): the bare-array
-`functions` list with `--offset`/`--limit`; the `{"total", "xrefs"}`
+`functions` list with `--offset`/`--limit` (plus the opt-in
+`--envelope`/`envelope` preview with an exact `total` and compact
+`calls_count` rows, see [migration](migration.md)); the `{"total", "xrefs"}`
 `xrefs` envelope; the bare-array `strings` list with
-`--start`/`--limit` (`--offset` stays a deprecated alias that warns);
+`--start`/`--limit` (`--offset` stays a deprecated alias that warns on
+stderr; plus the opt-in `--envelope`/`envelope` preview with an exact
+`total`);
 `symbols` exports keep their shape while imports carry additive
 `address`/`address_hex` (the call pointer: the Mach-O `__stubs` entry,
 the PE IAT slot, the ELF GOT slot named by `.rela.plt`/`.rel.plt`
@@ -194,7 +198,8 @@ bit cleared on ARM). Symbol addresses seed analysis as
 `symbol`-reasoned functions; per-address naming resolves export >
 symbol > stub import, with annotation renames winning over all three
 at display time. `sections`, `disasm`/`ir` with `error_at` and the 1 MiB
-range cap; `cfg` node/edge shape; `annotate` read/write semantics
+range cap; `cfg` node/edge shape (plus the additive `query_addr` echo of
+the requested address on `cfg`/`structure`/`pseudo`); `annotate` read/write semantics
 (`rename` only on known function entries, `comment` on any address,
 empty string clears, 8 KiB text cap); all exit codes and error
 channels. A future alignment of the grandfathered list shapes would
@@ -404,6 +409,11 @@ binscout search-bytes B PATTERN [--section S] [--range LO HI] [--offset N] [--li
 
 MCP tool `search_bytes` (`binary`, `db`?, `raw`?, `pattern`,
 `section`?, `range_start`?, `range_end`?, `offset?`, `limit?`).
+`range_lo`/`range_hi` are deprecated aliases of
+`range_start`/`range_end` (same half-open semantics, warning on
+stderr); the canonical names win when both are given. `functions`
+keeps the opposite pairing: its inclusive `range_lo`/`range_hi`
+bounds accept `range_start`/`range_end` as deprecated aliases.
 `PATTERN` is a positional whitespace-separated full-byte token
 string, each two hex digits (case-insensitive) or a `??` wildcard
 (e.g. `48 8B ?? ??`). Empty, all-wildcard, odd-length, non-hex, or

@@ -1954,7 +1954,11 @@ impl Project {
     /// Function rows with annotation renames resolved, filtered then paged.
     ///
     /// Every present [`FunctionFilter`] field must match; filtering happens
-    /// before paging so `offset`/`limit` apply to the matching rows.
+    /// before paging so `offset`/`limit` apply to the matching rows. Rows
+    /// carry the full `calls` target array (unbounded for large callers);
+    /// [`Project::functions_envelope`] is the opt-in preview that wraps
+    /// the same matches in the protocol-1 [`Page`] envelope with compact
+    /// `calls_count` rows instead.
     #[must_use]
     pub fn functions_filtered(
         &self,
@@ -1962,6 +1966,27 @@ impl Project {
         offset: usize,
         limit: usize,
     ) -> Vec<serde_json::Value> {
+        self.matching_function_entries(filter)
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|entry| {
+                let (entry_json, entry_hex) = addr_pair(entry);
+                let f = &self.analysis.functions[&entry];
+                serde_json::json!({
+                    "id": f.id(), "entry": entry_json, "entry_hex": entry_hex,
+                    "name": self.function_name(entry),
+                    "blocks": f.blocks.len(), "insns": f.insn_count(), "calls": self.analysis.calls_of(entry),
+                })
+            })
+            .collect()
+    }
+
+    /// Entries matching [`Project::functions_filtered`], in entry order.
+    ///
+    /// Shared by the legacy bare-array list, the exact count, and the
+    /// opt-in envelope so all three agree on the match set.
+    fn matching_function_entries(&self, filter: &FunctionFilter) -> Vec<u64> {
         // Resolve anchor addresses once: None = filter disabled,
         // Some(None) = anchor lies in no function (matches nothing).
         let caller: Option<Option<u64>> =
@@ -1995,24 +2020,61 @@ impl Project {
                     .is_some_and(|n| n.to_lowercase().contains(q.as_str())),
                 None => true,
             })
+            .map(|f| f.entry)
+            .collect()
+    }
+
+    /// Exact count of [`Project::functions_filtered`] matches, before paging.
+    ///
+    /// Lets agents learn the function count without paging to the end;
+    /// the opt-in [`Project::functions_envelope`] reports this as `total`.
+    #[must_use]
+    pub fn count_functions_filtered(&self, filter: &FunctionFilter) -> usize {
+        self.matching_function_entries(filter).len()
+    }
+
+    /// Filtered function matches under the protocol-1 [`Page`] envelope.
+    ///
+    /// Opt-in preview of the planned functions-shape migration (see
+    /// `docs/book/src/migration.md`): `total` is the exact match count
+    /// and rows are compact — `calls_count` replaces the unbounded
+    /// `calls` target array, so the page stays bounded for arbitrarily
+    /// large callers. Direct callees remain one `callees` query away
+    /// (`depth` 1). The legacy [`Project::functions_filtered`] bare array
+    /// keeps the `calls` array unchanged.
+    #[must_use]
+    pub fn functions_envelope(
+        &self,
+        filter: &FunctionFilter,
+        offset: usize,
+        limit: usize,
+    ) -> Page<serde_json::Value> {
+        let matched = self.matching_function_entries(filter);
+        let total = matched.len();
+        let items = matched
+            .into_iter()
             .skip(offset)
             .take(limit.min(MAX_ROWS))
-            .map(|f| {
-                let (entry, entry_hex) = addr_pair(f.entry);
+            .map(|entry| {
+                let (entry_json, entry_hex) = addr_pair(entry);
+                let f = &self.analysis.functions[&entry];
                 serde_json::json!({
-                    "id": f.id(), "entry": entry, "entry_hex": entry_hex,
-                    "name": self.function_name(f.entry),
-                    "blocks": f.blocks.len(), "insns": f.insn_count(), "calls": self.analysis.calls_of(f.entry),
+                    "id": f.id(), "entry": entry_json, "entry_hex": entry_hex,
+                    "name": self.function_name(entry),
+                    "blocks": f.blocks.len(), "insns": f.insn_count(),
+                    "calls_count": self.analysis.calls_count(entry),
                 })
             })
-            .collect()
+            .collect();
+        page_envelope(total, offset, limit, items)
     }
 
     /// Full function detail: blocks with instructions in address order.
     ///
     /// `addr` may be any address inside the function; it snaps to the
     /// containing entry. The result carries both `entry` (the canonical
-    /// function entry) and `containing_entry` (the entry containing `addr`).
+    /// function entry) and `containing_entry` (the entry containing `addr`),
+    /// plus `query_addr` echoing the address the caller passed.
     /// Instruction rows carry the render-time `target_name`/`comment`/
     /// `string` listing annotations (see [`Insn`]).
     ///
@@ -2050,9 +2112,11 @@ impl Project {
             .collect();
         let (entry_json, entry_hex) = addr_pair(f.entry);
         let (_, containing_hex) = addr_pair(entry);
+        let (query_json, query_hex) = addr_pair(addr);
         Ok(serde_json::json!({
             "id": f.id(), "entry": entry_json, "entry_hex": entry_hex,
             "containing_entry": entry, "containing_entry_hex": containing_hex,
+            "query_addr": query_json, "query_addr_hex": query_hex,
             "name": self.function_name(entry),
             "blocks": blocks, "edges": f.edges(),
             "inferred_edges": f.inferred_edges(),
@@ -2180,7 +2244,8 @@ impl Project {
     ///
     /// `addr` may be any address inside the function; it snaps to the
     /// containing entry. The result carries both `entry` (the canonical
-    /// function entry) and `containing_entry` (the entry containing `addr`).
+    /// function entry) and `containing_entry` (the entry containing `addr`),
+    /// plus `query_addr` echoing the address the caller passed.
     ///
     /// # Errors
     /// [`Error::NotFound`] when `addr` lies in no function.
@@ -2208,8 +2273,9 @@ impl Project {
             })
             .collect();
         let (_, entry_hex) = addr_pair(entry);
+        let (query_json, query_hex) = addr_pair(addr);
         Ok(
-            serde_json::json!({ "entry": entry, "entry_hex": entry_hex, "containing_entry": entry, "containing_entry_hex": entry_hex, "nodes": nodes, "edges": f.edges(), "inferred_edges": f.inferred_edges() }),
+            serde_json::json!({ "entry": entry, "entry_hex": entry_hex, "containing_entry": entry, "containing_entry_hex": entry_hex, "query_addr": query_json, "query_addr_hex": query_hex, "nodes": nodes, "edges": f.edges(), "inferred_edges": f.inferred_edges() }),
         )
     }
 
@@ -2221,7 +2287,8 @@ impl Project {
     /// containing entry exactly like [`Project::cfg_of`]. The result
     /// carries `entry` (the canonical function entry) plus `structure`
     /// (`loops`/`ifs` rows with `0x`-hex twins and the top-level
-    /// `warning`). Read-only: never writes the binary or the sidecar.
+    /// `warning`), and `query_addr` echoing the address the caller
+    /// passed. Read-only: never writes the binary or the sidecar.
     ///
     /// # Errors
     /// [`Error::NotFound`] when `addr` lies in no function.
@@ -2236,9 +2303,11 @@ impl Project {
             .ok_or_else(|| Error::NotFound(format!("function {addr:#x}")))?;
         let structure = serde_json::to_value(structure).expect("structure serializes");
         let (entry_json, entry_hex) = addr_pair(entry);
+        let (query_json, query_hex) = addr_pair(addr);
         Ok(serde_json::json!({
             "entry": entry_json, "entry_hex": entry_hex,
             "containing_entry": entry, "containing_entry_hex": entry_hex,
+            "query_addr": query_json, "query_addr_hex": query_hex,
             "structure": structure,
         }))
     }
@@ -2247,8 +2316,9 @@ impl Project {
     /// row plus the assembled text, with the approximation warning.
     ///
     /// `addr` may be any address inside the function; it snaps to the
-    /// containing entry exactly like [`Project::cfg_of`]. Each line
-    /// propagates its source IR warning (`None` for mapped rows) and the
+    /// containing entry exactly like [`Project::cfg_of`]. The top-level
+    /// object carries `query_addr` echoing the address the caller passed.
+    /// Each line propagates its source IR warning (`None` for mapped rows) and the
     /// resolved import name when the source instruction calls through an
     /// import slot or stub; direct call/branch targets render under their
     /// display name (rename wins over symbol-table and import names, with
@@ -2354,9 +2424,11 @@ impl Project {
         }
         let pseudo = serde_json::to_value(pseudo).expect("pseudo serializes");
         let (entry_json, entry_hex) = addr_pair(entry);
+        let (query_json, query_hex) = addr_pair(addr);
         Ok(serde_json::json!({
             "entry": entry_json, "entry_hex": entry_hex,
             "containing_entry": entry, "containing_entry_hex": entry_hex,
+            "query_addr": query_json, "query_addr_hex": query_hex,
             "pseudo": pseudo,
         }))
     }
@@ -2678,6 +2750,21 @@ impl Project {
         self.analysis.strings_page_filtered(filter)
     }
 
+    /// Extracted strings, filtered then paged under the protocol-1 envelope.
+    ///
+    /// Opt-in preview of the planned strings-shape migration (see
+    /// `docs/book/src/migration.md`): `total` is the exact filtered count
+    /// and `items` holds the requested page. The legacy
+    /// [`Project::query_strings`] bare array is unchanged.
+    ///
+    /// # Errors
+    /// Same as [`Project::query_strings`].
+    pub fn query_strings_envelope(&self, filter: &StringsFilter) -> Result<Page<StringHit>> {
+        let total = self.analysis.strings_count_filtered(filter)?;
+        let items = self.analysis.strings_page_filtered(filter)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
+    }
+
     /// Decoded-view strings: `strings --decode` over an in-memory transform.
     ///
     /// Re-extracts over a per-segment decoded copy (see
@@ -2696,6 +2783,27 @@ impl Project {
     ) -> Result<Vec<StringHit>> {
         self.analysis
             .strings_decoded_view(&self.binary, filter, decode)
+    }
+
+    /// Decoded-view strings under the protocol-1 envelope.
+    ///
+    /// Same opt-in preview as [`Project::query_strings_envelope`] over the
+    /// in-memory decoded view (see [`Project::query_strings_decoded`]).
+    ///
+    /// # Errors
+    /// Same as [`Project::query_strings_decoded`].
+    pub fn query_strings_decoded_envelope(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+    ) -> Result<Page<StringHit>> {
+        let total = self
+            .analysis
+            .strings_decoded_count(&self.binary, filter, decode)?;
+        let items = self
+            .analysis
+            .strings_decoded_view(&self.binary, filter, decode)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
     }
 
     /// Search mapped file bytes for a literal/wildcard pattern, paged.

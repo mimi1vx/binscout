@@ -274,7 +274,19 @@ fn project_snaps_and_stays_read_only() {
     );
 
     let snapped = p.pseudo_of(BASE + 1).expect("snap");
-    assert_eq!(snapped, v, "snap must equal the entry view");
+    assert_eq!(snapped["entry"], v["entry"]);
+    assert_eq!(snapped["pseudo"], v["pseudo"], "snap keeps the entry view");
+    assert_eq!(
+        snapped["query_addr"],
+        BASE + 1,
+        "query echoes the passed address"
+    );
+    assert_eq!(
+        snapped["query_addr_hex"],
+        format!("{:#x}", BASE + 1),
+        "query echoes the passed address"
+    );
+    assert_eq!(v["query_addr"], BASE, "entry view echoes the entry");
 
     assert!(
         p.pseudo_of(0xdead).is_err(),
