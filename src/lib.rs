@@ -613,7 +613,12 @@ pub struct Page<T> {
 ///
 /// `limit` is clipped to [`MAX_ROWS`]; `next_offset` uses the effective
 /// limit with saturating arithmetic, so extreme offsets cannot wrap.
-fn page_envelope<T>(total: usize, offset: usize, limit: usize, items: Vec<T>) -> Page<T> {
+pub(crate) fn page_envelope<T>(
+    total: usize,
+    offset: usize,
+    limit: usize,
+    items: Vec<T>,
+) -> Page<T> {
     let effective = limit.min(MAX_ROWS);
     let end = offset.saturating_add(effective);
     let next_offset = if effective == 0 || end >= total {
@@ -2511,6 +2516,84 @@ impl Project {
             self.persist_merged(changes, seed_changes)?;
         }
         Ok(summary)
+    }
+
+    /// Build a portable annotation document over this project's identity.
+    ///
+    /// The crate-internal seam behind [`crate::diff::transfer_renames`]:
+    /// the caller supplies rename rows addressed in this project and this
+    /// wraps them in an [`crate::annotations::AnnotationDocument`] carrying
+    /// this binary's SHA-256 plus size and loader mapping, so the result
+    /// imports through [`Project::import_annotations`] unchanged. Read-only:
+    /// no sidecar is created or modified.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on duplicate or field-less rows,
+    /// [`Error::NotFound`] when a rename targets an unknown function entry,
+    /// [`Error::Limit`] past field, row, or document budgets,
+    /// [`Error::Storage`] when the binary cannot be re-read for its digest.
+    pub(crate) fn transfer_document(
+        &self,
+        rows: Vec<crate::annotations::AnnotationRow>,
+    ) -> Result<crate::annotations::AnnotationDocument> {
+        use crate::annotations::{ANNOTATION_FORMAT_REVISION, MAX_TRANSFER_BYTES};
+        let mut sorted = rows;
+        sorted.sort_by_key(|r| r.addr);
+        let mut seen = std::collections::BTreeSet::new();
+        for row in &sorted {
+            if !seen.insert(row.addr) {
+                return Err(Error::Invalid(format!(
+                    "duplicate transfer address {:#x}",
+                    row.addr
+                )));
+            }
+            if row.rename.as_deref().is_none_or(|s| s.is_empty()) && row.comment.is_none() {
+                return Err(Error::Invalid(format!(
+                    "transfer row at {:#x} has neither rename nor comment",
+                    row.addr
+                )));
+            }
+            for (label, s) in [("rename", &row.rename), ("comment", &row.comment)] {
+                if let Some(t) = s
+                    && t.len() > crate::db::MAX_ANNOTATION_BYTES
+                {
+                    return Err(Error::Limit(format!(
+                        "transfer {label} of {} bytes exceeds {}",
+                        t.len(),
+                        crate::db::MAX_ANNOTATION_BYTES
+                    )));
+                }
+            }
+            if let Some(name) = &row.rename
+                && !name.is_empty()
+                && !self.analysis.functions.contains_key(&row.addr)
+            {
+                return Err(Error::NotFound(format!(
+                    "rename target {:#x} is not a known function",
+                    row.addr
+                )));
+            }
+        }
+        if sorted.len() > crate::db::MAX_SNAPSHOT_ANNOTATIONS {
+            return Err(Error::Limit("transfer exceeds cap".to_string()));
+        }
+        let doc = crate::annotations::AnnotationDocument {
+            revision: ANNOTATION_FORMAT_REVISION,
+            sha256: self.ensure_sha256()?.to_string(),
+            size: self.size,
+            mapping: self.mapping.clone(),
+            annotations: sorted,
+            func_seeds: Vec::new(),
+        };
+        let text = serde_json::to_string(&doc)
+            .map_err(|e| Error::Storage(format!("encode transfer document: {e}")))?;
+        if text.len() > MAX_TRANSFER_BYTES {
+            return Err(Error::Limit(format!(
+                "transfer of {} bytes exceeds the {MAX_TRANSFER_BYTES}-byte cap",
+                text.len()
+            )));
+        }
+        Ok(doc)
     }
 
     /// File-backed bytes mapped at `va` (zero-padded past file data).

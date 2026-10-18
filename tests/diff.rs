@@ -69,8 +69,9 @@ fn lib_diff_reports_added_removed_changed() {
     );
 
     // Same IR under bumped immediates pairs by content, not by entry math.
-    assert_eq!(r.changed.len(), 1);
-    let c = &r.changed[0];
+    assert_eq!(r.changed.total, 1);
+    assert_eq!(r.changed.items.len(), 1);
+    let c = &r.changed.items[0];
     assert_eq!((c.entry_a, c.entry_b), (0x14, 0x14));
     assert_eq!(c.reason, binscout::diff::MatchReason::IrMatch);
     assert!(c.similarity.is_none(), "only fuzzy sets similarity");
@@ -78,10 +79,10 @@ fn lib_diff_reports_added_removed_changed() {
     assert_ne!(c.bytes_hash_a, c.bytes_hash_b);
 
     // IR-dissimilar leaves stay unpaired (similarity 4/6 < 0.8).
-    assert_eq!(r.removed.len(), 1);
-    assert_eq!(r.removed[0].entry, 0x1F);
-    assert_eq!(r.added.len(), 1);
-    assert_eq!(r.added[0].entry, 0x1F);
+    assert_eq!(r.removed.total, 1);
+    assert_eq!(r.removed.items[0].entry, 0x1F);
+    assert_eq!(r.added.total, 1);
+    assert_eq!(r.added.items[0].entry, 0x1F);
 
     // Reads never create sidecars.
     assert!(!temp_db(&dir, "a").exists());
@@ -115,8 +116,8 @@ fn lib_diff_same_export_new_body_is_name_match() {
     assert_eq!(r.summary.matched, 0);
     assert_eq!(r.summary.added, 0);
     assert_eq!(r.summary.removed, 0);
-    assert_eq!(r.changed.len(), 1);
-    let c = &r.changed[0];
+    assert_eq!(r.changed.total, 1);
+    let c = &r.changed.items[0];
     assert_eq!((c.entry_a, c.entry_b), (BASIC_ENTRY_VA, BASIC_ENTRY_VA));
     assert_eq!(c.reason, binscout::diff::MatchReason::NameMatch);
     assert_eq!(c.name_a.as_deref(), Some("basic_entry"));
@@ -160,16 +161,16 @@ fn lib_diff_func_rows_carry_renames_without_affecting_pairing() {
     assert_eq!(r.summary.removed, 1);
 
     // One-sided rows carry the rename-resolved display name.
-    assert_eq!(r.removed.len(), 1);
-    assert_eq!(r.removed[0].entry, 0x1F);
-    assert_eq!(r.removed[0].name.as_deref(), Some("old_gone"));
-    assert_eq!(r.added.len(), 1);
-    assert_eq!(r.added[0].entry, 0x1F);
-    assert_eq!(r.added[0].name.as_deref(), Some("new_here"));
+    assert_eq!(r.removed.total, 1);
+    assert_eq!(r.removed.items[0].entry, 0x1F);
+    assert_eq!(r.removed.items[0].name.as_deref(), Some("old_gone"));
+    assert_eq!(r.added.total, 1);
+    assert_eq!(r.added.items[0].entry, 0x1F);
+    assert_eq!(r.added.items[0].name.as_deref(), Some("new_here"));
 
     // Differing renames do not break content pairing.
-    assert_eq!(r.changed.len(), 1);
-    let c = &r.changed[0];
+    assert_eq!(r.changed.total, 1);
+    let c = &r.changed.items[0];
     assert_eq!((c.entry_a, c.entry_b), (0x14, 0x14));
     assert_eq!(c.reason, binscout::diff::MatchReason::IrMatch);
     cleanup(&dir);
@@ -192,13 +193,13 @@ fn cli_diff_reports_added_removed_changed_and_writes_nothing() {
     assert_eq!(v["summary"]["added"], 1);
     assert_eq!(v["summary"]["removed"], 1);
     assert_eq!(v["summary"]["truncated"], false);
-    assert_eq!(v["changed"][0]["reason"], "ir-match");
-    assert_eq!(v["changed"][0]["entry_a"], 0x14);
-    assert_eq!(v["changed"][0]["entry_a_hex"], "0x14");
-    assert!(v["changed"][0]["similarity"].is_null());
-    assert_eq!(v["removed"][0]["entry"], 0x1F);
-    assert_eq!(v["removed"][0]["entry_hex"], "0x1f");
-    assert_eq!(v["added"][0]["entry"], 0x1F);
+    assert_eq!(v["changed"]["items"][0]["reason"], "ir-match");
+    assert_eq!(v["changed"]["items"][0]["entry_a"], 0x14);
+    assert_eq!(v["changed"]["items"][0]["entry_a_hex"], "0x14");
+    assert!(v["changed"]["items"][0]["similarity"].is_null());
+    assert_eq!(v["removed"]["items"][0]["entry"], 0x1F);
+    assert_eq!(v["removed"]["items"][0]["entry_hex"], "0x1f");
+    assert_eq!(v["added"]["items"][0]["entry"], 0x1F);
     assert_eq!(v["arch_a"], "x86_64");
     assert_eq!(v["arch_b"], "x86_64");
 
@@ -254,15 +255,25 @@ fn lib_diff_summary_counts_survive_truncation() {
     assert_eq!(r.summary.removed, 1);
     assert_eq!(r.summary.added, N);
     assert!(r.summary.truncated);
-    assert_eq!(r.added.len(), 1024, "list clips to the page budget");
-    assert_eq!(r.removed.len(), 1);
-    assert!(r.changed.is_empty());
+    assert_eq!(r.added.total, N, "exact total survives paging");
+    assert_eq!(r.added.items.len(), 1024, "first page clips to the budget");
+    assert_eq!(r.added.next_offset, Some(1024));
+    assert_eq!(r.removed.total, 1);
+    assert_eq!(r.removed.items.len(), 1);
+    assert!(r.changed.items.is_empty());
+    assert_eq!(r.changed.total, 0);
     // Truncation keeps entry order from the head.
-    assert_eq!(r.added.first().map(|f| f.entry), Some(0));
+    assert_eq!(r.added.items.first().map(|f| f.entry), Some(0));
     assert_eq!(
-        r.added.last().map(|f| f.entry),
+        r.added.items.last().map(|f| f.entry),
         Some(1023 * STUB.len() as u64)
     );
+
+    // Second page walks on from next_offset with its own total.
+    let p2 = binscout::diff::diff_projects_page(&pa, &pb, 1024, 1024);
+    assert_eq!(p2.added.total, N);
+    assert_eq!(p2.added.items.len(), N - 1024);
+    assert_eq!(p2.added.next_offset, None);
 
     // Reads never create sidecars.
     assert!(!temp_db(&dir, "a").exists());
