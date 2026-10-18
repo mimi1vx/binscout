@@ -1833,7 +1833,7 @@ impl Analysis {
         filter: &StringsFilter,
         decode: strings::DecodeSpec,
     ) -> Result<Vec<StringHit>> {
-        let hits = self.decoded_hits(bin, decode);
+        let hits = decoded_string_hits(bin, decode);
         filter_string_hits(&hits, filter)
     }
 
@@ -1847,50 +1847,57 @@ impl Analysis {
         filter: &StringsFilter,
         decode: strings::DecodeSpec,
     ) -> Result<usize> {
-        let hits = self.decoded_hits(bin, decode);
+        let hits = decoded_string_hits(bin, decode);
         count_string_hits(&hits, filter)
     }
+}
 
-    /// Decoded-view hits over a per-segment decoded copy, section-tagged
-    /// exactly like [`analyze`].
-    ///
-    /// Shared by [`Analysis::strings_decoded_view`] and
-    /// [`Analysis::strings_decoded_count`] so the count and the page agree
-    /// on the underlying rows.
-    fn decoded_hits(&self, bin: &LoadedBinary, decode: strings::DecodeSpec) -> Vec<StringHit> {
-        let mut hits: Vec<StringHit> = Vec::new();
-        for seg in &bin.segments {
-            let decoded = decode.apply(&seg.data);
-            for mut h in strings::extract(
-                &decoded,
-                strings::DEFAULT_MIN_LEN,
-                strings::DEFAULT_MAX_HITS,
-                Some(seg.vaddr),
-            ) {
-                // Same tagging as `analyze`: sections win, raw blobs and
-                // unmapped hits inherit the segment's flags.
-                let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
-                h.section = section;
-                h.executable = executable;
-                hits.push(h);
-            }
+/// Decoded-view hits over a per-segment decoded copy, section-tagged
+/// exactly like [`analyze`].
+///
+/// Free of `self` (only the binary matters), so the loader-only open
+/// serves `strings --decode` without a decoded analysis; the count and
+/// the page agree on the underlying rows via the shared filter helpers.
+pub(crate) fn decoded_string_hits(
+    bin: &LoadedBinary,
+    decode: strings::DecodeSpec,
+) -> Vec<StringHit> {
+    let mut hits: Vec<StringHit> = Vec::new();
+    for seg in &bin.segments {
+        let decoded = decode.apply(&seg.data);
+        for mut h in strings::extract(
+            &decoded,
+            strings::DEFAULT_MIN_LEN,
+            strings::DEFAULT_MAX_HITS,
+            Some(seg.vaddr),
+        ) {
+            // Same tagging as `analyze`: sections win, raw blobs and
+            // unmapped hits inherit the segment's flags.
+            let (section, executable) = locate_hit(&bin.sections, seg, h.vaddr);
+            h.section = section;
+            h.executable = executable;
+            hits.push(h);
         }
-        hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
-        hits
     }
+    hits.sort_by_key(|h| h.vaddr.unwrap_or(u64::MAX));
+    hits
 }
 
 /// Filter stored or decoded-view string hits, then page.
 ///
 /// Shared by [`Analysis::strings_page_filtered`] and
-/// [`Analysis::strings_decoded_view`] so the `strings --decode` view keeps
-/// the default-view semantics (executable-memory hiding, lazy pattern
-/// compile, filter-before-page).
+/// [`Analysis::strings_decoded_view`] (plus the loader-only open, which
+/// filters stored snapshot rows without a decoded analysis) so the
+/// `strings --decode` view keeps the default-view semantics
+/// (executable-memory hiding, lazy pattern compile, filter-before-page).
 ///
 /// # Errors
 /// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
 /// expression fails to compile.
-fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<StringHit>> {
+pub(crate) fn filter_string_hits(
+    hits: &[StringHit],
+    filter: &StringsFilter,
+) -> Result<Vec<StringHit>> {
     let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
     // Compiled once, lazily at the first row reaching pattern evaluation:
     // a malformed/overlong pattern errors only when a row survives the
@@ -1954,7 +1961,7 @@ fn filter_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<Vec<
 /// # Errors
 /// [`Error::Invalid`] when `filter.pattern` is overlong or a `regex:`
 /// expression fails to compile.
-fn count_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<usize> {
+pub(crate) fn count_string_hits(hits: &[StringHit], filter: &StringsFilter) -> Result<usize> {
     let show_code = filter.include_code || filter.section.is_some() || filter.pattern.is_some();
     // Compiled once, lazily at the first row reaching pattern evaluation:
     // a malformed/overlong pattern errors only when a row survives the

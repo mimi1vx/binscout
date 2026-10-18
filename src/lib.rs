@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{
-    Analysis, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref, XrefKind,
-    analyze_with_seeds, diagnostic_detail, import_index, import_slots,
+    Analysis, AnalysisSummary, BlockSummary, DiagnosticKind, DiagnosticRow, StringsFilter, Xref,
+    XrefKind, analyze_with_seeds, diagnostic_detail, import_index, import_slots,
 };
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
 use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
@@ -144,6 +144,36 @@ pub fn open_mapped(
     }
 }
 
+/// [`open_mapped`] for loader-only commands: explicit DB path (or the
+/// default sidecar), explicit raw mapping, and fat Mach-O slice selection
+/// interpreted identically, returning [`LoaderOpened`] so cache hits skip
+/// instruction re-decode (see [`Project::open_loader_only`]).
+///
+/// # Errors
+/// Same as [`open_mapped`].
+pub fn open_mapped_loader_only(
+    binary: &Path,
+    db: Option<&Path>,
+    raw: Option<RawOptions>,
+    fat_arch: Option<&str>,
+) -> Result<LoaderOpened> {
+    let owned;
+    let db_path = match db {
+        Some(p) => p,
+        None => {
+            owned = db::default_db_path(binary);
+            // Borrow lives until the open call below returns.
+            &owned
+        }
+    };
+    match (raw, fat_arch) {
+        (Some(_), Some(_)) => Err(Error::Invalid(
+            "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)".to_string(),
+        )),
+        _ => Project::open_loader_only(binary, db_path, raw, fat_arch),
+    }
+}
+
 /// Cache identity for an open request: explicit raw wins, else the fat
 /// slice selection, else auto detection. Raw and fat are exclusive.
 fn mapping_for(raw: Option<RawOptions>, fat_arch: Option<&str>) -> Result<db::StoredMapping> {
@@ -189,6 +219,58 @@ fn reject_db_is_binary(binary: &Path, db_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Shared open prologue for [`Project::open_inner`] and the loader-only
+/// open: input bytes plus content identity (hash, SHA-256, size), the
+/// effective loader mapping, and the read-only snapshot lookup.
+///
+/// The snapshot read is metadata-first over a read-only handle: cache
+/// identity covers content hash plus SHA-256 and size, loader mapping, and
+/// analysis revision before any layout replay (see `db::load_cached`), and
+/// the read-only open itself costs nothing proportional to the file. Reads
+/// never save and never create the sidecar.
+struct OpenInputs {
+    bytes: Vec<u8>,
+    hash: u64,
+    sha256: String,
+    size: u64,
+    mapping: db::StoredMapping,
+    cached: Option<db::Snapshot>,
+}
+
+fn read_open_inputs(
+    binary: &Path,
+    db_path: &Path,
+    raw: Option<RawOptions>,
+    fat_arch: Option<&str>,
+) -> Result<OpenInputs> {
+    reject_db_is_binary(binary, db_path)?;
+    // Single-open bounded read: one handle, chunked with checked
+    // accumulation, so a growing file cannot slip past a stat cap.
+    let bytes = read_input_bytes(binary)?;
+    let hash = db::content_hash(&bytes);
+    let sha256 = crate::annotations::sha256_hex(&bytes);
+    let size = bytes.len() as u64;
+    let mapping = mapping_for(raw, fat_arch)?;
+    let cached = if db_path.exists() {
+        match db::open_db_read_only(db_path) {
+            Ok(db) => Some(db::load_cached(&db, hash, &sha256, size, &mapping)?),
+            // Raced with a concurrent sidecar deletion: read as absent.
+            Err(_) if !db_path.exists() => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    Ok(OpenInputs {
+        bytes,
+        hash,
+        sha256,
+        size,
+        mapping,
+        cached,
+    })
 }
 
 /// Filters for [`Project::functions_filtered`]: every present field must match.
@@ -506,6 +588,505 @@ struct EnrichCtx<'a> {
     spans: Vec<(u64, u64, &'a str)>,
 }
 
+/// Outcome of [`Project::open_loader_only`]: either a decode-free
+/// cache-hit view or a fully analyzed project.
+///
+/// Loader-only commands (`sections`, `symbols`, `search-bytes`, `bytes`,
+/// `headers`, `strings`, `annotations-export`, `stats`, and the
+/// `load`/`project_info` summaries) serve from either variant with
+/// byte-identical JSON: a hit skips instruction re-decode entirely, while a
+/// stale or missing snapshot falls back to the full open. Both sides are
+/// boxed: each holds the mapped binary bytes, so an inline enum would carry
+/// hundreds of bytes per value.
+#[derive(Debug)]
+pub enum LoaderOpened {
+    /// Cache hit: serving needs no instruction decode (see [`LoaderProject`]).
+    Cached(Box<LoaderProject>),
+    /// Stale or missing snapshot: fully analyzed, same as [`Project::open`].
+    Fresh(Box<Project>),
+}
+
+/// Cache-hit view for loader-only commands: binary plus stored snapshot
+/// rows, without re-decoding a single instruction.
+///
+/// Built by [`Project::open_loader_only`] only when the sidecar holds a
+/// matching snapshot (content hash plus SHA-256 and size, loader mapping,
+/// and analysis revision already verified equal). Outcome counts come from
+/// the stored layouts instead of a rebuilt
+/// [`Analysis`]: one persisted instruction
+/// boundary replays to exactly one instruction (any mismatch is snapshot
+/// corruption), and xrefs, strings, and diagnostics replay verbatim, so the
+/// counts equal a full open's. Only the sidecar is ever read; like
+/// [`Project`], this never writes the analyzed binary.
+#[derive(Debug)]
+pub struct LoaderProject {
+    path: PathBuf,
+    db_path: PathBuf,
+    content_hash: u64,
+    content_sha256: String,
+    size: u64,
+    binary: LoadedBinary,
+    summary: AnalysisSummary,
+    diagnostics: usize,
+    diagnostics_truncated: bool,
+    diagnostics_omitted: usize,
+    inferred_truncated: bool,
+    inferred_omitted: usize,
+    strings: Vec<StringHit>,
+    annotations: BTreeMap<u64, Annotation>,
+    func_seeds: BTreeMap<u64, crate::db::FuncSeed>,
+    mapping: db::StoredMapping,
+}
+
+/// Outcome counts from stored snapshot rows, without decoding.
+///
+/// `functions` is the layout count, `blocks`/`insns` sum the stored block
+/// and boundary rows, and `xrefs`/`strings` are the stored row counts: the
+/// rebuild replays each boundary to exactly one instruction and carries the
+/// row vectors over unchanged, so this equals a full open's
+/// [`Analysis::summary`](crate::analysis::Analysis::summary).
+fn summary_of_hit(
+    functions: &[crate::analysis::FunctionLayout],
+    xrefs: &[Xref],
+    strings: &[StringHit],
+) -> AnalysisSummary {
+    AnalysisSummary {
+        functions: functions.len(),
+        blocks: functions.iter().map(|f| f.blocks.len()).sum(),
+        insns: functions
+            .iter()
+            .map(|f| f.blocks.iter().map(|b| b.insns.len()).sum::<usize>())
+            .sum(),
+        xrefs: xrefs.len(),
+        strings: strings.len(),
+    }
+}
+
+impl LoaderProject {
+    /// Whether the sidecar already holds this exact snapshot.
+    ///
+    /// Always true: a [`LoaderProject`] only exists for a cache hit, so
+    /// `load` skips its `save` exactly like a fresh full open.
+    #[must_use]
+    pub fn snapshot_fresh(&self) -> bool {
+        true
+    }
+
+    /// Agent-facing summary; always JSON-serializable.
+    ///
+    /// Same document as [`Project::project_info`]: counts come from the
+    /// stored snapshot rows instead of a rebuilt analysis.
+    #[must_use]
+    pub fn project_info(&self) -> ProjectInfo {
+        let s = &self.summary;
+        let (mode, base) = match &self.mapping {
+            db::StoredMapping::Auto => ("auto".to_string(), None),
+            db::StoredMapping::Explicit { base, .. } => ("raw".to_string(), Some(*base)),
+            db::StoredMapping::Fat { .. } => ("fat".to_string(), None),
+        };
+        ProjectInfo {
+            binary: self.path.display().to_string(),
+            db_path: self.db_path.display().to_string(),
+            version: version().to_string(),
+            protocol: WIRE_PROTOCOL,
+            mode,
+            base,
+            arch: db::arch_name(self.binary.arch).to_string(),
+            format: db::format_name(self.binary.format).to_string(),
+            entry: self.binary.entry,
+            content_hash: self.content_hash,
+            size: self.size,
+            supported: true,
+            reason: None,
+            functions: s.functions,
+            blocks: s.blocks,
+            insns: s.insns,
+            xrefs: s.xrefs,
+            strings: s.strings,
+            annotations: self.annotations.values().filter(|a| !a.is_empty()).count(),
+            diagnostics: self.diagnostics,
+            diagnostics_truncated: self.diagnostics_truncated,
+            diagnostics_omitted: self.diagnostics_omitted,
+            inferred_truncated: self.inferred_truncated,
+            inferred_omitted: self.inferred_omitted,
+            analysis_revision: crate::analysis::ANALYSIS_REVISION,
+        }
+    }
+
+    /// Storage stats for the project: binary size plus sidecar DB size
+    /// and the same analysis counts as [`LoaderProject::project_info`].
+    ///
+    /// Same document as [`Project::stats_json`]: `db_size` is `0` when no
+    /// sidecar exists yet. A loader-only open only exists for a cache hit,
+    /// so no stale annotations were dropped.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] when the sidecar exists but cannot be statted.
+    pub fn stats_json(&self) -> Result<serde_json::Value> {
+        let s = &self.summary;
+        let db_size = db::db_file_size(&self.db_path)?;
+        let (mode, (base, base_hex)) = match &self.mapping {
+            db::StoredMapping::Auto => ("auto".to_string(), crate::opt_addr_pair(None)),
+            db::StoredMapping::Explicit { base, .. } => {
+                ("raw".to_string(), crate::opt_addr_pair(Some(*base)))
+            }
+            db::StoredMapping::Fat { .. } => ("fat".to_string(), crate::opt_addr_pair(None)),
+        };
+        let (entry, entry_hex) = crate::opt_addr_pair(self.binary.entry);
+        Ok(serde_json::json!({
+            "binary": self.path.display().to_string(),
+            "db_path": self.db_path.display().to_string(),
+            "version": version(),
+            "protocol": WIRE_PROTOCOL,
+            "mode": mode,
+            "base": base,
+            "base_hex": base_hex,
+            "arch": db::arch_name(self.binary.arch),
+            "format": db::format_name(self.binary.format),
+            "entry": entry,
+            "entry_hex": entry_hex,
+            "content_hash": self.content_hash,
+            "content_sha256": self.content_sha256,
+            "size": self.size,
+            "db_size": db_size,
+            "functions": s.functions,
+            "blocks": s.blocks,
+            "insns": s.insns,
+            "xrefs": s.xrefs,
+            "strings": s.strings,
+            "annotations": self.annotations.values().filter(|a| !a.is_empty()).count(),
+            "annotations_dropped": 0,
+            "stale_warning": serde_json::Value::Null,
+            "diagnostics": self.diagnostics,
+            "diagnostics_truncated": self.diagnostics_truncated,
+            "diagnostics_omitted": self.diagnostics_omitted,
+            "inferred_truncated": self.inferred_truncated,
+            "inferred_omitted": self.inferred_omitted,
+            "analysis_revision": crate::analysis::ANALYSIS_REVISION,
+        }))
+    }
+
+    /// On-demand header metadata: triage staples plus file hashes.
+    ///
+    /// Same document as [`Project::headers_json`]: re-reads the binary file
+    /// and parses its container headers, computed on demand and never
+    /// persisted.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] when the binary cannot be re-read, [`Error::Limit`]
+    /// past the input budget (see [`crate::loader::MAX_INPUT_BYTES`]).
+    pub fn headers_json(&self) -> Result<serde_json::Value> {
+        let bytes = read_input_bytes(&self.path)?;
+        Ok(crate::headers::headers_of(
+            &bytes,
+            &self.binary,
+            &self.content_sha256,
+        ))
+    }
+
+    /// Imports plus exports plus symbol-table code addresses for symbol views.
+    ///
+    /// Same document as [`Project::symbols_json`]: straight from the loader,
+    /// no analysis involved.
+    #[must_use]
+    pub fn symbols_json(&self) -> serde_json::Value {
+        serde_json::json!({ "imports": self.binary.imports, "exports": self.binary.exports, "symbols": self.binary.symbols })
+    }
+
+    /// Section table in file order: name, virtual address, in-memory size,
+    /// file offset/size of the raw bytes, and permissions.
+    ///
+    /// Same rows as [`Project::sections_json`]: straight from the loader,
+    /// no analysis involved. Raw blobs have no table and report an empty
+    /// array.
+    #[must_use]
+    pub fn sections_json(&self) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self
+            .binary
+            .sections
+            .iter()
+            .map(|s| {
+                let (vaddr, vaddr_hex) = addr_pair(s.vaddr);
+                serde_json::json!({
+                    "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
+                    "file_off": s.file_off, "file_size": s.data.len(),
+                    "readable": s.readable, "writable": s.writable,
+                    "executable": s.executable,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(rows)
+    }
+
+    /// Raw byte range at `va` with VA/file provenance and a typed view.
+    ///
+    /// Same result as [`Project::bytes_view`]: validated through the shared
+    /// range helper (same 1 MiB cap, zero-padded BSS tails, unmapped ranges
+    /// are [`Error::NotFound`]). Read-only: never writes the binary or the
+    /// sidecar.
+    ///
+    /// # Errors
+    /// Same as [`Project::bytes_view`].
+    pub fn bytes_view(
+        &self,
+        va: u64,
+        len: usize,
+        as_: BytesAs,
+        endian: BytesEndian,
+    ) -> Result<BytesView> {
+        bytes_view_of(&self.binary, va, len, as_, endian)
+    }
+
+    /// Search mapped file bytes for a literal/wildcard pattern, paged.
+    ///
+    /// Same page as [`Project::search_bytes`]: `pattern` is
+    /// whitespace-separated full-byte tokens, each two hex digits or a `??`
+    /// wildcard. Read-only: never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on malformed/overlong patterns and empty ranges,
+    /// [`Error::NotFound`] when `section` names no section,
+    /// [`Error::Limit`] past the per-request scan budget.
+    pub fn search_bytes(
+        &self,
+        pattern: &str,
+        section: Option<&str>,
+        range: Option<(u64, u64)>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<ByteMatch>> {
+        let parsed = BytePattern::parse(pattern)?;
+        let (total, items) = crate::search::run(
+            &self.binary,
+            &parsed,
+            section,
+            range,
+            offset,
+            limit.min(MAX_ROWS),
+        )?;
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Extracted strings, filtered then paged (the `strings` command query).
+    ///
+    /// Same rows as [`Project::query_strings`]: the stored snapshot rows
+    /// through the shared filter, no decoded analysis involved.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
+        crate::analysis::filter_string_hits(&self.strings, filter)
+    }
+
+    /// Extracted strings, filtered then paged under the protocol-1 envelope.
+    ///
+    /// Same page as [`Project::query_strings_envelope`]: `total` is the
+    /// exact filtered count and `items` holds the requested page.
+    ///
+    /// # Errors
+    /// Same as [`LoaderProject::query_strings`].
+    pub fn query_strings_envelope(&self, filter: &StringsFilter) -> Result<Page<StringHit>> {
+        let total = crate::analysis::count_string_hits(&self.strings, filter)?;
+        let items = crate::analysis::filter_string_hits(&self.strings, filter)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
+    }
+
+    /// Decoded-view strings: `strings --decode` over an in-memory transform.
+    ///
+    /// Same rows as [`Project::query_strings_decoded`]: re-extracted over a
+    /// per-segment decoded copy, strictly read-only.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings_decoded(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+    ) -> Result<Vec<StringHit>> {
+        let hits = crate::analysis::decoded_string_hits(&self.binary, decode);
+        crate::analysis::filter_string_hits(&hits, filter)
+    }
+
+    /// Decoded-view strings under the protocol-1 envelope.
+    ///
+    /// Same page as [`Project::query_strings_decoded_envelope`].
+    ///
+    /// # Errors
+    /// Same as [`LoaderProject::query_strings_decoded`].
+    pub fn query_strings_decoded_envelope(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+    ) -> Result<Page<StringHit>> {
+        let hits = crate::analysis::decoded_string_hits(&self.binary, decode);
+        let total = crate::analysis::count_string_hits(&hits, filter)?;
+        let items = crate::analysis::filter_string_hits(&hits, filter)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
+    }
+
+    /// Export renames, comments, and function seeds as a portable JSON
+    /// interchange document.
+    ///
+    /// Same document as [`Project::export_annotations`]: strictly read-only,
+    /// no sidecar is created or modified.
+    ///
+    /// # Errors
+    /// [`Error::Limit`] past annotation, seed, or document budgets,
+    /// [`Error::Storage`] on encoding failure.
+    pub fn export_annotations(&self) -> Result<String> {
+        crate::annotations::build_document(
+            &self.content_sha256,
+            self.size,
+            &self.mapping,
+            &self.annotations,
+            &self.func_seeds,
+        )
+    }
+}
+
+/// Raw bytes at `va` from one loaded binary (the [`Project::bytes_at`]
+/// core, shared with the loader-only open).
+///
+/// Same 1 MiB cap, zero-padded BSS tails, unmapped ranges are
+/// [`Error::NotFound`].
+fn bytes_at_in(bin: &LoadedBinary, va: u64, len: usize) -> Result<Vec<u8>> {
+    if len == 0 || len > MAX_RANGE_BYTES {
+        return Err(Error::Limit(format!("range length {len} out of bounds")));
+    }
+    let len_u64 = len as u64;
+    let seg = bin
+        .segments
+        .iter()
+        .find(|s| {
+            if va < s.vaddr {
+                return false;
+            }
+            let Some(off) = va.checked_sub(s.vaddr) else {
+                return false;
+            };
+            let Some(need) = off.checked_add(len_u64) else {
+                return false;
+            };
+            need <= s.mem_size
+        })
+        .ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
+    let mut out = vec![0u8; len];
+    let off = (va - seg.vaddr) as usize;
+    let have = seg.data.len().saturating_sub(off).min(len);
+    if have > 0 {
+        out[..have].copy_from_slice(&seg.data[off..off + have]);
+    }
+    Ok(out)
+}
+
+/// File offset of the byte at `va` in one loaded binary (the
+/// [`Project::file_off_of`] core, shared with the loader-only open).
+fn file_off_of_in(bin: &LoadedBinary, va: u64) -> Option<u64> {
+    for sec in &bin.sections {
+        if sec.data.is_empty() || va < sec.vaddr {
+            continue;
+        }
+        let d = va - sec.vaddr;
+        if d < sec.data.len() as u64 {
+            return sec.file_off.checked_add(d);
+        }
+    }
+    if bin.format == crate::loader::BinaryFormat::Raw {
+        for seg in &bin.segments {
+            if va < seg.vaddr {
+                continue;
+            }
+            let d = va - seg.vaddr;
+            if d < seg.data.len() as u64 {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Name of the file-backed section covering `va` in one loaded binary (the
+/// [`Project::section_of`] core, shared with the loader-only open).
+fn section_of_in(bin: &LoadedBinary, va: u64) -> Option<&str> {
+    for sec in &bin.sections {
+        if sec.data.is_empty() || va < sec.vaddr {
+            continue;
+        }
+        let d = va - sec.vaddr;
+        if d < sec.data.len() as u64 {
+            return Some(sec.name.as_str());
+        }
+    }
+    None
+}
+
+/// Raw byte range with VA/file provenance and a typed view from one loaded
+/// binary (the [`Project::bytes_view`] core, shared with the loader-only
+/// open).
+fn bytes_view_of(
+    bin: &LoadedBinary,
+    va: u64,
+    len: usize,
+    as_: BytesAs,
+    endian: BytesEndian,
+) -> Result<BytesView> {
+    let bytes = bytes_at_in(bin, va, len)?;
+    let width = match as_ {
+        BytesAs::U8 | BytesAs::CStr => 1,
+        BytesAs::U16 | BytesAs::Utf16 => 2,
+        BytesAs::U32 => 4,
+        BytesAs::U64 => 8,
+        BytesAs::Ptr => match bin.arch {
+            crate::disasm::Arch::X86_64 | crate::disasm::Arch::Aarch64 => 8,
+            _ => 4,
+        },
+    };
+    let le = endian == BytesEndian::Le;
+    let get = |w: &[u8]| -> u64 {
+        let mut v = 0u64;
+        if le {
+            for (i, &b) in w.iter().enumerate() {
+                v |= u64::from(b) << (8 * i);
+            }
+        } else {
+            for &b in w {
+                v = (v << 8) | u64::from(b);
+            }
+        }
+        v
+    };
+    let values: Vec<serde_json::Value> = match as_ {
+        BytesAs::U8 => bytes.iter().map(|&b| serde_json::Value::from(b)).collect(),
+        BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => bytes
+            .chunks_exact(width)
+            .map(|w| serde_json::Value::from(get(w)))
+            .collect(),
+        BytesAs::CStr => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            vec![serde_json::Value::from(
+                String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            )]
+        }
+        BytesAs::Utf16 => {
+            let (units, _) = bytes.as_chunks::<2>();
+            let units: Vec<u16> = units.iter().map(|w| get(w) as u16).collect();
+            let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+            vec![serde_json::Value::from(String::from_utf16_lossy(
+                &units[..end],
+            ))]
+        }
+    };
+    Ok(BytesView {
+        addr: va,
+        file_off: file_off_of_in(bin, va),
+        section: section_of_in(bin, va).map(str::to_string),
+        bytes,
+        values,
+    })
+}
+
 /// Opened analysis project: binary plus its cached analysis and annotations.
 ///
 /// The binary file is only ever read; all persistence (analysis snapshot,
@@ -625,37 +1206,116 @@ impl Project {
         Self::open_inner(binary, db_path, None, Some(fat_arch))
     }
 
+    /// Open for loader-only commands, skipping instruction re-decode on a
+    /// cache hit.
+    ///
+    /// Shares the [`Project::open_with_db`] cache identity (content hash
+    /// plus SHA-256 and size, loader mapping, analysis revision) over an
+    /// explicit DB path. A matching snapshot returns
+    /// [`LoaderOpened::Cached`]: the binary plus stored counts, strings,
+    /// annotations, and seeds, with outcome counts derived from the stored
+    /// layouts instead of a rebuilt analysis. A stale or missing snapshot
+    /// returns [`LoaderOpened::Fresh`]: a fully analyzed project identical
+    /// to [`Project::open_with_db`]. Reads never save or create the sidecar;
+    /// only [`Project::save`] and the annotation/seed setters write, and
+    /// only the sidecar.
+    ///
+    /// # Errors
+    /// Same as [`Project::open_with_db`].
+    pub fn open_loader_only(
+        binary: &Path,
+        db_path: &Path,
+        raw: Option<RawOptions>,
+        fat_arch: Option<&str>,
+    ) -> Result<LoaderOpened> {
+        let inputs = read_open_inputs(binary, db_path, raw, fat_arch)?;
+        let OpenInputs {
+            bytes,
+            hash,
+            sha256,
+            size,
+            mapping,
+            cached,
+        } = inputs;
+        match cached {
+            Some(db::Snapshot::Hit(hit)) => {
+                let loaded = reload_binary(&bytes, raw, fat_arch)?;
+                let db::Loaded {
+                    functions,
+                    xrefs,
+                    strings,
+                    diagnostics,
+                    annotations,
+                    seeds,
+                    meta,
+                    ..
+                } = *hit;
+                let summary = summary_of_hit(&functions, &xrefs, &strings);
+                Ok(LoaderOpened::Cached(Box::new(LoaderProject {
+                    path: binary.to_path_buf(),
+                    db_path: db_path.to_path_buf(),
+                    content_hash: hash,
+                    content_sha256: sha256,
+                    size,
+                    binary: loaded,
+                    summary,
+                    diagnostics: diagnostics.len(),
+                    diagnostics_truncated: meta.diagnostics_truncated,
+                    diagnostics_omitted: meta.diagnostics_omitted,
+                    inferred_truncated: meta.inferred_truncated,
+                    inferred_omitted: meta.inferred_omitted,
+                    strings,
+                    annotations,
+                    func_seeds: seeds,
+                    mapping,
+                })))
+            }
+            Some(db::Snapshot::Stale {
+                meta: stale_meta,
+                annotations,
+                seeds,
+            }) => Ok(LoaderOpened::Fresh(Box::new(Self::reanalyze(
+                binary,
+                db_path,
+                bytes,
+                raw,
+                fat_arch,
+                hash,
+                sha256,
+                size,
+                Some(stale_meta),
+                annotations,
+                seeds,
+            )?))),
+            Some(db::Snapshot::Miss) | None => Ok(LoaderOpened::Fresh(Box::new(Self::reanalyze(
+                binary,
+                db_path,
+                bytes,
+                raw,
+                fat_arch,
+                hash,
+                sha256,
+                size,
+                None,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )?))),
+        }
+    }
+
     fn open_inner(
         binary: &Path,
         db_path: &Path,
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
     ) -> Result<Self> {
-        reject_db_is_binary(binary, db_path)?;
-        // Single-open bounded read: one handle, chunked with checked
-        // accumulation, so a growing file cannot slip past a stat cap.
-        let bytes = read_input_bytes(binary)?;
-        let hash = db::content_hash(&bytes);
-        let sha256 = crate::annotations::sha256_hex(&bytes);
-        let size = bytes.len() as u64;
-        let mapping = mapping_for(raw, fat_arch)?;
-
-        // Metadata-first snapshot read over a read-only handle: cache
-        // identity covers content hash plus SHA-256 and size, loader mapping,
-        // and analysis revision before any layout replay (see
-        // `db::load_cached`), and the read-only open itself costs nothing
-        // proportional to the file. Reads never save and never create the
-        // sidecar.
-        let cached = if db_path.exists() {
-            match db::open_db_read_only(db_path) {
-                Ok(db) => Some(db::load_cached(&db, hash, &sha256, size, &mapping)?),
-                // Raced with a concurrent sidecar deletion: read as absent.
-                Err(_) if !db_path.exists() => None,
-                Err(e) => return Err(e),
-            }
-        } else {
-            None
-        };
+        let inputs = read_open_inputs(binary, db_path, raw, fat_arch)?;
+        let bytes = inputs.bytes;
+        let hash = inputs.hash;
+        let sha256 = inputs.sha256;
+        let size = inputs.size;
+        let mapping = inputs.mapping;
+        let cached = inputs.cached;
 
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
@@ -1737,34 +2397,7 @@ impl Project {
     /// [`Error::Limit`] for empty/oversize ranges, [`Error::NotFound`] when
     /// the range is not fully mapped.
     pub fn bytes_at(&self, va: u64, len: usize) -> Result<Vec<u8>> {
-        if len == 0 || len > MAX_RANGE_BYTES {
-            return Err(Error::Limit(format!("range length {len} out of bounds")));
-        }
-        let len_u64 = len as u64;
-        let seg = self
-            .binary
-            .segments
-            .iter()
-            .find(|s| {
-                if va < s.vaddr {
-                    return false;
-                }
-                let Some(off) = va.checked_sub(s.vaddr) else {
-                    return false;
-                };
-                let Some(need) = off.checked_add(len_u64) else {
-                    return false;
-                };
-                need <= s.mem_size
-            })
-            .ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
-        let mut out = vec![0u8; len];
-        let off = (va - seg.vaddr) as usize;
-        let have = seg.data.len().saturating_sub(off).min(len);
-        if have > 0 {
-            out[..have].copy_from_slice(&seg.data[off..off + have]);
-        }
-        Ok(out)
+        bytes_at_in(&self.binary, va, len)
     }
 
     /// File offset of the byte at `va`, if file-backed.
@@ -1776,27 +2409,7 @@ impl Project {
     /// `file_off` provenance of [`Project::search_bytes`].
     #[must_use]
     pub fn file_off_of(&self, va: u64) -> Option<u64> {
-        for sec in &self.binary.sections {
-            if sec.data.is_empty() || va < sec.vaddr {
-                continue;
-            }
-            let d = va - sec.vaddr;
-            if d < sec.data.len() as u64 {
-                return sec.file_off.checked_add(d);
-            }
-        }
-        if self.binary.format == crate::loader::BinaryFormat::Raw {
-            for seg in &self.binary.segments {
-                if va < seg.vaddr {
-                    continue;
-                }
-                let d = va - seg.vaddr;
-                if d < seg.data.len() as u64 {
-                    return Some(d);
-                }
-            }
-        }
-        None
+        file_off_of_in(&self.binary, va)
     }
 
     /// Virtual address backed by file offset `off`, if any.
@@ -1831,16 +2444,7 @@ impl Project {
     /// the `section` provenance of [`Project::search_bytes`].
     #[must_use]
     pub fn section_of(&self, va: u64) -> Option<&str> {
-        for sec in &self.binary.sections {
-            if sec.data.is_empty() || va < sec.vaddr {
-                continue;
-            }
-            let d = va - sec.vaddr;
-            if d < sec.data.len() as u64 {
-                return Some(sec.name.as_str());
-            }
-        }
-        None
+        section_of_in(&self.binary, va)
     }
 
     /// Raw byte range at `va` with VA/file provenance and a typed view.
@@ -1861,59 +2465,7 @@ impl Project {
         as_: BytesAs,
         endian: BytesEndian,
     ) -> Result<BytesView> {
-        let bytes = self.bytes_at(va, len)?;
-        let width = match as_ {
-            BytesAs::U8 | BytesAs::CStr => 1,
-            BytesAs::U16 | BytesAs::Utf16 => 2,
-            BytesAs::U32 => 4,
-            BytesAs::U64 => 8,
-            BytesAs::Ptr => match self.binary.arch {
-                crate::disasm::Arch::X86_64 | crate::disasm::Arch::Aarch64 => 8,
-                _ => 4,
-            },
-        };
-        let le = endian == BytesEndian::Le;
-        let get = |w: &[u8]| -> u64 {
-            let mut v = 0u64;
-            if le {
-                for (i, &b) in w.iter().enumerate() {
-                    v |= u64::from(b) << (8 * i);
-                }
-            } else {
-                for &b in w {
-                    v = (v << 8) | u64::from(b);
-                }
-            }
-            v
-        };
-        let values: Vec<serde_json::Value> = match as_ {
-            BytesAs::U8 => bytes.iter().map(|&b| serde_json::Value::from(b)).collect(),
-            BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => bytes
-                .chunks_exact(width)
-                .map(|w| serde_json::Value::from(get(w)))
-                .collect(),
-            BytesAs::CStr => {
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                vec![serde_json::Value::from(
-                    String::from_utf8_lossy(&bytes[..end]).into_owned(),
-                )]
-            }
-            BytesAs::Utf16 => {
-                let (units, _) = bytes.as_chunks::<2>();
-                let units: Vec<u16> = units.iter().map(|w| get(w) as u16).collect();
-                let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-                vec![serde_json::Value::from(String::from_utf16_lossy(
-                    &units[..end],
-                ))]
-            }
-        };
-        Ok(BytesView {
-            addr: va,
-            file_off: self.file_off_of(va),
-            section: self.section_of(va).map(str::to_string),
-            bytes,
-            values,
-        })
+        bytes_view_of(&self.binary, va, len, as_, endian)
     }
 
     /// Disassemble `len` bytes at `va` with the binary's architecture.
