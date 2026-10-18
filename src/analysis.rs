@@ -6,7 +6,10 @@
 //! prologue scan for functions unreachable from those seeds. Decoded code is
 //! split into basic blocks, each function gets a CFG and the whole binary a
 //! callgraph (both `petgraph` maps), and cross-references are split into
-//! code, data, string, and import refs.
+//! code, data, string, and import refs. Calls to known-noreturn imports
+//! (`exit`, `abort`, `ExitProcess`, and similar) cut the fall-through CFG
+//! edge and flag the function row; wrappers propagate to a bounded
+//! fixpoint (see `plan_noreturn`).
 //!
 //! Control flow reuses the M3 lift ([`lift`](crate::ir::lift)): `Branch`/`CBranch`/`Call`
 //! carry their direct target, `Return` ends a path, everything else
@@ -46,7 +49,7 @@ pub const MAX_SEEDS: usize = 100_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 10;
+pub const ANALYSIS_REVISION: u32 = 11;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -108,6 +111,13 @@ pub const MAX_CALL_DEPTH: usize = 64;
 /// over the instruction set. Mirrors [`MAX_CALL_DEPTH`]: direct
 /// predecessors are depth 1, zero yields an empty set.
 pub const MAX_SLICE_DEPTH: usize = 64;
+/// Cap on noreturn propagation rounds per `plan_noreturn` call.
+///
+/// Each round marks every dirty function whose entry can no longer reach
+/// a return; a chain of wrappers around `exit` needs one round per link.
+/// Real chains are a handful deep; past this bound the leftovers stay
+/// returning (today's behavior), never guessed noreturn.
+pub const MAX_NORETURN_ROUNDS: usize = 64;
 
 /// What a cross-reference points through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -287,6 +297,12 @@ pub enum DiagnosticKind {
     /// Call without a direct target. The site stays edgeless.
     #[serde(alias = "UnresolvedIndirectCall")]
     UnresolvedIndirectCall,
+    /// Call to a target that never returns (a known-noreturn import or a
+    /// function with no return-reachable exit). The fall-through edge is
+    /// cut: the site keeps its callgraph and import edges, but the next
+    /// instruction is not a successor.
+    #[serde(alias = "NoreturnCut")]
+    NoreturnCut,
     /// Executable bytes at a discovery address that did not decode.
     /// Only queued discovery addresses are recorded, never every
     /// undecoded byte in the binary.
@@ -369,6 +385,7 @@ pub fn diagnostic_detail(kind: DiagnosticKind) -> &'static str {
         DiagnosticKind::DecodeFailure => {
             "executable bytes at a queued discovery address that did not decode"
         }
+        DiagnosticKind::NoreturnCut => "call to a noreturn target; the fall-through edge is cut",
     }
 }
 
@@ -492,6 +509,9 @@ pub struct Function {
     /// `None` means the project arch. Persisted per function so snapshot
     /// reload re-decodes identical bytes.
     pub decode_arch: Option<Arch>,
+    /// Whether this function never returns: no path from the entry
+    /// reaches a return or an unknown exit (see `plan_noreturn`).
+    pub noreturn: bool,
 }
 
 impl Function {
@@ -604,6 +624,7 @@ impl Function {
             inferred: inferred_set,
             reasons: reasons.into_iter().collect(),
             decode_arch,
+            noreturn: false,
         }
     }
 }
@@ -1328,6 +1349,32 @@ pub fn rebuild(
                 }
             }
         }
+        // Noreturn flags over the replayed graphs: the persisted edges
+        // already exclude cut fall-throughs and pruned blocks are absent,
+        // so the same fixpoint over fresh lifts reproduces the flags of
+        // a fresh analysis (see `plan_noreturn`).
+        let mut flows: BTreeMap<(u64, u64), Flow> = BTreeMap::new();
+        for (entry, f) in &analysis.functions {
+            let func_arch = f.decode_arch.unwrap_or(arch);
+            for (start, block) in &f.blocks {
+                if let Some(last) = block.insns.last() {
+                    flows.insert((*entry, *start), flow_of(func_arch, last));
+                }
+            }
+        }
+        let mut seeds = BTreeSet::new();
+        for (&site, &i) in &stubs {
+            if analysis.functions.contains_key(&site)
+                && let Some(imp) = bin.imports.get(i)
+                && is_noreturn_import(&imp.name)
+            {
+                seeds.insert(site);
+            }
+        }
+        let plan = plan_noreturn(&analysis.functions, &flows, &seeds);
+        for (entry, f) in analysis.functions.iter_mut() {
+            f.noreturn = plan.noreturn.contains(entry);
+        }
         analysis.import_stubs = stubs;
         analysis
     })
@@ -1415,6 +1462,12 @@ pub struct FunctionSummary {
     pub insns: usize,
     /// Sorted direct call targets.
     pub calls: Vec<u64>,
+    /// Whether this function never returns (see [`Function::noreturn`]).
+    ///
+    /// Defaults to `false` so rows written before noreturn tracking
+    /// still decode.
+    #[serde(default)]
+    pub noreturn: bool,
 }
 
 impl Serialize for FunctionSummary {
@@ -1423,7 +1476,7 @@ impl Serialize for FunctionSummary {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("FunctionSummary", 7)?;
+        let mut st = serializer.serialize_struct("FunctionSummary", 8)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("entry", &self.entry)?;
         st.serialize_field("entry_hex", &crate::addr_hex(self.entry))?;
@@ -1431,6 +1484,7 @@ impl Serialize for FunctionSummary {
         st.serialize_field("blocks", &self.blocks)?;
         st.serialize_field("insns", &self.insns)?;
         st.serialize_field("calls", &self.calls)?;
+        st.serialize_field("noreturn", &self.noreturn)?;
         st.end()
     }
 }
@@ -1567,6 +1621,7 @@ impl Analysis {
                 blocks: f.blocks.len(),
                 insns: f.insn_count(),
                 calls: self.calls_of(f.entry),
+                noreturn: f.noreturn,
             })
             .collect()
     }
@@ -2045,6 +2100,289 @@ fn flow_of(arch: Arch, insn: &Insn) -> Flow {
         Some((IrOp::Return, _)) => Flow::Ret,
         _ => Flow::Seq,
     }
+}
+
+/// Whether `name` is a known-noreturn import: `exit`, `abort`, `_exit`,
+/// `__assert_fail`, `__stack_chk_fail`, `ExitProcess`, and similar across
+/// glibc, msvcrt, kernel32, and libSystem.
+///
+/// Exact names only, plus one stripped leading underscore for the Mach-O
+/// `_`-prefix convention (`_exit` calls `exit`, `___stack_chk_fail` calls
+/// `__stack_chk_fail`). Substrings never match: `myexit` is not `exit`.
+fn is_noreturn_import(name: &str) -> bool {
+    const NORETURN: &[&str] = &[
+        "exit",
+        "_exit",
+        "_Exit",
+        "abort",
+        "quick_exit",
+        "longjmp",
+        "siglongjmp",
+        "pthread_exit",
+        "exit_group",
+        "__assert_fail",
+        "__assert_rtn",
+        "__stack_chk_fail",
+        "__fortify_fail",
+        "_Unwind_Resume",
+        "__cxa_throw",
+        "__cxa_rethrow",
+        "ExitProcess",
+        "ExitThread",
+        "TerminateProcess",
+        "TerminateThread",
+        "FatalExit",
+        "os_fatal",
+    ];
+    if NORETURN.contains(&name) {
+        return true;
+    }
+    name.strip_prefix('_')
+        .is_some_and(|rest| NORETURN.contains(&rest))
+}
+
+/// Noreturn plan: which functions never return and which call
+/// fall-throughs to cut (see [`plan_noreturn`]).
+struct NoreturnPlan {
+    /// Entries with no return-reachable exit.
+    noreturn: BTreeSet<u64>,
+    /// `(func, block)` call sites whose fall-through edge is cut.
+    cuts: BTreeSet<(u64, u64)>,
+}
+
+/// Shared context for [`end_facts`]: the noreturn set under
+/// consideration plus the maps that resolve exits.
+struct EndCtx<'a> {
+    noreturn: &'a BTreeSet<u64>,
+    owner: &'a dyn Fn(u64) -> Option<u64>,
+    code: &'a BTreeSet<u64>,
+    apply_cuts: bool,
+}
+
+/// Successors of one block end under a noreturn set.
+///
+/// `blocks` is the containing function's block map; `last` is its last
+/// instruction ending at `end` with `flow`. Returns `(succs, cut,
+/// poison)`: `succs` holds the in-function block starts control may
+/// reach next; `cut` marks a call whose fall-through is severed (its
+/// target never returns); `poison` marks a possible return or an exit
+/// through unknown code (a `Return`, an unresolved jump, a truncated
+/// path, or a jump out to a function that may return).
+///
+/// Unknown exits poison rather than diverge: only positive evidence (a
+/// noreturn call or a tail jump to a noreturn function) ends a path
+/// silently. `apply_cuts` selects the cut graph (`true`) or the uncut
+/// graph (`false`, for delta pruning); poison is reported either way.
+fn end_facts(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    last: &Insn,
+    end: u64,
+    flow: Flow,
+    ctx: &EndCtx,
+) -> (Vec<u64>, bool, bool) {
+    match flow {
+        Flow::Ret => (Vec::new(), false, true),
+        Flow::Seq => {
+            if blocks.contains_key(&end) {
+                (vec![end], false, false)
+            } else {
+                (Vec::new(), false, true)
+            }
+        }
+        Flow::Branch { target: None } => (Vec::new(), false, true),
+        Flow::Branch { target: Some(t) } => {
+            if blocks.contains_key(&t) {
+                (vec![t], false, false)
+            } else if ctx.code.contains(&t)
+                && (ctx.owner)(t).is_some_and(|g| ctx.noreturn.contains(&g))
+            {
+                (Vec::new(), false, false)
+            } else {
+                (Vec::new(), false, true)
+            }
+        }
+        Flow::CBranch { target } => {
+            let mut succs = Vec::new();
+            let mut poison = false;
+            match target {
+                Some(t) if blocks.contains_key(&t) => succs.push(t),
+                Some(t)
+                    if ctx.code.contains(&t)
+                        && (ctx.owner)(t).is_some_and(|g| ctx.noreturn.contains(&g)) => {}
+                _ => poison = true,
+            }
+            if blocks.contains_key(&end) {
+                succs.push(end);
+            } else {
+                poison = true;
+            }
+            (succs, false, poison)
+        }
+        Flow::Call { target } => {
+            let import_nr = last.import.as_deref().is_some_and(is_noreturn_import);
+            let callee = target.filter(|t| ctx.code.contains(t)).and_then(ctx.owner);
+            let cut = import_nr || callee.is_some_and(|g| ctx.noreturn.contains(&g));
+            if cut && ctx.apply_cuts {
+                (Vec::new(), true, false)
+            } else if blocks.contains_key(&end) {
+                (vec![end], cut, false)
+            } else {
+                (Vec::new(), cut, true)
+            }
+        }
+    }
+}
+
+/// Blocks reachable from the entry over `func`'s blocks, following
+/// [`end_facts`] successors plus `inferred` edges with or without
+/// noreturn cuts, and whether any reached block end poisons (a possible
+/// return or unknown exit; the prune pass ignores the flag).
+fn walk_function(
+    func: &Function,
+    flows: &BTreeMap<(u64, u64), Flow>,
+    inferred: &BTreeMap<u64, Vec<u64>>,
+    noreturn: &BTreeSet<u64>,
+    owner: &dyn Fn(u64) -> Option<u64>,
+    code: &BTreeSet<u64>,
+    apply_cuts: bool,
+) -> (BTreeSet<u64>, bool) {
+    let ctx = EndCtx {
+        noreturn,
+        owner,
+        code,
+        apply_cuts,
+    };
+    let mut seen = BTreeSet::new();
+    let mut poison = false;
+    let mut stack = vec![func.entry];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(&b) else {
+            continue;
+        };
+        let Some(last) = block.insns.last() else {
+            continue;
+        };
+        let flow = flows[&(func.entry, b)];
+        let (mut succs, _cut, poisoned) = end_facts(&func.blocks, last, block.end(), flow, &ctx);
+        poison |= poisoned;
+        if let Some(extra) = inferred.get(&b) {
+            succs.extend(extra.iter().copied());
+        }
+        stack.extend(succs.into_iter().filter(|s| !seen.contains(s)));
+    }
+    (seen, poison)
+}
+
+/// Inferred block edges per function: entry to `from_block` to targets.
+///
+/// Shared by [`plan_noreturn`] and delta pruning so both follow the same
+/// same-function resolutions.
+fn inferred_map(functions: &BTreeMap<u64, Function>) -> BTreeMap<u64, BTreeMap<u64, Vec<u64>>> {
+    let mut map: BTreeMap<u64, BTreeMap<u64, Vec<u64>>> = BTreeMap::new();
+    for (e, f) in functions {
+        for (a, b) in f.inferred_edges() {
+            map.entry(*e).or_default().entry(a).or_default().push(b);
+        }
+    }
+    map
+}
+
+/// Find functions that never return and the call fall-throughs to cut.
+///
+/// A function is noreturn when no path from its entry reaches a return
+/// or an unknown exit; every terminating path instead ends in a call to
+/// a noreturn target or a tail jump to one. `seeds` are import-stub
+/// entries for known-noreturn imports (`exit@plt` and friends); direct
+/// callers and tail jumps propagate to a fixpoint bounded by
+/// [`MAX_NORETURN_ROUNDS`]. Anything unproven stays returning: a cut is
+/// only ever added on positive evidence.
+///
+/// `flows` carries each block's end flow: stored walker flows in
+/// [`analyze`], fresh lifts in [`rebuild`]. Both run this over the same
+/// block ends, so fresh and cached analyses flag identically: pruning
+/// only drops blocks no cut-graph path reaches, and verdicts only
+/// consult cut-graph-reachable blocks.
+fn plan_noreturn(
+    functions: &BTreeMap<u64, Function>,
+    flows: &BTreeMap<(u64, u64), Flow>,
+    seeds: &BTreeSet<u64>,
+) -> NoreturnPlan {
+    let entries: Vec<u64> = functions.keys().copied().collect();
+    let owner = |va: u64| function_owner(&entries, va);
+    let code: BTreeSet<u64> = functions
+        .values()
+        .flat_map(|f| f.blocks.keys().copied())
+        .collect();
+    let inferred = inferred_map(functions);
+    // Reverse callgraph for dirty propagation: callee to callers. Only
+    // direct-target calls matter here; import-noreturn sites are static.
+    let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (e, f) in functions {
+        for (b, block) in &f.blocks {
+            if !matches!(flows[&(*e, *b)], Flow::Call { .. }) {
+                continue;
+            }
+            let target = block.insns.last().and_then(|i| i.branch_target);
+            if let Some(t) = target.filter(|t| code.contains(t))
+                && let Some(g) = owner(t)
+            {
+                callers.entry(g).or_default().insert(*e);
+            }
+        }
+    }
+    let mut noreturn: BTreeSet<u64> = seeds
+        .iter()
+        .copied()
+        .filter(|e| functions.contains_key(e))
+        .collect();
+    let mut dirty: BTreeSet<u64> = functions.keys().copied().collect();
+    for _ in 0..MAX_NORETURN_ROUNDS {
+        let mut fresh = Vec::new();
+        for &e in &dirty {
+            if noreturn.contains(&e) {
+                continue;
+            }
+            let f = &functions[&e];
+            let empty: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+            let inf = inferred.get(&e).unwrap_or(&empty);
+            let (_, poison) = walk_function(f, flows, inf, &noreturn, &owner, &code, true);
+            if !poison {
+                fresh.push(e);
+            }
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        dirty.clear();
+        for e in fresh {
+            noreturn.insert(e);
+            if let Some(cs) = callers.get(&e) {
+                dirty.extend(cs.iter().copied());
+            }
+        }
+    }
+    let ctx = EndCtx {
+        noreturn: &noreturn,
+        owner: &owner,
+        code: &code,
+        apply_cuts: true,
+    };
+    let mut cuts = BTreeSet::new();
+    for (e, f) in functions {
+        for (b, block) in &f.blocks {
+            let Some(last) = block.insns.last() else {
+                continue;
+            };
+            let (_, cut, _) = end_facts(&f.blocks, last, block.end(), flows[&(*e, *b)], &ctx);
+            if cut {
+                cuts.insert((*e, *b));
+            }
+        }
+    }
+    NoreturnPlan { noreturn, cuts }
 }
 
 /// Resolve a string hit's section name and executability.
@@ -3539,6 +3877,7 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
                 inferred: BTreeSet::new(),
                 reasons: reasons.remove(e).unwrap_or_default(),
                 decode_arch: None,
+                noreturn: false,
             },
         );
     }
@@ -3601,10 +3940,40 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
     for e in functions.keys() {
         callgraph.add_node(*e);
     }
+    // Noreturn calls: stub entries serving known-noreturn imports seed
+    // the fixpoint; direct callers and tail jumps propagate (see
+    // `plan_noreturn`). Flows are the stored walker flows, exactly as
+    // edge building reads them below.
+    let mut flows: BTreeMap<(u64, u64), Flow> = BTreeMap::new();
+    for (entry, f) in &functions {
+        for (start, block) in &f.blocks {
+            if let Some(last) = block.insns.last() {
+                flows.insert(
+                    (*entry, *start),
+                    decoded
+                        .get(&last.addr)
+                        .map(|d| d.flow)
+                        .unwrap_or_else(|| flow_of(arch, last)),
+                );
+            }
+        }
+    }
+    let mut seeds = BTreeSet::new();
+    for (&site, &i) in &stubs {
+        if entries.contains(&site)
+            && let Some(imp) = bin.imports.get(i)
+            && is_noreturn_import(&imp.name)
+        {
+            seeds.insert(site);
+        }
+    }
+    let plan = plan_noreturn(&functions, &flows, &seeds);
     // Block-end lookup for edge targets.
     let keys: Vec<u64> = functions.keys().copied().collect();
     let mut cfg_edges: Vec<(u64, u64, u64)> = Vec::new();
-    let mut cg_edges: Vec<(u64, u64)> = Vec::new();
+    // Callgraph edges carry the caller block: pruned blocks (past cuts)
+    // must not contribute edges.
+    let mut cg_edges: Vec<(u64, u64, u64)> = Vec::new();
     for entry in keys {
         let Some(f) = functions.get(&entry) else {
             continue;
@@ -3628,7 +3997,7 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
                     } else if decoded.contains_key(&t)
                         && let Some(o) = owner(t)
                     {
-                        cg_edges.push((entry, o));
+                        cg_edges.push((entry, *start, o));
                     }
                 }
                 Flow::Branch { target: None } => {}
@@ -3647,7 +4016,12 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
                         && decoded.contains_key(&t)
                         && let Some(o) = owner(t)
                     {
-                        cg_edges.push((entry, o));
+                        cg_edges.push((entry, *start, o));
+                    }
+                    // Noreturn calls never reach the next instruction:
+                    // the fall-through edge is cut (see `plan_noreturn`).
+                    if plan.cuts.contains(&(entry, *start)) {
+                        continue;
                     }
                     if f.blocks.contains_key(&end) {
                         cfg_edges.push((entry, *start, end));
@@ -3662,15 +4036,67 @@ pub fn analyze_with_seeds(bin: &LoadedBinary, user: &[UserSeed]) -> Result<Analy
             }
         }
     }
+    // Prune blocks reachable only through cut fall-throughs: they hold
+    // bytes the walker decoded past noreturn calls (padding or data),
+    // never real continuations. Blocks reachable without cuts (inferred
+    // targets included) stay.
+    let code: BTreeSet<u64> = functions
+        .values()
+        .flat_map(|f| f.blocks.keys().copied())
+        .collect();
+    let inf = inferred_map(&functions);
+    let no_inf: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    let mut pruned: Vec<(u64, u64)> = Vec::new();
+    for (entry, f) in &functions {
+        let fi = inf.get(entry).unwrap_or(&no_inf);
+        let (uncut, _) = walk_function(f, &flows, fi, &plan.noreturn, &owner, &code, false);
+        let (cut, _) = walk_function(f, &flows, fi, &plan.noreturn, &owner, &code, true);
+        pruned.extend(uncut.difference(&cut).map(|b| (*entry, *b)));
+    }
+    for (entry, start) in &pruned {
+        if let Some(f) = functions.get_mut(entry) {
+            f.blocks.remove(start);
+            f.cfg.remove_node(*start);
+        }
+    }
+    for f in functions.values_mut() {
+        f.inferred
+            .retain(|(a, b)| f.blocks.contains_key(a) && f.blocks.contains_key(b));
+    }
     for (func, a, b) in cfg_edges {
-        if let Some(f) = functions.get_mut(&func) {
+        if let Some(f) = functions.get_mut(&func)
+            && f.blocks.contains_key(&a)
+            && f.blocks.contains_key(&b)
+        {
             f.cfg.add_edge(a, b, ());
         }
     }
-    for (a, b) in cg_edges {
-        if functions.contains_key(&b) {
+    for (a, blk, b) in cg_edges {
+        if functions
+            .get(&a)
+            .is_some_and(|f| f.blocks.contains_key(&blk))
+            && functions.contains_key(&b)
+        {
             callgraph.add_edge(a, b, ());
         }
+    }
+    // One record per cut call site that survived pruning (pruned sites
+    // are unreachable padding; the surviving cut marks the real edge).
+    for (func, block) in &plan.cuts {
+        if let Some(site) = functions
+            .get(func)
+            .and_then(|f| f.blocks.get(block))
+            .and_then(|b| b.insns.last())
+            .map(|i| i.addr)
+        {
+            diagnostic_set.insert(Diagnostic {
+                addr: site,
+                kind: DiagnosticKind::NoreturnCut,
+            });
+        }
+    }
+    for (entry, f) in functions.iter_mut() {
+        f.noreturn = plan.noreturn.contains(entry);
     }
 
     // Pass D: xrefs. Code from direct branch/call targets, data from
@@ -3882,6 +4308,53 @@ mod tests {
             insns: Vec::new(),
         };
         assert_eq!(b.id(0x2000), "block@0x2000+0x2007");
+    }
+
+    #[test]
+    fn noreturn_import_names_are_exact() {
+        for name in [
+            "exit",
+            "_exit",
+            "_Exit",
+            "abort",
+            "quick_exit",
+            "longjmp",
+            "siglongjmp",
+            "pthread_exit",
+            "exit_group",
+            "__assert_fail",
+            "__assert_rtn",
+            "__stack_chk_fail",
+            "__fortify_fail",
+            "_Unwind_Resume",
+            "__cxa_throw",
+            "__cxa_rethrow",
+            "ExitProcess",
+            "ExitThread",
+            "TerminateProcess",
+            "TerminateThread",
+            "FatalExit",
+            "os_fatal",
+            // Mach-O `_` prefix convention.
+            "_abort",
+            "___stack_chk_fail",
+            "_pthread_exit",
+        ] {
+            assert!(is_noreturn_import(name), "{name:?} is noreturn");
+        }
+        for name in [
+            "foo",
+            "myexit",
+            "exit2",
+            "exiting",
+            "Exit",
+            "ABORT",
+            "abort_handler",
+            "pthread_create",
+            "",
+        ] {
+            assert!(!is_noreturn_import(name), "{name:?} returns");
+        }
     }
 
     /// Eager pre-fix oracle: collect every candidate, sort, dedup, filter,

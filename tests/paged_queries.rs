@@ -223,6 +223,7 @@ fn functions_page_matches_collect_all_oracle() {
                     blocks: f.blocks.len(),
                     insns: f.insn_count(),
                     calls: a.calls_of(f.entry),
+                    noreturn: f.noreturn,
                 })
                 .collect();
             let want = oracle_slice(&full, off, lim);

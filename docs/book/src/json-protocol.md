@@ -174,8 +174,15 @@ still snaps to the canonical `entry`:
 ```json
 {"id": "func@0x401000", "entry": 4198400, "entry_hex": "0x401000",
  "name": "main", "blocks": 1, "insns": 3, "calls": 0,
- "inferred_edges": 0, "reasons": ["entry"]}
+ "inferred_edges": 0, "reasons": ["entry"], "noreturn": false}
 ```
+
+Function rows (the bare-array `functions` list, the opt-in envelope
+preview, `func` detail, and `func-meta`) carry an additive `noreturn`
+bool: true when no path from the entry reaches a return. Calls to
+known-noreturn imports (`exit`, `abort`, `ExitProcess`, and similar)
+cut the fall-through CFG edge and record a `noreturn-cut` diagnostic;
+wrappers around them propagate to a bounded fixpoint.
 
 Explicitly unchanged in this contract (no style churn): the bare-array
 `functions` list with `--offset`/`--limit` (plus the opt-in
@@ -361,7 +368,7 @@ binscout diagnostics B [--kind KIND] [--func ADDR] [--offset N] [--limit N]
 
 MCP tool `diagnostics` (`binary`, `db`?, `raw`?, `kind?`, `func?`,
 `offset?`, `limit?`). `kind` is one of `unresolved-indirect-jump`,
-`unresolved-indirect-call`, `decode-failure`; anything else is an
+`unresolved-indirect-call`, `noreturn-cut`, `decode-failure`; anything else is an
 `Invalid` error. `func` snaps to its containing function and keeps
 only that function's sites (`NotFound` when in no function). Items
 order by (`kind`, `addr`); each row carries `kind`, `addr`/`addr_hex`,

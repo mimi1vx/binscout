@@ -13,7 +13,7 @@ the binary re-analyzes. Annotations and user seeds carry over by address
 when the mapping is unchanged. A sidecar holding annotations or seeds
 opened under an incompatible mapping fails with a separate-DB error
 instead of remapping them. A sidecar written by an older schema version (current
-version 8, analysis revision 10) behaves the same way: annotations and
+version 8, analysis revision 11) behaves the same way: annotations and
 seeds carry over and the binary re-analyzes. Metadata, annotations, and
 user seeds persist as JSON rows; derived rows (functions, xrefs, strings)
 persist as chunked compact binary blobs with integer chunk keys, while
@@ -29,7 +29,7 @@ always match the stored seeds.
 | `functions` | entry address | function row (name, callees, discovery reasons, decode-arch override) plus its block layouts (address range plus per-instruction sizes, successors, inferred successors) |
 | `xrefs` | chunk index | cross-reference blob chunk (fixed `(from, kind, to)` entries: direct, `import`, and `inferred-code` kinds) |
 | `strings` | chunk index | extracted-string blob chunk |
-| `diagnostics` | `(addr, kind)` | key-only provenance row (unresolved indirect sites, decode failures) |
+| `diagnostics` | `(addr, kind)` | key-only provenance row (unresolved indirect sites, noreturn cuts, decode failures) |
 | `annotations` | address | rename and/or comment |
 | `func_seeds` | address | user function seed (decode mode, excluded flag) |
 
