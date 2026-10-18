@@ -354,6 +354,10 @@ pub struct StringsParams {
     /// obfuscated text with original offsets; never writes the
     /// binary.
     pub decode: Option<String>,
+    /// Include the bounded referencing-instruction list per string
+    /// (capped at 64 refs per row), so one call replaces the `strings`
+    /// then `xrefs` round-trip.
+    pub with_xrefs: Option<bool>,
 }
 
 /// Parameters for the `functions` tool: paged list with optional filters.
@@ -976,6 +980,7 @@ struct BatchStrings {
     section: Option<String>,
     include_code: Option<bool>,
     decode: Option<String>,
+    with_xrefs: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1234,8 +1239,13 @@ fn run_batch_op(
                 .map(|v| parse_addr(&v))
                 .transpose()
                 .map_err(|e| e.to_string())?;
-            let (total, rows) =
-                proj.query_xrefs_page(to, from, kind, a.offset.unwrap_or(0), a.limit.unwrap_or(50));
+            let (total, rows) = proj.query_xref_rows_page(
+                to,
+                from,
+                kind,
+                a.offset.unwrap_or(0),
+                a.limit.unwrap_or(50),
+            );
             Ok(serde_json::json!({ "total": total, "xrefs": rows }))
         }
         "strings" => {
@@ -1257,17 +1267,20 @@ fn run_batch_op(
                 start: a.start.or(a.offset).unwrap_or(0),
                 limit: a.limit.unwrap_or(50),
             };
+            let with_xrefs = a.with_xrefs.unwrap_or(false);
             if a.envelope.unwrap_or(false) {
                 let page = match decode {
-                    Some(spec) => proj.query_strings_decoded_envelope(&filter, spec),
-                    None => proj.query_strings_envelope(&filter),
+                    Some(spec) => {
+                        proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs)
+                    }
+                    None => proj.query_strings_rows_envelope(&filter, with_xrefs),
                 }
                 .map_err(invalid_msg)?;
                 Ok(serde_json::to_value(page).expect("strings envelope serializes"))
             } else {
                 let rows = match decode {
-                    Some(spec) => proj.query_strings_decoded(&filter, spec),
-                    None => proj.query_strings(&filter),
+                    Some(spec) => proj.query_strings_decoded_rows(&filter, spec, with_xrefs),
+                    None => proj.query_strings_rows(&filter, with_xrefs),
                 }
                 .map_err(invalid_msg)?;
                 Ok(serde_json::to_value(rows).expect("strings serialize"))
@@ -1876,7 +1889,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "xrefs",
-        description = "Cross-references filtered by to/from address and kind, paged with total match count"
+        description = "Cross-references filtered by to/from address and kind, paged with total match count; rows carry the containing function (from_func/from_func_name), the target display name (to_name), and the string preview for string-kind rows (to_string)"
     )]
     async fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1896,13 +1909,13 @@ impl BinscoutMcp {
             .map_err(error_data)?;
         let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
         let (total, rows) =
-            proj.query_xrefs_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
+            proj.query_xref_rows_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
         ok(serde_json::json!({ "total": total, "xrefs": rows }))
     }
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only obfuscated view: xor:<byte>, xor:0x<HEXKEY> (rolling multi-byte key), add:<byte>, rot:<0-7>, or bare base64 (blob plaintext). offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only obfuscated view: xor:<byte>, xor:0x<HEXKEY> (rolling multi-byte key), add:<byte>, rot:<0-7>, or bare base64 (blob plaintext). offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total. With with_xrefs, each row carries its bounded referencing-instruction list"
     )]
     async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1917,7 +1930,7 @@ impl BinscoutMcp {
             .map_err(error_data)?;
         // Cloned before the move into the open; the decode error above keeps
         // its pre-open precedence.
-        let (pattern, min_len, section, include_code, start, offset, limit, envelope) = (
+        let (pattern, min_len, section, include_code, start, offset, limit, envelope, with_xrefs) = (
             p.pattern.clone(),
             p.min_len,
             p.section.clone(),
@@ -1926,6 +1939,7 @@ impl BinscoutMcp {
             p.offset,
             p.limit,
             p.envelope.unwrap_or(false),
+            p.with_xrefs.unwrap_or(false),
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
@@ -1939,15 +1953,15 @@ impl BinscoutMcp {
         };
         if envelope {
             let page = match decode {
-                Some(spec) => proj.query_strings_decoded_envelope(&filter, spec),
-                None => proj.query_strings_envelope(&filter),
+                Some(spec) => proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs),
+                None => proj.query_strings_rows_envelope(&filter, with_xrefs),
             }
             .map_err(error_data)?;
             return ok(serde_json::to_value(page).expect("strings envelope serializes"));
         }
         let rows = match decode {
-            Some(spec) => proj.query_strings_decoded(&filter, spec),
-            None => proj.query_strings(&filter),
+            Some(spec) => proj.query_strings_decoded_rows(&filter, spec, with_xrefs),
+            None => proj.query_strings_rows(&filter, with_xrefs),
         }
         .map_err(error_data)?;
         ok(serde_json::to_value(rows).expect("strings serialize"))
@@ -2091,8 +2105,7 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(error_data)?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.set_type_hint_json(addr, &hint).map_err(error_data)?;
         hint_envelope(&proj, addr).and_then(ok)
     }
@@ -2106,8 +2119,7 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(error_data)?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         hint_envelope(&proj, addr).and_then(ok)
     }
 
@@ -2120,8 +2132,7 @@ impl BinscoutMcp {
         let addr_s = p.addr.clone();
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(error_data)?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         ok(proj.annotation_json(addr))
     }
 
@@ -2136,15 +2147,13 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(error_data)?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
         let mode = mode_s
             .as_deref()
             .map(crate::analysis::SeedMode::parse)
             .transpose()
             .map_err(error_data)?;
-        proj.define_func(addr, mode)
-            .map_err(error_data)?;
+        proj.define_func(addr, mode).map_err(error_data)?;
         ok(proj.seed_json(addr))
     }
 
@@ -2159,10 +2168,8 @@ impl BinscoutMcp {
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
-        let addr =
-            parse_addr(&addr_s).map_err(error_data)?;
-        proj.undefine_func(addr)
-            .map_err(error_data)?;
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        proj.undefine_func(addr).map_err(error_data)?;
         ok(proj.seed_json(addr))
     }
 
@@ -2360,10 +2367,8 @@ impl BinscoutMcp {
             let proj = entry_a.lock_project();
             let mut report = crate::diff::diff_projects_page(&proj, &proj, offset, limit);
             if transfer {
-                report.transfer = Some(
-                    crate::diff::transfer_renames(&proj, &proj)
-                        .map_err(error_data)?,
-                );
+                report.transfer =
+                    Some(crate::diff::transfer_renames(&proj, &proj).map_err(error_data)?);
             }
             report
         } else if Arc::as_ptr(&entry_a) < Arc::as_ptr(&entry_b) {
@@ -2371,10 +2376,7 @@ impl BinscoutMcp {
             let b = entry_b.lock_project();
             let mut report = crate::diff::diff_projects_page(&a, &b, offset, limit);
             if transfer {
-                report.transfer = Some(
-                    crate::diff::transfer_renames(&a, &b)
-                        .map_err(error_data)?,
-                );
+                report.transfer = Some(crate::diff::transfer_renames(&a, &b).map_err(error_data)?);
             }
             report
         } else {
@@ -2382,10 +2384,7 @@ impl BinscoutMcp {
             let a = entry_a.lock_project();
             let mut report = crate::diff::diff_projects_page(&a, &b, offset, limit);
             if transfer {
-                report.transfer = Some(
-                    crate::diff::transfer_renames(&a, &b)
-                        .map_err(error_data)?,
-                );
+                report.transfer = Some(crate::diff::transfer_renames(&a, &b).map_err(error_data)?);
             }
             report
         };
@@ -2418,18 +2417,15 @@ impl BinscoutMcp {
         let (entry_a, entry_b) = (entry_a?, entry_b?);
         let report = if Arc::ptr_eq(&entry_a, &entry_b) {
             let proj = entry_a.lock_project();
-            crate::diff::diff_func(&proj, addr_a, &proj, addr_b)
-                .map_err(error_data)?
+            crate::diff::diff_func(&proj, addr_a, &proj, addr_b).map_err(error_data)?
         } else if Arc::as_ptr(&entry_a) < Arc::as_ptr(&entry_b) {
             let a = entry_a.lock_project();
             let b = entry_b.lock_project();
-            crate::diff::diff_func(&a, addr_a, &b, addr_b)
-                .map_err(error_data)?
+            crate::diff::diff_func(&a, addr_a, &b, addr_b).map_err(error_data)?
         } else {
             let b = entry_b.lock_project();
             let a = entry_a.lock_project();
-            crate::diff::diff_func(&a, addr_a, &b, addr_b)
-                .map_err(error_data)?
+            crate::diff::diff_func(&a, addr_a, &b, addr_b).map_err(error_data)?
         };
         ok(serde_json::to_value(report).expect("func diff report serializes"))
     }

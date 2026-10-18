@@ -494,6 +494,125 @@ impl Serialize for SliceNode {
     }
 }
 
+/// One cross-reference with listing context resolved.
+///
+/// The stored [`crate::analysis::Xref`] triple (`from`/`to`/`kind`)
+/// stays the query key; these additive fields spare agents the follow-up
+/// lookups: `from_func` is the entry of the function containing `from`
+/// (null when in no function), `from_func_name` its rename-resolved
+/// display name, `to_name` the rename-resolved display name of the target
+/// (function or import; code targets fall back to `func@0x...`, unresolvable
+/// data targets stay null), and `to_string` the truncated preview of the
+/// referenced string (only for [`XrefKind::String`], else null).
+///
+/// JSON pairs `from`/`to`/`from_func` with their `0x`-hex twins; the twins
+/// are recomputed on serialize and ignored on deserialize, and rows
+/// written without the additive fields still decode.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct XrefRow {
+    /// Address of the referring instruction.
+    pub from: u64,
+    /// Referenced address (code target, data address, or string start).
+    pub to: u64,
+    /// How the reference is made.
+    pub kind: XrefKind,
+    /// Entry of the function containing `from`, if any.
+    #[serde(default)]
+    pub from_func: Option<u64>,
+    /// Rename-resolved display name of that function, if any.
+    #[serde(default)]
+    pub from_func_name: Option<String>,
+    /// Rename-resolved display name of `to`, if any.
+    #[serde(default)]
+    pub to_name: Option<String>,
+    /// Truncated preview of the string at `to`, if `kind` is string.
+    #[serde(default)]
+    pub to_string: Option<String>,
+}
+
+impl Serialize for XrefRow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("XrefRow", 10)?;
+        st.serialize_field("from", &self.from)?;
+        st.serialize_field("from_hex", &crate::addr_hex(self.from))?;
+        st.serialize_field("to", &self.to)?;
+        st.serialize_field("to_hex", &crate::addr_hex(self.to))?;
+        st.serialize_field("kind", &self.kind)?;
+        st.serialize_field("from_func", &self.from_func)?;
+        st.serialize_field("from_func_hex", &self.from_func.map(crate::addr_hex))?;
+        st.serialize_field("from_func_name", &self.from_func_name)?;
+        st.serialize_field("to_name", &self.to_name)?;
+        st.serialize_field("to_string", &self.to_string)?;
+        st.end()
+    }
+}
+
+/// One instruction referring to a string: the referrer plus its function.
+///
+/// Rows come from [`XrefKind::String`] xrefs pointing at the string start,
+/// in `(from, kind)` order, capped at [`MAX_STRING_XREFS`] per string.
+/// JSON pairs `from`/`from_func` with their `0x`-hex twins; rows without
+/// the additive fields still decode.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StringXref {
+    /// Address of the referring instruction.
+    pub from: u64,
+    /// How the reference is made (always string here).
+    pub kind: XrefKind,
+    /// Entry of the function containing `from`, if any.
+    #[serde(default)]
+    pub from_func: Option<u64>,
+    /// Rename-resolved display name of that function, if any.
+    #[serde(default)]
+    pub from_func_name: Option<String>,
+}
+
+impl Serialize for StringXref {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("StringXref", 6)?;
+        st.serialize_field("from", &self.from)?;
+        st.serialize_field("from_hex", &crate::addr_hex(self.from))?;
+        st.serialize_field("kind", &self.kind)?;
+        st.serialize_field("from_func", &self.from_func)?;
+        st.serialize_field("from_func_hex", &self.from_func.map(crate::addr_hex))?;
+        st.serialize_field("from_func_name", &self.from_func_name)?;
+        st.end()
+    }
+}
+
+/// One extracted string with an optional referencing-instruction list.
+///
+/// Without `with_xrefs` this serializes exactly like
+/// [`crate::loader::strings::StringHit`] (the `xrefs` key is
+/// omitted); with it, `xrefs` carries the bounded [`StringXref`] list
+/// (empty when nothing refers to the string). Old rows without `xrefs`
+/// still decode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringRow {
+    /// The extracted string hit.
+    #[serde(flatten)]
+    pub hit: StringHit,
+    /// Referring instructions, present only when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xrefs: Option<Vec<StringXref>>,
+}
+
+impl StringRow {
+    /// Row without a reference list: serializes exactly like the hit.
+    #[must_use]
+    pub fn plain(hit: StringHit) -> Self {
+        Self { hit, xrefs: None }
+    }
+}
+
 /// Typed view over raw bytes for [`Project::bytes_view`].
 ///
 /// `U8`/`U16`/`U32`/`U64` decode fixed-width little- or big-endian
@@ -3643,6 +3762,59 @@ impl Project {
         self.query_xrefs_page(to, from, kind, 0, 0).0
     }
 
+    /// Xrefs filtered by endpoint/kind with listing context, in one pass.
+    ///
+    /// The enriched single call behind the CLI/MCP `xrefs` envelope:
+    /// `total` is the exact match count and `items` the requested page of
+    /// [`XrefRow`] rows, computed in one index-narrowed pass like
+    /// [`Project::query_xrefs_page`]. The listing context (render-time
+    /// symbols, imports, strings) builds once per call and every row
+    /// reuses the sorted xref storage plus binary searches, so per-page
+    /// work scales with the page, never with re-scans. `limit` clips to
+    /// `MAX_ROWS`, as in [`Project::query_xrefs`].
+    #[must_use]
+    pub fn query_xref_rows_page(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+        offset: usize,
+        limit: usize,
+    ) -> (usize, Vec<XrefRow>) {
+        let (total, rows) =
+            self.analysis
+                .xrefs_matching_page(to, from, kind, offset, limit.min(MAX_ROWS));
+        let ctx = self.enrich_ctx();
+        let items = rows
+            .into_iter()
+            .map(|x| self.enrich_xref(&ctx, x))
+            .collect();
+        (total, items)
+    }
+
+    /// Resolve one xref's listing context: containing function, display
+    /// names, and the string preview for string-kind rows.
+    ///
+    /// Pure read-only lookup over the project; `to_name` reuses the same
+    /// rename-over-symbol-over-import resolution as instruction listings
+    /// (code targets fall back to `func@0x...`), and `to_string` reuses the
+    /// same truncated preview.
+    fn enrich_xref(&self, ctx: &EnrichCtx, x: Xref) -> XrefRow {
+        let from_func = self.analysis.containing_function(x.from);
+        let is_code = matches!(x.kind, XrefKind::Code | XrefKind::InferredCode);
+        XrefRow {
+            from: x.from,
+            to: x.to,
+            kind: x.kind,
+            from_func,
+            from_func_name: from_func.and_then(|e| self.function_name(e)),
+            to_name: self.target_name_in(ctx, x.to, is_code),
+            to_string: (x.kind == XrefKind::String)
+                .then(|| self.string_preview_in(ctx, x.to))
+                .flatten(),
+        }
+    }
+
     /// Imports plus exports plus symbol-table code addresses for symbol views.
     ///
     /// Ordinal-only imports carry `ordinal` plus `unresolved: true`;
@@ -3699,7 +3871,86 @@ impl Project {
     /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
     /// expression fails to compile.
     pub fn query_strings(&self, filter: &StringsFilter) -> Result<Vec<StringHit>> {
-        self.analysis.strings_page_filtered(filter)
+        Ok(self
+            .query_strings_rows(filter, false)?
+            .into_iter()
+            .map(|r| r.hit)
+            .collect())
+    }
+
+    /// Extracted strings with an optional referencing-instruction list.
+    ///
+    /// Same filter semantics as [`Project::query_strings`]; with
+    /// `with_xrefs` every row additionally carries the [`StringXref`]s
+    /// pointing at its start (bounded at [`MAX_STRING_XREFS`] per row, in
+    /// `(from, kind)` order), so agents skip the `strings` then
+    /// `xrefs --to --kind string` round-trip. The reverse index builds once
+    /// on first use and every row reuses it. Without the flag rows carry
+    /// no list and serialize exactly like [`StringHit`].
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings_rows(
+        &self,
+        filter: &StringsFilter,
+        with_xrefs: bool,
+    ) -> Result<Vec<StringRow>> {
+        let hits = self.analysis.strings_page_filtered(filter)?;
+        if !with_xrefs {
+            return Ok(hits.into_iter().map(StringRow::plain).collect());
+        }
+        Ok(hits.into_iter().map(|hit| self.string_row(hit)).collect())
+    }
+
+    /// Extracted strings with optional xref context, under the protocol-1 envelope.
+    ///
+    /// Combines [`Project::query_strings_envelope`] (exact `total`) with
+    /// [`Project::query_strings_rows`] (optional per-row `xrefs`): `total`
+    /// is the exact filtered count and `items` holds the requested page of
+    /// [`StringRow`] rows. When `with_xrefs` is false, items serialize
+    /// exactly like [`StringHit`] rows.
+    ///
+    /// # Errors
+    /// Same as [`Project::query_strings`].
+    pub fn query_strings_rows_envelope(
+        &self,
+        filter: &StringsFilter,
+        with_xrefs: bool,
+    ) -> Result<Page<StringRow>> {
+        let total = self.analysis.strings_count_filtered(filter)?;
+        let items = self.query_strings_rows(filter, with_xrefs)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
+    }
+
+    /// One string row with its bounded reference list, if any.
+    ///
+    /// References are the [`XrefKind::String`] xrefs pointing at the hit's
+    /// start (the same rows `xrefs --to <addr> --kind string` reports),
+    /// each resolved to its containing function and rename-resolved name.
+    /// Hits with no virtual address (whole-file scans) carry an empty list.
+    fn string_row(&self, hit: StringHit) -> StringRow {
+        let refs = hit.vaddr.map_or_else(Vec::new, |v| {
+            self.analysis
+                .xrefs_to(v)
+                .into_iter()
+                .filter(|x| x.kind == XrefKind::String)
+                .take(MAX_STRING_XREFS)
+                .map(|x| {
+                    let from_func = self.analysis.containing_function(x.from);
+                    StringXref {
+                        from: x.from,
+                        kind: x.kind,
+                        from_func,
+                        from_func_name: from_func.and_then(|e| self.function_name(e)),
+                    }
+                })
+                .collect()
+        });
+        StringRow {
+            hit,
+            xrefs: Some(refs),
+        }
     }
 
     /// Extracted strings, filtered then paged under the protocol-1 envelope.
@@ -3734,8 +3985,59 @@ impl Project {
         filter: &StringsFilter,
         decode: crate::loader::strings::DecodeSpec,
     ) -> Result<Vec<StringHit>> {
-        self.analysis
-            .strings_decoded_view(&self.binary, filter, decode)
+        Ok(self
+            .query_strings_decoded_rows(filter, decode, false)?
+            .into_iter()
+            .map(|r| r.hit)
+            .collect())
+    }
+
+    /// Decoded-view strings with an optional referencing-instruction list.
+    ///
+    /// Same rows as [`Project::query_strings_decoded`] (re-extracted over
+    /// the in-memory transform with original offsets) plus the same bounded
+    /// [`StringXref`] list as [`Project::query_strings_rows`] when
+    /// `with_xrefs` is set: references resolve against the original xref
+    /// set, which shares the decoded hits' virtual addresses.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when the filter pattern is overlong or a `regex:`
+    /// expression fails to compile.
+    pub fn query_strings_decoded_rows(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+        with_xrefs: bool,
+    ) -> Result<Vec<StringRow>> {
+        let hits = self
+            .analysis
+            .strings_decoded_view(&self.binary, filter, decode)?;
+        if !with_xrefs {
+            return Ok(hits.into_iter().map(StringRow::plain).collect());
+        }
+        Ok(hits.into_iter().map(|hit| self.string_row(hit)).collect())
+    }
+
+    /// Decoded-view strings with optional xref context, under the protocol-1 envelope.
+    ///
+    /// Combines [`Project::query_strings_decoded_envelope`] (exact `total`)
+    /// with [`Project::query_strings_decoded_rows`] (optional per-row
+    /// `xrefs`). When `with_xrefs` is false, items serialize exactly like
+    /// decoded [`StringHit`] rows.
+    ///
+    /// # Errors
+    /// Same as [`Project::query_strings_decoded`].
+    pub fn query_strings_decoded_rows_envelope(
+        &self,
+        filter: &StringsFilter,
+        decode: crate::loader::strings::DecodeSpec,
+        with_xrefs: bool,
+    ) -> Result<Page<StringRow>> {
+        let total = self
+            .analysis
+            .strings_decoded_count(&self.binary, filter, decode.clone())?;
+        let items = self.query_strings_decoded_rows(filter, decode, with_xrefs)?;
+        Ok(page_envelope(total, filter.start, filter.limit, items))
     }
 
     /// Decoded-view strings under the protocol-1 envelope.
@@ -4023,6 +4325,13 @@ impl Project {
 pub const MAX_RANGE_BYTES: usize = 1 << 20;
 /// Cap on rows per paged query.
 const MAX_ROWS: usize = 1024;
+/// Cap on referring instructions per [`StringRow`].
+///
+/// One popular string can draw thousands of references; without a per-row
+/// bound a single `strings --with-xrefs` page could dwarf the 1024-row
+/// page cap it rides on. Rows keep the first [`MAX_STRING_XREFS`]
+/// references in `(from, kind)` order.
+pub const MAX_STRING_XREFS: usize = 64;
 /// Cap on distinct unlifted mnemonics in an
 /// [`Project::ir_coverage_at`] range summary; beyond it `truncated` is set.
 pub const MAX_COVERAGE_MNEMONICS: usize = 32;

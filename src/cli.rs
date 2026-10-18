@@ -240,6 +240,11 @@ pub enum Cmd {
         /// Show strings in executable memory (hidden by default).
         #[arg(long)]
         include_code: bool,
+        /// Include the bounded referencing-instruction list per string
+        /// (capped at 64 refs per row), so one call replaces the
+        /// `strings` then `xrefs --to --kind string` round-trip.
+        #[arg(long)]
+        with_xrefs: bool,
         /// Decode-and-display view over an in-memory transform:
         /// `xor:<byte>`, `xor:0x<HEXKEY>` (4+ hex digits, rolling
         /// multi-byte key), `add:<byte>`, `rot:<0-7>` (byte is `0x`-hex
@@ -585,6 +590,7 @@ impl Cli {
                 min_len,
                 section,
                 include_code,
+                with_xrefs,
                 decode,
                 envelope,
             } => {
@@ -613,6 +619,7 @@ impl Cli {
                         start: start.or(offset).unwrap_or(0),
                         limit,
                     },
+                    with_xrefs,
                     decode,
                     envelope,
                 )
@@ -1159,22 +1166,33 @@ fn xrefs(
     let p = open(binary, db, raw, fat_arch)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
-    let (total, rows) = p.query_xrefs_page(to, from, kind, offset, limit);
+    let (total, rows) = p.query_xref_rows_page(to, from, kind, offset, limit);
     Ok(serde_json::json!({ "total": total, "xrefs": rows }))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
 fn strings(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
     filter: &binscout::analysis::StringsFilter,
+    with_xrefs: bool,
     decode: Option<binscout::loader::strings::DecodeSpec>,
     envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
+    if with_xrefs {
+        let p = open(binary, db, raw, fat_arch)?;
+        return strings_from_project(&p, filter, decode, envelope, true);
+    }
     match open_loader(binary, db, raw, fat_arch)? {
         binscout::LoaderOpened::Cached(p) => strings_from_loader(&p, filter, decode, envelope),
-        binscout::LoaderOpened::Fresh(p) => strings_from_project(&p, filter, decode, envelope),
+        binscout::LoaderOpened::Fresh(p) => {
+            strings_from_project(&p, filter, decode, envelope, false)
+        }
     }
 }
 
@@ -1203,17 +1221,18 @@ fn strings_from_project(
     filter: &binscout::analysis::StringsFilter,
     decode: Option<binscout::loader::strings::DecodeSpec>,
     envelope: bool,
+    with_xrefs: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     if envelope {
         let page = match decode {
-            Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
-            None => p.query_strings_envelope(filter)?,
+            Some(spec) => p.query_strings_decoded_rows_envelope(filter, spec, with_xrefs)?,
+            None => p.query_strings_rows_envelope(filter, with_xrefs)?,
         };
         return Ok(serde_json::to_value(page).expect("strings envelope serializes"));
     }
     let rows = match decode {
-        Some(spec) => p.query_strings_decoded(filter, spec)?,
-        None => p.query_strings(filter)?,
+        Some(spec) => p.query_strings_decoded_rows(filter, spec, with_xrefs)?,
+        None => p.query_strings_rows(filter, with_xrefs)?,
     };
     Ok(serde_json::to_value(rows).expect("strings serialize"))
 }
