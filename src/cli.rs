@@ -389,6 +389,25 @@ pub enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Scan mapped bytes with user-supplied YARA rules, paged with VA,
+    /// section, and containing function per hit. Rules come from a local
+    /// path and are never fetched from the network. Requires the `yara`
+    /// cargo feature (rebuild with `--features yara`).
+    ScanYara {
+        binary: PathBuf,
+        /// Path to the YARA rules file (local path only).
+        rules: PathBuf,
+        /// Keep only this rule (e.g. `ransom_note`).
+        #[arg(long)]
+        rule: Option<String>,
+        /// Keep matches whose start lies in this section (e.g. `.text`).
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Emit the portable annotation interchange document to stdout.
     /// Read-only: never creates or modifies the sidecar.
     AnnotationsExport { binary: PathBuf },
@@ -718,6 +737,24 @@ impl Cli {
                 raw_opts,
                 fat_arch,
                 name.as_deref(),
+                section.as_deref(),
+                offset,
+                limit,
+            ),
+            Cmd::ScanYara {
+                binary,
+                rules,
+                rule,
+                section,
+                offset,
+                limit,
+            } => scan_yara(
+                &binary,
+                db,
+                raw_opts,
+                fat_arch,
+                &rules,
+                rule.as_deref(),
                 section.as_deref(),
                 offset,
                 limit,
@@ -1468,6 +1505,26 @@ fn crypto_scan(
     let p = open(binary, db, raw, fat_arch)?;
     let page = p.crypto_scan(name, section, offset, limit)?;
     Ok(serde_json::to_value(page).expect("crypto_scan page serializes"))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
+fn scan_yara(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    rules: &std::path::Path,
+    rule: Option<&str>,
+    section: Option<&str>,
+    offset: usize,
+    limit: usize,
+) -> binscout::error::Result<serde_json::Value> {
+    let p = open(binary, db, raw, fat_arch)?;
+    let page = p.scan_yara(rules, rule, section, offset, limit)?;
+    Ok(serde_json::to_value(page).expect("scan_yara page serializes"))
 }
 
 fn annotations_export(

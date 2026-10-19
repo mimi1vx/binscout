@@ -1,5 +1,5 @@
 //! M6 MCP e2e: spawn `binscout-mcp` over stdio, run the JSON-RPC handshake,
-//! list the 41 tools, and call every one against fixtures.
+//! list the 42 tools, and call every one against fixtures.
 
 mod common;
 
@@ -138,6 +138,7 @@ fn handshake_lists_tools() {
             "project_info",
             "pseudo",
             "rename",
+            "scan_yara",
             "search_bytes",
             "sections",
             "set_type_hint",
@@ -151,7 +152,7 @@ fn handshake_lists_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 41 tools"
+        "exactly the 42 tools"
     );
     let search = tools
         .iter()
@@ -224,6 +225,18 @@ fn handshake_lists_tools() {
         .expect("input schema properties");
     for key in ["binary", "db", "raw", "name", "section", "offset", "limit"] {
         assert!(props.contains_key(key), "crypto_scan exposes {key}");
+    }
+    let yara = tools
+        .iter()
+        .find(|t| t["name"] == "scan_yara")
+        .expect("scan_yara listed");
+    let props = yara["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in [
+        "binary", "db", "raw", "rules", "rule", "section", "offset", "limit",
+    ] {
+        assert!(props.contains_key(key), "scan_yara exposes {key}");
     }
 }
 

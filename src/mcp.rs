@@ -1,4 +1,4 @@
-//! binscout MCP server: 41 tools over a cached [`Project`].
+//! binscout MCP server: 42 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -712,6 +712,30 @@ pub struct CryptoScanParams {
     /// Keep only this constant (e.g. `aes-sbox`).
     pub name: Option<String>,
     /// Keep matches fully inside this section (e.g. `.rdata`).
+    pub section: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
+/// Parameters for the `scan_yara` tool: YARA rule scan over mapped bytes.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct YaraScanParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Path to the YARA rules file (local path only, never fetched).
+    pub rules: String,
+    /// Keep only this rule (e.g. `ransom_note`).
+    pub rule: Option<String>,
+    /// Keep matches whose start lies in this section (e.g. `.text`).
     pub section: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
@@ -2239,6 +2263,32 @@ impl BinscoutMcp {
         )
         .map_err(error_data)
         .and_then(|page| ok(serde_json::to_value(page).expect("crypto_scan page serializes")))
+    }
+
+    #[tool(
+        name = "scan_yara",
+        description = "Scan mapped bytes with user-supplied YARA rules (local path only, never fetched), paged with VA, section, and containing function per hit; requires the yara cargo feature"
+    )]
+    async fn scan_yara(&self, p: Parameters<YaraScanParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (rules, rule, section, offset, limit) = (
+            p.rules.clone(),
+            p.rule.clone(),
+            p.section.clone(),
+            p.offset,
+            p.limit,
+        );
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        proj.scan_yara(
+            std::path::Path::new(&rules),
+            rule.as_deref(),
+            section.as_deref(),
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
+        )
+        .map_err(error_data)
+        .and_then(|page| ok(serde_json::to_value(page).expect("scan_yara page serializes")))
     }
 
     #[tool(
