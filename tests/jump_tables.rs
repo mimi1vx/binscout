@@ -989,3 +989,42 @@ fn many_register_indirect_sites_visit_once_each() {
         "20k unresolvable sites took {elapsed:?} (budget {budget:?})"
     );
 }
+
+#[test]
+fn ordered_lookup_helpers_match_collecting_predecessors() {
+    // rsdbg-5tk.11: `inferred_succs`/`inferred_len` and
+    // `containing_function` replaced full collects and linear scans on hot
+    // paths (layout, budget check, diagnostics, slicing). Pin them to the
+    // same rows: per-block ranges must reassemble the full edge set (n1
+    // has two targets from one site block), every decoded address must
+    // attribute to its owning function, and gap bytes to none.
+    for a in [
+        x32(&p1(), 0x401000, Some(0x401000)),
+        x64(&p2(), 0x400000, Some(0x400000)),
+        x32(&n1(), 0x401000, Some(0x401000)),
+    ] {
+        for f in a.functions.values() {
+            assert_eq!(f.inferred_len(), f.inferred_edges().len());
+            let mut reassembled: Vec<(u64, u64)> = Vec::new();
+            for &start in f.blocks.keys() {
+                reassembled.extend(f.inferred_succs(start).into_iter().map(|t| (start, t)));
+            }
+            reassembled.sort_unstable();
+            assert_eq!(reassembled, f.inferred_edges());
+            for b in f.blocks.values() {
+                for i in &b.insns {
+                    assert_eq!(a.containing_function(i.addr), Some(f.entry));
+                }
+            }
+        }
+    }
+    let a = x32(&p1(), 0x401000, Some(0x401000));
+    assert_eq!(a.containing_function(0x401000), Some(0x401000));
+    assert_eq!(a.containing_function(0x40100a), Some(0x401000));
+    assert_eq!(
+        a.containing_function(0x401008),
+        None,
+        "slot bytes are a gap"
+    );
+    assert_eq!(a.containing_function(0x400000), None, "below first entry");
+}
