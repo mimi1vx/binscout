@@ -1,4 +1,4 @@
-//! binscout MCP server: 41 tools over a cached [`Project`].
+//! binscout MCP server: 42 tools over a cached [`Project`].
 //!
 //! Every tool takes a `binary` path (plus optional `db` sidecar path), opens
 //! the project, and returns one JSON document as text. Failures surface as
@@ -863,6 +863,33 @@ pub struct DiffFuncParams {
     pub fat_arch: Option<String>,
 }
 
+/// Parameters for the `patch` tool: assemble replacement bytes at an
+/// address and export the patch without writing the binary.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PatchParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping.
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// Virtual address of the patched instruction (`0x`-hex or decimal).
+    pub addr: String,
+    /// Intel-syntax assembly encoded at `addr` (x86 only; one of `nop`,
+    /// `ret`, `int3`, `jmp ADDR`, `call ADDR`); exactly one of `asm`/`bytes`.
+    pub asm: Option<String>,
+    /// Literal bytes as whitespace-separated hex pairs (`"90 90"`);
+    /// exactly one of `asm`/`bytes`.
+    pub bytes: Option<String>,
+    /// Write the patch file here (never the analyzed binary).
+    pub out: Option<String>,
+    /// Patch file format for `out`: `json` (default) or `ips`.
+    pub format: Option<String>,
+}
+
 /// One operation inside a `batch` call: a read-only tool
 /// name plus its tool-specific parameters (as an object, without the
 /// batch envelope identity: `binary`/`db`/`raw`/`fat_arch` live on
@@ -882,7 +909,7 @@ pub struct BatchOp {
 /// entry lock and returns its own element of the `results` array, so one
 /// round trip replaces the `func`/`cfg`/`pseudo`/`xrefs` per-function loop.
 /// Write tools (`load`, `rename`, `comment`, `set_type_hint`,
-/// `define_func`, `undefine_func`, `annotations_import`) stay explicit
+/// `define_func`, `undefine_func`, `patch`, `annotations_import`) stay explicit
 /// top-level calls and are rejected per op, as is the two-binary `diff`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
@@ -1387,6 +1414,7 @@ fn run_batch_op(
         | "set_type_hint"
         | "define_func"
         | "undefine_func"
+        | "patch"
         | "annotations_import" => Err(format!(
             "batch rejects write tool {tool:?}: run it as a top-level call to keep writes explicit"
         )),
@@ -2431,6 +2459,52 @@ impl BinscoutMcp {
     }
 
     #[tool(
+        name = "patch",
+        description = "Assemble replacement bytes at one x86 address and export the patch (va, file_off, old_hex, new_hex, size_ok) without writing the binary. Exactly one of asm (one of nop, ret, int3, jmp ADDR, call ADDR, encoded at addr) or bytes (whitespace-separated hex pairs); shorter replacements NOP-pad to the instruction boundary, longer ones report size_ok:false. Out optionally writes a json/ips patch file that must differ from the binary"
+    )]
+    async fn patch(&self, p: Parameters<PatchParams>) -> Result<String, ErrorData> {
+        let p = all_params(p);
+        let (addr_s, asm, bytes, out, format) = (
+            p.addr.clone(),
+            p.asm.clone(),
+            p.bytes.clone(),
+            p.out.clone(),
+            p.format.clone(),
+        );
+        if format.is_some() && out.is_none() {
+            return Err(invalid_params("patch format needs out"));
+        }
+        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let proj = entry.lock_project();
+        let addr = parse_addr(&addr_s).map_err(error_data)?;
+        let input = match (asm, bytes) {
+            (Some(text), None) => crate::patch::PatchInput::Asm(text),
+            (None, Some(text)) => crate::patch::PatchInput::Bytes(
+                crate::patch::parse_patch_bytes(&text).map_err(error_data)?,
+            ),
+            (Some(_), Some(_)) => {
+                return Err(invalid_params("patch takes exactly one of asm/bytes"));
+            }
+            (None, None) => return Err(invalid_params("patch needs asm or bytes")),
+        };
+        let preview = proj.patch_preview(addr, &input).map_err(error_data)?;
+        let mut value = serde_json::to_value(&preview).expect("patch preview serializes");
+        if let Some(out) = out {
+            let fmt = match format {
+                Some(name) => crate::patch::parse_patch_format(&name).map_err(error_data)?,
+                None => crate::patch::PatchFileFormat::Json,
+            };
+            let summary = proj
+                .write_patch_file(&preview, Path::new(&out), fmt)
+                .map_err(error_data)?;
+            for (key, val) in summary.as_object().expect("summary is an object") {
+                value[key] = val.clone();
+            }
+        }
+        ok(value)
+    }
+
+    #[tool(
         name = "batch",
         description = "Run up to 32 read-only ops over one open project: the envelope binary/db/raw/fat_arch applies to every op, ops run in order under a single open, and the result is {results: [{ok} | {error}]} with per-op limits unchanged and total output capped at 1 MiB (write tools and diff are rejected per op)"
     )]
@@ -2637,6 +2711,7 @@ mod tests {
             "set_type_hint",
             "define_func",
             "undefine_func",
+            "patch",
             "annotations_import",
         ] {
             let e = run(w, serde_json::json!({"addr": "0x0"})).expect_err("write rejected");
