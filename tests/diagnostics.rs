@@ -119,6 +119,7 @@ fn export_and_direct_call_reasons_coexist_sorted() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     };
     let a = analyze(&bin).expect("raw with export must analyze");
     assert_eq!(reasons_of(&a, 0x1000), [DiscoveryReason::Entry]);

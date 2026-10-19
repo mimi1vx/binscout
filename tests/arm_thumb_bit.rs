@@ -33,6 +33,7 @@ fn odd_arm_entry_is_masked_with_diagnostic() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     };
     let a = analyze(&bin).expect("synthetic arm elf must analyze");
     for (entry, f) in &a.functions {

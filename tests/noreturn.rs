@@ -58,6 +58,7 @@ fn image_with_import(format: BinaryFormat, name: &str, code: Vec<u8>) -> LoadedB
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     }
 }
 

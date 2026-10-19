@@ -277,6 +277,7 @@ fn stub_binary(prefix: &[u8]) -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     }
 }
 

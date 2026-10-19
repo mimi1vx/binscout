@@ -1485,6 +1485,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            relocatable: false,
         };
         assert_eq!(elf_headers(b"MZ garbage"), None);
         let v = headers_of(b"nope", &loaded, "00");
@@ -1534,6 +1535,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            relocatable: false,
         }
     }
 

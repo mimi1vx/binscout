@@ -55,7 +55,7 @@ pub const MAX_POINTER_SEEDS: usize = 10_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 12;
+pub const ANALYSIS_REVISION: u32 = 13;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -4005,11 +4005,20 @@ pub fn analyze_with_options(
     // Import call sites: the slot map comes from loader-resolved
     // addresses (PE IAT / ELF GOT); stub sites come from decoded
     // `jmp [slot]` shapes, CET `endbr` preludes included (see
-    // `collect_stubs`), or on Mach-O straight from the loader's stub-entry
-    // addresses (see `macho_import_stubs`). Calls through slots are
-    // callers, not stubs.
+    // `collect_stubs`), on Mach-O straight from the loader's stub-entry
+    // addresses (see `macho_import_stubs`), or on relocatable objects
+    // from the loader's synthetic stub addresses for undefined symbols.
+    // Calls through slots are callers, not stubs.
     let slots = import_slots(bin);
-    let stubs: BTreeMap<u64, usize> = if bin.format == BinaryFormat::MachO {
+    let stubs: BTreeMap<u64, usize> = if bin.relocatable {
+        let mut map: BTreeMap<u64, usize> = BTreeMap::new();
+        for (i, imp) in bin.imports.iter().enumerate() {
+            if let Some(addr) = imp.address {
+                map.entry(addr).or_insert(i);
+            }
+        }
+        map
+    } else if bin.format == BinaryFormat::MachO {
         macho_import_stubs(bin)
     } else if matches!(arch, Arch::X86_64 | Arch::X86_32) {
         collect_stubs(
@@ -4715,6 +4724,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            relocatable: false,
         }
     }
 

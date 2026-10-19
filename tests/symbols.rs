@@ -176,32 +176,41 @@ fn coff_static_case() -> Vec<u8> {
 
 #[test]
 fn static_symbol_seeds_unnamed_function() {
+    use binscout::loader::RELOC_BASE;
     let bin = load(&coff_static_case()).expect("symbol COFF must load");
     assert_eq!(bin.format, BinaryFormat::Coff);
     assert_eq!(bin.entry, None);
+    assert!(bin.relocatable);
     // Section symbols and the non-executable `datalbl` stay out; the two
-    // `.text` functions remain in table order.
+    // `.text` functions remain in table order at synthetic addresses.
     let addrs: Vec<(String, u64)> = bin
         .symbols
         .iter()
         .map(|s| (s.name.clone(), s.address))
         .collect();
-    assert_eq!(addrs, [("efunc".to_string(), 0), ("sthelp".to_string(), 2)]);
+    assert_eq!(
+        addrs,
+        [
+            ("efunc".to_string(), RELOC_BASE),
+            ("sthelp".to_string(), RELOC_BASE + 2)
+        ]
+    );
 
     // Nothing calls `sthelp`: without the symbol seed it would be one
     // unreachable prologue-less blob. The seed makes it a named entry.
     let a = analyze(&bin).expect("analysis must run");
     assert_eq!(a.functions.len(), 2);
-    let entry = a.functions.get(&0).expect("efunc entry");
+    let entry = a.functions.get(&RELOC_BASE).expect("efunc entry");
     assert_eq!(entry.name.as_deref(), Some("efunc"));
     assert!(entry.reason_list().contains(&DiscoveryReason::Symbol));
-    let helper = a.functions.get(&2).expect("static entry");
+    let helper = a.functions.get(&(RELOC_BASE + 2)).expect("static entry");
     assert_eq!(helper.name.as_deref(), Some("sthelp"));
     assert_eq!(helper.reason_list(), [DiscoveryReason::Symbol]);
 }
 
 #[test]
 fn symbols_output_exposes_locals_with_hex_twins() {
+    use binscout::loader::RELOC_BASE;
     let dir = common::tmpdir("symbols-output");
     let path = common::write_bin(&dir, "sym.obj", &coff_static_case());
     let db = common::temp_db(&dir, "sym");
@@ -212,26 +221,28 @@ fn symbols_output_exposes_locals_with_hex_twins() {
     let rows = v["symbols"].as_array().expect("symbols array");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["name"], "efunc");
-    assert_eq!(rows[0]["address"], 0);
-    assert_eq!(rows[0]["address_hex"], "0x0");
+    assert_eq!(rows[0]["address"], RELOC_BASE);
+    assert_eq!(rows[0]["address_hex"], "0x10000");
     assert_eq!(rows[1]["name"], "sthelp");
-    assert_eq!(rows[1]["address"], 2);
-    assert_eq!(rows[1]["address_hex"], "0x2");
+    assert_eq!(rows[1]["address"], RELOC_BASE + 2);
+    assert_eq!(rows[1]["address_hex"], "0x10002");
     // Project display names resolve through the symbol table.
-    assert_eq!(p.function_name(2).as_deref(), Some("sthelp"));
+    assert_eq!(p.function_name(RELOC_BASE + 2).as_deref(), Some("sthelp"));
     common::cleanup(&dir);
 }
 
 #[test]
 fn rename_still_wins_over_symbol_name() {
+    use binscout::loader::RELOC_BASE;
     let dir = common::tmpdir("symbols-rename");
     let path = common::write_bin(&dir, "sym.obj", &coff_static_case());
     let db = common::temp_db(&dir, "sym");
     let mut p = binscout::Project::open_with_db(&path, &db).expect("fixture must open");
-    p.rename_function(2, "custom").expect("rename works");
-    assert_eq!(p.function_name(2).as_deref(), Some("custom"));
-    p.rename_function(2, "").expect("clear works");
-    assert_eq!(p.function_name(2).as_deref(), Some("sthelp"));
+    p.rename_function(RELOC_BASE + 2, "custom")
+        .expect("rename works");
+    assert_eq!(p.function_name(RELOC_BASE + 2).as_deref(), Some("custom"));
+    p.rename_function(RELOC_BASE + 2, "").expect("clear works");
+    assert_eq!(p.function_name(RELOC_BASE + 2).as_deref(), Some("sthelp"));
     common::cleanup(&dir);
 }
 
@@ -296,6 +307,7 @@ fn table_binary() -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     }
 }
 
@@ -390,9 +402,12 @@ fn thumb_bit_masks_arm_symbol_addresses() {
     assert_eq!(bin.arch, Arch::Arm32);
     assert_eq!(bin.symbols.len(), 1);
     assert_eq!(bin.symbols[0].name, "tfunc");
-    assert_eq!(bin.symbols[0].address, 4);
+    assert_eq!(bin.symbols[0].address, binscout::loader::RELOC_BASE + 4);
     let a = analyze(&bin).expect("ARM analysis must run");
-    let f = a.functions.get(&4).expect("masked entry must exist");
+    let f = a
+        .functions
+        .get(&(binscout::loader::RELOC_BASE + 4))
+        .expect("masked entry must exist");
     assert_eq!(f.name.as_deref(), Some("tfunc"));
     assert_eq!(f.reason_list(), [DiscoveryReason::Symbol]);
 }
