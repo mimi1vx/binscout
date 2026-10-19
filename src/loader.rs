@@ -77,6 +77,22 @@ pub const MAX_INIT_FUNCS: usize = 100_000;
 /// Matches [`MAX_SYMBOLS`]: one start per function, bounded like any
 /// other table-derived seed source.
 pub const MAX_FUNC_STARTS: usize = 100_000;
+/// Base virtual address for synthetic relocatable layouts.
+///
+/// Relocatable objects (ELF `ET_REL`, COFF `.obj`) link at address 0, so
+/// every section overlaps. The loader lays mapped sections out from here
+/// instead, leaving the null page unmapped like a linked image.
+pub const RELOC_BASE: u64 = 0x10000;
+/// Alignment between synthetic relocatable sections.
+///
+/// Sections lay out in file order, each start rounded up to this boundary
+/// (or its own stricter alignment), so no two mapped ranges overlap.
+pub const RELOC_ALIGN: u64 = 16;
+/// Cap on applied relocations per relocatable object.
+///
+/// Matches [`MAX_IMPORTS`]: one relocation row is at most one import or
+/// one patched site, bounded like any other table-derived source.
+pub const MAX_RELOCS: usize = 100_000;
 
 /// One loaded object: a contiguous virtual range with its file bytes.
 ///
@@ -122,10 +138,11 @@ pub enum BinaryFormat {
     Pe,
     /// Mach-O (macOS).
     MachO,
-    /// COFF relocatable object (e.g. Windows `.obj`): sections map at
-    /// their link-time addresses (usually zero), entry is `None`, and
-    /// imports/exports are empty (`object` exposes no COFF import/export
-    /// tables yet).
+    /// COFF relocatable object (e.g. Windows `.obj`): sections lay out at
+    /// synthetic non-overlapping addresses from [`RELOC_BASE`] (aligned to
+    /// [`RELOC_ALIGN`] in file order), entry is `None`, and imports are
+    /// synthesized from undefined symbols referenced by relocations in
+    /// executable sections (each carrying a synthetic stub `address`).
     Coff,
     /// Linear Executable (DOS4GW), analyzed as [`Arch::X86_32`].
     Le,
@@ -209,7 +226,9 @@ pub fn section_entropy(data: &[u8]) -> f64 {
 /// Resolved imports carry the pointer they are called through in
 /// `address`: the `__stubs`/`__auth_stubs` entry on Mach-O, the IAT slot
 /// on PE, the GOT slot named by `.rela.plt`/`.rel.plt` `R_*_JUMP_SLOT`
-/// relocations on ELF. Unresolved imports carry `address: None`. JSON
+/// relocations on ELF, or the synthetic stub past the last section on
+/// relocatable objects (ELF `.o`, COFF `.obj`). Unresolved imports carry
+/// `address: None`. JSON
 /// pairs `address` with `address_hex` (`null` on both sides for
 /// address-less imports).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -228,7 +247,8 @@ pub struct ImportRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demangled: Option<String>,
     /// `__stubs`/`__auth_stubs` entry address on Mach-O, IAT slot on PE,
-    /// GOT slot on ELF (`None` for unmapped imports; see `load`).
+    /// GOT slot on ELF, synthetic stub on relocatable objects (`None` for
+    /// unmapped imports; see `load`).
     #[serde(default)]
     pub address: Option<u64>,
 }
@@ -409,6 +429,14 @@ pub struct LoadedBinary {
     /// Exact starts decoded from ULEB deltas off the `__TEXT` base; empty
     /// on other formats. Capped at [`MAX_FUNC_STARTS`].
     pub func_starts: Vec<u64>,
+    /// Whether this binary is a relocatable object with a synthetic layout.
+    ///
+    /// True for COFF `.obj` and ELF `ET_REL`: sections lay out at
+    /// non-overlapping synthetic addresses from [`RELOC_BASE`] (see
+    /// [`RELOC_ALIGN`]), relocations are applied to the mapped bytes, and
+    /// undefined symbols referenced from executable code become imports
+    /// with synthetic stub addresses. Linked images report `false`.
+    pub relocatable: bool,
 }
 
 /// Options for [`load_raw`].
@@ -610,6 +638,7 @@ pub fn load_raw_vec(bytes: Vec<u8>, opts: RawOptions) -> Result<LoadedBinary> {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     })
 }
 
@@ -646,6 +675,458 @@ pub fn canonical_code_addr(arch: Arch, addr: u64) -> u64 {
     }
 }
 
+/// True when `bytes` hold an ELF relocatable object (`ET_REL`).
+///
+/// Reads only the ELF ident plus `e_type`, honoring the file's own byte
+/// order; anything shorter, non-ELF, or with an unknown encoding is not
+/// relocatable (linked ELF images report `false` here and keep the
+/// segment mapping).
+#[must_use]
+fn is_elf_relocatable(bytes: &[u8]) -> bool {
+    if bytes.len() < 18 || bytes[0..4] != [0x7F, b'E', b'L', b'F'] {
+        return false;
+    }
+    match bytes[5] {
+        1 => u16::from_le_bytes([bytes[16], bytes[17]]) == 1,
+        2 => u16::from_be_bytes([bytes[16], bytes[17]]) == 1,
+        _ => false,
+    }
+}
+
+/// Round `v` up to `align` (a power of two; `0` means no alignment).
+fn align_up(v: u64, align: u64) -> Option<u64> {
+    if align <= 1 {
+        return Some(v);
+    }
+    let mask = align.wrapping_sub(1);
+    if align & mask != 0 {
+        return None;
+    }
+    v.checked_add(mask).map(|a| a & !mask)
+}
+
+/// Whether a section kind maps into the synthetic relocatable layout.
+///
+/// Loadable code/data (including zero-fill `bss`) map; debug, metadata,
+/// linker, and note sections stay out, exactly like a linker discarding
+/// non-`ALLOC` sections.
+fn is_reloc_mapped_kind(kind: object::SectionKind) -> bool {
+    use object::SectionKind as K;
+    matches!(
+        kind,
+        K::Text
+            | K::Data
+            | K::ReadOnlyData
+            | K::ReadOnlyString
+            | K::UninitializedData
+            | K::Tls
+            | K::UninitializedTls
+            | K::TlsVariables
+    )
+}
+
+/// Load a relocatable object (ELF `ET_REL` or COFF `.obj`) at synthetic
+/// addresses with relocations applied and externals as imports.
+///
+/// Sections that map (see [`is_reloc_mapped_kind`]) lay out in file order
+/// from [`RELOC_BASE`], each start rounded up to its own alignment or
+/// [`RELOC_ALIGN`]. Defined `Text` symbols remap through their section's
+/// base and seed analysis like linked-image symbols; relocations in
+/// executable sections patch the mapped bytes (`Relative`/`PltRelative`
+/// as `target + addend - place`, `Absolute` as `target + addend`), and
+/// undefined symbols referenced from executable code become imports with
+/// synthetic stub addresses past the last section (direct calls to them
+/// resolve through the same stub map as Mach-O imports in analysis).
+/// Anything unhandled (unknown kinds, unreadable symbols, out-of-range
+/// places) is skipped, never guessed.
+///
+/// # Errors
+/// [`Error::Limit`] when sections, symbols, imports, relocations, mapped
+/// bytes, or metadata exceed their caps.
+fn load_relocatable<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    format: BinaryFormat,
+    arch: Arch,
+    meta_bytes: &mut u64,
+    demangle_cache: &mut HashMap<String, Option<String>>,
+) -> Result<LoadedBinary> {
+    use object::RelocationKind as K;
+    let le = file.endianness() == object::Endianness::Little;
+    // Sections in file order with their synthetic bases.
+    struct Mapped {
+        name: String,
+        base: u64,
+        size: u64,
+        file_off: u64,
+        data: Vec<u8>,
+        readable: bool,
+        writable: bool,
+        executable: bool,
+    }
+    let mut mapped: Vec<Mapped> = Vec::new();
+    let mut by_index: HashMap<object::SectionIndex, usize> = HashMap::new();
+    let mut cursor = RELOC_BASE;
+    let mut smapped: u64 = 0;
+    for sec in file.sections() {
+        if !is_reloc_mapped_kind(sec.kind()) {
+            continue;
+        }
+        let size = sec.size();
+        if size == 0 {
+            continue;
+        }
+        if mapped.len() >= MAX_SECTIONS {
+            return Err(Error::Limit("sections exceed cap".to_string()));
+        }
+        let align = sec.align().max(RELOC_ALIGN);
+        let Some(base) = align_up(cursor, align) else {
+            return Err(Error::Limit("relocatable layout overflow".to_string()));
+        };
+        let Some(next) = base.checked_add(size) else {
+            return Err(Error::Limit("relocatable layout overflow".to_string()));
+        };
+        let data = match sec.data() {
+            Ok(d) => d,
+            Err(_) if is_bss(sec.kind()) => &[],
+            Err(e) => return Err(Error::Invalid(format!("bad section data: {e}"))),
+        };
+        smapped = smapped
+            .checked_add(data.len() as u64)
+            .filter(|m| *m <= MAX_MAPPED_BYTES)
+            .ok_or_else(|| Error::Limit("section bytes exceed 256 MiB".to_string()))?;
+        let name = match sec.name_bytes() {
+            Ok(b) => decode_owned_name(b, meta_bytes)?,
+            Err(_) => {
+                account_meta(meta_bytes, "<invalid>".len())?;
+                "<invalid>".to_string()
+            }
+        };
+        let (readable, writable, executable) = section_perms(sec.kind());
+        let (file_off, _) = sec.file_range().unwrap_or((0, 0));
+        by_index.insert(sec.index(), mapped.len());
+        cursor = next;
+        mapped.push(Mapped {
+            name,
+            base,
+            size,
+            file_off,
+            data: data.to_vec(),
+            readable,
+            writable,
+            executable,
+        });
+    }
+    // Defined text symbols remapped through their section's base.
+    let mut ranges: Vec<(u64, u64)> = mapped
+        .iter()
+        .filter(|m| m.executable && m.size > 0)
+        .map(|m| (m.base, m.base.saturating_add(m.size)))
+        .collect();
+    ranges.sort_unstable();
+    let in_exec = |addr: u64| -> bool { ranges.iter().any(|(lo, hi)| addr >= *lo && addr < *hi) };
+    let mut symbols: Vec<SymbolRef> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for sym in file.symbols() {
+        if sym.kind() != object::SymbolKind::Text {
+            continue;
+        }
+        let object::SymbolSection::Section(idx) = sym.section() else {
+            continue;
+        };
+        let Some(&pos) = by_index.get(&idx) else {
+            continue;
+        };
+        let m = &mapped[pos];
+        if !m.executable {
+            continue;
+        }
+        let raw = sym.address();
+        let off = if arch == Arch::Arm32 { raw & !1 } else { raw };
+        if off >= m.size {
+            continue;
+        }
+        let Some(addr) = m.base.checked_add(off) else {
+            continue;
+        };
+        let addr = canonical_code_addr(arch, addr);
+        if !in_exec(addr) {
+            continue;
+        }
+        let raw_name = match sym.name_bytes() {
+            Ok(b) if !b.is_empty() => decode_owned_name(b, meta_bytes)?,
+            _ => continue,
+        };
+        if !seen.insert(addr) {
+            continue;
+        }
+        if symbols.len() >= MAX_SYMBOLS {
+            return Err(Error::Limit("symbols exceed cap".to_string()));
+        }
+        let demangled = demangle_bounded(&raw_name, meta_bytes, demangle_cache)?;
+        symbols.push(SymbolRef {
+            name: raw_name,
+            address: addr,
+            demangled,
+        });
+    }
+    // Relocations in executable sections: patch sites, externals as imports.
+    struct Patch {
+        seg: usize,
+        off: usize,
+        size: u8,
+        value: i64,
+    }
+    let mut patches: Vec<Patch> = Vec::new();
+    let mut imports: Vec<ImportRef> = Vec::new();
+    let mut import_pos: HashMap<String, usize> = HashMap::new();
+    // Stub cursor past the last section.
+    let mut stub_cursor = cursor;
+    let mut relocs = 0usize;
+    // Map section index to its position in `mapped` for relocation lookup.
+    for sec in file.sections() {
+        let Some(&pos) = by_index.get(&sec.index()) else {
+            continue;
+        };
+        if !mapped[pos].executable {
+            continue;
+        }
+        let base = mapped[pos].base;
+        for (offset, rel) in sec.relocations() {
+            if relocs >= MAX_RELOCS {
+                return Err(Error::Limit("relocations exceed cap".to_string()));
+            }
+            relocs += 1;
+            let kind = rel.kind();
+            if !matches!(kind, K::Relative | K::PltRelative | K::Absolute) {
+                continue;
+            }
+            if rel.size() != 32 && rel.size() != 64 {
+                continue;
+            }
+            let Some(place) = base.checked_add(offset) else {
+                continue;
+            };
+            // Resolve the target to a synthetic address or an import.
+            enum Target {
+                Addr(u64),
+                Import(usize),
+            }
+            let target: Target = match rel.target() {
+                object::RelocationTarget::Symbol(sym_idx) => {
+                    let Ok(sym) = file.symbol_by_index(sym_idx) else {
+                        continue;
+                    };
+                    match sym.section() {
+                        object::SymbolSection::Section(idx) => {
+                            let Some(&tpos) = by_index.get(&idx) else {
+                                continue;
+                            };
+                            let tbase = mapped[tpos].base;
+                            let tsize = mapped[tpos].size;
+                            let raw = sym.address();
+                            let off = if arch == Arch::Arm32 { raw & !1 } else { raw };
+                            if off >= tsize {
+                                continue;
+                            }
+                            let Some(addr) = tbase.checked_add(off) else {
+                                continue;
+                            };
+                            Target::Addr(canonical_code_addr(arch, addr))
+                        }
+                        object::SymbolSection::Undefined
+                        | object::SymbolSection::Unknown
+                        | object::SymbolSection::None
+                        | object::SymbolSection::Common => {
+                            let raw = match sym.name_bytes() {
+                                Ok(b) if !b.is_empty() => decode_owned_name(b, meta_bytes)?,
+                                _ => continue,
+                            };
+                            if let Some(&i) = import_pos.get(&raw) {
+                                Target::Import(i)
+                            } else {
+                                if imports.len() >= MAX_IMPORTS {
+                                    return Err(Error::Limit("imports exceed cap".to_string()));
+                                }
+                                let Some(stub) = align_up(stub_cursor, RELOC_ALIGN) else {
+                                    return Err(Error::Limit(
+                                        "relocatable layout overflow".to_string(),
+                                    ));
+                                };
+                                let Some(next) = stub.checked_add(RELOC_ALIGN) else {
+                                    return Err(Error::Limit(
+                                        "relocatable layout overflow".to_string(),
+                                    ));
+                                };
+                                stub_cursor = next;
+                                let demangled = demangle_bounded(&raw, meta_bytes, demangle_cache)?;
+                                let idx = imports.len();
+                                import_pos.insert(raw.clone(), idx);
+                                imports.push(ImportRef {
+                                    library: String::new(),
+                                    name: raw,
+                                    ordinal: None,
+                                    unresolved: false,
+                                    demangled,
+                                    address: Some(stub),
+                                });
+                                Target::Import(idx)
+                            }
+                        }
+                        object::SymbolSection::Absolute => continue,
+                        _ => continue,
+                    }
+                }
+                object::RelocationTarget::Section(idx) => {
+                    let Some(&tpos) = by_index.get(&idx) else {
+                        continue;
+                    };
+                    let tbase = mapped[tpos].base;
+                    let total = rel.addend();
+                    let Ok(off) = u64::try_from(total) else {
+                        continue;
+                    };
+                    if off >= mapped[tpos].size {
+                        continue;
+                    }
+                    let Some(addr) = tbase.checked_add(off) else {
+                        continue;
+                    };
+                    Target::Addr(addr)
+                }
+                object::RelocationTarget::Absolute => continue,
+                _ => continue,
+            };
+            let target_va = match target {
+                Target::Addr(a) => a,
+                Target::Import(i) => match imports.get(i).and_then(|r| r.address) {
+                    Some(a) => a,
+                    None => continue,
+                },
+            };
+            // Segment holding the place must be the section's own bytes.
+            let seg = pos;
+            let m = &mapped[seg];
+            let Ok(doff) = usize::try_from(place.wrapping_sub(m.base)) else {
+                continue;
+            };
+            let size = rel.size();
+            let bytes_needed = if size == 32 { 4usize } else { 8usize };
+            if doff
+                .checked_add(bytes_needed)
+                .is_none_or(|e| e > m.data.len())
+            {
+                continue;
+            }
+            let mut implicit: i64 = 0;
+            if rel.has_implicit_addend() {
+                let raw = &m.data[doff..doff + bytes_needed];
+                implicit = if bytes_needed == 4 {
+                    let w: [u8; 4] = raw.try_into().unwrap_or([0; 4]);
+                    i64::from(if le {
+                        i32::from_le_bytes(w)
+                    } else {
+                        i32::from_be_bytes(w)
+                    })
+                } else {
+                    let w: [u8; 8] = raw.try_into().unwrap_or([0; 8]);
+                    if le {
+                        i64::from_le_bytes(w)
+                    } else {
+                        i64::from_be_bytes(w)
+                    }
+                };
+            }
+            let value = match kind {
+                K::Relative | K::PltRelative => {
+                    match (target_va as i64)
+                        .checked_add(rel.addend())
+                        .and_then(|v| v.checked_add(implicit))
+                        .and_then(|v| v.checked_sub(place as i64))
+                    {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
+                _ => match (target_va as i64)
+                    .checked_add(rel.addend())
+                    .and_then(|v| v.checked_add(implicit))
+                {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            patches.push(Patch {
+                seg,
+                off: doff,
+                size,
+                value,
+            });
+        }
+    }
+    // Apply patches to the owned segment bytes.
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
+    for (i, m) in mapped.into_iter().enumerate() {
+        let mut data = m.data;
+        for p in patches.iter().filter(|p| p.seg == i) {
+            if p.size == 32 {
+                let w = (p.value as i32).to_le_bytes();
+                // Relocatable test objects are little-endian; big-endian
+                // images encode through the same branch with swapped bytes.
+                if le {
+                    data[p.off..p.off + 4].copy_from_slice(&w);
+                } else {
+                    let w = (p.value as i32).to_be_bytes();
+                    data[p.off..p.off + 4].copy_from_slice(&w);
+                }
+            } else if p.off + 8 <= data.len() {
+                let w = if le {
+                    (p.value).to_le_bytes()
+                } else {
+                    (p.value).to_be_bytes()
+                };
+                data[p.off..p.off + 8].copy_from_slice(&w);
+            }
+        }
+        let entropy = section_entropy(&data);
+        let file_size = data.len() as u64;
+        sections.push(Section {
+            name: m.name,
+            vaddr: m.base,
+            size: m.size,
+            file_off: m.file_off,
+            file_size,
+            entropy,
+            readable: m.readable,
+            writable: m.writable,
+            executable: m.executable,
+        });
+        segments.push(Segment {
+            vaddr: m.base,
+            mem_size: m.size,
+            data,
+            readable: m.readable,
+            writable: m.writable,
+            executable: m.executable,
+        });
+    }
+    Ok(LoadedBinary {
+        format,
+        arch,
+        entry: None,
+        segments,
+        sections,
+        imports,
+        exports: Vec::new(),
+        symbols,
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
+        relocatable: true,
+    })
+}
+
 fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
     let file =
         object::File::parse(bytes).map_err(|e| Error::Invalid(format!("object parse: {e}")))?;
@@ -654,6 +1135,9 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
     // before each copy so repeated long names fail fast instead of OOMing.
     let mut meta_bytes: u64 = 0;
     let mut demangle_cache: HashMap<String, Option<String>> = HashMap::new();
+    if format == BinaryFormat::Coff || (format == BinaryFormat::Elf && is_elf_relocatable(bytes)) {
+        return load_relocatable(&file, format, arch, &mut meta_bytes, &mut demangle_cache);
+    }
 
     let mut mapped: u64 = 0;
     let mut segments = Vec::new();
@@ -828,6 +1312,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         tls_callbacks,
         init_funcs,
         func_starts,
+        relocatable: false,
     })
 }
 
@@ -2526,6 +3011,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        relocatable: false,
     }
 }
 

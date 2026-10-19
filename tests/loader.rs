@@ -251,25 +251,28 @@ fn macho_lc_main_entryoff_translates_to_va() {
 }
 
 #[test]
-fn coff_loads_section_at_zero_with_no_entry() {
+fn coff_loads_section_at_synthetic_base_with_no_entry() {
+    use binscout::loader::RELOC_BASE;
     let bytes = common::fixture_bytes(builders::COFF_NAME);
     let bin = load(&bytes).expect("synthetic COFF must load");
     assert_eq!(bin.format, BinaryFormat::Coff);
     assert_eq!(bin.arch, Arch::X86_64);
-    // Relocatable objects link at address 0 and carry no entry point.
+    // Relocatable objects carry no entry point; sections lay out at
+    // synthetic non-overlapping addresses from RELOC_BASE.
     assert_eq!(bin.entry, None);
+    assert!(bin.relocatable);
     assert_eq!(bin.segments.len(), 1);
     let seg = &bin.segments[0];
-    assert_eq!(seg.vaddr, 0);
+    assert_eq!(seg.vaddr, RELOC_BASE);
     assert_eq!(seg.mem_size, 3);
     assert_eq!(seg.data, [0x90, 0x90, 0xC3]);
     assert!(seg.readable && seg.executable && !seg.writable);
     assert_eq!(bin.sections.len(), 1);
     assert_eq!(bin.sections[0].name, ".text");
-    assert_eq!(bin.sections[0].vaddr, 0);
+    assert_eq!(bin.sections[0].vaddr, RELOC_BASE);
     assert_eq!(common::section_bytes(&bin, 0), &[0x90, 0x90, 0xC3]);
     assert!(bin.sections[0].executable);
-    // `object` exposes no COFF import/export tables.
+    // No undefined symbols referenced: no synthesized imports.
     assert!(bin.imports.is_empty());
     assert!(bin.exports.is_empty());
     let insns = disasm_range(bin.arch, &seg.data, seg.vaddr, 100).expect("code must decode");

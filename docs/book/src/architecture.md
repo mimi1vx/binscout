@@ -66,3 +66,15 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   identity covers content, loader mapping, and analysis revision —
   a changed binary, a different raw mapping, or an older schema
   (current version 5) re-analyzes instead of replaying layouts.
+
+## Format support
+
+| Format | Entry | Layout | Imports | Function seeds |
+|---|---|---|---|---|
+| ELF linked | `e_entry` | segments at link VAs | dynamic table; GOT slots via `.rela.plt` | entry, exports, symbols, init arrays |
+| ELF relocatable (`.o`) | none | synthetic: mapped sections in file order from `0x10000`, 16-aligned; relocations patched | undefined symbols referenced from executable code, each with a synthetic stub address | symbols, direct-call targets, prologue scan |
+| PE | entry RVA + ImageBase | sections at `ImageBase + RVA` | IAT slots | entry, exports, symbols, `.pdata`, TLS callbacks |
+| Mach-O | `LC_MAIN`/`LC_UNIXTHREAD` | segments at `vmaddr` | `__stubs`/`__auth_stubs` entries | entry, exports, symbols, stubs, function starts |
+| COFF relocatable (`.obj`) | none | synthetic, same as ELF `.o` | same as ELF `.o` | symbols, direct-call targets, prologue scan |
+| LE | bundle entry | objects at `reloc_base` | fixup targets (`#ordinal`, `@0xoff`) | entry, exports, prologue scan |
+| Raw | `--entry` or none | one `RWX` segment at `--base` | none | entry or first byte, prologue scan |
