@@ -244,7 +244,7 @@ fn ordinals_rdata() -> Vec<u8> {
     put32(&mut r, 0x00, RDATA_RVA + ilt_off as u32); // OriginalFirstThunk
     put32(&mut r, 0x0C, RDATA_RVA + dll_off as u32); // Name
     put32(&mut r, 0x10, RDATA_RVA + iat_off as u32); // FirstThunk
-    // ILT/IAT: two ordinals, one named, null.
+                                                     // ILT/IAT: two ordinals, one named, null.
     for (i, ord) in ORDINALS_ORDINALS.iter().enumerate() {
         let e = 0x8000_0000 | u32::from(*ord);
         put32(&mut r, ilt_off + 4 * i, e);

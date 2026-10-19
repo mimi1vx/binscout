@@ -22,7 +22,6 @@ The MCP server exposes 41 tools: `project_info`, `load`, `functions`,
 `annotations_export`, `annotations_import`, `diff`, `diff_func`, `stack_strings`, `batch`. The CLI has the same
 capabilities as 36 subcommands (`load` covers `project_info`;
 `annotate` covers `rename`/`comment`/`annotation`); the MCP `load` tool is the
->>>>>>> work/em6.7
 sidecar-warming counterpart of the CLI `load`.
 
 Three versions move independently:

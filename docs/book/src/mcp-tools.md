@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 42 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 43 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`; `batch` takes one
 envelope plus a list of read-only ops) and returns one JSON

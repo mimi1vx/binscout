@@ -18,6 +18,7 @@ pub mod patch;
 pub mod pseudo;
 pub mod search;
 pub mod stackstrings;
+pub mod yara;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -4266,6 +4267,75 @@ impl Project {
                 section: m.section,
                 len: m.len,
                 xrefs_count: self.count_xrefs(Some(m.addr), None, None),
+            })
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
+    }
+
+    /// Scan mapped bytes with user-supplied YARA rules, paged.
+    ///
+    /// Rules come from the user path (never fetched from the network) and
+    /// are compiled per call; each mapped segment's file-backed bytes are
+    /// scanned separately so gaps and BSS never bridge. `rule` keeps one
+    /// rule identifier, `section` keeps matches whose start lies in that
+    /// file-backed section. Rows order by `(addr, rule, pattern)` under
+    /// the protocol-1 [`Page`] envelope; `total` is exact. Each row maps
+    /// the match offset to its virtual address plus the covering section
+    /// and containing function. Read-only: never writes the binary or the
+    /// sidecar.
+    ///
+    /// Without the `yara` cargo feature this is
+    /// [`Error::Unsupported`]: rebuild with `--features yara`.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] when the rules path is missing, when `rule`
+    /// matches no compiled rule, or when `section` names no section,
+    /// [`Error::Invalid`] on malformed rules or a failed scan,
+    /// [`Error::Limit`] past the rules-file or hit budget,
+    /// [`Error::Unsupported`] without the `yara` feature.
+    pub fn scan_yara(
+        &self,
+        rules: &Path,
+        rule: Option<&str>,
+        section: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<crate::yara::YaraHit>> {
+        if let Some(name) = section
+            && !self.binary.sections.iter().any(|s| s.name == name)
+        {
+            return Err(Error::NotFound(format!("no section {name:?}")));
+        }
+        let text = crate::yara::read_rules_file(rules)?;
+        let raw = crate::yara::collect_raw(&self.binary, &text, rule)?;
+        let total = if section.is_none() {
+            raw.len()
+        } else {
+            raw.iter()
+                .filter(|m| crate::yara::section_of(m.addr, &self.binary).as_deref() == section)
+                .count()
+        };
+        let items = raw
+            .into_iter()
+            .filter(|m| {
+                section.is_none_or(|want| {
+                    crate::yara::section_of(m.addr, &self.binary).as_deref() == Some(want)
+                })
+            })
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .map(|m| {
+                let func = self.analysis.containing_function(m.addr);
+                crate::yara::YaraHit {
+                    rule: m.rule,
+                    pattern: m.pattern,
+                    addr: m.addr,
+                    file_off: crate::yara::file_off_of(m.addr, &self.binary),
+                    section: crate::yara::section_of(m.addr, &self.binary),
+                    len: m.len,
+                    func,
+                    func_name: func.and_then(|e| self.function_name(e)),
+                }
             })
             .collect();
         Ok(page_envelope(total, offset, limit, items))
