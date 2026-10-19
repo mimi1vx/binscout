@@ -987,7 +987,7 @@ impl LoaderProject {
     }
 
     /// Section table in file order: name, virtual address, in-memory size,
-    /// file offset/size of the raw bytes, and permissions.
+    /// file offset/size of the raw bytes, Shannon entropy, and permissions.
     ///
     /// Same rows as [`Project::sections_json`]: straight from the loader,
     /// no analysis involved. Raw blobs have no table and report an empty
@@ -1003,6 +1003,7 @@ impl LoaderProject {
                 serde_json::json!({
                     "name": s.name, "vaddr": vaddr, "vaddr_hex": vaddr_hex, "size": s.size,
                     "file_off": s.file_off, "file_size": s.file_size,
+                    "entropy": s.entropy(),
                     "readable": s.readable, "writable": s.writable,
                     "executable": s.executable,
                 })

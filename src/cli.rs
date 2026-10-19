@@ -267,8 +267,9 @@ pub enum Cmd {
     /// Imports and exports.
     Symbols { binary: PathBuf },
     /// Section table: name, virtual address, in-memory and file sizes,
-    /// permissions. `vaddr` is the flat virtual address (PE:
-    /// `IMAGE_BASE + RVA`); `file_off` locates the raw bytes in the file.
+    /// Shannon entropy (bits per byte), permissions. `vaddr` is the flat
+    /// virtual address (PE: `IMAGE_BASE + RVA`); `file_off` locates the
+    /// raw bytes in the file.
     Sections { binary: PathBuf },
     /// Lift `len` bytes at `addr` to IR.
     Ir {

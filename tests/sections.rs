@@ -77,6 +77,11 @@ fn check_rows(rows: &serde_json::Value) {
         assert_eq!(row["size"], e.size, "{row}");
         assert_eq!(row["file_off"], e.file_off, "{row}");
         assert_eq!(row["file_size"], e.file_size, "{row}");
+        let entropy = row["entropy"].as_f64().expect("entropy is a number");
+        assert!(
+            (0.0..=8.0).contains(&entropy),
+            "entropy is Shannon bits per byte: {row}"
+        );
         assert_eq!(row["readable"], e.readable, "{row}");
         assert_eq!(row["writable"], e.writable, "{row}");
         assert_eq!(row["executable"], e.executable, "{row}");
@@ -113,5 +118,33 @@ fn sections_empty_without_table() {
         serde_json::Value::Array(Vec::new()),
         "raw must report no sections"
     );
+    cleanup(&dir);
+}
+
+/// The loader-only cache hit reports the same section rows (including
+/// `entropy`) as a full open: `sections` serves from the cached path once
+/// `load` has warmed the sidecar.
+#[test]
+fn sections_cached_matches_full_open() {
+    let dir = tmpdir("sections-cached");
+    let bin = write_fixture(&dir, builders::BASIC_NAME);
+    let db = temp_db(&dir, "basic");
+    let full = binscout::Project::open_with_db(&bin, &db).expect("fixture must open");
+    full.save().expect("warm the sidecar");
+    let want = full.sections_json();
+    let cached = match binscout::open_mapped_loader_only(&bin, Some(&db), None, None)
+        .expect("loader-only open")
+    {
+        binscout::LoaderOpened::Cached(p) => p,
+        binscout::LoaderOpened::Fresh(_) => panic!("warmed sidecar must hit"),
+    };
+    let got = cached.sections_json();
+    assert_eq!(got, want, "cached sections match the full open");
+    for row in got.as_array().expect("sections is an array") {
+        assert!(
+            row["entropy"].is_number(),
+            "cached rows carry entropy: {row}"
+        );
+    }
     cleanup(&dir);
 }

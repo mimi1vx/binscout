@@ -2070,7 +2070,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "sections",
-        description = "Section table: name, virtual address (PE: IMAGE_BASE + RVA), in-memory and file sizes, permissions"
+        description = "Section table: name, virtual address (PE: IMAGE_BASE + RVA), in-memory and file sizes, Shannon entropy (bits per byte), permissions"
     )]
     async fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
