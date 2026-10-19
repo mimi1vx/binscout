@@ -14,6 +14,7 @@ pub mod headers;
 pub mod ir;
 pub mod loader;
 pub mod mcp;
+pub mod patch;
 pub mod pseudo;
 pub mod search;
 pub mod stackstrings;
@@ -191,6 +192,28 @@ fn mapping_for(raw: Option<RawOptions>, fat_arch: Option<&str>) -> Result<db::St
     }
 }
 
+/// True when both paths name the same file: canonicalized equality, or
+/// equal `(dev, ino)` on unix (catches hard links). Best-effort:
+/// unresolvable paths simply do not match.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b))
+        && ca == cb
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b))
+            && ma.dev() == mb.dev()
+            && ma.ino() == mb.ino()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Reject a `--db` path that resolves to the analyzed binary.
 ///
 /// The sidecar is rewritten by [`Project::save`], so opening with the
@@ -201,26 +224,10 @@ fn reject_db_is_binary(binary: &Path, db_path: &Path) -> Result<()> {
     if !db_path.exists() {
         return Ok(());
     }
-    if let (Ok(can_bin), Ok(can_db)) = (
-        std::fs::canonicalize(binary),
-        std::fs::canonicalize(db_path),
-    ) && can_bin == can_db
-    {
+    if same_file(binary, db_path) {
         return Err(Error::Invalid(
             "--db must not be the analyzed binary".to_string(),
         ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let (Ok(bin_meta), Ok(db_meta)) = (std::fs::metadata(binary), std::fs::metadata(db_path))
-            && bin_meta.dev() == db_meta.dev()
-            && bin_meta.ino() == db_meta.ino()
-        {
-            return Err(Error::Invalid(
-                "--db must not be the analyzed binary".to_string(),
-            ));
-        }
     }
     Ok(())
 }
@@ -3000,6 +3007,123 @@ impl Project {
             prev = Some(insn.clone());
         }
         Ok(partial)
+    }
+
+    /// Assemble a one-instruction patch preview at `va` without writing anything.
+    ///
+    /// The first decode at `va` sets the instruction boundary; the
+    /// replacement ([`crate::patch::PatchInput::Asm`] via the iced-x86 encoder,
+    /// or [`crate::patch::PatchInput::Bytes`] literally) must fit inside it,
+    /// and shorter replacements are padded with single-byte NOPs. The result carries
+    /// the original and replacement bytes plus `size_ok` and the file
+    /// offset, or null when the address is not file-backed. Read-only:
+    /// never writes the binary or the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on non-x86 binaries, [`Error::NotFound`]
+    /// when `va` is unmapped, [`Error::Invalid`] on undecodable bytes or
+    /// bad replacement text (see [`crate::patch::assemble_x86`] and
+    /// [`crate::patch::parse_patch_bytes`]).
+    pub fn patch_preview(
+        &self,
+        va: u64,
+        input: &crate::patch::PatchInput,
+    ) -> Result<crate::patch::PatchPreview> {
+        let arch = self.binary.arch;
+        if !arch.is_x86() {
+            return Err(Error::Unsupported(format!(
+                "patch is x86-only (binary arch is {})",
+                crate::db::arch_name(arch)
+            )));
+        }
+        // x86 instructions are at most 15 bytes; shrink from there so a
+        // short tail near a segment end still decodes.
+        let mut window = None;
+        for len in (1..=15usize).rev() {
+            if let Ok(bytes) = self.bytes_at(va, len) {
+                window = Some(bytes);
+                break;
+            }
+        }
+        let window =
+            window.ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
+        let first = crate::disasm::disasm_first(arch, &window, va)?
+            .ok_or_else(|| Error::Invalid(format!("no bytes at {va:#x}")))?;
+        let old_len = first.size as usize;
+        let old = window[..old_len].to_vec();
+        let raw = match input {
+            crate::patch::PatchInput::Asm(text) => crate::patch::assemble_x86(arch, va, text)?,
+            crate::patch::PatchInput::Bytes(bytes) => bytes.clone(),
+        };
+        let (new, size_ok) = if raw.len() <= old_len {
+            let mut padded = raw;
+            padded.resize(old_len, crate::patch::X86_NOP);
+            (padded, true)
+        } else {
+            (raw, false)
+        };
+        Ok(crate::patch::PatchPreview {
+            addr: va,
+            file_off: self.file_off_of(va),
+            old,
+            new,
+            size_ok,
+        })
+    }
+
+    /// Write a [`crate::patch::PatchPreview`] to `out` as JSON or IPS.
+    ///
+    /// The output path must differ from the analyzed binary (same guard as
+    /// `--db`); overflowing previews (`size_ok` false) and non-file-backed
+    /// addresses are refused, so the file never clobbers neighboring bytes
+    /// and IPS always has a real offset. Returns `{"out", "format",
+    /// "bytes_written"}`. Only the output file is written; the binary and
+    /// the sidecar are untouched.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] when `out` is the analyzed binary, the preview
+    /// overflows, the address has no file offset, or the format/payload is
+    /// out of range; [`Error::Io`] when the file cannot be written.
+    pub fn write_patch_file(
+        &self,
+        preview: &crate::patch::PatchPreview,
+        out: &Path,
+        format: crate::patch::PatchFileFormat,
+    ) -> Result<serde_json::Value> {
+        crate::patch::reject_output_is_binary(&self.path, out)?;
+        if !preview.size_ok {
+            return Err(Error::Invalid(format!(
+                "refusing to write patch: {} new bytes exceed the {}-byte instruction boundary at {:#x}",
+                preview.new.len(),
+                preview.old.len(),
+                preview.addr
+            )));
+        }
+        let Some(file_off) = preview.file_off else {
+            return Err(Error::Invalid(format!(
+                "refusing to write patch: {:#x} is not file-backed (no file offset)",
+                preview.addr
+            )));
+        };
+        let (bytes, name) = match format {
+            crate::patch::PatchFileFormat::Json => {
+                let mut doc = serde_json::to_value(preview).expect("PatchPreview serializes");
+                doc["arch"] = crate::db::arch_name(self.binary.arch).into();
+                let mut bytes = serde_json::to_vec(&doc).expect("patch document serializes");
+                bytes.push(b'\n');
+                (bytes, "json")
+            }
+            crate::patch::PatchFileFormat::Ips => {
+                (crate::patch::ips_bytes(file_off, &preview.new)?, "ips")
+            }
+        };
+        std::fs::write(out, &bytes)
+            .map_err(|e| Error::Io(format!("write {}: {e}", out.display())))?;
+        Ok(serde_json::json!({
+            "out": out.display().to_string(),
+            "format": name,
+            "bytes_written": bytes.len(),
+        }))
     }
 
     /// Function rows with annotation renames resolved, ordered by entry.

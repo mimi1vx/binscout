@@ -779,6 +779,34 @@ sites carry the additive `import` name. Import rows share the
 1,000,000-per-kind xref budget with their own cap. Uncalled PLT
 stubs seed no function: with no caller there is nothing to xref.
 
+### `patch`
+
+```sh
+binscout patch B ADDR --asm "jmp 0x401020" | --bytes "90 90" [--out fix.json --format json]
+```
+
+MCP tool `patch` (`binary`, `db`?, `raw`?, `addr`, `asm`?/`bytes`?,
+`out`?, `format`?). Assembles replacement bytes at one x86 address
+and exports the patch without writing the binary. Exactly one of
+`asm` (one of `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`, encoded
+at the address so branch displacements are exact) or `bytes`
+(whitespace-separated hex pairs) is required. The first decode at
+the address sets the instruction boundary: shorter replacements
+NOP-pad to it, longer ones report `size_ok: false`. `file_off` is
+the file offset (null when the address is not file-backed);
+non-x86 binaries are `Unsupported`, undecodable or unmapped
+addresses error. `out` writes the patch as `json` (default: the
+preview fields plus `arch`) or `ips` (`PATCH` + one 24-bit-offset
+record + `EOF`); the path must differ from the binary, and
+overflowing or non-file-backed previews refuse the file write. The
+binary and the sidecar are never written; `patch` is rejected in
+`batch`.
+
+```sh
+$ binscout patch fw.elf 0x401000 --bytes "90 90"
+{"va":4198400,"va_hex":"0x401000","file_off":512,"old_hex":"5589e5","new_hex":"9090","size_ok":true}
+```
+
 ## Errors and validation
 
 Library variants, their machine-readable `kind`, and their surfaces.

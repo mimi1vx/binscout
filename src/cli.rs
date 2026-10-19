@@ -453,6 +453,29 @@ pub enum Cmd {
         #[arg(long)]
         db_b: Option<PathBuf>,
     },
+    /// Assemble replacement bytes at one address and export the patch
+    /// (`va`, `file_off`, `old_hex`, `new_hex`, `size_ok`) without
+    /// writing the binary. The first instruction at `addr` sets the
+    /// boundary; shorter replacements are NOP-padded, longer ones report
+    /// `size_ok: false`. `--out` writes a `json`/`ips` patch file that
+    /// must differ from the binary.
+    Patch {
+        binary: PathBuf,
+        addr: String,
+        /// Intel-syntax assembly encoded at `addr` (x86 only; one of
+        /// `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`).
+        #[arg(long, conflicts_with = "bytes", required_unless_present = "bytes")]
+        asm: Option<String>,
+        /// Literal bytes as whitespace-separated hex pairs (`"90 90"`).
+        #[arg(long, conflicts_with = "asm", required_unless_present = "asm")]
+        bytes: Option<String>,
+        /// Write the patch file here (never the analyzed binary).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Patch file format for `--out`: `json` or `ips`.
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 impl Cli {
@@ -767,6 +790,24 @@ impl Cli {
                 db_b.as_deref(),
                 raw_opts,
                 fat_arch,
+            ),
+            Cmd::Patch {
+                binary,
+                addr,
+                asm,
+                bytes,
+                out,
+                format,
+            } => patch(
+                &binary,
+                db,
+                raw_opts,
+                fat_arch,
+                &addr,
+                asm.as_deref(),
+                bytes.as_deref(),
+                out.as_deref(),
+                format.as_deref(),
             ),
         };
         match result {
@@ -1570,6 +1611,65 @@ fn diff_func(
         binscout::parse_addr(addr_b)?,
     )?;
     Ok(serde_json::to_value(report).expect("func diff report serializes"))
+}
+
+/// Assemble replacement bytes at one address and export the patch.
+///
+/// Exactly one of `asm`/`bytes` is required (clap enforces the same);
+/// `format` without `out` is an error. Stdout is always the preview
+/// (`va`, `file_off`, `old_hex`, `new_hex`, `size_ok`), extended with
+/// `out`/`format`/`bytes_written` when a patch file is written. The binary
+/// and the sidecar are never written.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch"
+)]
+fn patch(
+    binary: &std::path::Path,
+    db: Option<&std::path::Path>,
+    raw: Option<binscout::loader::RawOptions>,
+    fat_arch: Option<&str>,
+    addr: &str,
+    asm: Option<&str>,
+    bytes: Option<&str>,
+    out: Option<&std::path::Path>,
+    format: Option<&str>,
+) -> binscout::error::Result<serde_json::Value> {
+    if format.is_some() && out.is_none() {
+        return Err(binscout::error::Error::Invalid(
+            "--format needs --out".to_string(),
+        ));
+    }
+    let p = open(binary, db, raw, fat_arch)?;
+    let input = match (asm, bytes) {
+        (Some(text), None) => binscout::patch::PatchInput::Asm(text.to_string()),
+        (None, Some(text)) => {
+            binscout::patch::PatchInput::Bytes(binscout::patch::parse_patch_bytes(text)?)
+        }
+        (Some(_), Some(_)) => {
+            return Err(binscout::error::Error::Invalid(
+                "--asm and --bytes are exclusive".to_string(),
+            ));
+        }
+        (None, None) => {
+            return Err(binscout::error::Error::Invalid(
+                "patch needs --asm or --bytes".to_string(),
+            ));
+        }
+    };
+    let preview = p.patch_preview(binscout::parse_addr(addr)?, &input)?;
+    let mut value = serde_json::to_value(&preview).expect("patch preview serializes");
+    if let Some(out) = out {
+        let fmt = match format {
+            Some(name) => binscout::patch::parse_patch_format(name)?,
+            None => binscout::patch::PatchFileFormat::Json,
+        };
+        let summary = p.write_patch_file(&preview, out, fmt)?;
+        for (key, val) in summary.as_object().expect("summary is an object") {
+            value[key] = val.clone();
+        }
+    }
+    Ok(value)
 }
 
 /// Read an interchange document with a hard pre-parse budget.

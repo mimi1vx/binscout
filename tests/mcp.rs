@@ -135,6 +135,7 @@ fn handshake_lists_tools() {
             "ir",
             "ir_coverage",
             "load",
+            "patch",
             "project_info",
             "pseudo",
             "rename",
@@ -151,7 +152,7 @@ fn handshake_lists_tools() {
             "undefine_func",
             "xrefs",
         ],
-        "exactly the 41 tools"
+        "exactly the 42 tools"
     );
     let search = tools
         .iter()
@@ -224,6 +225,18 @@ fn handshake_lists_tools() {
         .expect("input schema properties");
     for key in ["binary", "db", "raw", "name", "section", "offset", "limit"] {
         assert!(props.contains_key(key), "crypto_scan exposes {key}");
+    }
+    let patch = tools
+        .iter()
+        .find(|t| t["name"] == "patch")
+        .expect("patch listed");
+    let props = patch["inputSchema"]["properties"]
+        .as_object()
+        .expect("input schema properties");
+    for key in [
+        "binary", "db", "raw", "fat_arch", "addr", "asm", "bytes", "out", "format",
+    ] {
+        assert!(props.contains_key(key), "patch exposes {key}");
     }
 }
 
@@ -500,6 +513,35 @@ fn define_undefine_round_trip() {
         fixture,
         "binary untouched"
     );
+    cleanup(&dir);
+}
+
+// Patch export over MCP: same preview shape as the CLI, read-only.
+#[test]
+fn mcp_patch_previews_replacement() {
+    let dir = tmpdir("mcp-patch");
+    let bin = write_bin(&dir, "p.bin", &[0x74, 0x02, 0x90, 0x90])
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "p").display().to_string();
+    let base = json!({"binary": bin, "db": db, "raw": {"arch": "x86_64", "base": "0x400000"}});
+
+    let mut args = base.clone();
+    args["addr"] = json!("0x400000");
+    args["bytes"] = json!("cc 90");
+    let v = tool_once(10, "patch", args);
+    assert_eq!(v["va_hex"], "0x400000");
+    assert_eq!(v["file_off"], 0);
+    assert_eq!(v["old_hex"], "7402");
+    assert_eq!(v["new_hex"], "cc90");
+    assert_eq!(v["size_ok"], true);
+
+    let mut args = base.clone();
+    args["addr"] = json!("0x400000");
+    args["asm"] = json!("jmp 0x401020");
+    let v = tool_once(11, "patch", args);
+    assert_eq!(v["new_hex"], "e91b100000");
+    assert_eq!(v["size_ok"], false);
     cleanup(&dir);
 }
 

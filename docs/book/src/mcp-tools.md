@@ -1,6 +1,6 @@
 # MCP tools
 
-`binscout-mcp` serves 41 tools over stdio (newline-delimited JSON-RPC).
+`binscout-mcp` serves 42 tools over stdio (newline-delimited JSON-RPC).
 Each takes `binary` plus an optional `db` path (`diff` takes
 `binary_a`/`binary_b` plus optional `db_a`/`db_b`; `batch` takes one
 envelope plus a list of read-only ops) and returns one JSON
@@ -56,6 +56,7 @@ document as text; failures are tool errors. Attach it to any MCP client:
 | `annotations_import` | binary, document, overwrite? | Atomically merge a document; returns row/change counts, default fails on conflicts |
 | `diff` | binary_a, binary_b, db_a?/db_b?, raw?/fat_arch?, offset?/limit?, transfer_renames? | Function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason, plus BinDiff-style neighbour propagation); each list pages under the protocol-1 envelope; `transfer_renames` embeds the side-B rename document for `annotations_import`; both projects open read-only, never creating or modifying a sidecar; the shared `raw`/`fat_arch` selection (if any) applies to both |
 | `diff_func` | binary_a, binary_b, addr_a, addr_b, db_a?/db_b?, raw?/fat_arch? | Block- and instruction-level delta between two functions (blocks match by hash then by position, each matched block carries a bounded edit script); addresses snap to their containing entries; read-only like `diff` |
+| `patch` | binary, addr, asm?/bytes?, out?/format? | Assemble replacement bytes at one x86 address and export the patch (`va`/`va_hex`, `file_off` null when not file-backed, `old_hex`, `new_hex`, `size_ok`) without writing the binary; exactly one of `asm` (one of `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`, encoded at the address) or `bytes` (whitespace-separated hex pairs); shorter replacements NOP-pad to the instruction boundary, longer ones report `size_ok:false`; `out` writes a `json` (default) or `ips` patch file that must differ from the binary; overflowing or non-file-backed patches refuse the file write; rejected in `batch` |
 | `batch` | binary, db?/raw?/fat_arch?, ops (1–32) | Up to 32 read-only ops over one open project, run in order; returns `{"results": [{"ok"} \| {"error"}]}` with per-op limits unchanged and total output capped at 1 MiB (see below) |
 
 Addresses are `0x`-hex or decimal strings. `kind` filters accept
