@@ -247,6 +247,7 @@ fn non_executable_target_stays_unresolved() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };
@@ -549,6 +550,7 @@ fn non_executable_table_entry_stays_unresolved() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };
@@ -639,6 +641,7 @@ fn cross_function_table_entry_stays_unresolved() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };
@@ -741,6 +744,7 @@ fn container_absolute_table_resolves_like_raw() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };
@@ -816,6 +820,7 @@ fn container_format_stays_unresolved_by_design() {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };
@@ -1179,6 +1184,7 @@ fn pe_container(bytes: Vec<u8>, base: u64, arch: Arch) -> Analysis {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     };

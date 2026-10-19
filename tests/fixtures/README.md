@@ -18,6 +18,15 @@ All PE32 fixtures: `I386`, `ImageBase 0x400000`, `.text` at `0x401000`,
   `?myfunc@@YAXH@Z` (C++ mangled). Ground truth for L3/A8.
 - `le-minimal.exe`: minimal MZ->LE image (one R-X object, entry bundle).
   Loader-level truth; L1/A1 makes `Project::open` reject it.
+- `pdb-mini.exe` + `pdb-mini.pdb`: two-function Windows x86-64 PE
+  (`__declspec(dllexport) int helper(int)`, `int main(void)`, image base
+  `0x140000000`) plus its full PDB. Generated once with
+  `clang --target=x86_64-windows-msvc -gcodeview` and `lld-link /debug`
+  (see `tests/debuginfo.rs`); the checked-in bytes are fixed and no
+  toolchain runs at test time. The PDB path embedded in the exe is stale
+  by design: binscout never auto-loads PDBs, only explicit `--pdb`.
+  Ground truth for em6.23: PDB publics/procedures seed `debug`-reasoned
+  functions with exact names and bounds.
 - `text-garbage.bin`: x86-64 prologue, invalid opcode `0xD6`, noise strings
   `VWf3` and `D$ f`, trailing nops+ret. Decode-stop truth for D2/A6,
   byte-noise truth for D3/A7.

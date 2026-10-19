@@ -7,10 +7,12 @@ binary: `.rsdbg.redb` appended to the full file name by default
 itself is only ever read.
 
 On open, the stored content hash, loader mapping (auto versus
-explicit raw arch/base/entry), and analysis revision are compared
+explicit raw arch/base/entry), explicit debug inputs (`--pdb` /
+`--debug-file` content identity), and analysis revision are compared
 against the request; a mismatch means the snapshot is discarded and
 the binary re-analyzes. Annotations and user seeds carry over by address
-when the mapping is unchanged. A sidecar holding annotations or seeds
+when the mapping is unchanged (a debug-input mismatch re-analyzes but
+never errors). A sidecar holding annotations or seeds
 opened under an incompatible mapping fails with a separate-DB error
 instead of remapping them. A sidecar written by an older schema version (current
 version 8, analysis revision 11) behaves the same way: annotations and

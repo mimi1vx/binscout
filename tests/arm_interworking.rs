@@ -11,10 +11,10 @@
 //! - ARM literal-pool loads (`ldr rX, [pc, #imm]`) reference the pool word
 //!   plus the pointer stored there.
 
-use binscout::analysis::{DiscoveryReason, XrefKind, analyze};
+use binscout::analysis::{analyze, DiscoveryReason, XrefKind};
 use binscout::disasm::Arch;
 use binscout::ir::lift_range;
-use binscout::loader::{ArmHints, BinaryFormat, LoadedBinary, Segment, load};
+use binscout::loader::{load, ArmHints, BinaryFormat, LoadedBinary, Segment};
 use binscout::pseudo::render_function;
 
 fn text_seg(vaddr: u64, code: Vec<u8>) -> Segment {
@@ -55,6 +55,7 @@ fn arm_bin(entry: Option<u64>, segments: Vec<Segment>) -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: ArmHints::default(),
     }
@@ -280,7 +281,7 @@ fn arm_mixed_elf() -> Vec<u8> {
     put16(&mut f, 46, 40); // shentsize
     put16(&mut f, 48, 5); // shnum
     put16(&mut f, 50, 4); // shstrndx
-    // Program header: one RX load.
+                          // Program header: one RX load.
     let p = 52;
     put32(&mut f, p, 1); // PT_LOAD
     put32(&mut f, p + 4, text_off as u32); // offset

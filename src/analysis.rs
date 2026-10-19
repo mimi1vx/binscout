@@ -251,6 +251,12 @@ pub enum DiscoveryReason {
     /// [`AnalyzeOptions::pointer_scan`], never on by default.
     #[serde(alias = "Pointer")]
     Pointer,
+    /// Debug-info address (DWARF `DW_TAG_subprogram` or PDB public /
+    /// procedure row) resolving to executable code.
+    ///
+    /// Compiler-emitted starts and names; exact like symbol-table seeds.
+    #[serde(alias = "Debug")]
+    Debug,
 }
 
 /// Decode mode of one user-defined function seed (`define-func --mode`).
@@ -554,8 +560,8 @@ impl BasicBlock {
 pub struct Function {
     /// Function entry address; the stable key.
     pub entry: u64,
-    /// Export, symbol, stub-import, PLT (`sym@plt`), or thunk name when
-    /// one resolves to `entry`.
+    /// Export, debug-info, symbol, stub-import, PLT (`sym@plt`), or thunk
+    /// name when one resolves to `entry`.
     pub name: Option<String>,
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
@@ -2806,6 +2812,12 @@ fn authoritative_seeds(
         let (addr, mode) = arm_seed(bin, *addr);
         push(&mut seeds, addr, mode);
     }
+    // Debug info (DWARF subprograms, PDB publics/procedures): exact
+    // compiler-emitted starts.
+    for f in &bin.debug_funcs {
+        let (addr, mode) = arm_seed(bin, f.address);
+        push(&mut seeds, addr, mode);
+    }
     // Pointer scan (opt-in): aligned data pointers to decodable code.
     if options.pointer_scan {
         for (addr, mode) in pointer_seeds(space, bin) {
@@ -4693,6 +4705,11 @@ pub fn analyze_with_options(
         .iter()
         .map(|a| normalize_arm_seed(arch, *a).0)
         .collect();
+    let debug_addrs: BTreeSet<u64> = bin
+        .debug_funcs
+        .iter()
+        .map(|f| normalize_arm_seed(arch, f.address).0)
+        .collect();
     let pointer_addrs: BTreeSet<u64> = if options.pointer_scan {
         pointer_seeds(&space, bin)
             .into_iter()
@@ -4740,6 +4757,9 @@ pub fn analyze_with_options(
         }
         if starts_addrs.contains(e) {
             r.insert(DiscoveryReason::FunctionStarts);
+        }
+        if debug_addrs.contains(e) {
+            r.insert(DiscoveryReason::Debug);
         }
         if pointer_addrs.contains(e) {
             r.insert(DiscoveryReason::Pointer);
@@ -4855,19 +4875,24 @@ pub fn analyze_with_options(
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries, then symbol-table names, then import
-    // addresses (Mach-O stubs; PE slots are data and never collide).
-    // ELF stubs take `sym@plt` from the stub map below. Precedence per
-    // address: export > symbol > import; annotation renames win over all
-    // three at display time (see `Project::function_name`). Export
-    // addresses normalize like seeds so an odd ARM export still names
-    // its function.
+    // Export names for entries, then debug-info names, then symbol-table
+    // names, then import addresses (Mach-O stubs; PE slots are data and
+    // never collide). ELF stubs take `sym@plt` from the stub map below.
+    // Precedence per address: export > debug > symbol > import; annotation
+    // renames win over all four at display time (see
+    // `Project::function_name`). Export addresses normalize like seeds so
+    // an odd ARM export still names its function.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
             names
                 .entry(normalize_arm_seed(arch, addr).0)
                 .or_insert_with(|| exp.name.clone());
+        }
+    }
+    for f in &bin.debug_funcs {
+        if let Some(name) = &f.name {
+            names.entry(f.address).or_insert_with(|| name.clone());
         }
     }
     for sym in &bin.symbols {
@@ -5519,6 +5544,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
             arm_hints: Default::default(),
         }

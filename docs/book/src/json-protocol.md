@@ -173,7 +173,10 @@ After — `func` is a bounded summary. `blocks`/`insns` are counts,
 `inferred_edges` counts provenance-marked indirect-jump resolutions in
 that function, and `reasons` is the sorted, deduplicated discovery
 vocabulary (`entry`, `export`, `symbol`, `direct-call`, `prologue`,
-`user` — the last for agent-defined seeds, see `define-func` below).
+`debug` — DWARF/PDB rows, see below — `user` for agent-defined seeds,
+see `define-func` below; `pdata`, `tls-callback`, `init-array`,
+`function-starts`, and `pointer` cover the remaining table-derived and
+opt-in seed sources).
 The redundant `containing_entry` twin is dropped; any interior address
 still snaps to the canonical `entry`:
 
@@ -217,8 +220,11 @@ an import slot or stub (alongside the retained `data`/`code` rows); a third addi
 object symbol tables (locals included, deduplicated by address, Thumb
 bit cleared on ARM). Symbol addresses seed analysis as
 `symbol`-reasoned functions; per-address naming resolves export >
-symbol > stub import, with annotation renames winning over all three
-at display time. `sections`, `disasm`/`ir` with `error_at` and the 1 MiB
+debug > symbol > stub import, with annotation renames winning over all
+four at display time. Debug-info rows (DWARF `DW_TAG_subprogram` from
+embedded sections or `--debug-file`, PDB publics/procedures from
+`--pdb`) seed `debug`-reasoned functions with exact names and optional
+ends; `project_info`/`stats` report their count as `debug_funcs`. `sections`, `disasm`/`ir` with `error_at` and the 1 MiB
 range cap; `cfg` node/edge shape (plus the additive `query_addr` echo of
 the requested address on `cfg`/`structure`/`pseudo`); `annotate` read/write semantics
 (`rename` only on known function entries, `comment` on any address,

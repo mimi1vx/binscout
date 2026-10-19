@@ -315,6 +315,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
             arm_hints: Default::default(),
         };

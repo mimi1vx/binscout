@@ -41,7 +41,7 @@ fn bootstrap_raw(bin: &Path, db: &Path, o: RawOptions) -> (u64, String, u64) {
 
 fn cached_with(db: &Path, hash: u64, sha256: &str, size: u64, m: &StoredMapping) -> db::Snapshot {
     let handle = db::open_db(db).expect("open db");
-    db::load_cached(&handle, hash, sha256, size, m).expect("load_cached")
+    db::load_cached(&handle, hash, sha256, size, m, &db::DebugId::default()).expect("load_cached")
 }
 
 fn assert_stale(snap: db::Snapshot) {
@@ -151,8 +151,15 @@ fn auto_and_explicit_never_alias() {
     let handle = db::open_db(&db2).expect("open db");
     assert!(
         matches!(
-            db::load_cached(&handle, hash, &sha256, size, &StoredMapping::Auto)
-                .expect("load_cached"),
+            db::load_cached(
+                &handle,
+                hash,
+                &sha256,
+                size,
+                &StoredMapping::Auto,
+                &db::DebugId::default()
+            )
+            .expect("load_cached"),
             db::Snapshot::Stale { .. }
         ),
         "auto open must not hit an explicit snapshot"
@@ -263,6 +270,7 @@ fn mapping_conflict_with_annotations_errors_without_writes() {
         diagnostics_omitted: q.analysis().diagnostics.omitted,
         inferred_truncated: q.analysis().diagnostics.inferred_truncated,
         inferred_omitted: q.analysis().diagnostics.inferred_omitted,
+        debug: db::DebugId::default(),
         seeds_hash: 0,
     };
     let err = db::save(&hog, &meta, q.analysis(), q.annotations(), q.func_seeds()).unwrap_err();
@@ -355,7 +363,15 @@ fn legacy_annotated_requires_separate_db() {
     let size = bytes.len() as u64;
     {
         let handle = db::open_db_read_only(&db).expect("open db");
-        let err = db::load_cached(&handle, hash, &sha256, size, &mapping_of(o)).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            hash,
+            &sha256,
+            size,
+            &mapping_of(o),
+            &db::DebugId::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("separate --db") && msg.contains("legacy"),
@@ -672,8 +688,14 @@ fn open_mapped_shares_parser_with_open_raw() {
         .expect("parse")
         .expect("explicit");
     let db_a = common::temp_db(&dir, "a");
-    let via_mapped =
-        binscout::open_mapped(&bin, Some(&db_a), Some(parsed), None).expect("open_mapped");
+    let via_mapped = binscout::open_mapped(
+        &bin,
+        Some(&db_a),
+        Some(parsed),
+        None,
+        &binscout::DebugOptions::default(),
+    )
+    .expect("open_mapped");
     let db_b = common::temp_db(&dir, "b");
     let via_raw = Project::open_raw(&bin, &db_b, parsed).expect("open_raw");
     let (m, r) = (via_mapped.project_info(), via_raw.project_info());

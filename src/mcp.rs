@@ -230,7 +230,14 @@ fn open_uncached(
         }
         None => None,
     };
-    crate::open_mapped(Path::new(binary), db_ref, raw_opts, fat_arch).map_err(error_data)
+    crate::open_mapped(
+        Path::new(binary),
+        db_ref,
+        raw_opts,
+        fat_arch,
+        &crate::DebugOptions::default(),
+    )
+    .map_err(error_data)
 }
 
 /// Parse an MCP `raw` object through the shared CLI/MCP validator.

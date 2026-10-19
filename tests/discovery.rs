@@ -152,6 +152,7 @@ fn pointer_binary() -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
         arm_hints: Default::default(),
     }
@@ -225,6 +226,7 @@ fn table_seeds_become_entries_with_reasons() {
             tls_callbacks: tls,
             init_funcs: init,
             func_starts: starts,
+            debug_funcs: Vec::new(),
             relocatable: false,
             arm_hints: Default::default(),
         };

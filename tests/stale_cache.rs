@@ -183,8 +183,15 @@ fn hit_loads_cached_snapshot() {
     let (hash, sha256, size) = ident(&raw_for_hit);
     {
         let handle = db::open_db(&db).expect("open db");
-        match db::load_cached(&handle, hash, &sha256, size, &db::StoredMapping::Auto)
-            .expect("load_cached")
+        match db::load_cached(
+            &handle,
+            hash,
+            &sha256,
+            size,
+            &db::StoredMapping::Auto,
+            &db::DebugId::default(),
+        )
+        .expect("load_cached")
         {
             db::Snapshot::Hit(hit) => {
                 assert_eq!(hit.meta.content_hash, hash);
@@ -234,8 +241,15 @@ fn miss_on_fresh_db() {
     let handle = db::open_db(&db).expect("create db");
     assert!(
         matches!(
-            db::load_cached(&handle, 1234, "deadbeef", 0, &db::StoredMapping::Auto)
-                .expect("load_cached"),
+            db::load_cached(
+                &handle,
+                1234,
+                "deadbeef",
+                0,
+                &db::StoredMapping::Auto,
+                &db::DebugId::default()
+            )
+            .expect("load_cached"),
             db::Snapshot::Miss
         ),
         "fresh sidecar has no snapshot"
@@ -263,7 +277,15 @@ fn meta_without_binaries_row_errors() {
             let _ = wtxn.open_table(BINARIES).expect("create binaries");
         }
         wtxn.commit().expect("commit");
-        let err = db::load_cached(&handle, 0, "", 0, &db::StoredMapping::Auto).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            0,
+            "",
+            0,
+            &db::StoredMapping::Auto,
+            &db::DebugId::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("no binary row"),
             "unexpected: {err:?}"
@@ -305,6 +327,7 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
             &old_sha256,
             old_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .unwrap_err();
         assert!(
@@ -326,7 +349,8 @@ fn missing_derived_tables_error_on_hit_but_stale_skips() {
                     new_hash,
                     &new_sha256,
                     new_size,
-                    &db::StoredMapping::Auto
+                    &db::StoredMapping::Auto,
+                    &db::DebugId::default(),
                 )
                 .expect("load_cached"),
                 db::Snapshot::Stale { .. }
@@ -360,6 +384,7 @@ fn version_mismatch_is_stale_but_carries_annotations() {
             &old_sha256,
             old_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .expect("load_cached")
         {
@@ -395,6 +420,7 @@ fn version_mismatch_is_stale_but_carries_annotations() {
             &new_sha256,
             new_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .expect("load_cached")
         {
@@ -530,6 +556,7 @@ fn stale_corrupt_derived_rows_are_discarded() {
             &old_sha256,
             old_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .unwrap_err();
         assert!(
@@ -551,7 +578,8 @@ fn stale_corrupt_derived_rows_are_discarded() {
                     new_hash,
                     &new_sha256,
                     new_size,
-                    &db::StoredMapping::Auto
+                    &db::StoredMapping::Auto,
+                    &db::DebugId::default(),
                 )
                 .expect("load_cached"),
                 db::Snapshot::Stale { .. }
@@ -593,6 +621,7 @@ fn stale_corrupt_annotations_still_error() {
             &new_sha256,
             new_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .unwrap_err();
         assert!(
@@ -671,8 +700,15 @@ fn stale_snapshot_reads_one_coherent_sidecar_generation() {
     assert_eq!(expected.meta.content_hash, hash_b);
     assert_eq!(expected.meta.content_sha256, sha_b);
     assert_eq!(expected.meta.size, size_b);
-    match db::load_cached(&handle, hash_a, &sha_a, size_a, &db::StoredMapping::Auto)
-        .expect("load_cached")
+    match db::load_cached(
+        &handle,
+        hash_a,
+        &sha_a,
+        size_a,
+        &db::StoredMapping::Auto,
+        &db::DebugId::default(),
+    )
+    .expect("load_cached")
     {
         db::Snapshot::Stale {
             meta,
@@ -754,6 +790,7 @@ fn corrupt_unknown_arch_still_errors_on_hit_but_stale_skips() {
             &old_sha256,
             old_size,
             &db::StoredMapping::Auto,
+            &db::DebugId::default(),
         )
         .unwrap_err();
         assert!(
@@ -865,7 +902,15 @@ fn auto_snapshot_explicit_open_rebuilds_when_empty() {
         let handle = db::open_db_read_only(&db).expect("open db");
         assert!(
             matches!(
-                db::load_cached(&handle, hash, &sha256, size, &explicit).expect("load_cached"),
+                db::load_cached(
+                    &handle,
+                    hash,
+                    &sha256,
+                    size,
+                    &explicit,
+                    &db::DebugId::default()
+                )
+                .expect("load_cached"),
                 db::Snapshot::Stale { .. }
             ),
             "explicit open must not hit an auto snapshot"
@@ -899,7 +944,15 @@ fn auto_snapshot_explicit_open_conflicts_when_annotated() {
     {
         let handle = db::open_db_read_only(&db).expect("open db");
         let (b_hash, b_sha256, b_size) = ident(&bytes);
-        let err = db::load_cached(&handle, b_hash, &b_sha256, b_size, &explicit).unwrap_err();
+        let err = db::load_cached(
+            &handle,
+            b_hash,
+            &b_sha256,
+            b_size,
+            &explicit,
+            &db::DebugId::default(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("separate --db"),
             "mode mismatch must name a separate DB: {err:?}"
@@ -977,8 +1030,15 @@ fn sha256_mismatch_is_stale_not_hit() {
     let (hash, _, size) = ident(&bytes);
     let handle = db::open_db(&db).expect("open db");
     let wrong_sha = "00".repeat(32);
-    match db::load_cached(&handle, hash, &wrong_sha, size, &db::StoredMapping::Auto)
-        .expect("load_cached")
+    match db::load_cached(
+        &handle,
+        hash,
+        &wrong_sha,
+        size,
+        &db::StoredMapping::Auto,
+        &db::DebugId::default(),
+    )
+    .expect("load_cached")
     {
         db::Snapshot::Stale { .. } => {}
         other => panic!("SHA-256 mismatch must be stale, got {other:?}"),
@@ -991,6 +1051,7 @@ fn sha256_mismatch_is_stale_not_hit() {
         &sha256,
         size.wrapping_add(1),
         &db::StoredMapping::Auto,
+        &db::DebugId::default(),
     )
     .expect("load_cached")
     {

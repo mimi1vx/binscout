@@ -560,6 +560,7 @@ fn oversized_export_fails_explicitly() {
         diagnostics_omitted: p.analysis().diagnostics.omitted,
         inferred_truncated: p.analysis().diagnostics.inferred_truncated,
         inferred_omitted: p.analysis().diagnostics.inferred_omitted,
+        debug: db::DebugId::default(),
         seeds_hash: 0,
     };
     let handle = db::open_db(&db).expect("create db");

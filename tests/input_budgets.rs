@@ -689,6 +689,7 @@ fn save_rejects_oversize_annotations_before_writing() {
         diagnostics_omitted: 0,
         inferred_truncated: false,
         inferred_omitted: 0,
+        debug: binscout::db::DebugId::default(),
         seeds_hash: 0,
     };
     let mut annotations = BTreeMap::new();

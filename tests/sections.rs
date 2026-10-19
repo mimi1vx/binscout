@@ -132,8 +132,14 @@ fn sections_cached_matches_full_open() {
     let full = binscout::Project::open_with_db(&bin, &db).expect("fixture must open");
     full.save().expect("warm the sidecar");
     let want = full.sections_json();
-    let cached = match binscout::open_mapped_loader_only(&bin, Some(&db), None, None)
-        .expect("loader-only open")
+    let cached = match binscout::open_mapped_loader_only(
+        &bin,
+        Some(&db),
+        None,
+        None,
+        &binscout::DebugOptions::default(),
+    )
+    .expect("loader-only open")
     {
         binscout::LoaderOpened::Cached(p) => p,
         binscout::LoaderOpened::Fresh(_) => panic!("warmed sidecar must hit"),
