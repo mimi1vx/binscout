@@ -133,6 +133,13 @@ pub struct Insn {
     /// old rows without the key still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub string: Option<String>,
+    /// Whether this instruction decoded in Thumb mode (32-bit ARM only).
+    ///
+    /// Always false on other architectures, including [`Arch::Arm32`]
+    /// rows. Pure decode fact, like `size`: set by the range decoders,
+    /// never edited by analysis or enrichment.
+    #[serde(default)]
+    pub thumb: bool,
 }
 
 /// Max characters in an [`Insn::string`] preview (counted after escaping).
@@ -173,7 +180,7 @@ impl Serialize for Insn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut len = 12;
+        let mut len = 13;
         for present in [
             self.import.is_some(),
             self.target_name.is_some(),
@@ -200,6 +207,7 @@ impl Serialize for Insn {
         st.serialize_field("mem_target_hex", &self.mem_target.map(crate::addr_hex))?;
         st.serialize_field("table_base", &self.table_base)?;
         st.serialize_field("table_base_hex", &self.table_base.map(crate::addr_hex))?;
+        st.serialize_field("thumb", &self.thumb)?;
         if self.import.is_some() {
             st.serialize_field("import", &self.import)?;
         } else {
@@ -808,6 +816,7 @@ fn x86_insn(
         target_name: None,
         comment: None,
         string: None,
+        thumb: false,
     }
 }
 
@@ -996,6 +1005,7 @@ fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruc
         target_name: None,
         comment: None,
         string: None,
+        thumb: false,
     }
 }
 
@@ -1171,7 +1181,20 @@ pub(crate) fn resolve_adrp_pair(first: &Insn, second: &Insn) -> Option<u64> {
 
 /// Strict `#`-immediate (`#0x10`, `#16`): anything else is `None`.
 fn parse_hash_imm(op: &str) -> Option<u64> {
-    let digits = op.strip_prefix('#')?;
+    parse_digits(op.strip_prefix('#')?)
+}
+
+/// Strict bare immediate (`0x10`, `16`): anything else is `None`.
+///
+/// ARM `mov`/`movt` immediates print without the `#` prefix (`mov r0,
+/// 0x1234`), unlike AArch64 `add`/`ldr` forms, so the pair resolver takes
+/// the operand as printed. An optional `#` is accepted so both shapes
+/// resolve.
+fn parse_bare_imm(digits: &str) -> Option<u64> {
+    parse_digits(digits.strip_prefix('#').unwrap_or(digits))
+}
+
+fn parse_digits(digits: &str) -> Option<u64> {
     if let Some(hex) = digits
         .strip_prefix("0x")
         .or_else(|| digits.strip_prefix("0X"))
@@ -1186,6 +1209,57 @@ fn parse_hash_imm(op: &str) -> Option<u64> {
         }
         digits.parse::<u64>().ok()
     }
+}
+
+/// Final address of a `movw` + `movt` pair materializing a 32-bit constant,
+/// if any.
+///
+/// `movw` writes the low halfword (yaxpeax-arm prints it as plain `mov`:
+/// `mov r0, 0x1234`) and `movt` the high halfword, so the referenced
+/// address spans two instructions — the ARM32 equivalent of
+/// [`resolve_adrp_pair`]. Returns `(hi << 16) | lo` when `first` is a
+/// two-operand `mov` with a bare-hex immediate destination-equal to
+/// `second`'s `movt` destination, else `None`. A plain `mov rX, #imm`
+/// first row resolves identically: it fully writes the register, so the
+/// following `movt` still determines the high halfword. Register sources
+/// (`mov r0, r1`), extra operands, mismatched destinations, and
+/// halfwords wider than 16 bits return `None`; the function never
+/// guesses. Pairing (adjacency, same block) is the caller's job.
+pub(crate) fn resolve_movw_pair(first: &Insn, second: &Insn) -> Option<u64> {
+    if !matches!(first.mnem.as_str(), "mov" | "movw") || second.mnem != "movt" {
+        return None;
+    }
+    if first.ops.len() != 2 || second.ops.len() != 2 {
+        return None;
+    }
+    if first.ops[0] != second.ops[0] {
+        return None;
+    }
+    let lo = parse_bare_imm(&first.ops[1])?;
+    let hi = parse_bare_imm(&second.ops[1])?;
+    if lo > 0xffff || hi > 0xffff {
+        return None;
+    }
+    Some((hi << 16) | lo)
+}
+
+/// Base mnemonic of an ARMv7 row: one trailing `.w`/`.n` width suffix
+/// stripped (`bl.w` decodes as `bl`).
+///
+/// Conditional suffixes stay intact (`blxeq` is not `blx`): mode-switch and
+/// literal-pool checks only fire on unconditional forms.
+pub(crate) fn arm_base_mnem(mnem: &str) -> &str {
+    mnem.strip_suffix(".w")
+        .or_else(|| mnem.strip_suffix(".n"))
+        .unwrap_or(mnem)
+}
+
+/// Final address of a two-instruction constant pair ending at `second`,
+/// if any: an AArch64 `adrp`+`add`/`ldr` pair or an ARM32 `movw`+`movt`
+/// pair (see [`resolve_adrp_pair`] and [`resolve_movw_pair`). The two
+/// arches never share a row, so trying both never double-resolves.
+pub(crate) fn resolve_const_pair(first: &Insn, second: &Insn) -> Option<u64> {
+    resolve_adrp_pair(first, second).or_else(|| resolve_movw_pair(first, second))
 }
 
 /// Decode exactly one ARMv7 instruction from the start of `bytes`
@@ -1295,6 +1369,7 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
         target_name: None,
         comment: None,
         string: None,
+        thumb: inst.thumb(),
     }
 }
 
@@ -1714,6 +1789,51 @@ mod tests {
 
     fn adrp_pair(bytes: &[u8], va: u64) -> Vec<Insn> {
         disasm_aarch64(bytes, va, 8).expect("adrp pair must decode")
+    }
+
+    fn movw_pair(bytes: &[u8], va: u64) -> Vec<Insn> {
+        disasm_arm32(bytes, va, 8).expect("movw pair must decode")
+    }
+
+    #[test]
+    fn movw_movt_pair_resolves_final_address() {
+        // movw r0, #0x9000; movt r0, #0x0 -> 0x9000.
+        let v = movw_pair(&[0x00, 0x00, 0x09, 0xE3, 0x00, 0x00, 0x40, 0xE3], 0x8000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].mnem, "mov");
+        assert_eq!(v[0].ops, ["r0", "0x9000"]);
+        assert_eq!(v[1].mnem, "movt");
+        assert_eq!(v[1].ops, ["r0", "0x0"]);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), Some(0x9000));
+        // Nonzero halves: movw r2, #0x1234; movt r2, #0x5678 -> 0x56781234.
+        let v = movw_pair(&[0x34, 0x22, 0x01, 0xE3, 0x78, 0x26, 0x45, 0xE3], 0x8000);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), Some(0x5678_1234));
+    }
+
+    #[test]
+    fn movw_pair_rejects_non_pairs() {
+        // Register mismatch: movt writes r1.
+        let v = movw_pair(&[0x00, 0x00, 0x09, 0xE3, 0x00, 0x10, 0x40, 0xE3], 0x8000);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), None);
+        // Wrong second mnemonic: mov r0, #0x9000 twice.
+        let v = movw_pair(&[0x00, 0x00, 0x09, 0xE3, 0x00, 0x00, 0x09, 0xE3], 0x8000);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), None);
+        // Register source is not a constant: mov r0, r1.
+        let v = movw_pair(&[0x01, 0x00, 0xA0, 0xE1, 0x00, 0x00, 0x40, 0xE3], 0x8000);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), None);
+        // First instruction is not mov: movt; movt.
+        let v = movw_pair(&[0x00, 0x00, 0x40, 0xE3, 0x00, 0x00, 0x40, 0xE3], 0x8000);
+        assert_eq!(resolve_movw_pair(&v[0], &v[1]), None);
+        // Unparseable immediates never resolve, never panic.
+        let v = movw_pair(&[0x00, 0x00, 0x09, 0xE3, 0x00, 0x00, 0x40, 0xE3], 0x8000);
+        let mut bad = v[0].clone();
+        bad.ops[1] = "r1".to_string();
+        assert_eq!(resolve_movw_pair(&bad, &v[1]), None);
+        bad.ops[1] = "0x1_0000".to_string();
+        assert_eq!(resolve_movw_pair(&bad, &v[1]), None);
+        let mut wide = v[1].clone();
+        wide.ops[1] = "0x10000".to_string();
+        assert_eq!(resolve_movw_pair(&v[0], &wide), None);
     }
 
     #[test]

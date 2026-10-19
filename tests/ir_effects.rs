@@ -20,6 +20,7 @@ fn synth(mnem: &str, ops: &[&str]) -> binscout::disasm::Insn {
         target_name: None,
         comment: None,
         string: None,
+        thumb: false,
     }
 }
 

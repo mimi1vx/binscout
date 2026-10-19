@@ -32,7 +32,7 @@ use crate::analysis::{
     XrefKind, analyze_with_seeds, diagnostic_detail, import_index, import_slots,
 };
 use crate::db::{Annotation, BinaryMeta, ProjectInfo};
-use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
+use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_const_pair};
 use crate::error::{Error, Result};
 use crate::flirt::FlirtHint;
 use crate::loader::strings::{Encoding, StringHit};
@@ -2365,7 +2365,7 @@ impl Project {
             insn.import = Some(imp.name.clone());
         }
         let resolved_mem = prev
-            .and_then(|p| resolve_adrp_pair(p, insn))
+            .and_then(|p| resolve_const_pair(p, insn))
             .or(insn.mem_target);
         if insn.target_name.is_none() {
             if let Some(t) = insn.branch_target {
@@ -3560,7 +3560,7 @@ impl Project {
                 continue;
             };
             let resolved_mem = prev
-                .and_then(|p| resolve_adrp_pair(p, insn))
+                .and_then(|p| resolve_const_pair(p, insn))
                 .or(insn.mem_target);
             let ctrl = crate::ir::lift(self.binary.arch, insn)
                 .into_iter()

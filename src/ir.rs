@@ -209,7 +209,7 @@
 //! (see [`crate::addr_hex`]).
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{Arch, Insn, resolve_adrp_pair};
+use crate::disasm::{Arch, Insn, resolve_adrp_pair, resolve_movw_pair};
 
 /// Minimal P-code-inspired operation set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -408,17 +408,21 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
 ///
 /// AArch64 pairs thread the immediate predecessor so an `adrp`+`add`/`ldr`
 /// second row carries its resolved address (see
-/// [`lift_aarch64_with_prev`]); every other arch lifts each instruction
+/// [`lift_aarch64_with_prev`]); ARM32/Thumb pairs thread it so a
+/// `movw`+`movt` second row carries its resolved address (see
+/// [`lift_arm32_with_prev`]); every other arch lifts each instruction
 /// independently.
 #[must_use]
 pub fn lift_range(arch: Arch, insns: &[Insn]) -> Vec<IrInsn> {
-    if arch != Arch::Aarch64 {
-        return insns.iter().flat_map(|i| lift(arch, i)).collect();
-    }
+    let lift_prev: fn(&Insn, Option<&Insn>) -> Vec<IrInsn> = match arch {
+        Arch::Aarch64 => lift_aarch64_with_prev,
+        Arch::Arm32 | Arch::Thumb => lift_arm32_with_prev,
+        _ => return insns.iter().flat_map(|i| lift(arch, i)).collect(),
+    };
     let mut out = Vec::new();
     for (idx, insn) in insns.iter().enumerate() {
         let prev = idx.checked_sub(1).and_then(|p| insns.get(p));
-        let mut rows = lift_aarch64_with_prev(insn, prev);
+        let mut rows = lift_prev(insn, prev);
         if let [row] = rows.as_mut_slice()
             && row.warning.is_none()
         {
@@ -1366,6 +1370,26 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
             sp_delta: None,
         },
     }]
+}
+
+/// Lift one ARM32/Thumb instruction with its immediate predecessor, if any.
+///
+/// When `prev` ends where `insn` begins and the two form a `movw`+`movt`
+/// pair resolving to a final address, the second row's `target` carries
+/// that address; otherwise the row is identical to [`lift_arm32`].
+/// Nonadjacent or unresolvable pairs keep current behavior exactly.
+#[must_use]
+pub fn lift_arm32_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
+    let mut rows = lift_arm32(insn);
+    if let [row] = rows.as_mut_slice()
+        && row.target.is_none()
+        && let Some(first) = prev
+        && first.addr.wrapping_add(u64::from(first.size)) == insn.addr
+        && let Some(resolved) = resolve_movw_pair(first, insn)
+    {
+        row.target = Some(resolved);
+    }
+    rows
 }
 
 /// Reduce an ARMv7 mnemonic to its base plus whether it carries a condition
@@ -2633,6 +2657,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            thumb: false,
         }
     }
 

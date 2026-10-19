@@ -6,7 +6,7 @@ mod common;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin, write_fixture};
 
@@ -418,14 +418,18 @@ fn all_tools_return_json_over_stdio() {
 
     let structure: Value = serde_json::from_str(tool_text(by_id[&30])).expect("structure json");
     assert_eq!(structure["entry"], 0);
-    assert!(structure["structure"]["loops"]
-        .as_array()
-        .expect("loops")
-        .is_empty());
-    assert!(structure["structure"]["ifs"]
-        .as_array()
-        .expect("ifs")
-        .is_empty());
+    assert!(
+        structure["structure"]["loops"]
+            .as_array()
+            .expect("loops")
+            .is_empty()
+    );
+    assert!(
+        structure["structure"]["ifs"]
+            .as_array()
+            .expect("ifs")
+            .is_empty()
+    );
     assert!(
         structure["structure"]["warning"]
             .as_str()

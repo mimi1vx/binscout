@@ -59,6 +59,7 @@ fn image_with_import(format: BinaryFormat, name: &str, code: Vec<u8>) -> LoadedB
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     }
 }
 

@@ -246,6 +246,7 @@ fn non_executable_target_stays_unresolved() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -546,6 +547,7 @@ fn non_executable_table_entry_stays_unresolved() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -635,6 +637,7 @@ fn cross_function_table_entry_stays_unresolved() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic segments must analyze");
     assert_eq!(
@@ -732,6 +735,7 @@ fn container_table_stays_unresolved_by_design() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(
@@ -794,6 +798,7 @@ fn container_format_stays_unresolved_by_design() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
     assert_eq!(

@@ -30,11 +30,11 @@ use memchr::{memchr2, memchr3};
 use petgraph::graphmap::DiGraphMap;
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{Arch, Insn, resolve_adrp_pair};
+use crate::disasm::{Arch, Insn, arm_base_mnem, resolve_const_pair, resolve_movw_pair};
 use crate::error::{Error, Result};
 use crate::ir::IrOp;
 use crate::loader::strings::{self, Encoding, StringHit};
-use crate::loader::{BinaryFormat, LoadedBinary, RawOptions, Section, Segment, load_raw};
+use crate::loader::{ArmHints, BinaryFormat, LoadedBinary, RawOptions, Section, Segment, load_raw};
 
 /// Cap on decoded instructions per [`analyze`] call.
 pub const MAX_TOTAL_INSNS: usize = 1_000_000;
@@ -55,7 +55,7 @@ pub const MAX_POINTER_SEEDS: usize = 10_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 13;
+pub const ANALYSIS_REVISION: u32 = 14;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -570,8 +570,9 @@ pub struct Function {
     /// Decode-arch override for this function, if it differs from the
     /// project arch.
     ///
-    /// Set when a user seed decoded this entry under an explicit
-    /// [`SeedMode`] (Thumb code in an `Arm32` project or vice versa);
+    /// Set when the entry decoded under an explicit [`SeedMode`], an
+    /// ARM interworking seed (Thumb bit, mapping symbol, Thumb-function
+    /// mark), or a mode-switch edge (direct `blx`, resolved `bx`).
     /// `None` means the project arch. Persisted per function so snapshot
     /// reload re-decodes identical bytes.
     pub decode_arch: Option<Arch>,
@@ -2489,6 +2490,7 @@ fn locate_hit(sections: &[Section], seg: &Segment, vaddr: Option<u64>) -> (Optio
 struct AddrSpace<'a> {
     exec: Vec<&'a Segment>,
     all: Vec<&'a Segment>,
+    hints: &'a ArmHints,
 }
 
 impl<'a> AddrSpace<'a> {
@@ -2497,7 +2499,11 @@ impl<'a> AddrSpace<'a> {
         exec.sort_by_key(|s| s.vaddr);
         let mut all: Vec<&Segment> = bin.segments.iter().collect();
         all.sort_by_key(|s| s.vaddr);
-        Self { exec, all }
+        Self {
+            exec,
+            all,
+            hints: &bin.arm_hints,
+        }
     }
 
     fn seg_at(segs: &[&'a Segment], va: u64) -> Option<&'a Segment> {
@@ -2573,7 +2579,8 @@ struct Decoded {
     insn: Insn,
     flow: Flow,
     /// Disassembler target this address decoded with: the project arch,
-    /// or a user seed's explicit [`SeedMode`] propagated along its walk.
+    /// a Thumb-mode ARM seed, a mode-switch edge target, or a user seed's
+    /// explicit [`SeedMode`] propagated along its walk.
     arch: Arch,
 }
 
@@ -2583,9 +2590,8 @@ struct Decoded {
 /// On ARM ELF, `e_entry` and `STT_FUNC` values carry bit 0 set for Thumb
 /// functions, but ARM containers decode as [`Arch::Arm32`]: an odd seed
 /// would read misaligned garbage. Returns the (possibly masked) address
-/// plus whether the bit was set; callers record a diagnostic for masked
-/// seeds. Structured for later interworking support: the flag marks the
-/// seeds a Thumb-capable walker would decode as Thumb instead of masking.
+/// plus whether the bit was set; [`arm_seed`] turns a set bit into a
+/// Thumb-mode seed.
 fn normalize_arm_seed(arch: Arch, addr: u64) -> (u64, bool) {
     if arch == Arch::Arm32 && addr & 1 == 1 {
         (addr & !1, true)
@@ -2594,17 +2600,50 @@ fn normalize_arm_seed(arch: Arch, addr: u64) -> (u64, bool) {
     }
 }
 
-/// Push one seed address, masking the ARM Thumb bit (see
-/// [`normalize_arm_seed`]) and recording the odd address when masked.
-fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr: u64) {
-    let (addr, masked) = normalize_arm_seed(arch, addr);
-    if masked {
-        diags.push(Diagnostic {
-            addr: addr | 1,
-            kind: DiagnosticKind::DecodeFailure,
-        });
+/// Whether `va` lies in one of the sorted `(start, end)` mapping `ranges`.
+fn range_contains(ranges: &[(u64, u64)], va: u64) -> bool {
+    let idx = ranges.partition_point(|(start, _)| *start <= va);
+    idx.checked_sub(1).is_some_and(|i| va < ranges[i].1)
+}
+
+/// Canonical address plus decode mode for one ARM seed.
+///
+/// The Thumb bit (bit 0), a loader Thumb-function mark, or a `$t`
+/// mapping range selects [`Arch::Thumb`]; anything else keeps the project
+/// arch. Non-ARM projects pass through unchanged.
+fn arm_seed(bin: &LoadedBinary, addr: u64) -> (u64, Arch) {
+    if bin.arch != Arch::Arm32 {
+        return (addr, bin.arch);
     }
-    seeds.push(addr);
+    let (canon, bit) = normalize_arm_seed(bin.arch, addr);
+    let thumb = bit
+        || bin.arm_hints.thumb_seeds.binary_search(&canon).is_ok()
+        || range_contains(&bin.arm_hints.thumb_ranges, canon);
+    (canon, if thumb { Arch::Thumb } else { bin.arch })
+}
+
+/// Mode of the mapping range starting exactly at `va`, if any.
+///
+/// Linear fallthrough never changes mode (see [`Walker::run`]): when the
+/// next address opens a range of the other mode, that range has its own
+/// seed and the path stops here instead of decoding Thumb bytes as ARM
+/// (or vice versa).
+fn range_start_mode(hints: &ArmHints, va: u64) -> Option<Arch> {
+    if hints
+        .thumb_ranges
+        .binary_search_by_key(&va, |(start, _)| *start)
+        .is_ok()
+    {
+        Some(Arch::Thumb)
+    } else if hints
+        .arm_ranges
+        .binary_search_by_key(&va, |(start, _)| *start)
+        .is_ok()
+    {
+        Some(Arch::Arm32)
+    } else {
+        None
+    }
 }
 
 /// Aligned pointer-scan seeds: pointer-sized values in non-executable
@@ -2620,12 +2659,12 @@ fn push_seed(seeds: &mut Vec<u64>, diags: &mut Vec<Diagnostic>, arch: Arch, addr
 /// Lower confidence than table-derived seeds (vtables and callback tables
 /// share the shape with stray pointers), so callers gate it behind
 /// [`AnalyzeOptions::pointer_scan`].
-fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
+fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<(u64, Arch)> {
     let ptr: usize = match bin.arch {
         Arch::X86_64 | Arch::Aarch64 => 8,
         _ => 4,
     };
-    let mut out: Vec<u64> = Vec::new();
+    let mut out: Vec<(u64, Arch)> = Vec::new();
     for seg in &space.all {
         if seg.executable || seg.data.is_empty() {
             continue;
@@ -2646,46 +2685,62 @@ fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<u64> {
             if target == 0 {
                 continue;
             }
-            let (canon, _) = normalize_arm_seed(bin.arch, target);
+            // A set Thumb bit selects Thumb decode first (ARM vtables hold
+            // odd function pointers); anything else decodes as the project
+            // arch. The first mode that decodes wins.
+            let (canon, bit) = normalize_arm_seed(bin.arch, target);
             if canon == 0 {
                 continue;
             }
+            let modes: &[Arch] = if bit {
+                &[Arch::Thumb, Arch::Arm32]
+            } else {
+                &[bin.arch]
+            };
             let Some(bytes) = space.code_bytes(canon) else {
                 continue;
             };
-            if !matches!(
-                crate::disasm::disasm_first(bin.arch, bytes, canon),
-                Ok(Some(_))
-            ) {
-                continue;
+            for mode in modes {
+                if matches!(
+                    crate::disasm::disasm_first(*mode, bytes, canon),
+                    Ok(Some(_))
+                ) {
+                    out.push((canon, *mode));
+                    break;
+                }
             }
-            out.push(canon);
         }
         if out.len() >= MAX_POINTER_SEEDS {
             break;
         }
     }
-    out.sort_unstable();
+    out.sort_by_key(|(a, _)| *a);
     out.dedup();
     out.truncate(MAX_POINTER_SEEDS);
     out
 }
 
 /// Seed addresses from the entry point, exports, symbol-table entries,
-/// Mach-O stub entries, `.pdata`/`TLS`/init/`LC_FUNCTION_STARTS` tables,
-/// and optional pointer-scan hits resolving to executable code, plus user
-/// seeds from `define-func`. When none exists (raw blobs, stripped
-/// objects), the first executable byte seeds analysis so some function
-/// is always found.
+/// ARM mapping ranges, Mach-O stub entries, `.pdata`/`TLS`/init/
+/// `LC_FUNCTION_STARTS` tables, and optional pointer-scan hits resolving
+/// to executable code, plus user seeds from `define-func`. When none
+/// exists (raw blobs, stripped objects), the first executable byte seeds
+/// analysis so some function is always found.
 ///
-/// ARM32 seeds pass through [`normalize_arm_seed`]: masked seeds keep their
-/// even address here and contribute a [`DiagnosticKind::DecodeFailure`] at
-/// the odd address (a queued discovery address never decoded as given).
+/// Every seed carries its decode mode: the project arch, or Thumb on
+/// 32-bit ARM when the seed's Thumb bit is set, a loader Thumb-function
+/// mark names it, or a `$t` mapping range covers it (see [`arm_seed`]).
+/// Mapping range starts seed their own mode so interworking boundaries
+/// decode correctly even when nothing calls them. Same-address seeds
+/// under different arches both queue; the walk decodes first-wins from a
+/// stably address-sorted stack, so an explicit user mode wins over the
+/// project-arch seed.
+///
 /// User seeds carry an explicit [`SeedMode`] instead: `Thumb` decodes as
-/// Thumb (bit cleared, no diagnostic), `Arm` masks silently. Same-address
-/// seeds under different arches both queue; the walk decodes first-wins
-/// from a stably address-sorted stack, so an explicit user mode wins over
-/// the project-arch seed.
+/// Thumb (bit cleared), `Arm` masks to ARM. Modes only apply on 32-bit
+/// ARM; elsewhere the project arch decodes (the project boundary rejects
+/// modes there, so this is a backstop for direct API use, never a silent
+/// success).
 ///
 /// Table seeds (`.pdata` starts, TLS callbacks, ELF init/fini,
 /// `LC_FUNCTION_STARTS`) are authoritative and always on; pointer-scan
@@ -2696,62 +2751,64 @@ fn authoritative_seeds(
     user: &[UserSeed],
     options: AnalyzeOptions,
 ) -> (Vec<(u64, Arch)>, Vec<Diagnostic>) {
-    let mut seeds: Vec<u64> = Vec::new();
-    let mut diags: Vec<Diagnostic> = Vec::new();
-    if let Some(entry) = bin.entry
-        && space.code_bytes(entry).is_some()
-    {
-        push_seed(&mut seeds, &mut diags, bin.arch, entry);
+    let mut seeds: Vec<(u64, Arch)> = Vec::new();
+    let push = |seeds: &mut Vec<(u64, Arch)>, addr: u64, arch: Arch| {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(addr).is_some() {
+            seeds.push((addr, arch));
+        }
+    };
+    if let Some(entry) = bin.entry {
+        let (addr, mode) = arm_seed(bin, entry);
+        push(&mut seeds, addr, mode);
     }
     for exp in &bin.exports {
-        if let Some(addr) = exp.address
-            && seeds.len() < MAX_SEEDS
-            && space.code_bytes(addr).is_some()
-        {
-            push_seed(&mut seeds, &mut diags, bin.arch, addr);
+        if let Some(addr) = exp.address {
+            let (addr, mode) = arm_seed(bin, addr);
+            push(&mut seeds, addr, mode);
         }
     }
     // Symbol-table code addresses (locals included): the only seed path
     // for static functions nothing calls. Loader-canonical already
-    // (Thumb bit cleared), so they seed exactly as stored.
+    // (Thumb bit cleared); the mode still comes from the bit and the
+    // loader's Thumb-function marks (see `arm_seed`).
     for sym in &bin.symbols {
-        if seeds.len() < MAX_SEEDS && space.code_bytes(sym.address).is_some() {
-            seeds.push(sym.address);
-        }
+        let (addr, mode) = arm_seed(bin, sym.address);
+        push(&mut seeds, addr, mode);
+    }
+    // Mapping ranges: each region start seeds its own mode.
+    for (start, _) in &bin.arm_hints.thumb_ranges {
+        push(&mut seeds, *start, Arch::Thumb);
+    }
+    for (start, _) in &bin.arm_hints.arm_ranges {
+        push(&mut seeds, *start, bin.arch);
     }
     // PE `.pdata` starts: exact starts for every non-leaf function.
     for (start, _) in &bin.pdata_funcs {
-        if seeds.len() < MAX_SEEDS && space.code_bytes(*start).is_some() {
-            push_seed(&mut seeds, &mut diags, bin.arch, *start);
-        }
+        let (addr, mode) = arm_seed(bin, *start);
+        push(&mut seeds, addr, mode);
     }
     // PE TLS callbacks: malware anti-debug entry points.
     for addr in &bin.tls_callbacks {
-        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
-            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
-        }
+        let (addr, mode) = arm_seed(bin, *addr);
+        push(&mut seeds, addr, mode);
     }
     // ELF init/fini addresses: constructors and destructors nothing calls.
     for addr in &bin.init_funcs {
-        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
-            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
-        }
+        let (addr, mode) = arm_seed(bin, *addr);
+        push(&mut seeds, addr, mode);
     }
     // Mach-O `LC_FUNCTION_STARTS`: exact starts off the `__TEXT` base.
     for addr in &bin.func_starts {
-        if seeds.len() < MAX_SEEDS && space.code_bytes(*addr).is_some() {
-            push_seed(&mut seeds, &mut diags, bin.arch, *addr);
-        }
+        let (addr, mode) = arm_seed(bin, *addr);
+        push(&mut seeds, addr, mode);
     }
     // Pointer scan (opt-in): aligned data pointers to decodable code.
     if options.pointer_scan {
-        for addr in pointer_seeds(space, bin) {
+        for (addr, mode) in pointer_seeds(space, bin) {
             if seeds.len() >= MAX_SEEDS {
                 break;
             }
-            if space.code_bytes(addr).is_some() {
-                seeds.push(addr);
-            }
+            push(&mut seeds, addr, mode);
         }
     }
     // Mach-O stub entries carry their import's address (see
@@ -2761,22 +2818,18 @@ fn authoritative_seeds(
     // slots, never code, so they must not seed.
     if bin.format == BinaryFormat::MachO {
         for imp in &bin.imports {
-            if let Some(addr) = imp.address
-                && seeds.len() < MAX_SEEDS
-                && space.code_bytes(addr).is_some()
-            {
-                seeds.push(addr);
+            if let Some(addr) = imp.address {
+                push(&mut seeds, addr, bin.arch);
             }
         }
     }
     if seeds.is_empty()
         && let Some(base) = space.first_exec_base()
     {
-        seeds.push(base);
+        seeds.push((base, bin.arch));
     }
-    seeds.sort_unstable();
+    seeds.sort_by_key(|(a, _)| *a);
     seeds.dedup();
-    let mut paired: Vec<(u64, Arch)> = seeds.into_iter().map(|a| (a, bin.arch)).collect();
     // User seeds join the authoritative set with their explicit decode
     // mode: an agent assertion that there is code at an address the
     // loader never seeded (shellcode, firmware vectors, obfuscated code,
@@ -2785,7 +2838,7 @@ fn authoritative_seeds(
     // this is a backstop for direct API use, never a silent success).
     let mixed = matches!(bin.arch, Arch::Arm32 | Arch::Thumb);
     for s in user {
-        if paired.len() >= MAX_SEEDS {
+        if seeds.len() >= MAX_SEEDS {
             break;
         }
         let seed_arch = match (mixed, s.mode) {
@@ -2800,19 +2853,11 @@ fn authoritative_seeds(
         if space.code_bytes(addr).is_none() {
             continue;
         }
-        if matches!((bin.arch, s.mode), (Arch::Arm32, None))
-            && normalize_arm_seed(bin.arch, s.addr).1
-        {
-            diags.push(Diagnostic {
-                addr: s.addr,
-                kind: DiagnosticKind::DecodeFailure,
-            });
-        }
-        paired.push((addr, seed_arch));
+        seeds.push((addr, seed_arch));
     }
-    paired.sort_by_key(|(a, _)| *a);
-    paired.dedup();
-    (paired, diags)
+    seeds.sort_by_key(|(a, _)| *a);
+    seeds.dedup();
+    (seeds, Vec::new())
 }
 
 /// Prologue-scan hits outside `reached` that decode. These seed the second
@@ -3101,6 +3146,13 @@ struct Walker<'a> {
     jump_targets: BTreeSet<u64>,
     fallthroughs: BTreeSet<u64>,
     call_targets: BTreeSet<u64>,
+    /// Mode-switch edge targets: direct `blx` immediates and resolved
+    /// `bx`-register constants land in the other state, so they start
+    /// their own function (see [`Walker::run`]). Without this, one
+    /// function would span both modes and snapshot rebuild — which
+    /// re-decodes each function under its entry arch — would mis-decode
+    /// the switched rows.
+    switch_targets: BTreeSet<u64>,
     diagnostics: BTreeSet<Diagnostic>,
     /// Remaining predicated slots in the open Thumb IT block, with the
     /// address expecting the next one. The single-instruction decoder is
@@ -3110,6 +3162,12 @@ struct Walker<'a> {
     /// fails open to the old stateless decode).
     it_remaining: u8,
     it_next: Option<u64>,
+    /// Last two decoded instructions, for the `bx`-register constant
+    /// chain (see [`Walker::bx_const_target`]). Updated on every
+    /// successful decode; adjacency guards keep interleaved worklist
+    /// paths from fusing unrelated rows.
+    prev: Option<Insn>,
+    prev_prev: Option<Insn>,
 }
 
 impl<'a> Walker<'a> {
@@ -3120,19 +3178,70 @@ impl<'a> Walker<'a> {
             jump_targets: BTreeSet::new(),
             fallthroughs: BTreeSet::new(),
             call_targets: BTreeSet::new(),
+            switch_targets: BTreeSet::new(),
             diagnostics: BTreeSet::new(),
             it_remaining: 0,
             it_next: None,
+            prev: None,
+            prev_prev: None,
         }
+    }
+
+    /// Constant and mode of a `bx reg` interworking branch, if the two
+    /// linearly-adjacent predecessors materialize the register via
+    /// `movw`/`movt` (see [`resolve_movw_pair`]).
+    ///
+    /// Bit 0 of the constant selects the mode (set is Thumb), the way a
+    /// hardware `bx` does; the masked address must hold executable bytes.
+    /// Predicated rows never resolve here (callers gate on the IT state),
+    /// and anything but an adjacent `movw`/`movt`-then-`bx` triple returns
+    /// `None`: register sources, gaps, and mismatched destinations stay
+    /// unresolved indirect jumps.
+    fn bx_const_target(&self, insn: &Insn) -> Option<(u64, Arch)> {
+        let reg = insn.ops.first()?;
+        let (prev, prev_prev) = (self.prev.as_ref()?, self.prev_prev.as_ref()?);
+        if prev.addr.wrapping_add(u64::from(prev.size)) != insn.addr {
+            return None;
+        }
+        if prev_prev.addr.wrapping_add(u64::from(prev_prev.size)) != prev.addr {
+            return None;
+        }
+        let value = resolve_movw_pair(prev_prev, prev)?;
+        if prev.ops.first()? != reg {
+            return None;
+        }
+        self.space.code_bytes(value & !1)?;
+        let mode = if value & 1 == 1 {
+            Arch::Thumb
+        } else {
+            Arch::Arm32
+        };
+        Some((value & !1, mode))
+    }
+
+    /// Queue a fallthrough edge, stopping at interworking boundaries.
+    ///
+    /// A linear path never changes mode: when `next` opens a mapping
+    /// range of the other mode, that range has its own seed and the path
+    /// stops here instead of decoding those bytes in the wrong mode.
+    fn push_fallthrough(&self, stack: &mut Vec<(u64, Arch)>, next: u64, arch: Arch) {
+        if range_start_mode(self.space.hints, next).is_some_and(|m| m != arch) {
+            return;
+        }
+        stack.push((next, arch));
     }
 
     /// Decode from `seeds`, following direct branches, calls, and fallthrough.
     ///
-    /// Each seed carries its decode arch: the project arch, or a user
-    /// seed's explicit [`SeedMode`]. Direct successors inherit the
-    /// address's arch, so one Thumb seed walks Thumb code even inside an
-    /// ARM32 project; an address decoded under one arch is never
-    /// re-decoded under another (first wins).
+    /// Each seed carries its decode arch: the project arch, a Thumb-mode
+    /// ARM seed (bit 0, mapping symbol, or Thumb-function mark), a
+    /// direct `blx` target in the other state, or a user seed's explicit
+    /// [`SeedMode`]. Direct successors inherit the address's arch, so one
+    /// Thumb seed walks Thumb code even inside an ARM32 project; an
+    /// address decoded under one arch is never re-decoded under another
+    /// (first wins). Linear fallthrough never changes mode: a path
+    /// reaching a mapping range of the other mode stops (see
+    /// [`Walker::push_fallthrough`]); that range has its own seed.
     ///
     /// Records bounded evidence while walking: executable bytes at a queued
     /// address that do not decode become [`DiagnosticKind::DecodeFailure`],
@@ -3195,6 +3304,33 @@ impl<'a> Walker<'a> {
                 self.it_remaining = n;
                 self.it_next = Some(va.wrapping_add(u64::from(insn.size)));
             }
+            // Interworking mode switches (32-bit ARM only, unconditional
+            // forms): a direct `blx` immediate always changes state, and a
+            // `bx reg` whose register the adjacent `movw`/`movt` pair just
+            // materialized branches to that constant in bit-0-selected
+            // state. Anything else inherits the address's arch.
+            let mut flow = flow;
+            let mut follow_arch = item_arch;
+            if matches!(item_arch, Arch::Arm32 | Arch::Thumb) && !predicated {
+                let base = arm_base_mnem(&insn.mnem);
+                if base == "blx" && matches!(flow, Flow::Call { target: Some(_) }) {
+                    follow_arch = if item_arch == Arch::Arm32 {
+                        Arch::Thumb
+                    } else {
+                        Arch::Arm32
+                    };
+                } else if base == "bx"
+                    && insn.ops.len() == 1
+                    && insn.ops[0] != "lr"
+                    && insn.ops[0] != "pc"
+                    && let Some((target, mode)) = self.bx_const_target(&insn)
+                {
+                    flow = Flow::Branch {
+                        target: Some(target),
+                    };
+                    follow_arch = mode;
+                }
+            }
             let flow = if predicated {
                 match flow {
                     Flow::Ret => Flow::CBranch { target: None },
@@ -3223,11 +3359,14 @@ impl<'a> Walker<'a> {
             }
             let next = va.wrapping_add(u64::from(insn.size));
             match flow {
-                Flow::Seq => stack.push((next, item_arch)),
+                Flow::Seq => self.push_fallthrough(&mut stack, next, item_arch),
                 Flow::Branch { target } => {
                     if let Some(t) = target {
                         self.jump_targets.insert(t);
-                        stack.push((t, item_arch));
+                        if follow_arch != item_arch {
+                            self.switch_targets.insert(t);
+                        }
+                        stack.push((t, follow_arch));
                     }
                 }
                 Flow::CBranch { target } => {
@@ -3236,18 +3375,25 @@ impl<'a> Walker<'a> {
                         stack.push((t, item_arch));
                     }
                     self.fallthroughs.insert(next);
-                    stack.push((next, item_arch));
+                    self.push_fallthrough(&mut stack, next, item_arch);
                 }
                 Flow::Call { target } => {
                     if let Some(t) = target {
                         self.jump_targets.insert(t);
                         self.call_targets.insert(t);
-                        stack.push((t, item_arch));
+                        if follow_arch != item_arch {
+                            self.switch_targets.insert(t);
+                        }
+                        stack.push((t, follow_arch));
                     }
                     self.fallthroughs.insert(next);
-                    stack.push((next, item_arch));
+                    self.push_fallthrough(&mut stack, next, item_arch);
                 }
                 Flow::Ret => {}
+            }
+            if matches!(item_arch, Arch::Arm32 | Arch::Thumb) {
+                self.prev_prev = self.prev.take();
+                self.prev = Some(insn.clone());
             }
             self.decoded.insert(
                 va,
@@ -3846,7 +3992,8 @@ pub fn analyze_with_options(
     walk.diagnostics.extend(seed_diags);
     walk.run(seeds1.clone())?;
     let seeds2 = prologue_seeds(arch, &space, |va| walk.decoded.contains_key(&va))?;
-    walk.run(seeds2.iter().map(|&a| (a, arch)).collect())?;
+    // Round-two hits decode in their own mode, like round-one seeds.
+    walk.run(seeds2.iter().map(|&a| (a, arm_seed(bin, a).1)).collect())?;
 
     if walk.decoded.is_empty() {
         let diagnostics = Diagnostics::collect(walk.diagnostics.into_iter().collect(), false, 0);
@@ -3863,8 +4010,10 @@ pub fn analyze_with_options(
     }
 
     // Function entries: both rounds' seeds that decoded, plus direct call
-    // targets. Round-one hits are excluded by construction: `seeds2` only
-    // holds prologue matches outside round-one code.
+    // targets and interworking switch targets (which start their own
+    // function so no function spans both modes). Round-one hits are
+    // excluded by construction: `seeds2` only holds prologue matches
+    // outside round-one code.
     let mut entries: BTreeSet<u64> = BTreeSet::new();
     for s in seeds1.iter().map(|(a, _)| a).chain(seeds2.iter()) {
         if walk.decoded.contains_key(s) {
@@ -3872,6 +4021,13 @@ pub fn analyze_with_options(
         }
     }
     for t in &walk.call_targets {
+        if walk.decoded.contains_key(t) {
+            entries.insert(*t);
+        }
+    }
+    // Mode-switch targets start their own function so no function spans
+    // both modes (see `Walker::switch_targets`).
+    for t in &walk.switch_targets {
         if walk.decoded.contains_key(t) {
             entries.insert(*t);
         }
@@ -3923,7 +4079,10 @@ pub fn analyze_with_options(
         .map(|a| normalize_arm_seed(arch, *a).0)
         .collect();
     let pointer_addrs: BTreeSet<u64> = if options.pointer_scan {
-        pointer_seeds(&space, bin).into_iter().collect()
+        pointer_seeds(&space, bin)
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect()
     } else {
         BTreeSet::new()
     };
@@ -4387,6 +4546,20 @@ pub fn analyze_with_options(
         {
             xrefs.insert((va, XrefKind::Data, m));
         }
+        // ARM literal-pool loads (`ldr rX, [pc, #imm]`) resolve the pool
+        // word above; the word's value is the real pointer, so reference
+        // it too. Only the word form carries a pointer: the byte/halfword
+        // literal loads read narrower values from the same pool shape.
+        if matches!(d.arch, Arch::Arm32 | Arch::Thumb)
+            && arm_base_mnem(&d.insn.mnem) == "ldr"
+            && let Some(slot) = d.insn.mem_target
+            && let Some(raw) = space.file_bytes_at(slot, 4)
+        {
+            let value = u64::from(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+            if space.contains(value) {
+                xrefs.insert((va, XrefKind::Data, value));
+            }
+        }
         // Import rows: indirect slot references and direct stub/thunk
         // targets both resolve to the import's slot address.
         if let Some(i) = import_index(&slots, &stubs, target, d.insn.mem_target)
@@ -4399,10 +4572,13 @@ pub fn analyze_with_options(
     // the next instruction (`add`/`ldr`). Where an adjacent same-block
     // pair resolves, the second instruction references the final address
     // too; the page-base row above is retained as the strict fallback.
+    // ARM32 `movw`/`movt` pairs behave the same way (see
+    // `resolve_movw_pair`): the low half rides in the first row, the high
+    // half in the second.
     for f in functions.values() {
         for block in f.blocks.values() {
             for pair in block.insns.windows(2) {
-                if let Some(final_addr) = resolve_adrp_pair(&pair[0], &pair[1])
+                if let Some(final_addr) = resolve_const_pair(&pair[0], &pair[1])
                     && space.contains(final_addr)
                 {
                     xrefs.insert((pair[1].addr, XrefKind::Data, final_addr));
@@ -4536,6 +4712,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            thumb: false,
         };
         assert_eq!(flow_of(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
@@ -4551,6 +4728,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            thumb: false,
         };
         assert_eq!(
             flow_of(Arch::X86_64, &call),
@@ -4725,6 +4903,7 @@ mod tests {
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
             relocatable: false,
+            arm_hints: Default::default(),
         }
     }
 

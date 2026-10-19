@@ -153,6 +153,7 @@ fn pointer_binary() -> LoadedBinary {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     }
 }
 
@@ -225,6 +226,7 @@ fn table_seeds_become_entries_with_reasons() {
             init_funcs: init,
             func_starts: starts,
             relocatable: false,
+            arm_hints: Default::default(),
         };
     assert!(
         reasons_of(&mk(vec![(0x1010, 0x1020)], vec![], vec![], vec![],), 0x1010)

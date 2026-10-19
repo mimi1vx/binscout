@@ -74,6 +74,7 @@ fn test_insn(addr: u64) -> Insn {
         target_name: None,
         comment: None,
         string: None,
+        thumb: false,
     }
 }
 

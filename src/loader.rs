@@ -385,6 +385,28 @@ impl Serialize for SymbolRef {
     }
 }
 
+/// ARM/Thumb decode hints for 32-bit ARM containers.
+///
+/// ARM ELF images mix ARM and Thumb code in one executable segment. The
+/// mode is recorded per address: `$a`/`$t` mapping symbols mark ARM/Thumb
+/// regions, and `STT_FUNC` symbols carry the Thumb bit (bit 0) for Thumb
+/// functions. These hints let analysis seed each address in its own mode
+/// instead of decoding everything as ARM.
+///
+/// Empty on other architectures and on raw/LE/relocatable mappings (which
+/// have no mapping tables). All addresses are canonical (Thumb bit
+/// cleared, see [`canonical_code_addr`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArmHints {
+    /// Thumb-mode code ranges from `$t` mapping symbols, as
+    /// `(start, end)` with `start < end`, in table order.
+    pub thumb_ranges: Vec<(u64, u64)>,
+    /// ARM-mode code ranges from `$a` mapping symbols, same shape.
+    pub arm_ranges: Vec<(u64, u64)>,
+    /// Canonical Thumb-function addresses (`STT_FUNC` with bit 0 set).
+    pub thumb_seeds: Vec<u64>,
+}
+
 /// A parsed binary ready for disassembly and analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedBinary {
@@ -437,6 +459,11 @@ pub struct LoadedBinary {
     /// undefined symbols referenced from executable code become imports
     /// with synthetic stub addresses. Linked images report `false`.
     pub relocatable: bool,
+    /// 32-bit ARM decode hints (mapping symbols, Thumb-bit functions).
+    ///
+    /// Empty on other architectures and on raw/LE/relocatable mappings,
+    /// which have no mapping tables.
+    pub arm_hints: ArmHints,
 }
 
 /// Options for [`load_raw`].
@@ -639,13 +666,16 @@ pub fn load_raw_vec(bytes: Vec<u8>, opts: RawOptions) -> Result<LoadedBinary> {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: ArmHints::default(),
     })
 }
 
 /// Map an `object` architecture to a disassembler target.
 ///
 /// 32-bit ARM containers default to ARM mode; Thumb regions decode through
-/// [`Arch::Thumb`] raw mappings.
+/// [`Arch::Thumb`] seeds derived from [`ArmHints`] (mapping symbols and
+/// Thumb-bit function addresses), direct `blx` targets, and explicit
+/// `define-func --mode` seeds.
 ///
 /// # Errors
 /// [`Error::Unsupported`] for any architecture without a disassembler.
@@ -1124,6 +1154,7 @@ fn load_relocatable<'a>(
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: true,
+        arm_hints: ArmHints::default(),
     })
 }
 
@@ -1277,6 +1308,8 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         &mut demangle_cache,
     )?;
 
+    let arm_hints = collect_arm_hints(&file, arch, &sections, &segments)?;
+
     let (pdata_funcs, tls_callbacks, init_funcs, func_starts) = match format {
         BinaryFormat::Pe => (
             pe_pdata_ranges(bytes, &segments),
@@ -1313,6 +1346,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         init_funcs,
         func_starts,
         relocatable: false,
+        arm_hints,
     })
 }
 
@@ -3012,6 +3046,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: ArmHints::default(),
     }
 }
 
@@ -3088,25 +3123,10 @@ fn export_from_object(
     }
 }
 
-/// Collect defined code symbols from the regular and dynamic tables.
-///
-/// Keeps `SymbolKind::Text` definitions sectioned in executable memory
-/// (locals included: statics, non-exported globals), canonicalized via
-/// [`canonical_code_addr`] and deduplicated by address with the first
-/// table row winning. Names and demangled copies count against the
-/// shared metadata budget; unique rows are capped at [`MAX_SYMBOLS`].
-///
-/// The executable-range check runs over the loader's own mapped
-/// sections (segments as fallback) so `Text`-kind rows pointing at
-/// data never seed or name functions.
-fn collect_symbols<'a>(
-    file: &object::File<'a, &'a [u8]>,
-    arch: Arch,
-    sections: &[Section],
-    segments: &[Segment],
-    meta: &mut u64,
-    cache: &mut HashMap<String, Option<String>>,
-) -> Result<Vec<SymbolRef>> {
+/// Executable address ranges from the loader's mapped sections (segments
+/// as fallback), merged so hostile overlaps cannot hide a hit behind a
+/// neighboring range.
+fn exec_ranges(sections: &[Section], segments: &[Segment]) -> Vec<(u64, u64)> {
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for s in sections {
         if s.executable && s.size > 0 {
@@ -3133,7 +3153,140 @@ fn collect_symbols<'a>(
         }
         merged.push((lo, hi));
     }
-    let ranges = merged;
+    merged
+}
+
+/// Collect 32-bit ARM decode hints (see [`ArmHints`]).
+///
+/// Reads `$a`/`$t` mapping symbols (plus `$d` data boundaries) and
+/// Thumb-bit `STT_FUNC` symbols from the regular and dynamic tables.
+/// Anything else (other architectures, relocatable objects, unreadable
+/// symbols, out-of-range mappings) yields empty hints, never an error —
+/// except hostile table sizes, which fail with [`Error::Limit`] like the
+/// other table collectors.
+///
+/// Mapping ranges extend from each marker to the next marker (any kind),
+/// clamped to the containing executable range; `$d` markers only bound
+/// their neighbors. A bare `$t` start with no executable cover is
+/// dropped. Names match exactly or with a dotted suffix (`$t.0`).
+fn collect_arm_hints<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    arch: Arch,
+    sections: &[Section],
+    segments: &[Segment],
+) -> Result<ArmHints> {
+    let mut hints = ArmHints::default();
+    if arch != Arch::Arm32 {
+        return Ok(hints);
+    }
+    let ranges = exec_ranges(sections, segments);
+    let in_exec = |addr: u64| -> bool {
+        ranges
+            .binary_search_by(|(lo, hi)| {
+                if addr < *lo {
+                    std::cmp::Ordering::Greater
+                } else if addr >= *hi {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    };
+    let exec_end = |addr: u64| -> Option<u64> {
+        ranges
+            .iter()
+            .find(|(lo, hi)| *lo <= addr && addr < *hi)
+            .map(|(_, hi)| *hi)
+    };
+    // (address, mode): `Some(true)` is `$t`, `Some(false)` is `$a`,
+    // `None` is a `$d` boundary (bounds neighbors, no range of its own).
+    let mut starts: Vec<(u64, Option<bool>)> = Vec::new();
+    // Chaining is lazy: dynamic rows only decode when the regular table
+    // is exhausted, mirroring [`collect_symbols`].
+    for sym in file.symbols().chain(file.dynamic_symbols()) {
+        if !matches!(sym.section(), object::SymbolSection::Section(_)) {
+            continue;
+        }
+        let Ok(name) = sym.name_bytes() else {
+            continue;
+        };
+        if name == b"$a" || name.starts_with(b"$a.") {
+            if starts.len() >= MAX_SYMBOLS {
+                return Err(Error::Limit("symbols exceed cap".to_string()));
+            }
+            starts.push((sym.address(), Some(false)));
+        } else if name == b"$t" || name.starts_with(b"$t.") {
+            if starts.len() >= MAX_SYMBOLS {
+                return Err(Error::Limit("symbols exceed cap".to_string()));
+            }
+            starts.push((sym.address(), Some(true)));
+        } else if name == b"$d" || name.starts_with(b"$d.") {
+            if starts.len() >= MAX_SYMBOLS {
+                return Err(Error::Limit("symbols exceed cap".to_string()));
+            }
+            starts.push((sym.address(), None));
+        } else if sym.kind() == object::SymbolKind::Text
+            && arch == Arch::Arm32
+            && sym.address() & 1 == 1
+        {
+            let addr = canonical_code_addr(arch, sym.address());
+            if in_exec(addr) {
+                if hints.thumb_seeds.len() >= MAX_SYMBOLS {
+                    return Err(Error::Limit("symbols exceed cap".to_string()));
+                }
+                hints.thumb_seeds.push(addr);
+            }
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup_by_key(|(addr, _)| *addr);
+    for (i, (addr, mode)) in starts.iter().enumerate() {
+        let Some(mode) = mode else {
+            continue;
+        };
+        let next = starts.get(i + 1).map(|(a, _)| *a).unwrap_or(u64::MAX);
+        let Some(hi) = exec_end(*addr) else {
+            continue;
+        };
+        let end = next.min(hi);
+        if end <= *addr {
+            continue;
+        }
+        if hints.thumb_ranges.len() + hints.arm_ranges.len() >= MAX_SYMBOLS {
+            return Err(Error::Limit("symbols exceed cap".to_string()));
+        }
+        if *mode {
+            hints.thumb_ranges.push((*addr, end));
+        } else {
+            hints.arm_ranges.push((*addr, end));
+        }
+    }
+    hints.thumb_seeds.sort_unstable();
+    hints.thumb_seeds.dedup();
+    Ok(hints)
+}
+
+/// Collect defined code symbols from the regular and dynamic tables.
+///
+/// Keeps `SymbolKind::Text` definitions sectioned in executable memory
+/// (locals included: statics, non-exported globals), canonicalized via
+/// [`canonical_code_addr`] and deduplicated by address with the first
+/// table row winning. Names and demangled copies count against the
+/// shared metadata budget; unique rows are capped at [`MAX_SYMBOLS`].
+///
+/// The executable-range check runs over the loader's own mapped
+/// sections (segments as fallback) so `Text`-kind rows pointing at
+/// data never seed or name functions.
+fn collect_symbols<'a>(
+    file: &object::File<'a, &'a [u8]>,
+    arch: Arch,
+    sections: &[Section],
+    segments: &[Segment],
+    meta: &mut u64,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Result<Vec<SymbolRef>> {
+    let ranges = exec_ranges(sections, segments);
     let in_exec = |addr: u64| -> bool {
         ranges
             .binary_search_by(|(lo, hi)| {

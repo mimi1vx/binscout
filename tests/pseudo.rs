@@ -121,6 +121,7 @@ fn unmapped_rows_keep_warning_verbatim() {
             target_name: None,
             comment: None,
             string: None,
+            thumb: false,
         },
     );
     assert_eq!(lifted.len(), 1);
