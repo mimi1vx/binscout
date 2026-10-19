@@ -1,5 +1,5 @@
-use binscout::disasm::{disasm_range, Arch};
-use binscout::ir::{coverage, lift, lift_x86, IrOp};
+use binscout::disasm::{Arch, disasm_range};
+use binscout::ir::{IrOp, coverage, lift, lift_x86};
 
 mod common;
 

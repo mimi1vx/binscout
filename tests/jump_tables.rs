@@ -17,9 +17,9 @@
 mod common;
 
 use binscout::analysis::{
-    analyze, analyze_raw, Analysis, DiagnosticKind, DiscoveryReason, XrefKind, MAX_INFERRED_EDGES,
-    MAX_INFERRED_PER_SITE, MAX_TABLE_ENTRIES_PER_SITE, MAX_TABLE_GUARD_BACKTRACK,
-    MIN_TABLE_ENTRIES_PER_SITE,
+    Analysis, DiagnosticKind, DiscoveryReason, MAX_INFERRED_EDGES, MAX_INFERRED_PER_SITE,
+    MAX_TABLE_ENTRIES_PER_SITE, MAX_TABLE_GUARD_BACKTRACK, MIN_TABLE_ENTRIES_PER_SITE, XrefKind,
+    analyze, analyze_raw,
 };
 use binscout::disasm::Arch;
 use binscout::loader::{BinaryFormat, LoadedBinary, RawOptions, Segment};

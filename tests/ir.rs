@@ -1,5 +1,5 @@
-use binscout::disasm::{disasm_range, Arch, Disassembler};
-use binscout::ir::{control_op, coverage, is_mapped, lift, lift_range, IrOp};
+use binscout::disasm::{Arch, Disassembler, disasm_range};
+use binscout::ir::{IrOp, control_op, coverage, is_mapped, lift, lift_range};
 
 mod common;
 
@@ -315,7 +315,7 @@ fn family(c: &binscout::ir::Coverage, op: IrOp) -> &binscout::ir::FamilyCoverage
 
 #[test]
 fn coverage_publishes_all_families_limits_and_fallback() {
-    use binscout::ir::{CoverageStatus, COVERAGE_LIMITATIONS};
+    use binscout::ir::{COVERAGE_LIMITATIONS, CoverageStatus};
     for arch in ALL_ARCHES {
         let c = coverage(arch);
         assert_eq!(c.arch, arch_name(arch));
