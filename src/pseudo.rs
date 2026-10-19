@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Function;
-use crate::disasm::{Arch, Insn, resolve_adrp_pair};
+use crate::disasm::{Arch, Insn, resolve_const_pair};
 use crate::ir::{IrInsn, IrOp};
 
 /// Approximate per-function pseudo-C warning.
@@ -223,7 +223,7 @@ pub fn render_function(arch: Arch, func: &Function) -> PseudoRender {
     for block in func.blocks.values() {
         let mut prev: Option<&Insn> = None;
         for insn in &block.insns {
-            let resolved = prev.and_then(|p| resolve_adrp_pair(p, insn));
+            let resolved = prev.and_then(|p| resolve_const_pair(p, insn));
             for row in crate::ir::lift(arch, insn) {
                 let mut line = render_one(&row);
                 if let Some(addr) = resolved {

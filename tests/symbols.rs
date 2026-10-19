@@ -308,6 +308,7 @@ fn table_binary() -> LoadedBinary {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     }
 }
 

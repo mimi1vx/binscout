@@ -1,5 +1,5 @@
-use binscout::disasm::{Arch, disasm_range};
-use binscout::ir::{IrOp, coverage, lift, lift_x86};
+use binscout::disasm::{disasm_range, Arch};
+use binscout::ir::{coverage, lift, lift_x86, IrOp};
 
 mod common;
 
@@ -21,6 +21,7 @@ fn synth(mnem: &str, ops: &[&str]) -> binscout::disasm::Insn {
         comment: None,
         string: None,
         operands: Vec::new(),
+        thumb: false,
     }
 }
 

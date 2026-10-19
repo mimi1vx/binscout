@@ -75,6 +75,7 @@ fn test_insn(addr: u64) -> Insn {
         comment: None,
         string: None,
         operands: Vec::new(),
+        thumb: false,
     }
 }
 

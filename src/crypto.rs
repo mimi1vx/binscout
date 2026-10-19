@@ -316,6 +316,7 @@ mod tests {
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
             relocatable: false,
+            arm_hints: Default::default(),
         };
         let hits = scan(&bin, None, Some(".rodata")).expect("section scan");
         assert_eq!(hits.len(), 1, "only the sigma matches: {hits:?}");

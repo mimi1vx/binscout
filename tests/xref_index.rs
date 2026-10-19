@@ -34,6 +34,7 @@ fn test_insn(addr: u64) -> Insn {
         comment: None,
         string: None,
         operands: Vec::new(),
+        thumb: false,
     }
 }
 
@@ -150,11 +151,9 @@ fn check_matching_page(a: &Analysis) {
 fn from_parts_sorts_unsorted_xrefs() {
     let mut xrefs = build_xrefs(1_000);
     xrefs.reverse();
-    assert!(
-        !xrefs
-            .windows(2)
-            .all(|w| (w[0].from, w[0].kind, w[0].to) <= (w[1].from, w[1].kind, w[1].to))
-    );
+    assert!(!xrefs
+        .windows(2)
+        .all(|w| (w[0].from, w[0].kind, w[0].to) <= (w[1].from, w[1].kind, w[1].to)));
     let a = build_analysis(xrefs);
     assert!(
         a.xrefs

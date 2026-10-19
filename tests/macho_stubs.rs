@@ -475,6 +475,7 @@ fn stub_binary(stub_addrs: [Option<u64>; 2]) -> LoadedBinary {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     }
 }
 

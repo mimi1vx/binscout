@@ -30,7 +30,10 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   jumps, which the resolver below consumes). An AArch64 `adrp` decodes
   to its 4K page base; an adjacent same-block `adrp` + `add`/`ldr`
   pair resolves to the final address for xref recovery, IR, and
-  pseudo rendering.
+  pseudo rendering. On 32-bit ARM each row records its decode mode
+  (`thumb`); an adjacent same-block `movw` + `movt` pair resolves the
+  same way, and ARM literal-pool loads resolve their pool word plus
+  the pointer stored there.
 - **IR** (`ir`): lifts one instruction to one P-code-inspired `IrInsn`
   (`COPY`, `LOAD`, `BRANCH`, `CALL`, ...). Unknown mnemonics become `NOP`
   with a warning instead of failing, so analysis proceeds over partial
@@ -52,7 +55,11 @@ IR, analysis, database — and both the CLI (`binscout`) and the MCP server
   provenance-marked `inferred-code` edges and xrefs (one edge per
   single-slot site, 2–8 slots per table site, 100,000 per project;
   unprovable sites stay unresolved and
-  edgeless). Where an `adrp` + `add`/`ldr` pair resolves, the second
+  edgeless). On 32-bit ARM, seeds carry their decode mode (Thumb-bit
+  addresses, `$a`/`$t` mapping symbols, Thumb-function marks), direct
+  `blx` targets and resolved `bx`-register constants switch state,
+  and switch targets start their own function so no function spans
+  both modes. Where an `adrp` + `add`/`ldr` pair resolves, the second
   instruction also carries a `Data` xref at the final address alongside
   the page-base row. Analysis revision 5; older snapshots re-analyze.
 - **Search** (`search`): bounded literal/`??`-wildcard scan over mapped

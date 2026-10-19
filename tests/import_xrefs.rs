@@ -278,6 +278,7 @@ fn stub_binary(prefix: &[u8]) -> LoadedBinary {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     }
 }
 

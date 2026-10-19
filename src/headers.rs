@@ -1486,6 +1486,7 @@ mod tests {
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
             relocatable: false,
+            arm_hints: Default::default(),
         };
         assert_eq!(elf_headers(b"MZ garbage"), None);
         let v = headers_of(b"nope", &loaded, "00");
@@ -1536,6 +1537,7 @@ mod tests {
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
             relocatable: false,
+            arm_hints: Default::default(),
         }
     }
 

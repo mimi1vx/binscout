@@ -120,6 +120,7 @@ fn export_and_direct_call_reasons_coexist_sorted() {
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
         relocatable: false,
+        arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("raw with export must analyze");
     assert_eq!(reasons_of(&a, 0x1000), [DiscoveryReason::Entry]);

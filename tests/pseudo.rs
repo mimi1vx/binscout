@@ -9,12 +9,12 @@ mod common;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use binscout::disasm::Arch;
 use binscout::ir::{IrInsn, IrOp};
 use binscout::loader::RawOptions;
-use binscout::pseudo::{PSEUDO_WARNING, render_function, render_one, render_rows};
+use binscout::pseudo::{render_function, render_one, render_rows, PSEUDO_WARNING};
 
 use common::{binscout_bin, cleanup, mcp_bin, temp_db, tmpdir, write_bin};
 
@@ -123,6 +123,7 @@ fn unmapped_rows_keep_warning_verbatim() {
             comment: None,
             string: None,
             operands: Vec::new(),
+            thumb: false,
         },
     );
     assert_eq!(lifted.len(), 1);
