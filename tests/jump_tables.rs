@@ -1,23 +1,25 @@
-//! Single-slot absolute indirect-jump resolution plus guarded scaled-index
-//! table recovery (plan §12).
+//! Guarded switch-table recovery across architectures (plan §12, em6.9).
 //!
-//! Synthetic raw blobs pin the exact recovered edge/xref sets for the two
-//! approved single-slot positives (x86-32 absolute slot, x86-64
-//! RIP-relative slot), the two guarded table positives (x86-32 `*4` and
-//! x86-64 `*8` displacement tables behind an index bound check), and keep
-//! every near-miss unresolved: unmapped/truncated slot, unmapped/truncated
-//! table base, truncated/garbage/non-executable/non-decoding/cross-function
-//! entries, singleton runs, oversized runs, missing guards, strided scales,
-//! immediate-reporting `mov`, non-raw containers, and cross-function
-//! targets. Fresh analyses and saved/reopened snapshots agree; direct
-//! control flow is unchanged.
+//! Synthetic blobs pin the exact recovered edge/xref sets for every approved
+//! shape: the two single-slot positives (x86-32 absolute slot, x86-64
+//! RIP-relative slot, raw only), the absolute scaled-index tables (x86-32
+//! `*4` and x86-64 `*8`, any format), the GCC/Clang PIE x86-64 relative
+//! table (`lea`/`movsxd`/`add`/`jmp`), the MSVC x64 image-base-relative
+//! table (`mov`/`add`/`jmp` over `r8`), ARM Thumb `tbb`/`tbh`, and AArch64
+//! `adrp`/`adr` relative tables. Table bounds come from the dominating
+//! guard (`cmp idx, max` gives `max + 1` entries, capped at
+//! [`MAX_TABLE_ENTRIES_PER_SITE`]); every near-miss stays unresolved with
+//! its diagnostic: unmapped/truncated slots and bases, bad entries,
+//! singleton and over-cap bounds, missing guards, strided scales,
+//! register mismatches, and cross-function targets. Fresh analyses and
+//! saved/reopened snapshots agree; direct control flow is unchanged.
 
 mod common;
 
 use binscout::analysis::{
-    Analysis, DiagnosticKind, DiscoveryReason, MAX_INFERRED_EDGES, MAX_INFERRED_PER_SITE,
-    MAX_TABLE_ENTRIES_PER_SITE, MAX_TABLE_GUARD_BACKTRACK, MIN_TABLE_ENTRIES_PER_SITE, XrefKind,
-    analyze, analyze_raw,
+    analyze, analyze_raw, Analysis, DiagnosticKind, DiscoveryReason, XrefKind, MAX_INFERRED_EDGES,
+    MAX_INFERRED_PER_SITE, MAX_TABLE_ENTRIES_PER_SITE, MAX_TABLE_GUARD_BACKTRACK,
+    MIN_TABLE_ENTRIES_PER_SITE,
 };
 use binscout::disasm::Arch;
 use binscout::loader::{BinaryFormat, LoadedBinary, RawOptions, Segment};
@@ -73,9 +75,9 @@ fn insn_at(a: &Analysis, entry: u64, addr: u64) -> &binscout::disasm::Insn {
 #[test]
 fn caps_match_the_investigation_ceiling() {
     assert_eq!(MAX_INFERRED_PER_SITE, 1);
-    assert_eq!(MAX_TABLE_ENTRIES_PER_SITE, 8);
+    assert_eq!(MAX_TABLE_ENTRIES_PER_SITE, 1024);
     assert_eq!(MIN_TABLE_ENTRIES_PER_SITE, 2);
-    assert_eq!(MAX_TABLE_GUARD_BACKTRACK, 4);
+    assert_eq!(MAX_TABLE_GUARD_BACKTRACK, 10);
     assert_eq!(MAX_INFERRED_EDGES, 100_000);
 }
 
@@ -341,9 +343,10 @@ fn indexed_x86_32_table_resolves_with_exact_edge_and_xref_sets() {
 
 // N2: cmp/jae guard over jmp [rax*8+0x400012]; default mov/ret; 4-entry
 // table; two ret bodies. Same typed-base recovery as N1 at 8-byte width.
+// The guard compares eax (32-bit alias of the rax index).
 fn n2() -> Vec<u8> {
     let mut b = vec![
-        0x83, 0xFF, 0x03, // 0x400000: cmp edi,3
+        0x83, 0xF8, 0x03, // 0x400000: cmp eax,3
         0x73, 0x08, // 0x400003: jae 0x40000d
         0x48, 0xFF, 0x24, 0xC5, 0x12, 0x00, 0x40, 0x00, // 0x400005: jmp [rax*8+table]
         0xBF, 0x01, 0x00, 0x00, 0x00, // 0x40000d: mov edi,1
@@ -656,8 +659,11 @@ fn cross_function_table_entry_stays_unresolved() {
     assert!(inferred_of(&a).is_empty());
 }
 
-// Guarded table with more valid entries than the per-site cap: exact-or-
-// reject keeps the whole site unresolved instead of partially recovering.
+// Guarded table whose bound exceeds the per-site cap: exact-or-reject keeps
+// the whole site unresolved instead of partially recovering. The guard
+// claims 11 entries but only 9 validate, so the table is incomplete under
+// bound semantics either way; the dedicated cap pin is
+// `table_bound_exceeding_cap_stays_unresolved` below.
 #[test]
 fn oversize_table_stays_unresolved() {
     let mut b = vec![
@@ -709,10 +715,11 @@ fn wrong_scale_table_stays_unresolved() {
     assert!(inferred_of(&a).is_empty());
 }
 
-// Byte-identical to the N1 positive, but a container's slot values are not
-// known final (relocations never apply to segment bytes).
+// Byte-identical to the N1 positive but parsed as an ELF container:
+// absolute tables resolve in every format now (linked images hold final
+// absolute addresses; PIE addends fail validation rather than guessing).
 #[test]
-fn container_table_stays_unresolved_by_design() {
+fn container_absolute_table_resolves_like_raw() {
     let bytes = n1();
     let bin = LoadedBinary {
         format: BinaryFormat::Elf,
@@ -738,11 +745,23 @@ fn container_table_stays_unresolved_by_design() {
         arm_hints: Default::default(),
     };
     let a = analyze(&bin).expect("synthetic container must analyze");
+    assert!(a.diagnostics.records.is_empty());
     assert_eq!(
-        diagnostics_of(&a),
-        [(0x401005, DiagnosticKind::UnresolvedIndirectJump)]
+        a.functions[&0x401000].inferred_edges(),
+        [(0x401005, 0x401022), (0x401005, 0x401023)]
     );
-    assert!(inferred_of(&a).is_empty());
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (0x401003, XrefKind::Code, 0x40100c),
+            (0x401005, XrefKind::Data, 0x401012),
+            (0x401005, XrefKind::Data, 0x401016),
+            (0x401005, XrefKind::Data, 0x40101a),
+            (0x401005, XrefKind::Data, 0x40101e),
+            (0x401005, XrefKind::InferredCode, 0x401022),
+            (0x401005, XrefKind::InferredCode, 0x401023),
+        ]
+    );
 }
 
 #[test]
@@ -1032,4 +1051,398 @@ fn ordered_lookup_helpers_match_collecting_predecessors() {
         "slot bytes are a gap"
     );
     assert_eq!(a.containing_function(0x400000), None, "below first entry");
+}
+
+// Q1: GCC/Clang PIE x86-64 switch (raw, base 0x400000):
+// cmp edi,2; jae default; mov eax,edi; lea rcx,[rip+JT]; movsxd
+// rax,[rcx+rax*4]; add rax,rcx; jmp rax. The table holds 32-bit offsets
+// from its own base; three bodies follow the table.
+fn q1() -> Vec<u8> {
+    let mut b = vec![
+        0x83, 0xFF, 0x02, // 0x400000: cmp edi,2
+        0x73, 0x12, // 0x400003: jae 0x400017
+        0x89, 0xF8, // 0x400005: mov eax,edi
+        0x48, 0x8D, 0x0D, 0x0F, 0x00, 0x00, 0x00, // 0x400007: lea rcx,[rip+0xF] -> 0x40001D
+        0x48, 0x63, 0x04, 0x81, // 0x40000E: movsxd rax,[rcx+rax*4]
+        0x48, 0x01, 0xC8, // 0x400012: add rax,rcx
+        0xFF, 0xE0, // 0x400015: jmp rax
+        0xBF, 0x01, 0x00, 0x00, 0x00, // 0x400017: mov edi,1
+        0xC3, // 0x40001C: ret
+    ];
+    assert_eq!(b.len(), 0x1D);
+    b.extend([0x0C, 0x00, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x00]); // slots 0-1
+    b.extend([0x0E, 0x00, 0x00, 0x00]); // slot 2
+    b.extend([0xC3, 0xC3, 0xC3]); // bodies 0x400029/2A/2B
+    assert_eq!(b.len(), 44);
+    b
+}
+
+#[test]
+fn pie_x86_64_relative_table_resolves() {
+    let a = x64(&q1(), 0x400000, Some(0x400000));
+    let site = insn_at(&a, 0x400000, 0x400015);
+    assert_eq!(site.mnem, "jmp");
+    assert_eq!(site.branch_target, None);
+    assert_eq!(site.mem_target, None);
+    assert_eq!(site.table_base, None);
+    let lea = insn_at(&a, 0x400000, 0x400007);
+    assert_eq!(lea.mem_target, Some(0x40001D));
+
+    assert!(a.diagnostics.records.is_empty());
+    assert_eq!(a.functions.keys().copied().collect::<Vec<_>>(), [0x400000]);
+    assert_eq!(
+        blocks_of(&a, 0x400000),
+        [0x400000, 0x400005, 0x400017, 0x400029, 0x40002A, 0x40002B]
+    );
+    let f = &a.functions[&0x400000];
+    assert_eq!(f.edges(), [(0x400000, 0x400005), (0x400000, 0x400017)]);
+    assert_eq!(
+        f.inferred_edges(),
+        [
+            (0x400005, 0x400029),
+            (0x400005, 0x40002A),
+            (0x400005, 0x40002B)
+        ]
+    );
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (0x400003, XrefKind::Code, 0x400017),
+            (0x400007, XrefKind::Data, 0x40001D),
+            (0x400015, XrefKind::Data, 0x40001D),
+            (0x400015, XrefKind::Data, 0x400021),
+            (0x400015, XrefKind::Data, 0x400025),
+            (0x400015, XrefKind::InferredCode, 0x400029),
+            (0x400015, XrefKind::InferredCode, 0x40002A),
+            (0x400015, XrefKind::InferredCode, 0x40002B),
+        ]
+    );
+    assert!(a.call_edges().is_empty());
+}
+
+// Q1 with the index copy removed (`mov eax,edi` replaced by two nops):
+// the compared register must alias the indexed register directly, so the
+// altered shape stays unresolved.
+#[test]
+fn pie_index_mismatch_stays_unresolved() {
+    let mut b = q1();
+    b[5] = 0x90;
+    b[6] = 0x90; // mov eax,edi -> nop;nop: index rax no longer copies edi
+    let a = x64(&b, 0x400000, Some(0x400000));
+    assert_eq!(
+        diagnostics_of(&a),
+        [(0x400015, DiagnosticKind::UnresolvedIndirectJump)]
+    );
+    assert!(inferred_of(&a).is_empty());
+}
+
+// Q2: MSVC x64 switch as a synthetic PE container (base 0x140000000):
+// cmp eax,2; jae default; mov ecx,[r8+rax*4+0x18]; add rcx,r8; jmp rcx.
+// The table holds 32-bit RVAs from the image base (`r8`); the displacement
+// is the table RVA, so the image base (lowest mapped address) recovers it.
+fn q2() -> Vec<u8> {
+    let mut b = vec![
+        0x83, 0xF8, 0x02, // cmp eax,2
+        0x73, 0x0D, // jae default (+0x12)
+        0x41, 0x8B, 0x8C, 0x80, 0x18, 0x00, 0x00, 0x00, // mov ecx,[r8+rax*4+0x18]
+        0x4C, 0x01, 0xC1, // add rcx,r8
+        0xFF, 0xE1, // jmp rcx
+        0xB8, 0x01, 0x00, 0x00, 0x00, // default: mov eax,1
+        0xC3, // ret
+    ];
+    assert_eq!(b.len(), 0x18);
+    b.extend([0x24, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x00]); // slots 0-1
+    b.extend([0x26, 0x00, 0x00, 0x00]); // slot 2
+    b.extend([0xC3, 0xC3, 0xC3]); // bodies
+    assert_eq!(b.len(), 39);
+    b
+}
+
+fn pe_container(bytes: Vec<u8>, base: u64, arch: Arch) -> Analysis {
+    let bin = LoadedBinary {
+        format: BinaryFormat::Pe,
+        arch,
+        entry: Some(base),
+        segments: vec![Segment {
+            vaddr: base,
+            mem_size: bytes.len() as u64,
+            data: bytes,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        sections: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        symbols: Vec::new(),
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
+        relocatable: false,
+        arm_hints: Default::default(),
+    };
+    analyze(&bin).expect("synthetic container must analyze")
+}
+
+#[test]
+fn msvc_x64_image_relative_table_resolves() {
+    const BASE: u64 = 0x140000000;
+    let a = pe_container(q2(), BASE, Arch::X86_64);
+    let site = insn_at(&a, BASE, BASE + 0x10);
+    assert_eq!(site.mnem, "jmp");
+    assert_eq!(site.branch_target, None);
+
+    assert!(a.diagnostics.records.is_empty());
+    assert_eq!(a.functions.keys().copied().collect::<Vec<_>>(), [BASE]);
+    assert_eq!(
+        blocks_of(&a, BASE),
+        [
+            BASE,
+            BASE + 5,
+            BASE + 0x12,
+            BASE + 0x24,
+            BASE + 0x25,
+            BASE + 0x26
+        ]
+    );
+    let f = &a.functions[&BASE];
+    assert_eq!(f.edges(), [(BASE, BASE + 5), (BASE, BASE + 0x12)]);
+    assert_eq!(
+        f.inferred_edges(),
+        [
+            (BASE + 5, BASE + 0x24),
+            (BASE + 5, BASE + 0x25),
+            (BASE + 5, BASE + 0x26)
+        ]
+    );
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (BASE + 3, XrefKind::Code, BASE + 0x12),
+            (BASE + 0x10, XrefKind::Data, BASE + 0x18),
+            (BASE + 0x10, XrefKind::Data, BASE + 0x1C),
+            (BASE + 0x10, XrefKind::Data, BASE + 0x20),
+            (BASE + 0x10, XrefKind::InferredCode, BASE + 0x24),
+            (BASE + 0x10, XrefKind::InferredCode, BASE + 0x25),
+            (BASE + 0x10, XrefKind::InferredCode, BASE + 0x26),
+        ]
+    );
+    assert!(a.call_edges().is_empty());
+}
+
+// Q4a: Thumb `tbb [pc, r0]` (base 0x20000):
+// cmp r0,#2; bhi default; tbb [pc,r0]; table(3B)+pad; default movs/bx;
+// three `bx lr` bodies. Targets are `base + 2 * byte`.
+fn q4a() -> Vec<u8> {
+    vec![
+        0x02, 0x28, // 0x20000: cmp r0,#2
+        0x02, 0xD8, // 0x20002: bhi 0x2000C
+        0xDF, 0xE8, 0x00, 0xF0, // 0x20004: tbb [pc, r0]
+        0x04, 0x05, 0x06, 0x00, // 0x20008: table + pad
+        0x01, 0x20, // 0x2000C: movs r0,#1
+        0x70, 0x47, // 0x2000E: bx lr
+        0x70, 0x47, // 0x20010
+        0x70, 0x47, // 0x20012
+        0x70, 0x47, // 0x20014
+    ]
+}
+
+fn thumb(bytes: &[u8], base: u64, entry: Option<u64>) -> Analysis {
+    analyze_raw(bytes, base, Arch::Thumb, entry).expect("synthetic blob must analyze")
+}
+
+#[test]
+fn thumb_tbb_table_resolves() {
+    let a = thumb(&q4a(), 0x20000, Some(0x20000));
+    let site = insn_at(&a, 0x20000, 0x20004);
+    assert_eq!(site.mnem, "tbb");
+    assert_eq!(site.branch_target, None);
+
+    assert!(a.diagnostics.records.is_empty());
+    assert_eq!(a.functions.keys().copied().collect::<Vec<_>>(), [0x20000]);
+    assert_eq!(
+        blocks_of(&a, 0x20000),
+        [0x20000, 0x20004, 0x2000C, 0x20010, 0x20012, 0x20014]
+    );
+    let f = &a.functions[&0x20000];
+    assert_eq!(f.edges(), [(0x20000, 0x20004), (0x20000, 0x2000C)]);
+    assert_eq!(
+        f.inferred_edges(),
+        [(0x20004, 0x20010), (0x20004, 0x20012), (0x20004, 0x20014)]
+    );
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (0x20002, XrefKind::Code, 0x2000C),
+            (0x20004, XrefKind::Data, 0x20008),
+            (0x20004, XrefKind::Data, 0x20009),
+            (0x20004, XrefKind::Data, 0x2000A),
+            (0x20004, XrefKind::InferredCode, 0x20010),
+            (0x20004, XrefKind::InferredCode, 0x20012),
+            (0x20004, XrefKind::InferredCode, 0x20014),
+        ]
+    );
+    assert!(a.call_edges().is_empty());
+}
+
+// Q4b: Thumb `tbh [pc, r0, lsl #1]` (base 0x21000): same guard shape with
+// halfword slots; targets are `base + 2 * halfword`.
+fn q4b() -> Vec<u8> {
+    vec![
+        0x02, 0x28, // 0x21000: cmp r0,#2
+        0x03, 0xD8, // 0x21002: bhi 0x2100E
+        0xDF, 0xE8, 0x10, 0xF1, // 0x21004: tbh [pc, r0, lsl #1]
+        0x05, 0x00, 0x06, 0x00, 0x07, 0x00, // 0x21008: table
+        0x01, 0x20, // 0x2100E: movs r0,#1
+        0x70, 0x47, // 0x21010: bx lr
+        0x70, 0x47, // 0x21012
+        0x70, 0x47, // 0x21014
+        0x70, 0x47, // 0x21016
+    ]
+}
+
+#[test]
+fn thumb_tbh_table_resolves() {
+    let a = thumb(&q4b(), 0x21000, Some(0x21000));
+    let site = insn_at(&a, 0x21000, 0x21004);
+    assert_eq!(site.mnem, "tbh");
+    assert_eq!(site.branch_target, None);
+
+    assert!(a.diagnostics.records.is_empty());
+    assert_eq!(a.functions.keys().copied().collect::<Vec<_>>(), [0x21000]);
+    assert_eq!(
+        blocks_of(&a, 0x21000),
+        [0x21000, 0x21004, 0x2100E, 0x21012, 0x21014, 0x21016]
+    );
+    let f = &a.functions[&0x21000];
+    assert_eq!(f.edges(), [(0x21000, 0x21004), (0x21000, 0x2100E)]);
+    assert_eq!(
+        f.inferred_edges(),
+        [(0x21004, 0x21012), (0x21004, 0x21014), (0x21004, 0x21016)]
+    );
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (0x21002, XrefKind::Code, 0x2100E),
+            (0x21004, XrefKind::Data, 0x21008),
+            (0x21004, XrefKind::Data, 0x2100A),
+            (0x21004, XrefKind::Data, 0x2100C),
+            (0x21004, XrefKind::InferredCode, 0x21012),
+            (0x21004, XrefKind::InferredCode, 0x21014),
+            (0x21004, XrefKind::InferredCode, 0x21016),
+        ]
+    );
+    assert!(a.call_edges().is_empty());
+}
+
+// Q4 with the guard removed (cmp/bhi replaced by nops): a detected but
+// unbounded `tbb` keeps its diagnostic instead of resolving.
+#[test]
+fn thumb_unguarded_tbb_stays_unresolved() {
+    let mut b = q4a();
+    b[0] = 0x00;
+    b[1] = 0xBF; // cmp -> nop
+    b[2] = 0x00;
+    b[3] = 0xBF; // bhi -> nop
+    let a = thumb(&b, 0x20000, Some(0x20000));
+    assert_eq!(
+        diagnostics_of(&a),
+        [(0x20004, DiagnosticKind::UnresolvedIndirectJump)]
+    );
+    assert!(inferred_of(&a).is_empty());
+}
+
+// Q5: AArch64 switch (base 0x4000):
+// cmp w0,#2; b.hi default; mov w8,w0; adrp x9,JT; add x9,x9,#0x38;
+// adr x10,base; ldrb w11,[x9,x8]; add x10,x10,x11,lsl #2; br x10.
+// The table holds byte offsets scaled by 4 from the `adr` base.
+fn q5() -> Vec<u8> {
+    let mut b = vec![
+        0x1F, 0x08, 0x00, 0x71, // 0x4000: cmp w0,#2
+        0x68, 0x01, 0x00, 0x54, // 0x4004: b.hi 0x4030
+        0xE8, 0x03, 0x00, 0x2A, // 0x4008: mov w8,w0
+        0x09, 0x00, 0x00, 0x90, // 0x400C: adrp x9,0x4000
+        0x29, 0xE1, 0x00, 0x91, // 0x4010: add x9,x9,#0x38
+        0x8A, 0x00, 0x00, 0x10, // 0x4014: adr x10,0x4024
+        0x2B, 0x69, 0x68, 0x38, // 0x4018: ldrb w11,[x9,x8]
+        0x4A, 0x09, 0x0B, 0x8B, // 0x401C: add x10,x10,x11,lsl #2
+        0x40, 0x01, 0x1F, 0xD6, // 0x4020: br x10
+        0xC0, 0x03, 0x5F, 0xD6, // 0x4024: ret
+        0xC0, 0x03, 0x5F, 0xD6, // 0x4028: ret
+        0xC0, 0x03, 0x5F, 0xD6, // 0x402C: ret
+        0x20, 0x00, 0x80, 0x52, // 0x4030: movz w0,#1
+        0xC0, 0x03, 0x5F, 0xD6, // 0x4034: ret
+    ];
+    assert_eq!(b.len(), 0x38);
+    b.extend([0x00, 0x01, 0x02]); // JT 0x4038
+    assert_eq!(b.len(), 59);
+    b
+}
+
+fn a64(bytes: &[u8], base: u64, entry: Option<u64>) -> Analysis {
+    analyze_raw(bytes, base, Arch::Aarch64, entry).expect("synthetic blob must analyze")
+}
+
+#[test]
+fn aarch64_relative_table_resolves() {
+    let a = a64(&q5(), 0x4000, Some(0x4000));
+    let site = insn_at(&a, 0x4000, 0x4020);
+    assert_eq!(site.mnem, "br");
+    assert_eq!(site.branch_target, None);
+
+    assert!(a.diagnostics.records.is_empty());
+    assert_eq!(a.functions.keys().copied().collect::<Vec<_>>(), [0x4000]);
+    assert_eq!(
+        blocks_of(&a, 0x4000),
+        [0x4000, 0x4008, 0x4024, 0x4028, 0x402C, 0x4030]
+    );
+    let f = &a.functions[&0x4000];
+    assert_eq!(f.edges(), [(0x4000, 0x4008), (0x4000, 0x4030)]);
+    assert_eq!(
+        f.inferred_edges(),
+        [(0x4008, 0x4024), (0x4008, 0x4028), (0x4008, 0x402C)]
+    );
+    assert_eq!(
+        xref_tuples(&a),
+        [
+            (0x4004, XrefKind::Code, 0x4030),
+            (0x400C, XrefKind::Data, 0x4000),
+            (0x4010, XrefKind::Data, 0x4038),
+            (0x4014, XrefKind::Data, 0x4024),
+            (0x4020, XrefKind::Data, 0x4038),
+            (0x4020, XrefKind::Data, 0x4039),
+            (0x4020, XrefKind::Data, 0x403A),
+            (0x4020, XrefKind::InferredCode, 0x4024),
+            (0x4020, XrefKind::InferredCode, 0x4028),
+            (0x4020, XrefKind::InferredCode, 0x402C),
+        ]
+    );
+    assert!(a.call_edges().is_empty());
+}
+
+// Bound over the per-site cap (`cmp eax, 2000` claims 2001 entries):
+// exact-or-reject keeps the site unresolved without scanning.
+#[test]
+fn table_bound_exceeding_cap_stays_unresolved() {
+    let b = vec![
+        0x3D, 0xD0, 0x07, 0x00, 0x00, // 0x401000: cmp eax,2000
+        0x73, 0x07, // jae default
+        0xFF, 0x24, 0x85, 0x15, 0x10, 0x40, 0x00, // jmp [eax*4+0x401015]
+        0xB8, 0x01, 0x00, 0x00, 0x00, // default: mov eax,1
+        0xC3, // ret
+        0x90, // pad to the table
+        0x1C, 0x10, 0x40, 0x00, // slot 0 -> body
+        0x1D, 0x10, 0x40, 0x00, // slot 1 -> body+1
+        0xC3, 0xC3, // bodies (never decoded: no typed base)
+    ];
+    let a = x32(&b, 0x401000, Some(0x401000));
+    let site = insn_at(&a, 0x401000, 0x401007);
+    assert_eq!(site.table_base, Some(0x401015));
+    assert_eq!(
+        diagnostics_of(&a),
+        [(0x401007, DiagnosticKind::UnresolvedIndirectJump)]
+    );
+    assert!(inferred_of(&a).is_empty());
+    assert!(a.xrefs_page(Some(XrefKind::InferredCode), 0, 64).is_empty());
 }

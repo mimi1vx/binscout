@@ -71,29 +71,33 @@ pub const MAX_DIAGNOSTICS: usize = 100_000;
 /// (`1 <= 1024`). Multi-entry tables have their own per-site cap (see
 /// [`MAX_TABLE_ENTRIES_PER_SITE`]).
 pub const MAX_INFERRED_PER_SITE: usize = 1;
-/// Cap on recovered table entries per guarded scaled-index site.
+/// Cap on recovered table entries per guarded switch site.
 ///
-/// The scan reads consecutive valid slots from the typed table base and
-/// stops at the first slot that fails validation (unmapped, truncated,
-/// non-executable, non-decoding, or cross-function). A run that is still
-/// valid at this length is not a bounded table but an open-ended index:
-/// the whole site stays unresolved rather than partially recovered
-/// (exact-or-reject). Runs shorter than [`MIN_TABLE_ENTRIES_PER_SITE`]
-/// are indistinguishable from stray pointers and stay unresolved too.
-pub const MAX_TABLE_ENTRIES_PER_SITE: usize = 8;
+/// The scan reads exactly the guard bound (`cmp idx, max; ja/jb default`
+/// gives `max + 1` entries) up to this ceiling; every slot must validate
+/// (mapped, file-backed, executable, decodable, same-function) or the whole
+/// site stays unresolved (exact-or-reject). Bounds above the ceiling are
+/// unrecoverable without truncating the table, so those sites stay
+/// unresolved too. Runs shorter than [`MIN_TABLE_ENTRIES_PER_SITE`]
+/// are indistinguishable from stray pointers and stay unresolved.
+pub const MAX_TABLE_ENTRIES_PER_SITE: usize = 1024;
 /// Minimum consecutive valid slots for a table site to resolve.
 ///
 /// Singleton runs fall back to the single-slot path (which owns the typed
 /// `mem_target` shapes); an indexed site with fewer valid slots than this
 /// keeps its diagnostic.
 pub const MIN_TABLE_ENTRIES_PER_SITE: usize = 2;
-/// How far back from a table site the index-guard search walks.
+/// How far back from a table site the index-guard and sequence search walks.
 ///
 /// Counts decoded instructions in reverse address order within the site's
 /// function. A guarded switch checks its index just before indexing
-/// (`cmp` + a direct conditional branch to the default path); an unguarded
-/// scaled-index jump has an unbounded index and is unrecoverable.
-pub const MAX_TABLE_GUARD_BACKTRACK: usize = 4;
+/// (`cmp` + a direct conditional branch to the default path); multi-step
+/// dispatch sequences (PIE `lea`/`movsxd`/`add`, AArch64
+/// `adrp`/`add`/`adr`/`ldrb`/`add`) span up to eight instructions, so the
+/// window covers the whole shape. An unguarded index has an unbounded index
+/// and is unrecoverable; detected-but-unbounded sites keep their
+/// [`DiagnosticKind::UnresolvedIndirectJump`].
+pub const MAX_TABLE_GUARD_BACKTRACK: usize = 10;
 /// Cap on recovered single-slot indirect-jump edges per [`analyze`] call.
 ///
 /// On exhaustion the site stays unresolved with its diagnostic retained and
@@ -3445,17 +3449,12 @@ struct InferredJumps {
     omitted: usize,
 }
 
-/// Slot width for indirect-jump resolution, or `None` when the resolvers
-/// cannot apply.
+/// Slot width for the single-slot resolver, or `None` when it cannot apply.
 ///
-/// Single gate shared by [`resolve_indirect_site`], [`resolve_table_site`],
-/// and [`resolve_indirect_jumps`]: only raw x86 mappings have known-final
-/// slot values in an approved shape (x86-32 absolute slots are 4 bytes,
-/// x86-64 RIP-relative slots 8; other arches report no typed slot, and
-/// container slot values are not final until relocations apply, which never
-/// happens to segment bytes). The resolvers take the width from here and
-/// [`resolve_indirect_jumps`] skips its scan via `is_none`, so the gate
-/// cannot drift from the checks.
+/// Raw x86 mappings only: container slot values are not known final until
+/// relocations apply, which never happens to segment bytes. x86-32 absolute
+/// slots are 4 bytes, x86-64 RIP-relative slots 8; other arches report no
+/// typed slot. Tables have their own gate (see [`absolute_table_width`]).
 fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
     if format != BinaryFormat::Raw {
         return None;
@@ -3465,6 +3464,106 @@ fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
         Arch::X86_64 => Some(8),
         Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => None,
     }
+}
+
+/// Slot width for absolute-index tables (x86, any format).
+///
+/// Unlike the single-slot path, absolute tables are enabled for containers:
+/// a linked `ET_EXEC` image holds final absolute addresses, while a `PIE`
+/// image holds relocation addends that fail the decodability and
+/// same-function checks, so exact-or-reject stays safe. x86-32 slots are 4
+/// bytes, x86-64 slots 8; other arches have no absolute-index shape.
+fn absolute_table_width(arch: Arch) -> Option<usize> {
+    match arch {
+        Arch::X86_32 => Some(4),
+        Arch::X86_64 => Some(8),
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => None,
+    }
+}
+
+/// Map an x86 register name to its index family (0-15), or `None`.
+///
+/// `rax`/`eax` share family 0 through `r15`/`r15d` sharing 15, so a 32-bit
+/// guard register aliases its 64-bit indexed use. Lowercase only; the
+/// decoder already lowercases mnemonics and registers.
+fn x86_reg_num(name: &str) -> Option<u8> {
+    match name {
+        "rax" | "eax" => Some(0),
+        "rcx" | "ecx" => Some(1),
+        "rdx" | "edx" => Some(2),
+        "rbx" | "ebx" => Some(3),
+        "rsp" | "esp" => Some(4),
+        "rbp" | "ebp" => Some(5),
+        "rsi" | "esi" => Some(6),
+        "rdi" | "edi" => Some(7),
+        "r8" | "r8d" => Some(8),
+        "r9" | "r9d" => Some(9),
+        "r10" | "r10d" => Some(10),
+        "r11" | "r11d" => Some(11),
+        "r12" | "r12d" => Some(12),
+        "r13" | "r13d" => Some(13),
+        "r14" | "r14d" => Some(14),
+        "r15" | "r15d" => Some(15),
+        _ => None,
+    }
+}
+
+/// Map an iced-x86 [`iced_x86::Register`] to its index family (0-15).
+///
+/// Covers the 32/64-bit general registers the switch shapes use; segment,
+/// control, and vector registers report `None` and never alias.
+fn x86_iced_num(reg: iced_x86::Register) -> Option<u8> {
+    use iced_x86::Register as R;
+    match reg {
+        R::RAX | R::EAX => Some(0),
+        R::RCX | R::ECX => Some(1),
+        R::RDX | R::EDX => Some(2),
+        R::RBX | R::EBX => Some(3),
+        R::RSP | R::ESP => Some(4),
+        R::RBP | R::EBP => Some(5),
+        R::RSI | R::ESI => Some(6),
+        R::RDI | R::EDI => Some(7),
+        R::R8 | R::R8D => Some(8),
+        R::R9 | R::R9D => Some(9),
+        R::R10 | R::R10D => Some(10),
+        R::R11 | R::R11D => Some(11),
+        R::R12 | R::R12D => Some(12),
+        R::R13 | R::R13D => Some(13),
+        R::R14 | R::R14D => Some(14),
+        R::R15 | R::R15D => Some(15),
+        _ => None,
+    }
+}
+
+/// Map an AArch64 register name to its number (0-30), or `None`.
+///
+/// `xN` and `wN` alias (same number); `xzr`/`wzr`/`sp` never alias a table
+/// index and report `None`.
+fn aarch64_reg_num(name: &str) -> Option<u8> {
+    let digits = name.strip_prefix('x').or_else(|| name.strip_prefix('w'))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u8 = digits.parse().ok()?;
+    (n <= 30).then_some(n)
+}
+
+/// Decode the single x86 instruction at `addr` with iced-x86.
+///
+/// Typed register/memory facts for the switch-sequence matchers, which the
+/// [`Insn`] rows do not carry (base/index/scale/displacement). Returns
+/// `None` for unmapped addresses and invalid encodings: the site stays
+/// unresolved.
+fn x86_insn_at(space: &AddrSpace, addr: u64, bitness: u32) -> Option<iced_x86::Instruction> {
+    let bytes = space.code_bytes(addr)?;
+    let win = &bytes[..bytes.len().min(15)];
+    let mut decoder = iced_x86::Decoder::new(bitness, win, iced_x86::DecoderOptions::NONE);
+    decoder.set_ip(addr);
+    let insn = decoder.decode();
+    if insn.is_invalid() {
+        return None;
+    }
+    Some(insn)
 }
 
 /// Check one `UnresolvedIndirectJump` site against the single-slot absolute
@@ -3534,35 +3633,29 @@ fn resolve_indirect_site(
     Some(target)
 }
 
-/// Check one `UnresolvedIndirectJump` site against the guarded scaled-index
-/// table pattern, returning its unique entry targets in ascending order.
+/// Check one `UnresolvedIndirectJump` site against the guarded absolute
+/// scaled-index table pattern, returning its unique entry targets.
 ///
-/// All evidence is typed decoder facts, never operand text. Rejections:
-/// - T1: `insn.mnem == "jmp"` with a `Branch { None }` lift (same gate as
-///   the single-slot path: excludes calls and predicated forms).
-/// - T2: `branch_target` is `None` (direct jumps never reach this set).
-/// - T3: `table_base == Some(base)` (excludes the single-slot shapes, which
-///   report `mem_target` instead, and strided scales, which report `None`).
-/// - T4: raw mappings only (container slot values are not known final).
-/// - T5: a direct conditional branch (`CBranch { Some }`, the index bound
-///   check) within [`MAX_TABLE_GUARD_BACKTRACK`] decoded predecessors in
-///   the site's function. Unguarded indexes are unbounded: unrecoverable.
-/// - T6: the scan reads consecutive slots from `base` while every per-slot
-///   check passes (same file-backed/executable/decodable/same-function
-///   rules as the single-slot R5-R8, at the arch pointer width); the
-///   first failure ends the table.
-/// - T7: at least [`MIN_TABLE_ENTRIES_PER_SITE`] consecutive valid slots.
-///   Singleton runs are stray pointers, not tables.
-/// - T8: a run still valid at [`MAX_TABLE_ENTRIES_PER_SITE`] slots is
-///   open-ended, not bounded: the whole site stays unresolved rather than
-///   partially recovered (exact-or-reject).
-///
-/// Only x86 has an approved table shape (x86-32 scale 4, x86-64 scale 8);
-/// other arches are rejected outright, as are ARM `tbb`/`tbh` (no typed
-/// displacement) and single-entry fallbacks to the single-slot path.
+/// Covers x86 absolute tables in any format: x86-32 `jmp [T+eax*4]` and
+/// x86-64 `jmp [T+rax*8]`, where the decoder reports the displacement as
+/// [`Insn::table_base`]. Rejections:
+/// - T1: `insn.mnem == "jmp"` with a `Branch { None }` lift.
+/// - T2: `branch_target` is `None`.
+/// - T3: `table_base == Some(base)` (single-slot shapes report `mem_target`
+///   instead, strided scales report `None`).
+/// - T4: x86 only (other arches have no absolute-index shape).
+/// - T5: a `cmp idx, max` plus a direct conditional branch (the index bound
+///   check) within [`MAX_TABLE_GUARD_BACKTRACK`] predecessors, with the
+///   compared register aliasing the indexed register. Unguarded indexes are
+///   unbounded: unrecoverable (the site keeps its diagnostic).
+/// - T6: the bound `max + 1` fits [`MAX_TABLE_ENTRIES_PER_SITE`] and reaches
+///   [`MIN_TABLE_ENTRIES_PER_SITE`]; oversized bounds and singleton bounds
+///   stay unresolved rather than partially recovered (exact-or-reject).
+/// - T7: every one of the bound slots validates (same file-backed,
+///   executable, decodable, same-function rules as the single-slot R5-R8).
+///   One bad slot rejects the whole site.
 fn resolve_table_site(
     arch: Arch,
-    format: BinaryFormat,
     space: &AddrSpace,
     decoded: &BTreeMap<u64, Decoded>,
     entries: &[u64],
@@ -3579,30 +3672,35 @@ fn resolve_table_site(
         return None;
     }
     let base = found.insn.table_base?;
-    let width = indirect_slot_width(arch, format)?;
+    let width = absolute_table_width(arch)?;
     if entries.is_empty() {
         return None;
     }
     let owner = function_owner(entries, site)?;
-    if !table_guard_present(decoded, entries, site, owner) {
+    let bitness = match arch {
+        Arch::X86_32 => 32,
+        Arch::X86_64 => 64,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+    };
+    let iced = x86_insn_at(space, site, bitness)?;
+    if iced.mnemonic() != iced_x86::Mnemonic::Jmp {
+        return None;
+    }
+    let index_num = x86_iced_num(iced.memory_index())?;
+    let (bound, cmp_reg) = guard_bound(decoded, entries, site, owner)?;
+    if x86_reg_num(&cmp_reg) != Some(index_num) {
+        return None;
+    }
+    if !bound_in_range(bound) {
         return None;
     }
     let mut targets = BTreeSet::new();
-    let mut slots = Vec::new();
-    for i in 0..MAX_TABLE_ENTRIES_PER_SITE {
+    let mut slots = Vec::with_capacity(bound);
+    for i in 0..bound {
         let slot = base.wrapping_add((i as u64).wrapping_mul(width as u64));
-        let Some(target) = table_slot_target(arch, space, entries, owner, slot, width) else {
-            break;
-        };
+        let target = table_slot_target(arch, space, entries, owner, slot, width)?;
         slots.push(slot);
         targets.insert(target);
-    }
-    if slots.len() < MIN_TABLE_ENTRIES_PER_SITE {
-        return None;
-    }
-    let probe = base.wrapping_add((MAX_TABLE_ENTRIES_PER_SITE as u64).wrapping_mul(width as u64));
-    if table_slot_target(arch, space, entries, owner, probe, width).is_some() {
-        return None;
     }
     Some(TableResolution {
         targets: targets.into_iter().collect(),
@@ -3618,21 +3716,76 @@ struct TableResolution {
     slots: Vec<u64>,
 }
 
-/// Whether a direct conditional branch (the index bound check) precedes
-/// `site` within [`MAX_TABLE_GUARD_BACKTRACK`] decoded predecessors in the
-/// same function. Typed lift facts only: a `CBranch` with a direct target.
-fn table_guard_present(
+/// Parse a `cmp reg, imm` bound immediate from operand text.
+///
+/// x86 `cmp eax, 3` reports `["eax", "3"]` (imm8, decimal) while imm32
+/// reports `["ecx", "0x100"]`; Thumb `cmp r0, 0x8`; AArch64 `cmp w0, #0x13`.
+/// Strips one `#` prefix, then hex (`0x`) or decimal. Anything else
+/// (negative, symbolic, malformed) is `None`: the site stays unresolved.
+fn parse_cmp_imm(ops: &[String]) -> Option<u64> {
+    if ops.len() != 2 {
+        return None;
+    }
+    let raw = ops[1].strip_prefix('#').unwrap_or(&ops[1]);
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        raw.parse::<u64>().ok()
+    }
+}
+
+/// Bound and compared register of the guard dominating `site`, if any.
+///
+/// Scans [`MAX_TABLE_GUARD_BACKTRACK`] same-function predecessors for a
+/// direct conditional branch (the bound check) immediately preceded by a
+/// `cmp reg, max` with a parseable immediate. Returns `max + 1` (valid
+/// indexes `0..=max`) plus the compared register name for the caller's
+/// alias check against the indexed register. `None` covers every
+/// unbounded shape: no branch, no adjacent `cmp`, or an unparseable
+/// immediate. Detected-but-unbounded sites keep their
+/// [`DiagnosticKind::UnresolvedIndirectJump`].
+fn guard_bound(
     decoded: &BTreeMap<u64, Decoded>,
     entries: &[u64],
     site: u64,
     owner: u64,
-) -> bool {
-    decoded
+) -> Option<(usize, String)> {
+    let preds: Vec<(u64, &Decoded)> = decoded
         .range(..site)
         .rev()
         .take(MAX_TABLE_GUARD_BACKTRACK)
         .take_while(|(va, _)| function_owner(entries, **va) == Some(owner))
-        .any(|(_, d)| matches!(d.flow, Flow::CBranch { target: Some(_) }))
+        .map(|(va, d)| (*va, d))
+        .collect();
+    for (i, (_, d)) in preds.iter().enumerate() {
+        if !matches!(d.flow, Flow::CBranch { target: Some(_) }) {
+            continue;
+        }
+        for prior in preds.iter().skip(i + 1).take(2) {
+            if prior.1.insn.mnem != "cmp" {
+                continue;
+            }
+            if let Some(max) = parse_cmp_imm(&prior.1.insn.ops) {
+                let bound = usize::try_from(max).ok()?.checked_add(1)?;
+                return Some((bound, prior.1.insn.ops[0].clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a guard bound is a recoverable table size: at least a pair
+/// (singleton runs are stray pointers) and at most
+/// [`MAX_TABLE_ENTRIES_PER_SITE`] (oversized bounds stay unresolved rather
+/// than partially recovered).
+fn bound_in_range(bound: usize) -> bool {
+    (MIN_TABLE_ENTRIES_PER_SITE..=MAX_TABLE_ENTRIES_PER_SITE).contains(&bound)
 }
 
 /// Validate one table slot: file-backed width bytes in a single segment,
@@ -3664,24 +3817,491 @@ fn table_slot_target(
     Some(target)
 }
 
-/// Resolve single-slot absolute indirect jumps and guarded scaled-index
-/// tables over the walker's `UnresolvedIndirectJump` sites in ascending
-/// address order.
+/// Validate one relative-table target: executable file-backed bytes that
+/// decode and attribute to the site's function. Shared by the PIE, MSVC,
+/// Thumb, and AArch64 relative shapes, whose slots hold offsets rather than
+/// absolute addresses.
+fn relative_slot_target(
+    arch: Arch,
+    space: &AddrSpace,
+    entries: &[u64],
+    owner: u64,
+    target: u64,
+) -> Option<u64> {
+    let target_bytes = space.code_bytes(target)?;
+    if !matches!(
+        crate::disasm::disasm_first(arch, target_bytes, target),
+        Ok(Some(_))
+    ) {
+        return None;
+    }
+    if function_owner(entries, target) != Some(owner) {
+        return None;
+    }
+    Some(target)
+}
+
+/// Same-function predecessors of `site`, nearest first, up to `n`.
+fn site_preds<'a>(
+    decoded: &'a BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+    owner: u64,
+    n: usize,
+) -> Vec<(u64, &'a Decoded)> {
+    decoded
+        .range(..site)
+        .rev()
+        .take(n)
+        .take_while(|(va, _)| function_owner(entries, **va) == Some(owner))
+        .map(|(va, d)| (*va, d))
+        .collect()
+}
+
+/// Whether a `mov` copying the guard index into the table index sits in
+/// `preds`: destination aliases `index_num`, source aliases `cmp_num.
+/// Accepts the compiler's index copy (`mov eax, edi` before the sequence)
+/// as well as the copy-free shape (both registers already alias).
+fn index_copy_present(preds: &[(u64, &Decoded)], index_num: u8, cmp_num: u8) -> bool {
+    if index_num == cmp_num {
+        return true;
+    }
+    preds.iter().any(|(_, d)| {
+        d.insn.mnem == "mov"
+            && d.insn.ops.len() == 2
+            && x86_reg_num(&d.insn.ops[0]) == Some(index_num)
+            && x86_reg_num(&d.insn.ops[1]) == Some(cmp_num)
+    })
+}
+
+/// Check one site against the GCC/Clang PIE x86-64 switch shape, returning
+/// its entry targets.
 ///
-/// Each site is checked once via [`resolve_indirect_site`], then via
-/// [`resolve_table_site`]; a pass decodes each target's continuation with
-/// the existing [`Walker::run`] (so case bodies decode normally) and
-/// registers the targets for block splitting. Continuation decoding can
-/// surface further indirect sites, which join the same ascending worklist.
-/// Single-slot sites contribute at most one edge
-/// ([`MAX_INFERRED_PER_SITE`], singleton by construction); table sites
-/// contribute up to [`MAX_TABLE_ENTRIES_PER_SITE`] unique edges. Past
-/// `max_edges` (normally [`MAX_INFERRED_EDGES`]) sites stay unresolved
-/// with `truncated` set and each omission counted, never silently clipped.
+/// ```text
+/// cmp edi, max; ja default
+/// [mov eax, edi]
+/// lea rcx, [rip+T]; movsxd rax, [rcx+rax*4]; add rax, rcx; jmp rax
+/// ```
 ///
-/// Non-raw and non-x86 binaries return empty immediately via
-/// [`indirect_slot_width`]: no site could resolve, so the diagnostic scan is
-/// skipped entirely rather than visiting every site once per pass.
+/// The table holds 32-bit signed offsets from its own base (`add` adds the
+/// `lea` base back), so `target[i] = T + sext32(slot[i])`. Register linkage
+/// is exact: the `jmp` register is the `add`/`movsxd` destination, the `add`
+/// source is the `lea` destination, and the `movsxd` memory is
+/// `[base + index*4]` with zero displacement (typed iced-x86 facts). The
+/// compared register must alias the `movsxd` index, directly or through one
+/// `mov` copy. The guard bound fixes the entry count; every slot must
+/// validate or the site stays unresolved.
+fn resolve_pie_table_site(
+    arch: Arch,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<TableResolution> {
+    if arch != Arch::X86_64 {
+        return None;
+    }
+    let found = decoded.get(&site)?;
+    if found.insn.mnem != "jmp" {
+        return None;
+    }
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    if found.insn.branch_target.is_some() || found.insn.ops.len() != 1 {
+        return None;
+    }
+    let jmp_reg = found.insn.ops[0].clone();
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = function_owner(entries, site)?;
+    let preds = site_preds(decoded, entries, site, owner, MAX_TABLE_GUARD_BACKTRACK);
+    if preds.len() < 3 {
+        return None;
+    }
+    if preds[0].1.insn.mnem != "add"
+        || preds[1].1.insn.mnem != "movsxd"
+        || preds[2].1.insn.mnem != "lea"
+    {
+        return None;
+    }
+    let table = preds[2].1.insn.mem_target?;
+    if preds[2].1.insn.ops.len() != 2 {
+        return None;
+    }
+    let base_reg = preds[2].1.insn.ops[0].clone();
+    if preds[1].1.insn.ops.len() != 2 || preds[1].1.insn.ops[0] != jmp_reg {
+        return None;
+    }
+    if preds[0].1.insn.ops.len() != 2
+        || preds[0].1.insn.ops[0] != jmp_reg
+        || preds[0].1.insn.ops[1] != base_reg
+    {
+        return None;
+    }
+    let site_iced = x86_insn_at(space, site, 64)?;
+    if site_iced.mnemonic() != iced_x86::Mnemonic::Jmp
+        || x86_iced_num(site_iced.op_register(0)).is_none_or(|n| x86_reg_num(&jmp_reg) != Some(n))
+    {
+        return None;
+    }
+    let movsxd_iced = x86_insn_at(space, preds[1].0, 64)?;
+    if movsxd_iced.mnemonic() != iced_x86::Mnemonic::Movsxd
+        || movsxd_iced.memory_index_scale() != 4
+        || movsxd_iced.memory_displacement32() != 0
+    {
+        return None;
+    }
+    let mem_base = x86_iced_num(movsxd_iced.memory_base())?;
+    let mem_index = x86_iced_num(movsxd_iced.memory_index())?;
+    if x86_reg_num(&base_reg) != Some(mem_base) {
+        return None;
+    }
+    let (bound, cmp_reg) = guard_bound(decoded, entries, site, owner)?;
+    if !bound_in_range(bound) {
+        return None;
+    }
+    let cmp_num = x86_reg_num(&cmp_reg)?;
+    if !index_copy_present(&preds, mem_index, cmp_num) {
+        return None;
+    }
+    let mut targets = BTreeSet::new();
+    let mut slots = Vec::with_capacity(bound);
+    for i in 0..bound {
+        let slot = table.wrapping_add((i as u64).wrapping_mul(4));
+        let raw = space.file_bytes_at(slot, 4)?;
+        let off = i32::from_le_bytes(raw.try_into().ok()?);
+        let target = table.wrapping_add_signed(i64::from(off));
+        relative_slot_target(arch, space, entries, owner, target)?;
+        slots.push(slot);
+        targets.insert(target);
+    }
+    Some(TableResolution {
+        targets: targets.into_iter().collect(),
+        slots,
+    })
+}
+
+/// Check one site against the MSVC x64 switch shape, returning its targets.
+///
+/// ```text
+/// cmp eax, max; ja default
+/// mov ecx, [r8+rax*4+T_rva]; add rcx, r8; jmp rcx
+/// ```
+///
+/// The table holds 32-bit RVAs from the image base (`r8`); the displacement
+/// is the table RVA, so `table_va = image_base + disp` with `image_base`
+/// approximated as the lowest mapped address (exact for single-segment
+/// images and header-mapped PEs; anything else fails validation rather than
+/// guessing). Register linkage mirrors the PIE path: the `jmp` register is
+/// the `add` destination (32-bit `mov` alias accepted), the `add` source is
+/// the `mov` base, and the `mov` memory is `[base + index*4]` with a typed
+/// iced-x86 scale of 4. Guard-bound and exact-or-reject as above.
+fn resolve_msvc_table_site(
+    arch: Arch,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<TableResolution> {
+    if arch != Arch::X86_64 {
+        return None;
+    }
+    let found = decoded.get(&site)?;
+    if found.insn.mnem != "jmp" {
+        return None;
+    }
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    if found.insn.branch_target.is_some() || found.insn.ops.len() != 1 {
+        return None;
+    }
+    let jmp_reg = found.insn.ops[0].clone();
+    let jmp_num = x86_reg_num(&jmp_reg)?;
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = function_owner(entries, site)?;
+    let preds = site_preds(decoded, entries, site, owner, MAX_TABLE_GUARD_BACKTRACK);
+    if preds.len() < 2 {
+        return None;
+    }
+    if preds[0].1.insn.mnem != "add" || preds[1].1.insn.mnem != "mov" {
+        return None;
+    }
+    if preds[0].1.insn.ops.len() != 2 || preds[1].1.insn.ops.len() != 2 {
+        return None;
+    }
+    if x86_reg_num(&preds[0].1.insn.ops[0]) != Some(jmp_num) {
+        return None;
+    }
+    let base_reg = preds[0].1.insn.ops[1].clone();
+    let base_num = x86_reg_num(&base_reg)?;
+    if x86_reg_num(&preds[1].1.insn.ops[0]) != Some(jmp_num) {
+        return None;
+    }
+    let mov_iced = x86_insn_at(space, preds[1].0, 64)?;
+    if mov_iced.mnemonic() != iced_x86::Mnemonic::Mov || mov_iced.memory_index_scale() != 4 {
+        return None;
+    }
+    if x86_iced_num(mov_iced.memory_base()) != Some(base_num) {
+        return None;
+    }
+    let mem_index = x86_iced_num(mov_iced.memory_index())?;
+    let disp = mov_iced.memory_displacement32();
+    let image_base = space.all.iter().map(|s| s.vaddr).min()?;
+    let table = image_base.wrapping_add(u64::from(disp));
+    let (bound, cmp_reg) = guard_bound(decoded, entries, site, owner)?;
+    if !bound_in_range(bound) {
+        return None;
+    }
+    let cmp_num = x86_reg_num(&cmp_reg)?;
+    if !index_copy_present(&preds, mem_index, cmp_num) {
+        return None;
+    }
+    let mut targets = BTreeSet::new();
+    let mut slots = Vec::with_capacity(bound);
+    for i in 0..bound {
+        let slot = table.wrapping_add((i as u64).wrapping_mul(4));
+        let raw = space.file_bytes_at(slot, 4)?;
+        let rva = u32::from_le_bytes(raw.try_into().ok()?);
+        let target = image_base.wrapping_add(u64::from(rva));
+        relative_slot_target(arch, space, entries, owner, target)?;
+        slots.push(slot);
+        targets.insert(target);
+    }
+    Some(TableResolution {
+        targets: targets.into_iter().collect(),
+        slots,
+    })
+}
+
+/// Check one site against the ARM Thumb switch shape.
+///
+/// `tbb [pc, rN]` holds byte offsets, `tbh [pc, rN, lsl #1]` halfword
+/// offsets, both `target = base + 2 * value` with
+/// `base = (site + 4) & !3` (the table follows the 4-byte instruction).
+/// The compared register must equal the indexed register; the guard bound
+/// fixes the count. Every slot validates or the site stays unresolved.
+fn resolve_thumb_table_site(
+    arch: Arch,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<TableResolution> {
+    if arch != Arch::Thumb {
+        return None;
+    }
+    let found = decoded.get(&site)?;
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    let width = match found.insn.mnem.as_str() {
+        "tbb" => 1,
+        "tbh" => 2,
+        _ => return None,
+    };
+    if found.insn.ops.len() != 1 {
+        return None;
+    }
+    let inner = found.insn.ops[0].strip_prefix('[')?.strip_suffix(']')?;
+    let mut parts = inner.split(',').map(str::trim);
+    if parts.next() != Some("pc") {
+        return None;
+    }
+    let index_reg = parts.next()?.to_string();
+    match width {
+        1 => {
+            if parts.next().is_some() {
+                return None;
+            }
+        }
+        _ => {
+            if parts.next() != Some("lsl 1") || parts.next().is_some() {
+                return None;
+            }
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = function_owner(entries, site)?;
+    let (bound, cmp_reg) = guard_bound(decoded, entries, site, owner)?;
+    if cmp_reg != index_reg {
+        return None;
+    }
+    if !bound_in_range(bound) {
+        return None;
+    }
+    let table = site.wrapping_add(4) & !3;
+    let mut targets = BTreeSet::new();
+    let mut slots = Vec::with_capacity(bound);
+    for i in 0..bound {
+        let slot = table.wrapping_add((i as u64).wrapping_mul(width as u64));
+        let raw = space.file_bytes_at(slot, width)?;
+        let value: u64 = match width {
+            1 => u64::from(raw[0]),
+            _ => u64::from(u16::from_le_bytes(raw.try_into().ok()?)),
+        };
+        let target = table.wrapping_add(value.wrapping_mul(2));
+        relative_slot_target(arch, space, entries, owner, target)?;
+        slots.push(slot);
+        targets.insert(target);
+    }
+    Some(TableResolution {
+        targets: targets.into_iter().collect(),
+        slots,
+    })
+}
+
+/// Check one site against the AArch64 switch shape, returning its targets.
+///
+/// ```text
+/// cmp w0, max; b.hi default
+/// [mov w8, w0]
+/// adrp x9, JT; add x9, x9, #lo12; adr x10, base
+/// ldrb w11, [x9, x8]; add x10, x10, x11, lsl #2; br x10
+/// ```
+///
+/// (`ldrh` with 2-byte slots decodes the same way.) The table holds byte or
+/// halfword offsets scaled by 4: `target[i] = base + (slot[i] << 2`, where
+/// `base` is the `adr` target and the table base reuses
+/// [`crate::disasm::resolve_adrp_pair`]. Register linkage is by number
+/// (`xN`/`wN` alias); the `lsl #2` shift is the only accepted scale.
+/// Optional `mov` index copy and guard-bound exact-or-reject as above.
+fn resolve_aarch64_table_site(
+    arch: Arch,
+    space: &AddrSpace,
+    decoded: &BTreeMap<u64, Decoded>,
+    entries: &[u64],
+    site: u64,
+) -> Option<TableResolution> {
+    if arch != Arch::Aarch64 {
+        return None;
+    }
+    let found = decoded.get(&site)?;
+    if found.insn.mnem != "br" {
+        return None;
+    }
+    if !matches!(found.flow, Flow::Branch { target: None }) {
+        return None;
+    }
+    if found.insn.ops.len() != 1 {
+        return None;
+    }
+    let jmp_num = aarch64_reg_num(&found.insn.ops[0])?;
+    if entries.is_empty() {
+        return None;
+    }
+    let owner = function_owner(entries, site)?;
+    let preds = site_preds(decoded, entries, site, owner, MAX_TABLE_GUARD_BACKTRACK);
+    if preds.len() < 5 {
+        return None;
+    }
+    if preds[0].1.insn.mnem != "add" || preds[0].1.insn.ops.len() != 4 {
+        return None;
+    }
+    if aarch64_reg_num(&preds[0].1.insn.ops[0]) != Some(jmp_num)
+        || preds[0].1.insn.ops[3] != "lsl #2"
+    {
+        return None;
+    }
+    let base_num = aarch64_reg_num(&preds[0].1.insn.ops[1])?;
+    let slot_num = aarch64_reg_num(&preds[0].1.insn.ops[2])?;
+    let load = &preds[1].1.insn;
+    let width = match load.mnem.as_str() {
+        "ldrb" => 1,
+        "ldrh" => 2,
+        _ => return None,
+    };
+    if load.ops.len() != 2 || aarch64_reg_num(&load.ops[0]) != Some(slot_num) {
+        return None;
+    }
+    let inner = load.ops[1].strip_prefix('[')?.strip_suffix(']')?;
+    let mut parts = inner.split(',').map(str::trim);
+    let table_reg = parts.next()?.to_string();
+    let table_num = aarch64_reg_num(&table_reg)?;
+    let index_name = parts.next()?.to_string();
+    let index_num = aarch64_reg_num(&index_name)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let adr = &preds[2].1.insn;
+    if adr.mnem != "adr" || adr.ops.len() != 2 || aarch64_reg_num(&adr.ops[0]) != Some(base_num) {
+        return None;
+    }
+    let base = adr.mem_target?;
+    let add = &preds[3].1.insn;
+    let adrp = &preds[4].1.insn;
+    if add.mnem != "add"
+        || add.ops.len() != 3
+        || aarch64_reg_num(&add.ops[0]) != Some(table_num)
+        || aarch64_reg_num(&add.ops[1]) != Some(table_num)
+    {
+        return None;
+    }
+    if adrp.mnem != "adrp"
+        || adrp.ops.len() != 2
+        || aarch64_reg_num(&adrp.ops[0]) != Some(table_num)
+    {
+        return None;
+    }
+    let table = crate::disasm::resolve_adrp_pair(adrp, add)?;
+    let (bound, cmp_reg) = guard_bound(decoded, entries, site, owner)?;
+    if !bound_in_range(bound) {
+        return None;
+    }
+    let cmp_num = aarch64_reg_num(&cmp_reg)?;
+    if index_num != cmp_num
+        && !preds.iter().any(|(_, d)| {
+            d.insn.mnem == "mov"
+                && d.insn.ops.len() == 2
+                && aarch64_reg_num(&d.insn.ops[0]) == Some(index_num)
+                && aarch64_reg_num(&d.insn.ops[1]) == Some(cmp_num)
+        })
+    {
+        return None;
+    }
+    let space_table = table;
+    let mut targets = BTreeSet::new();
+    let mut slots = Vec::with_capacity(bound);
+    for i in 0..bound {
+        let slot = space_table.wrapping_add((i as u64).wrapping_mul(width as u64));
+        let raw = space.file_bytes_at(slot, width)?;
+        let value: u64 = match width {
+            1 => u64::from(raw[0]),
+            _ => u64::from(u16::from_le_bytes(raw.try_into().ok()?)),
+        };
+        let target = base.wrapping_add(value.wrapping_mul(4));
+        relative_slot_target(arch, space, entries, owner, target)?;
+        slots.push(slot);
+        targets.insert(target);
+    }
+    Some(TableResolution {
+        targets: targets.into_iter().collect(),
+        slots,
+    })
+}
+
+/// Resolve indirect jumps over the walker's `UnresolvedIndirectJump` sites.
+///
+/// Each site is checked once, in order, via [`resolve_indirect_site`]
+/// (single-slot, raw x86 only), [`resolve_table_site`] (absolute x86
+/// tables, any format), [`resolve_pie_table_site`] (GCC/Clang PIE x86-64),
+/// [`resolve_msvc_table_site`] (MSVC x64), [`resolve_thumb_table_site`]
+/// (`tbb`/`tbh`), and [`resolve_aarch64_table_site`] (`adrp`/`adr` relative
+/// tables); a pass decodes each target's continuation with the existing
+/// [`Walker::run`] (so case bodies decode normally) and registers the
+/// targets for block splitting. Continuation decoding can surface further
+/// indirect sites, which join the same ascending worklist. Single-slot
+/// sites contribute at most one edge ([`MAX_INFERRED_PER_SITE`], singleton
+/// by construction); table sites contribute up to
+/// [`MAX_TABLE_ENTRIES_PER_SITE`] unique edges. Past `max_edges` (normally
+/// [`MAX_INFERRED_EDGES`]) sites stay unresolved with `truncated` set and
+/// each omission counted, never silently clipped.
 ///
 /// # Errors
 /// [`Error::Limit`] when continuation decoding exceeds the analysis
@@ -3696,14 +4316,6 @@ fn resolve_indirect_jumps(
 ) -> Result<InferredJumps> {
     let mut pairs: Vec<(u64, u64)> = Vec::new();
     let mut slots: Vec<(u64, u64)> = Vec::new();
-    if indirect_slot_width(arch, format).is_none() {
-        return Ok(InferredJumps {
-            pairs,
-            slots,
-            truncated: false,
-            omitted: 0,
-        });
-    }
     let mut processed: BTreeSet<u64> = BTreeSet::new();
     // Ascending worklist (the old scan's `next()` pick was the smallest
     // unprocessed address): one initial pass over diagnostics, then only
@@ -3737,8 +4349,11 @@ fn resolve_indirect_jumps(
                 }
             }
             walk.jump_targets.insert(target);
-        } else if let Some(table) =
-            resolve_table_site(arch, format, space, &walk.decoded, entries, site)
+        } else if let Some(table) = resolve_table_site(arch, space, &walk.decoded, entries, site)
+            .or_else(|| resolve_pie_table_site(arch, space, &walk.decoded, entries, site))
+            .or_else(|| resolve_msvc_table_site(arch, space, &walk.decoded, entries, site))
+            .or_else(|| resolve_thumb_table_site(arch, space, &walk.decoded, entries, site))
+            .or_else(|| resolve_aarch64_table_site(arch, space, &walk.decoded, entries, site))
         {
             let cost = table.targets.len();
             if pairs.len().saturating_add(cost) > max_edges {
@@ -3761,8 +4376,8 @@ fn resolve_indirect_jumps(
         }
     }
     // Unique by construction: single-slot sites resolve once, table
-    // targets are a per-site set, and the two shapes own disjoint sites
-    // (`mem_target` and `table_base` never coincide).
+    // targets are a per-site set, and each site takes the first matching
+    // shape.
     debug_assert_eq!(pairs.iter().collect::<BTreeSet<_>>().len(), pairs.len());
     Ok(InferredJumps {
         pairs,
