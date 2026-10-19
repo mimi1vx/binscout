@@ -256,6 +256,7 @@ fn fresh_db_bootstraps_full_snapshot() {
             diagnostics_omitted: 0,
             inferred_truncated: false,
             inferred_omitted: 0,
+            debug: db::DebugId::default(),
             seeds_hash: 0,
         };
         let ann = Annotation {

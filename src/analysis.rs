@@ -55,7 +55,7 @@ pub const MAX_POINTER_SEEDS: usize = 10_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 13;
+pub const ANALYSIS_REVISION: u32 = 14;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -247,6 +247,12 @@ pub enum DiscoveryReason {
     /// [`AnalyzeOptions::pointer_scan`], never on by default.
     #[serde(alias = "Pointer")]
     Pointer,
+    /// Debug-info address (DWARF `DW_TAG_subprogram` or PDB public /
+    /// procedure row) resolving to executable code.
+    ///
+    /// Compiler-emitted starts and names; exact like symbol-table seeds.
+    #[serde(alias = "Debug")]
+    Debug,
 }
 
 /// Decode mode of one user-defined function seed (`define-func --mode`).
@@ -550,8 +556,8 @@ impl BasicBlock {
 pub struct Function {
     /// Function entry address; the stable key.
     pub entry: u64,
-    /// Export, symbol, stub-import, PLT (`sym@plt`), or thunk name when
-    /// one resolves to `entry`.
+    /// Export, debug-info, symbol, stub-import, PLT (`sym@plt`), or thunk
+    /// name when one resolves to `entry`.
     pub name: Option<String>,
     /// Basic blocks keyed by start address.
     pub blocks: BTreeMap<u64, BasicBlock>,
@@ -2743,6 +2749,13 @@ fn authoritative_seeds(
             push_seed(&mut seeds, &mut diags, bin.arch, *addr);
         }
     }
+    // Debug info (DWARF subprograms, PDB publics/procedures): exact
+    // compiler-emitted starts.
+    for f in &bin.debug_funcs {
+        if seeds.len() < MAX_SEEDS && space.code_bytes(f.address).is_some() {
+            push_seed(&mut seeds, &mut diags, bin.arch, f.address);
+        }
+    }
     // Pointer scan (opt-in): aligned data pointers to decodable code.
     if options.pointer_scan {
         for addr in pointer_seeds(space, bin) {
@@ -3922,6 +3935,11 @@ pub fn analyze_with_options(
         .iter()
         .map(|a| normalize_arm_seed(arch, *a).0)
         .collect();
+    let debug_addrs: BTreeSet<u64> = bin
+        .debug_funcs
+        .iter()
+        .map(|f| normalize_arm_seed(arch, f.address).0)
+        .collect();
     let pointer_addrs: BTreeSet<u64> = if options.pointer_scan {
         pointer_seeds(&space, bin).into_iter().collect()
     } else {
@@ -3966,6 +3984,9 @@ pub fn analyze_with_options(
         }
         if starts_addrs.contains(e) {
             r.insert(DiscoveryReason::FunctionStarts);
+        }
+        if debug_addrs.contains(e) {
+            r.insert(DiscoveryReason::Debug);
         }
         if pointer_addrs.contains(e) {
             r.insert(DiscoveryReason::Pointer);
@@ -4081,19 +4102,24 @@ pub fn analyze_with_options(
     }
     flush(&mut cur_start, &mut cur, &mut blocks);
 
-    // Export names for entries, then symbol-table names, then import
-    // addresses (Mach-O stubs; PE slots are data and never collide).
-    // ELF stubs take `sym@plt` from the stub map below. Precedence per
-    // address: export > symbol > import; annotation renames win over all
-    // three at display time (see `Project::function_name`). Export
-    // addresses normalize like seeds so an odd ARM export still names
-    // its function.
+    // Export names for entries, then debug-info names, then symbol-table
+    // names, then import addresses (Mach-O stubs; PE slots are data and
+    // never collide). ELF stubs take `sym@plt` from the stub map below.
+    // Precedence per address: export > debug > symbol > import; annotation
+    // renames win over all four at display time (see
+    // `Project::function_name`). Export addresses normalize like seeds so
+    // an odd ARM export still names its function.
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     for exp in &bin.exports {
         if let Some(addr) = exp.address {
             names
                 .entry(normalize_arm_seed(arch, addr).0)
                 .or_insert_with(|| exp.name.clone());
+        }
+    }
+    for f in &bin.debug_funcs {
+        if let Some(name) = &f.name {
+            names.entry(f.address).or_insert_with(|| name.clone());
         }
     }
     for sym in &bin.symbols {
@@ -4724,6 +4750,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
         }
     }

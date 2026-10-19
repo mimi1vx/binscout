@@ -36,7 +36,7 @@ use crate::disasm::{Disassembler, Insn, PartialDisasm, resolve_adrp_pair};
 use crate::error::{Error, Result};
 use crate::flirt::FlirtHint;
 use crate::loader::strings::{Encoding, StringHit};
-use crate::loader::{LoadedBinary, RawOptions, load_raw, load_raw_vec, load_with_slice};
+use crate::loader::{LoadedBinary, RawOptions, load_raw, load_raw_vec, load_with_debug};
 use crate::search::{ByteMatch, BytePattern};
 
 /// Crate version, also served via CLI `--version` and MCP `project_info`.
@@ -108,28 +108,47 @@ pub fn parse_raw_options(
     }))
 }
 
+/// Explicit debug inputs for an open: local PDB and external DWARF files.
+///
+/// Both paths open as local files and read under the same input cap as the
+/// binary; a URL-looking value is just a (nonexistent) local path, never a
+/// fetch. The inputs join the snapshot identity (see
+/// [`crate::db::DebugId`]), so the same sidecar opened with and without
+/// them re-analyzes instead of replaying stale layouts.
+#[derive(Debug, Clone, Default)]
+pub struct DebugOptions {
+    /// `--pdb` path: PDB bytes for a PE binary (never fetched).
+    pub pdb: Option<PathBuf>,
+    /// `--debug-file` path: external linked DWARF object.
+    pub debug_file: Option<PathBuf>,
+}
+
 /// Open a binary with an optional explicit raw mapping, an optional fat
-/// Mach-O slice selection, and an optional explicit DB path.
+/// Mach-O slice selection, optional explicit debug inputs, and an optional
+/// explicit DB path.
 ///
 /// Shared by the CLI and MCP so every binary-taking operation interprets
 /// options identically: `raw` `Some` opens the explicit mapping with no
 /// fallback, `fat_arch` `Some` analyzes that fat slice (passed through
 /// unchanged to [`crate::loader::load_with_slice`]; missing/unknown
 /// selections on fat input error listing the available archs, and any
-/// selection on thin input errors), and both `None` preserves auto
-/// detection (container parse with raw x86-64-at-0 fallback). Raw and fat
+/// selection on thin input errors), `debug` attaches DWARF/PDB function
+/// rows (see [`DebugOptions`]), and `None` preserves auto detection
+/// (container parse with raw x86-64-at-0 fallback, no debug files). Raw and fat
 /// selections are exclusive. Reads never save or create the sidecar.
 ///
 /// # Errors
 /// Same as [`Project::open`] plus raw-mapping validation from
 /// [`crate::loader::load_raw`], plus [`Error::Invalid`] when raw and fat
-/// selections are combined, plus [`Error::Invalid`] when the DB path
+/// selections are combined, plus [`Error::Io`]/[`Error::NotFound`] when a
+/// debug file cannot be read, plus [`Error::Invalid`] when the DB path
 /// resolves to the analyzed binary.
 pub fn open_mapped(
     binary: &Path,
     db: Option<&Path>,
     raw: Option<RawOptions>,
     fat_arch: Option<&str>,
+    debug: &DebugOptions,
 ) -> Result<Project> {
     let owned;
     let db_path = match db {
@@ -144,16 +163,28 @@ pub fn open_mapped(
         (Some(_), Some(_)) => Err(Error::Invalid(
             "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)".to_string(),
         )),
-        (Some(opts), None) => Project::open_raw(binary, db_path, opts),
-        (None, Some(arch)) => Project::open_fat(binary, db_path, arch),
-        (None, None) => Project::open_with_db(binary, db_path),
+        // Raw plus `--pdb` is rejected: RVAs need an image base the
+        // explicit mapping does not name. Raw plus `--debug-file` flows
+        // through the debug-aware open below.
+        (Some(opts), None) => {
+            if debug.pdb.is_some() {
+                return Err(Error::Invalid(
+                    "--pdb needs a container binary, not explicit --raw (no image base)"
+                        .to_string(),
+                ));
+            }
+            Project::open_inner(binary, db_path, Some(opts), None, debug)
+        }
+        (None, Some(arch)) => Project::open_inner(binary, db_path, None, Some(arch), debug),
+        (None, None) => Project::open_inner(binary, db_path, None, None, debug),
     }
 }
 
 /// [`open_mapped`] for loader-only commands: explicit DB path (or the
-/// default sidecar), explicit raw mapping, and fat Mach-O slice selection
-/// interpreted identically, returning [`LoaderOpened`] so cache hits skip
-/// instruction re-decode (see [`Project::open_loader_only`]).
+/// default sidecar), explicit raw mapping, fat Mach-O slice selection, and
+/// explicit debug inputs interpreted identically, returning
+/// [`LoaderOpened`] so cache hits skip instruction re-decode (see
+/// [`Project::open_loader_only`]).
 ///
 /// # Errors
 /// Same as [`open_mapped`].
@@ -162,6 +193,7 @@ pub fn open_mapped_loader_only(
     db: Option<&Path>,
     raw: Option<RawOptions>,
     fat_arch: Option<&str>,
+    debug: &DebugOptions,
 ) -> Result<LoaderOpened> {
     let owned;
     let db_path = match db {
@@ -176,7 +208,7 @@ pub fn open_mapped_loader_only(
         (Some(_), Some(_)) => Err(Error::Invalid(
             "--raw and --fat-arch are exclusive (or MCP raw with fat_arch)".to_string(),
         )),
-        _ => Project::open_loader_only(binary, db_path, raw, fat_arch),
+        _ => Project::open_loader_only(binary, db_path, raw, fat_arch, debug),
     }
 }
 
@@ -238,10 +270,10 @@ fn reject_db_is_binary(binary: &Path, db_path: &Path) -> Result<()> {
 /// effective loader mapping, and the read-only snapshot lookup.
 ///
 /// The snapshot read is metadata-first over a read-only handle: cache
-/// identity covers content hash plus SHA-256 and size, loader mapping, and
-/// analysis revision before any layout replay (see `db::load_cached`), and
-/// the read-only open itself costs nothing proportional to the file. Reads
-/// never save and never create the sidecar.
+/// identity covers content hash plus SHA-256 and size, loader mapping,
+/// explicit debug inputs, and analysis revision before any layout replay
+/// (see `db::load_cached`), and the read-only open itself costs nothing
+/// proportional to the file. Reads never save and never create the sidecar.
 ///
 /// SHA-256 is computed only for a tentative match: the cheap identity
 /// (schema version, content hash, size, mapping, analysis revision) is
@@ -256,6 +288,16 @@ struct OpenInputs {
     size: u64,
     mapping: db::StoredMapping,
     cached: Option<db::Snapshot>,
+    debug: OpenDebug,
+}
+
+/// Explicit debug files read for one open: identity plus bytes.
+///
+/// The bytes feed analysis on a snapshot miss and are dropped from memory
+/// once the open completes; the id always joins the cache identity.
+struct OpenDebug {
+    id: db::DebugId,
+    inputs: crate::loader::debuginfo::DebugInputs,
 }
 
 /// Cheap snapshot identity without the wide hash: mirrors the
@@ -266,12 +308,14 @@ fn snapshot_fast_matches(
     hash: u64,
     size: u64,
     mapping: &db::StoredMapping,
+    debug: &db::DebugId,
 ) -> bool {
     meta.version == db::SCHEMA_VERSION
         && meta.content_hash == hash
         && meta.size == size
         && meta.mapping.as_ref() == Some(mapping)
         && meta.analysis_rev == Some(db::ANALYSIS_REVISION)
+        && meta.debug == *debug
 }
 
 /// Cache a computed SHA-256 digest, or defer it: an empty digest means the
@@ -290,6 +334,7 @@ fn read_open_inputs(
     db_path: &Path,
     raw: Option<RawOptions>,
     fat_arch: Option<&str>,
+    debug: &DebugOptions,
 ) -> Result<OpenInputs> {
     reject_db_is_binary(binary, db_path)?;
     // Single-open bounded read: one handle, chunked with checked
@@ -298,6 +343,7 @@ fn read_open_inputs(
     let hash = db::content_hash(&bytes);
     let size = bytes.len() as u64;
     let mapping = mapping_for(raw, fat_arch)?;
+    let debug = read_debug_inputs(debug)?;
     let (cached, sha256) = if db_path.exists() {
         match db::open_db_read_only(db_path) {
             Ok(db) => {
@@ -306,7 +352,7 @@ fn read_open_inputs(
                 // always carry a real one), so the mismatch path below
                 // reproduces the stale/error outcomes exactly.
                 let tentative = match db::read_meta(&db)? {
-                    Some(meta) => snapshot_fast_matches(&meta, hash, size, &mapping),
+                    Some(meta) => snapshot_fast_matches(&meta, hash, size, &mapping, &debug.id),
                     None => false,
                 };
                 let sha256 = if tentative {
@@ -314,7 +360,7 @@ fn read_open_inputs(
                 } else {
                     String::new()
                 };
-                let snap = db::load_cached(&db, hash, &sha256, size, &mapping)?;
+                let snap = db::load_cached(&db, hash, &sha256, size, &mapping, &debug.id)?;
                 (Some(snap), sha256)
             }
             // Raced with a concurrent sidecar deletion: read as absent.
@@ -331,7 +377,43 @@ fn read_open_inputs(
         size,
         mapping,
         cached,
+        debug,
     })
+}
+
+/// Read explicit debug files for one open: local paths only, bounded like
+/// the binary.
+///
+/// A missing or unreadable file errors here (never a silent no-debug open);
+/// a URL-looking value is just a nonexistent local path, never a fetch.
+/// Identity is the content hash plus size per file, so identical bytes
+/// under different paths share snapshots.
+///
+/// # Errors
+/// [`Error::NotFound`] when a path does not exist, [`Error::Limit`] past
+/// the input cap, [`Error::Io`] on I/O failure.
+fn read_debug_inputs(debug: &DebugOptions) -> Result<OpenDebug> {
+    let mut id = db::DebugId::default();
+    let mut inputs = crate::loader::debuginfo::DebugInputs::none();
+    if let Some(path) = &debug.pdb {
+        let bytes = read_input_bytes(path)?;
+        id.pdb_hash = db::content_hash(&bytes);
+        id.pdb_size = bytes.len() as u64;
+        inputs.pdb = Some(crate::loader::debuginfo::DebugFile {
+            bytes,
+            label: format!("--pdb {}", path.display()),
+        });
+    }
+    if let Some(path) = &debug.debug_file {
+        let bytes = read_input_bytes(path)?;
+        id.dwarf_hash = db::content_hash(&bytes);
+        id.dwarf_size = bytes.len() as u64;
+        inputs.external = Some(crate::loader::debuginfo::DebugFile {
+            bytes,
+            label: format!("--debug-file {}", path.display()),
+        });
+    }
+    Ok(OpenDebug { id, inputs })
 }
 
 /// Filters for [`Project::functions_filtered`]: every present field must match.
@@ -903,6 +985,7 @@ impl LoaderProject {
             inferred_truncated: self.inferred_truncated,
             inferred_omitted: self.inferred_omitted,
             analysis_revision: crate::analysis::ANALYSIS_REVISION,
+            debug_funcs: self.binary.debug_funcs.len(),
         }
     }
 
@@ -956,6 +1039,7 @@ impl LoaderProject {
             "inferred_truncated": self.inferred_truncated,
             "inferred_omitted": self.inferred_omitted,
             "analysis_revision": crate::analysis::ANALYSIS_REVISION,
+            "debug_funcs": self.binary.debug_funcs.len(),
         }))
     }
 
@@ -1412,6 +1496,10 @@ pub struct Project {
     annotations: BTreeMap<u64, Annotation>,
     func_seeds: BTreeMap<u64, crate::db::FuncSeed>,
     mapping: db::StoredMapping,
+    /// Debug inputs the in-memory analysis was taken over (see
+    /// [`crate::db::DebugId`]): persisted with the snapshot so a later open
+    /// with different inputs re-analyzes instead of replaying stale layouts.
+    debug_id: db::DebugId,
     stale_annotations_dropped: usize,
     stale_warning: Option<String>,
     /// Whether the sidecar already holds this exact snapshot: set when the
@@ -1441,8 +1529,8 @@ impl Project {
     /// x86-64 at base 0 so fixture blobs and shellcode open without options;
     /// explicit bases/arches go through [`Project::open_raw`]. Reads the
     /// sidecar when present: a matching content hash plus SHA-256 and size,
-    /// loader mapping, and
-    /// analysis revision loads the cached snapshot, a mismatch re-analyzes
+    /// loader mapping, explicit debug inputs, and analysis revision loads
+    /// the cached snapshot, a mismatch re-analyzes
     /// while keeping stored annotations only when
     /// [`db::stale_carry_plausible`] holds
     /// (same path or same arch/format/entry). An unrelated sidecar's rows
@@ -1472,10 +1560,31 @@ impl Project {
 
     /// [`Project::open`] with an explicit DB path (keeps fixture dirs clean).
     ///
+    /// Opens without explicit debug files; use [`open_mapped`] for `--pdb`
+    /// / `--debug-file` inputs.
+    ///
     /// # Errors
     /// Same as [`Project::open`].
     pub fn open_with_db(binary: &Path, db_path: &Path) -> Result<Self> {
-        Self::open_inner(binary, db_path, None, None)
+        Self::open_inner(binary, db_path, None, None, &DebugOptions::default())
+    }
+
+    /// [`Project::open_with_db`] with explicit debug inputs.
+    ///
+    /// [`open_mapped`] is the caller-facing entry; this is its
+    /// auto-detection arm, split out so tests and embedders can pass
+    /// [`DebugOptions`] without CLI flags.
+    ///
+    /// # Errors
+    /// Same as [`Project::open`], plus [`Error::Io`]/[`Error::NotFound`]
+    /// when a debug file cannot be read.
+    pub fn open_with_db_and_debug(
+        binary: &Path,
+        db_path: &Path,
+        debug: &DebugOptions,
+    ) -> Result<Self> {
+        let inputs = read_open_inputs(binary, db_path, None, None, debug)?;
+        Self::open_inner_from_inputs(binary, db_path, None, None, inputs)
     }
 
     /// Open a raw blob with explicit mapping options plus explicit DB path.
@@ -1483,12 +1592,13 @@ impl Project {
     /// The mapping is part of the cache identity: same bytes opened with
     /// different arch/base/entry (or auto vs explicit) never share cached
     /// layouts, and populated annotation sidecars under another mapping
-    /// require a separate DB path.
+    /// require a separate DB path. Opens without explicit debug files; use
+    /// [`open_mapped`] for `--pdb` / `--debug-file` inputs.
     ///
     /// # Errors
     /// Same as [`Project::open`].
     pub fn open_raw(binary: &Path, db_path: &Path, opts: RawOptions) -> Result<Self> {
-        Self::open_inner(binary, db_path, Some(opts), None)
+        Self::open_inner(binary, db_path, Some(opts), None, &DebugOptions::default())
     }
 
     /// Open the selected slice of a fat (universal) Mach-O binary plus
@@ -1500,20 +1610,28 @@ impl Project {
     /// `lipo` aliases); supplying it for thin input errors. The selection is
     /// part of the cache identity: each slice keeps its own snapshot, and
     /// populated annotation sidecars under another mapping require a
-    /// separate DB path.
+    /// separate DB path. Opens without explicit debug files; use
+    /// [`open_mapped`] for `--pdb` / `--debug-file` inputs.
     ///
     /// # Errors
     /// Same as [`Project::open`], plus [`Error::Invalid`] when fat input
     /// has no usable selection (missing, unknown, or ambiguous).
     pub fn open_fat(binary: &Path, db_path: &Path, fat_arch: &str) -> Result<Self> {
-        Self::open_inner(binary, db_path, None, Some(fat_arch))
+        Self::open_inner(
+            binary,
+            db_path,
+            None,
+            Some(fat_arch),
+            &DebugOptions::default(),
+        )
     }
 
     /// Open for loader-only commands, skipping instruction re-decode on a
     /// cache hit.
     ///
     /// Shares the [`Project::open_with_db`] cache identity (content hash
-    /// plus SHA-256 and size, loader mapping, analysis revision) over an
+    /// plus SHA-256 and size, loader mapping, explicit debug inputs,
+    /// analysis revision) over an
     /// explicit DB path. A matching snapshot returns
     /// [`LoaderOpened::Cached`]: the binary plus stored counts, strings,
     /// annotations, and seeds, with outcome counts derived from the stored
@@ -1530,8 +1648,9 @@ impl Project {
         db_path: &Path,
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
+        debug: &DebugOptions,
     ) -> Result<LoaderOpened> {
-        let inputs = read_open_inputs(binary, db_path, raw, fat_arch)?;
+        let inputs = read_open_inputs(binary, db_path, raw, fat_arch, debug)?;
         let OpenInputs {
             bytes,
             hash,
@@ -1539,6 +1658,7 @@ impl Project {
             size,
             mapping,
             cached,
+            debug,
         } = inputs;
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
@@ -1550,7 +1670,7 @@ impl Project {
                 } else {
                     sha256
                 };
-                let loaded = reload_binary(bytes, raw, fat_arch)?;
+                let loaded = reload_binary(bytes, raw, fat_arch, &debug.inputs)?;
                 let db::Loaded {
                     functions,
                     xrefs,
@@ -1591,6 +1711,7 @@ impl Project {
                 bytes,
                 raw,
                 fat_arch,
+                debug,
                 hash,
                 sha256,
                 size,
@@ -1604,6 +1725,7 @@ impl Project {
                 bytes,
                 raw,
                 fat_arch,
+                debug,
                 hash,
                 sha256,
                 size,
@@ -1619,18 +1741,32 @@ impl Project {
         db_path: &Path,
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
+        debug: &DebugOptions,
     ) -> Result<Self> {
-        let inputs = read_open_inputs(binary, db_path, raw, fat_arch)?;
+        let inputs = read_open_inputs(binary, db_path, raw, fat_arch, debug)?;
+        Self::open_inner_from_inputs(binary, db_path, raw, fat_arch, inputs)
+    }
+
+    /// [`open_inner`] over already-read inputs, so debug-aware callers
+    /// share the snapshot replay path exactly.
+    fn open_inner_from_inputs(
+        binary: &Path,
+        db_path: &Path,
+        raw: Option<RawOptions>,
+        fat_arch: Option<&str>,
+        inputs: OpenInputs,
+    ) -> Result<Self> {
         let bytes = inputs.bytes;
         let hash = inputs.hash;
         let sha256 = inputs.sha256;
         let size = inputs.size;
         let mapping = inputs.mapping;
         let cached = inputs.cached;
+        let debug = inputs.debug;
 
         match cached {
             Some(db::Snapshot::Hit(hit)) => {
-                let loaded = reload_binary(bytes, raw, fat_arch)?;
+                let loaded = reload_binary(bytes, raw, fat_arch, &debug.inputs)?;
                 let db::Loaded {
                     arch,
                     functions,
@@ -1669,6 +1805,7 @@ impl Project {
                     annotations,
                     func_seeds: seeds,
                     mapping,
+                    debug_id: debug.id,
                     stale_annotations_dropped: 0,
                     stale_warning: None,
                     snapshot_fresh: AtomicBool::new(true),
@@ -1684,6 +1821,7 @@ impl Project {
                 bytes,
                 raw,
                 fat_arch,
+                debug,
                 hash,
                 sha256,
                 size,
@@ -1697,6 +1835,7 @@ impl Project {
                 bytes,
                 raw,
                 fat_arch,
+                debug,
                 hash,
                 sha256,
                 size,
@@ -1726,6 +1865,7 @@ impl Project {
         bytes: Vec<u8>,
         raw: Option<RawOptions>,
         fat_arch: Option<&str>,
+        debug: OpenDebug,
         hash: u64,
         sha256: String,
         size: u64,
@@ -1735,10 +1875,28 @@ impl Project {
     ) -> Result<Self> {
         let mapping = mapping_for(raw, fat_arch)?;
         let loaded = if let Some(opts) = raw {
+            if let Some(pdb) = &debug.inputs.pdb {
+                return Err(Error::Invalid(format!(
+                    "{}: PDB input needs a container binary, not explicit --raw (no image base)",
+                    pdb.label
+                )));
+            }
             // Move the read buffer into the raw segment: no second copy.
-            load_raw_vec(bytes, opts)?
+            let mut loaded = load_raw_vec(bytes, opts)?;
+            if let Some(ext) = &debug.inputs.external {
+                let mut meta_bytes: u64 = 0;
+                let funcs = crate::loader::debuginfo::dwarf_funcs(
+                    &ext.bytes,
+                    &ext.label,
+                    loaded.arch,
+                    &mut meta_bytes,
+                )?;
+                loaded.debug_funcs =
+                    crate::loader::filter_debug_funcs(funcs, &loaded.sections, &loaded.segments);
+            }
+            loaded
         } else {
-            let loaded = load_or_raw(&bytes, fat_arch)?;
+            let loaded = load_or_raw(&bytes, fat_arch, &debug.inputs)?;
             // The loader owns its bytes from here on (segments hold the
             // file-backed ranges, sections are metadata over them); drop
             // the read buffer so containers hold the input once.
@@ -1785,6 +1943,7 @@ impl Project {
             annotations,
             func_seeds: seeds,
             mapping,
+            debug_id: debug.id,
             stale_annotations_dropped,
             stale_warning,
             snapshot_fresh: AtomicBool::new(false),
@@ -1854,6 +2013,7 @@ impl Project {
             diagnostics_omitted: analysis.diagnostics.omitted,
             inferred_truncated: analysis.diagnostics.inferred_truncated,
             inferred_omitted: analysis.diagnostics.inferred_omitted,
+            debug: self.debug_id,
         })
     }
 
@@ -2055,6 +2215,7 @@ impl Project {
             inferred_truncated: self.analysis.diagnostics.inferred_truncated,
             inferred_omitted: self.analysis.diagnostics.inferred_omitted,
             analysis_revision: crate::analysis::ANALYSIS_REVISION,
+            debug_funcs: self.binary.debug_funcs.len(),
         }
     }
 
@@ -2110,6 +2271,7 @@ impl Project {
             "inferred_truncated": self.analysis.diagnostics.inferred_truncated,
             "inferred_omitted": self.analysis.diagnostics.inferred_omitted,
             "analysis_revision": crate::analysis::ANALYSIS_REVISION,
+            "debug_funcs": self.binary.debug_funcs.len(),
         }))
     }
 
@@ -2258,8 +2420,9 @@ impl Project {
     }
 
     /// Display name of a function: annotation rename wins over the
-    /// analysis name (export > symbol-table > stub import, with ELF PLT
-    /// stubs as `sym@plt` and PE import thunks under the bare name).
+    /// analysis name (export > debug-info > symbol-table > stub import,
+    /// with ELF PLT stubs as `sym@plt` and PE import thunks under the
+    /// bare name).
     #[must_use]
     pub fn function_name(&self, entry: u64) -> Option<String> {
         if let Some(n) = self
@@ -4663,15 +4826,30 @@ pub fn parse_bytes_endian(s: &str) -> Result<BytesEndian> {
 /// Re-read the binary bytes for a hash-matching cached snapshot.
 ///
 /// Raw blobs need their mapping options again; containers re-parse with the
-/// same fat slice selection.
+/// same fat slice selection and explicit debug files.
 fn reload_binary(
     bytes: Vec<u8>,
     raw: Option<RawOptions>,
     fat_arch: Option<&str>,
+    debug: &crate::loader::debuginfo::DebugInputs,
 ) -> Result<LoadedBinary> {
     match raw {
-        Some(opts) => load_raw_vec(bytes, opts),
-        None => load_or_raw(&bytes, fat_arch),
+        Some(opts) => {
+            let mut bin = load_raw_vec(bytes, opts)?;
+            if let Some(ext) = &debug.external {
+                let mut meta_bytes: u64 = 0;
+                let funcs = crate::loader::debuginfo::dwarf_funcs(
+                    &ext.bytes,
+                    &ext.label,
+                    bin.arch,
+                    &mut meta_bytes,
+                )?;
+                bin.debug_funcs =
+                    crate::loader::filter_debug_funcs(funcs, &bin.sections, &bin.segments);
+            }
+            Ok(bin)
+        }
+        None => load_or_raw(&bytes, fat_arch, debug),
     }
 }
 
@@ -4748,20 +4926,28 @@ fn read_stream_capped(
 
 /// Container parse with raw x86-64 fallback for unrecognized bytes.
 ///
-/// `fat_arch` passes through to [`load_with_slice`](crate::loader::load_with_slice):
+/// `fat_arch` passes through to [`load_with_debug`](crate::loader::load_with_debug):
 /// it selects the slice for fat input (missing/unknown selections error
 /// listing the available archs) and errors for thin containers. An
 /// explicit selection also disables the raw fallback, so unrecognized
 /// bytes with a selection report the parse error instead of silently
-/// opening as raw. Only [`Error::Invalid`] on unrecognized input without
-/// a selection falls back; recognized containers that fail to parse (LE
-/// included) report the parse error, and [`Error::Limit`]/
-/// [`Error::Unsupported`] propagate unchanged. LE images that parse flow
-/// to analysis as x86_32.
-fn load_or_raw(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
-    match load_with_slice(bytes, fat_arch) {
+/// opening as raw. Explicit debug files disable the fallback the same way:
+/// `--pdb` or `--debug-file` with unrecognized bytes errors instead of
+/// silently analyzing without them. Only [`Error::Invalid`] on
+/// unrecognized input without a selection and without debug files falls
+/// back; recognized containers that fail to parse (LE included) report the
+/// parse error, and [`Error::Limit`]/[`Error::Unsupported`] propagate
+/// unchanged. LE images that parse flow to analysis as x86_32.
+fn load_or_raw(
+    bytes: &[u8],
+    fat_arch: Option<&str>,
+    debug: &crate::loader::debuginfo::DebugInputs,
+) -> Result<LoadedBinary> {
+    match load_with_debug(bytes, fat_arch, debug) {
         Ok(bin) => Ok(bin),
-        Err(Error::Invalid(_)) if fat_arch.is_none() && !crate::loader::is_recognized(bytes) => {
+        Err(Error::Invalid(_))
+            if fat_arch.is_none() && debug.is_empty() && !crate::loader::is_recognized(bytes) =>
+        {
             load_raw(
                 bytes,
                 RawOptions {

@@ -306,6 +306,24 @@ impl StoredMapping {
     }
 }
 
+/// Identity of the explicit debug inputs a snapshot was taken over.
+///
+/// Content hash plus size per file: the same binary analyzed with different
+/// (or absent) `--pdb` / `--debug-file` bytes never shares layouts. The all-
+/// zero value means no explicit debug files (and decodes from pre-debug
+/// snapshots via `serde(default)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DebugId {
+    /// xxh3 hash of the `--pdb` bytes (0 when absent).
+    pub pdb_hash: u64,
+    /// `--pdb` file size in bytes (0 when absent).
+    pub pdb_size: u64,
+    /// xxh3 hash of the `--debug-file` bytes (0 when absent).
+    pub dwarf_hash: u64,
+    /// `--debug-file` size in bytes (0 when absent).
+    pub dwarf_size: u64,
+}
+
 /// Mapping-conflict error: the sidecar holds `stored_count` live
 /// annotation(s) under `stored`, but the current open requests `expected`.
 ///
@@ -417,6 +435,11 @@ pub struct BinaryMeta {
     /// [`BinaryMeta::inferred_truncated`].
     #[serde(default)]
     pub inferred_omitted: usize,
+    /// Debug inputs the snapshot was taken over.
+    ///
+    /// Defaults to empty for pre-debug snapshots; see [`DebugId`].
+    #[serde(default)]
+    pub debug: DebugId,
 }
 
 fn default_supported() -> bool {
@@ -449,6 +472,7 @@ impl BinaryMeta {
             && self.inferred_truncated == other.inferred_truncated
             && self.inferred_omitted == other.inferred_omitted
             && self.seeds_hash == other.seeds_hash
+            && self.debug == other.debug
     }
 }
 
@@ -617,6 +641,10 @@ pub struct ProjectInfo {
     /// [`crate::analysis::ANALYSIS_REVISION`]).
     #[serde(default)]
     pub analysis_revision: u32,
+    /// Debug-info function rows attached at open (DWARF subprograms and
+    /// PDB publics/procedures): zero without debug info.
+    #[serde(default)]
+    pub debug_funcs: usize,
 }
 
 fn default_protocol() -> u32 {
@@ -633,7 +661,7 @@ impl Serialize for ProjectInfo {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("ProjectInfo", 27)?;
+        let mut st = serializer.serialize_struct("ProjectInfo", 28)?;
         st.serialize_field("binary", &self.binary)?;
         st.serialize_field("db_path", &self.db_path)?;
         st.serialize_field("version", &self.version)?;
@@ -661,6 +689,7 @@ impl Serialize for ProjectInfo {
         st.serialize_field("inferred_truncated", &self.inferred_truncated)?;
         st.serialize_field("inferred_omitted", &self.inferred_omitted)?;
         st.serialize_field("analysis_revision", &self.analysis_revision)?;
+        st.serialize_field("debug_funcs", &self.debug_funcs)?;
         st.end()
     }
 }
@@ -1074,6 +1103,7 @@ fn reason_code(reason: crate::analysis::DiscoveryReason) -> u8 {
         crate::analysis::DiscoveryReason::InitArray => 8,
         crate::analysis::DiscoveryReason::FunctionStarts => 9,
         crate::analysis::DiscoveryReason::Pointer => 10,
+        crate::analysis::DiscoveryReason::Debug => 11,
     }
 }
 
@@ -1091,6 +1121,7 @@ fn decode_reason(v: u8) -> Result<crate::analysis::DiscoveryReason> {
         8 => Ok(crate::analysis::DiscoveryReason::InitArray),
         9 => Ok(crate::analysis::DiscoveryReason::FunctionStarts),
         10 => Ok(crate::analysis::DiscoveryReason::Pointer),
+        11 => Ok(crate::analysis::DiscoveryReason::Debug),
         _ => Err(Error::Storage(format!("decode row: bad reason {v}"))),
     }
 }
@@ -2225,8 +2256,10 @@ pub enum Snapshot {
 /// Cache identity covers the binary content (`expected_hash` plus
 /// `expected_sha256` and `expected_size`), the
 /// loader mapping — auto, explicit raw arch/base/entry, or fat slice arch
-/// (`expected_mapping`) — and the analysis revision: layouts replay only when
-/// all agree with the stored snapshot on the current
+/// (`expected_mapping`) — the explicit debug inputs (`expected_debug`: a
+/// `--pdb` / `--debug-file` mismatch re-analyzes while carrying same-mapping
+/// annotations forward, never an error), and the analysis revision: layouts
+/// replay only when all agree with the stored snapshot on the current
 /// [`SCHEMA_VERSION`]. The 64-bit xxh3 hash is a fast pre-check; the
 /// SHA-256 plus size is the collision-resistant gate, so a constructed
 /// hash collision cannot replay another binary's layouts. A mapping mismatch
@@ -2278,6 +2311,7 @@ pub fn load_cached(
     expected_sha256: &str,
     expected_size: u64,
     expected_mapping: &StoredMapping,
+    expected_debug: &DebugId,
 ) -> Result<Snapshot> {
     let rtxn = db
         .begin_read()
@@ -2327,6 +2361,7 @@ pub fn load_cached(
         || meta.content_sha256 != expected_sha256
         || meta.size != expected_size
         || meta.analysis_rev != Some(ANALYSIS_REVISION)
+        || meta.debug != *expected_debug
     {
         let annotations = read_annotations_or_empty(&rtxn)?;
         let seeds = read_func_seeds_or_empty(&rtxn)?;
@@ -2547,7 +2582,7 @@ mod tests {
                 "unexpected: {err:?}"
             );
         }
-        for v in [255u8, 11] {
+        for v in [255u8, 12] {
             assert!(decode_xref_kind(v).is_err());
             assert!(decode_diagnostic_kind(v).is_err());
             assert!(decode_reason(v).is_err());

@@ -1,7 +1,7 @@
 # CLI reference
 
 ```sh
-binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] <command> <binary> [args]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] [--pdb PATH] [--debug-file PATH] <command> <binary> [args]
 ```
 
 `--db` overrides the sidecar database (default `<binary>.rsdbg.redb`).
@@ -19,10 +19,21 @@ case-insensitive); it is required for fat inputs, which error
 listing the available archs without it, and rejected for thin
 (non-fat) inputs. `--raw` and `--fat-arch`
 are exclusive. Different slices never share cached snapshots.
+`--pdb PATH` attaches a PDB file (local path only, never fetched from
+the network): public and procedure symbols seed function starts and
+names for PE binaries (other containers reject it, as does `--raw`,
+which has no image base). `--debug-file PATH` attaches an external
+linked DWARF object (a dSYM DWARF file or an unstripped copy; local
+path only, never fetched): `DW_TAG_subprogram` rows seed starts, ends,
+and names for container and `--raw` opens alike. Embedded DWARF parses
+automatically. Debug inputs join the snapshot identity: the same
+sidecar opened with and without them re-analyzes instead of replaying
+stale layouts. `project_info`/`stats` report the attached row count as
+`debug_funcs`.
 See [JSON protocol](json-protocol.md) for the output contract.
 | Command | Example | Output |
 |---|---|---|
-| `load` | `binscout load fw.elf` | project info (`protocol`, `mode`, `arch`, `base`, diagnostic totals, `analysis_revision`); caches the analysis snapshot |
+| `load` | `binscout load fw.elf` | project info (`protocol`, `mode`, `arch`, `base`, diagnostic totals, `analysis_revision`, `debug_funcs`); caches the analysis snapshot |
 | `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; `--query` is a case-insensitive substring over the resolved name, `--caller`/`--callee` keep call-graph neighbors of the function containing that address, `--range LO HI` keeps entries in the inclusive bounds; page with `--offset`/`--limit`, or `--envelope` for the protocol-1 page envelope with an exact `total` and compact `calls_count` rows |
 | `func` | `binscout func fw.elf 0x400000` | compact metadata: entry, name, block/insn/call counts, discovery `reasons` |
 | `blocks` | `binscout blocks fw.elf 0x400000 --offset 0 --limit 50` | block summaries (`id`, `start`/`start_hex`, `end`/`end_hex`, `insns` count, `succs`) of the containing function by block start, under the page envelope |
@@ -41,7 +52,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `import`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope; rows carry listing context (`from_func`/`from_func_name`, `to_name`, `to_string` for string-kind rows) |
 | `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6` | filtered strings by address (`--pattern` substring or `regex:` expression, `--min-len`, `--section`, `--include-code`; executable-memory hits hidden by default; paged by `--start`/`--limit`, `--offset` deprecated, or `--envelope` for the protocol-1 page envelope with an exact `total`; `--decode xor:<byte>`, `xor:0x<HEXKEY>` (rolling multi-byte key), `add:<byte>`, `rot:<0-7>`, or bare `base64` re-extracts over a read-only in-memory transform with original offsets; `--with-xrefs` adds the bounded per-row `xrefs` reference list) |
 | `stack-strings` | `binscout stack-strings fw.elf` | recovered stack-constructed strings: runs of `mov [rsp/rbp+off], imm` within one block, reassembled with function and address; read-only, never writes the binary or the sidecar |
-| `symbols` | `binscout symbols fw.elf` | imports, exports, and symbol-table code addresses (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below exports and above stubs |
+| `symbols` | `binscout symbols fw.elf` | imports, exports, and symbol-table code addresses (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below debug-info and exports and above stubs |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, Shannon `entropy` (bits per byte), permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
 | `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |

@@ -287,8 +287,14 @@ fn fat_slice_alias_shares_annotations() {
     let db = common::temp_db(&dir, "fat");
 
     // Rename under the alias spelling, then persist.
-    let mut proj =
-        binscout::open_mapped(&bin, Some(&db), None, Some("arm64")).expect("arm64 slice must open");
+    let mut proj = binscout::open_mapped(
+        &bin,
+        Some(&db),
+        None,
+        Some("arm64"),
+        &binscout::DebugOptions::default(),
+    )
+    .expect("arm64 slice must open");
     proj.rename_function(0x1000, "slice_main")
         .expect("rename under arm64");
     proj.save().expect("save slice snapshot");
@@ -296,8 +302,14 @@ fn fat_slice_alias_shares_annotations() {
 
     // The canonical spelling reopens the same snapshot: no mapping
     // mismatch, and the rename reads back.
-    let again =
-        binscout::open_mapped(&bin, Some(&db), None, Some("aarch64")).expect("aarch64 must reopen");
+    let again = binscout::open_mapped(
+        &bin,
+        Some(&db),
+        None,
+        Some("aarch64"),
+        &binscout::DebugOptions::default(),
+    )
+    .expect("aarch64 must reopen");
     assert_eq!(
         again.function_name(0x1000).as_deref(),
         Some("slice_main"),
@@ -333,7 +345,14 @@ fn thin_input_rejects_fat_arch() {
     let bin = common::write_bin(&dir, "thin.bin", &thin);
     for sel in ["aarch64", "mips"] {
         let db = common::temp_db(&dir, sel);
-        let err = binscout::open_mapped(&bin, Some(&db), None, Some(sel)).unwrap_err();
+        let err = binscout::open_mapped(
+            &bin,
+            Some(&db),
+            None,
+            Some(sel),
+            &binscout::DebugOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, Error::Invalid(_)),
             "thin open + {sel} must be invalid, got {err:?}"
@@ -345,7 +364,14 @@ fn thin_input_rejects_fat_arch() {
     // of silently falling back to raw.
     let raw = common::write_bin(&dir, "blob.bin", b"not a binary at all");
     let db = common::temp_db(&dir, "blob");
-    let err = binscout::open_mapped(&raw, Some(&db), None, Some("aarch64")).unwrap_err();
+    let err = binscout::open_mapped(
+        &raw,
+        Some(&db),
+        None,
+        Some("aarch64"),
+        &binscout::DebugOptions::default(),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, Error::Invalid(_)),
         "blob + fat_arch must be invalid, got {err:?}"
@@ -395,6 +421,7 @@ fn bootstrap_slice(
         diagnostics_omitted: analysis.diagnostics.omitted,
         inferred_truncated: analysis.diagnostics.inferred_truncated,
         inferred_omitted: analysis.diagnostics.inferred_omitted,
+        debug: db::DebugId::default(),
         seeds_hash: 0,
     };
     db::save(
@@ -416,7 +443,14 @@ fn fat_open_mapped_threads_selection_end_to_end() {
 
     // Missing selection errors listing the available archs and writes no sidecar.
     let db = common::temp_db(&dir, "missing");
-    let err = binscout::open_mapped(&bin, Some(&db), None, None).unwrap_err();
+    let err = binscout::open_mapped(
+        &bin,
+        Some(&db),
+        None,
+        None,
+        &binscout::DebugOptions::default(),
+    )
+    .unwrap_err();
     let msg = err.to_string();
     assert!(
         matches!(err, Error::Invalid(_)),
@@ -430,30 +464,55 @@ fn fat_open_mapped_threads_selection_end_to_end() {
 
     // Unknown selections also list the available archs.
     let db = common::temp_db(&dir, "unknown");
-    let err = binscout::open_mapped(&bin, Some(&db), None, Some("mips")).unwrap_err();
+    let err = binscout::open_mapped(
+        &bin,
+        Some(&db),
+        None,
+        Some("mips"),
+        &binscout::DebugOptions::default(),
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::Invalid(_)), "unknown arch: {err:?}");
     assert!(err.to_string().contains("x86_64"));
 
     // Each selection analyzes its slice and reports mode "fat".
     let db_x86 = common::temp_db(&dir, "x86");
-    let x86 = binscout::open_mapped(&bin, Some(&db_x86), None, Some("x86_64"))
-        .expect("x86_64 slice must open");
+    let x86 = binscout::open_mapped(
+        &bin,
+        Some(&db_x86),
+        None,
+        Some("x86_64"),
+        &binscout::DebugOptions::default(),
+    )
+    .expect("x86_64 slice must open");
     let info = x86.project_info();
     assert_eq!(info.mode, "fat");
     assert_eq!(info.arch, "x86_64");
     assert_eq!(info.format, "macho");
 
     let db_arm = common::temp_db(&dir, "arm");
-    let arm = binscout::open_mapped(&bin, Some(&db_arm), None, Some("arm64"))
-        .expect("arm64 slice must open");
+    let arm = binscout::open_mapped(
+        &bin,
+        Some(&db_arm),
+        None,
+        Some("arm64"),
+        &binscout::DebugOptions::default(),
+    )
+    .expect("arm64 slice must open");
     let info = arm.project_info();
     assert_eq!(info.mode, "fat");
     assert_eq!(info.arch, "aarch64");
 
     // The saved slice snapshot reopens under the same selection.
     arm.save().expect("save slice snapshot");
-    let again = binscout::open_mapped(&bin, Some(&db_arm), None, Some("arm64"))
-        .expect("same slice must reopen");
+    let again = binscout::open_mapped(
+        &bin,
+        Some(&db_arm),
+        None,
+        Some("arm64"),
+        &binscout::DebugOptions::default(),
+    )
+    .expect("same slice must reopen");
     assert_eq!(again.project_info().mode, "fat");
     assert_eq!(again.binary().arch, Arch::Aarch64);
 
@@ -464,7 +523,14 @@ fn fat_open_mapped_threads_selection_end_to_end() {
         entry: None,
     };
     let db = common::temp_db(&dir, "both");
-    let err = binscout::open_mapped(&bin, Some(&db), Some(raw), Some("x86_64")).unwrap_err();
+    let err = binscout::open_mapped(
+        &bin,
+        Some(&db),
+        Some(raw),
+        Some("x86_64"),
+        &binscout::DebugOptions::default(),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, Error::Invalid(_)),
         "raw plus fat_arch must be invalid: {err:?}"
@@ -656,6 +722,7 @@ fn fat_slices_do_not_share_snapshots() {
         &sha256,
         fat.len() as u64,
         &StoredMapping::for_fat_slice("x86_64"),
+        &db::DebugId::default(),
     )
     .expect("load_cached")
     {
@@ -674,7 +741,8 @@ fn fat_slices_do_not_share_snapshots() {
                 hash,
                 &sha256,
                 fat.len() as u64,
-                &StoredMapping::for_fat_slice("aarch64")
+                &StoredMapping::for_fat_slice("aarch64"),
+                &db::DebugId::default(),
             )
             .expect("load_cached"),
             db::Snapshot::Stale { .. }
@@ -688,7 +756,8 @@ fn fat_slices_do_not_share_snapshots() {
                 hash,
                 &sha256,
                 fat.len() as u64,
-                &StoredMapping::Auto
+                &StoredMapping::Auto,
+                &db::DebugId::default(),
             )
             .expect("load_cached"),
             db::Snapshot::Stale { .. }
@@ -720,6 +789,7 @@ fn fat_slices_do_not_share_snapshots() {
         &sha256_ann,
         fat.len() as u64,
         &StoredMapping::for_fat_slice("aarch64"),
+        &db::DebugId::default(),
     )
     .unwrap_err();
     assert!(

@@ -476,6 +476,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
         };
         let spanning = BytePattern::parse("AA AA BB BB").expect("parse");
@@ -526,6 +527,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
         };
         let (total, _) = run(
@@ -572,6 +574,7 @@ mod tests {
             tls_callbacks: Vec::new(),
             init_funcs: Vec::new(),
             func_starts: Vec::new(),
+            debug_funcs: Vec::new(),
             relocatable: false,
         };
         let pat = BytePattern::parse("90").expect("parse");

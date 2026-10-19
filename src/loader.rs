@@ -6,6 +6,7 @@
 //! (firmware, shellcode, `--base` dumps) map via [`load_raw`]. Printable
 //! runs live in [`strings`].
 
+pub mod debuginfo;
 pub mod le;
 pub mod strings;
 
@@ -429,6 +430,13 @@ pub struct LoadedBinary {
     /// Exact starts decoded from ULEB deltas off the `__TEXT` base; empty
     /// on other formats. Capped at [`MAX_FUNC_STARTS`].
     pub func_starts: Vec<u64>,
+    /// Debug-info functions: DWARF `DW_TAG_subprogram` rows (embedded or
+    /// `--debug-file`) and `--pdb` public/procedure rows.
+    ///
+    /// Exact starts with optional ends and names; empty without debug info
+    /// (raw blobs, LE images, and relocatable objects never carry rows).
+    /// Capped at [`debuginfo::MAX_DEBUG_FUNCS`].
+    pub debug_funcs: Vec<debuginfo::DebugFunc>,
     /// Whether this binary is a relocatable object with a synthetic layout.
     ///
     /// True for COFF `.obj` and ELF `ET_REL`: sections lay out at
@@ -503,6 +511,24 @@ pub fn load(bytes: &[u8]) -> Result<LoadedBinary> {
 /// for thin input, when fat input has no usable selection (missing,
 /// unknown, or ambiguous), or when the selected slice range is unreadable.
 pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBinary> {
+    load_with_debug(bytes, fat_arch, &debuginfo::DebugInputs::none())
+}
+
+/// [`load_with_slice`] with explicit debug inputs.
+///
+/// Embedded DWARF parses automatically; `debug.external` (a `--debug-file`
+/// object) and `debug.pdb` (a `--pdb` file, PE only) attach their function
+/// rows. LE images accept an external DWARF object but reject `--pdb`.
+///
+/// # Errors
+/// Same as [`load_with_slice`], plus [`Error::Invalid`] when `--pdb`
+/// names a non-PE binary or fails to parse, or when `--debug-file`
+/// parses but carries no DWARF sections.
+pub fn load_with_debug(
+    bytes: &[u8],
+    fat_arch: Option<&str>,
+    debug: &debuginfo::DebugInputs,
+) -> Result<LoadedBinary> {
     if bytes.is_empty() {
         return Err(Error::Invalid("empty input".to_string()));
     }
@@ -516,7 +542,19 @@ pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBin
                     .to_string(),
             ));
         }
-        return Ok(convert_le(le::parse_le(bytes)?));
+        let mut bin = convert_le(le::parse_le(bytes)?);
+        if let Some(pdb) = &debug.pdb {
+            return Err(Error::Invalid(format!(
+                "{}: PDB input needs a PE binary, got LE",
+                pdb.label
+            )));
+        }
+        if let Some(ext) = &debug.external {
+            let mut meta_bytes: u64 = 0;
+            let funcs = debuginfo::dwarf_funcs(&ext.bytes, &ext.label, bin.arch, &mut meta_bytes)?;
+            bin.debug_funcs = filter_debug_funcs(funcs, &bin.sections, &bin.segments);
+        }
+        return Ok(bin);
     }
     let kind = FileKind::parse(bytes).map_err(|e| {
         if fat_arch.is_some() {
@@ -532,13 +570,60 @@ pub fn load_with_slice(bytes: &[u8], fat_arch: Option<&str>) -> Result<LoadedBin
         ));
     }
     match kind {
-        FileKind::Elf32 | FileKind::Elf64 => load_object(bytes, BinaryFormat::Elf),
-        FileKind::Pe32 | FileKind::Pe64 => load_object(bytes, BinaryFormat::Pe),
-        FileKind::MachO32 | FileKind::MachO64 => load_object(bytes, BinaryFormat::MachO),
-        FileKind::MachOFat32 | FileKind::MachOFat64 => load_fat_slice(bytes, kind, fat_arch),
-        FileKind::Coff => load_object(bytes, BinaryFormat::Coff),
+        FileKind::Elf32 | FileKind::Elf64 => load_object(bytes, BinaryFormat::Elf, debug),
+        FileKind::Pe32 | FileKind::Pe64 => load_object(bytes, BinaryFormat::Pe, debug),
+        FileKind::MachO32 | FileKind::MachO64 => load_object(bytes, BinaryFormat::MachO, debug),
+        FileKind::MachOFat32 | FileKind::MachOFat64 => load_fat_slice(bytes, kind, fat_arch, debug),
+        FileKind::Coff => load_object(bytes, BinaryFormat::Coff, debug),
         other => Err(Error::Unsupported(format!("file kind {other:?}"))),
     }
+}
+
+/// Keep executable-range starts, deduplicated and capped, for opens whose
+/// container parse does not run [`debuginfo::collect_debug_funcs`] (LE with
+/// an external DWARF object; raw blobs via the same rule in `lib.rs`).
+#[must_use]
+pub fn filter_debug_funcs(
+    funcs: Vec<debuginfo::DebugFunc>,
+    sections: &[Section],
+    segments: &[Segment],
+) -> Vec<debuginfo::DebugFunc> {
+    debuginfo::finalize(funcs, sections, segments)
+}
+
+/// Merged executable address ranges over sections (segments when no
+/// executable section exists).
+///
+/// Shared by symbol collection and debug-info filtering so both agree on
+/// what "executable" means: section ranges win when present, segments are
+/// the fallback for section-less layouts, and overlaps merge so a binary
+/// search (or linear scan) cannot miss a hit hiding behind a neighbor.
+fn merged_exec_ranges(sections: &[Section], segments: &[Segment]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for s in sections {
+        if s.executable && s.size > 0 {
+            ranges.push((s.vaddr, s.vaddr.saturating_add(s.size)));
+        }
+    }
+    if ranges.is_empty() {
+        for s in segments {
+            if s.executable && s.mem_size > 0 {
+                ranges.push((s.vaddr, s.vaddr.saturating_add(s.mem_size)));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        if let Some((_, last_hi)) = merged.last_mut()
+            && lo <= *last_hi
+        {
+            *last_hi = (*last_hi).max(hi);
+            continue;
+        }
+        merged.push((lo, hi));
+    }
+    merged
 }
 
 /// Canonical raw arch name for diagnostics (`x86_64`, `x86_32`, `aarch64`,
@@ -638,6 +723,7 @@ pub fn load_raw_vec(bytes: Vec<u8>, opts: RawOptions) -> Result<LoadedBinary> {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
     })
 }
@@ -1123,11 +1209,16 @@ fn load_relocatable<'a>(
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: true,
     })
 }
 
-fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
+fn load_object(
+    bytes: &[u8],
+    format: BinaryFormat,
+    debug: &debuginfo::DebugInputs,
+) -> Result<LoadedBinary> {
     let file =
         object::File::parse(bytes).map_err(|e| Error::Invalid(format!("object parse: {e}")))?;
     let arch = arch_from_object(file.architecture())?;
@@ -1299,6 +1390,17 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
     };
 
+    let debug_funcs = debuginfo::collect_debug_funcs(
+        &file,
+        bytes,
+        format,
+        arch,
+        &sections,
+        &segments,
+        debug,
+        &mut meta_bytes,
+    )?;
+
     Ok(LoadedBinary {
         format,
         arch,
@@ -1312,6 +1414,7 @@ fn load_object(bytes: &[u8], format: BinaryFormat) -> Result<LoadedBinary> {
         tls_callbacks,
         init_funcs,
         func_starts,
+        debug_funcs,
         relocatable: false,
     })
 }
@@ -2761,7 +2864,12 @@ where
 /// against the entry architectures, and loads the selected slice bytes via
 /// [`load_object`] as Mach-O. Only the selected slice is copied; the rest
 /// of the container is never parsed.
-fn load_fat_slice(bytes: &[u8], kind: FileKind, fat_arch: Option<&str>) -> Result<LoadedBinary> {
+fn load_fat_slice(
+    bytes: &[u8],
+    kind: FileKind,
+    fat_arch: Option<&str>,
+    debug: &debuginfo::DebugInputs,
+) -> Result<LoadedBinary> {
     use object::read::macho::{MachOFatFile32, MachOFatFile64};
     let table: Vec<(object::Architecture, u64, u64)> = match kind {
         FileKind::MachOFat32 => {
@@ -2827,7 +2935,7 @@ fn load_fat_slice(bytes: &[u8], kind: FileKind, fat_arch: Option<&str>) -> Resul
         })
         .and_then(|(s, e)| bytes.get(s..e))
         .ok_or_else(|| Error::Invalid(format!("bad fat slice range {offset:#x}+{size:#x}")))?;
-    load_object(start, BinaryFormat::MachO)
+    load_object(start, BinaryFormat::MachO, debug)
 }
 
 /// Add `len` owned metadata bytes to the aggregate budget.
@@ -3011,6 +3119,7 @@ pub fn convert_le(img: LeImage) -> LoadedBinary {
         tls_callbacks: Vec::new(),
         init_funcs: Vec::new(),
         func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
         relocatable: false,
     }
 }
@@ -3107,33 +3216,7 @@ fn collect_symbols<'a>(
     meta: &mut u64,
     cache: &mut HashMap<String, Option<String>>,
 ) -> Result<Vec<SymbolRef>> {
-    let mut ranges: Vec<(u64, u64)> = Vec::new();
-    for s in sections {
-        if s.executable && s.size > 0 {
-            ranges.push((s.vaddr, s.vaddr.saturating_add(s.size)));
-        }
-    }
-    if ranges.is_empty() {
-        for s in segments {
-            if s.executable && s.mem_size > 0 {
-                ranges.push((s.vaddr, s.vaddr.saturating_add(s.mem_size)));
-            }
-        }
-    }
-    ranges.sort_unstable();
-    // Merge overlaps so the binary search below cannot miss a hit
-    // hiding behind a neighboring range in a hostile section table.
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-    for (lo, hi) in ranges {
-        if let Some((_, last_hi)) = merged.last_mut()
-            && lo <= *last_hi
-        {
-            *last_hi = (*last_hi).max(hi);
-            continue;
-        }
-        merged.push((lo, hi));
-    }
-    let ranges = merged;
+    let ranges = merged_exec_ranges(sections, segments);
     let in_exec = |addr: u64| -> bool {
         ranges
             .binary_search_by(|(lo, hi)| {
