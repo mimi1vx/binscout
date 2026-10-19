@@ -49,6 +49,7 @@ fn row(addr: u64, op: IrOp, inputs: &[&str], outputs: &[&str], target: Option<u6
         target,
         warning: None,
         effects: Default::default(),
+        operands: Vec::new(),
     }
 }
 
@@ -121,6 +122,7 @@ fn unmapped_rows_keep_warning_verbatim() {
             target_name: None,
             comment: None,
             string: None,
+            operands: Vec::new(),
         },
     );
     assert_eq!(lifted.len(), 1);

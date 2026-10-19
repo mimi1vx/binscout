@@ -4,7 +4,10 @@
 //! multi-op expansion (e.g. `push` as adjust-plus-store); M3 always emits a
 //! single element. Operands reuse the disassembler's strings verbatim and
 //! `target` carries direct branch/call destinations from
-//! [`Insn::branch_target`]. Flag and stack-pointer effects are scoped:
+//! [`Insn::branch_target`]; x86 rows also carry the decoder-typed
+//! [`Operand`] vec cloned from [`Insn::operands`] (reg/imm/mem, empty for
+//! other arches), so the first const-prop/stack-slot consumers read typed
+//! facts without parsing strings. Flag and stack-pointer effects are scoped:
 //! integer add/sub/cmp record [`IrEffects::sets_flags`] and x86
 //! push/pop/call/operand-free-ret record [`IrEffects::sp_delta`];
 //! everything else reports none (see [`IrEffects`] for the bounds).
@@ -208,8 +211,11 @@
 //! JSON pairs `addr` with `addr_hex` and `target` with `target_hex`
 //! (see [`crate::addr_hex`]).
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::disasm::{Arch, Insn, resolve_adrp_pair};
+use crate::disasm::{Arch, Insn, Operand, resolve_adrp_pair};
+
+pub use crate::disasm::{Operand as IrOperand, stack_slot};
 
 /// Minimal P-code-inspired operation set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -342,7 +348,10 @@ pub struct IrEffects {
 /// JSON pairs `addr` with `addr_hex` and `target` with `target_hex`
 /// (see [`crate::addr_hex`]); old rows without the twins still
 /// deserialize. Rows written before effects existed (no `effects` key)
-/// also still deserialize, defaulting to no modeled effects.
+/// also still deserialize, defaulting to no modeled effects. Rows
+/// written before structured operands existed (no `operands` key) still
+/// deserialize, defaulting to an empty vec; the field is omitted from
+/// JSON when empty so old goldens keep passing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct IrInsn {
     /// Address of the source machine instruction.
@@ -362,6 +371,13 @@ pub struct IrInsn {
     /// Defaults to no modeled effects so pre-effect rows still decode.
     #[serde(default)]
     pub effects: IrEffects,
+    /// Decoder-typed operands cloned from [`Insn::operands`] (x86 only;
+    /// empty for other arches and for hand-built rows).
+    ///
+    /// Defaults to empty so pre-operand rows still decode; omitted from
+    /// JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operands: Vec<Operand>,
 }
 
 impl Serialize for IrInsn {
@@ -370,7 +386,11 @@ impl Serialize for IrInsn {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("IrInsn", 8)?;
+        let mut len = 8;
+        if !self.operands.is_empty() {
+            len += 1;
+        }
+        let mut st = serializer.serialize_struct("IrInsn", len)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("op", &self.op)?;
@@ -380,6 +400,11 @@ impl Serialize for IrInsn {
         st.serialize_field("target_hex", &self.target.map(crate::addr_hex))?;
         st.serialize_field("warning", &self.warning)?;
         st.serialize_field("effects", &self.effects)?;
+        if !self.operands.is_empty() {
+            st.serialize_field("operands", &self.operands)?;
+        } else {
+            st.skip_field("operands")?;
+        }
         st.end()
     }
 }
@@ -641,7 +666,7 @@ pub struct Coverage {
 
 /// Engine-wide lift limitations shared by every architecture.
 pub const COVERAGE_LIMITATIONS: &[&str] = &[
-    "operands reuse the disassembler's strings verbatim; no operand decoding beyond that",
+    "operands reuse the disassembler's strings verbatim; x86 rows also carry additive decoder-typed operands (reg/imm/mem), other arches report none",
     "flag effects are scoped: integer add/sub/cmp record sets_flags (x86 EFLAGS writers, ARM NZCV writers); FP/SIMD/vector forms, lea, x87 FPU-condition writers, flag reads (adc/sbb carry-in), and preserved bits (inc/dec keep CF) are unmodeled",
     "stack effects are scoped: x86 push/pop/call and operand-free ret record sp_delta in bytes (pusha/popad as multi-slot constants); ret-with-immediate, far/privileged returns, traps, ARM multi-register push/pop, and calling-convention frame effects are unmodeled",
     "no SSA/PHI production: Phi is never emitted by lifters; it is synthesized at CFG merges",
@@ -1105,6 +1130,7 @@ pub fn lift_x86(insn: &Insn) -> Vec<IrInsn> {
             sets_flags,
             sp_delta: None,
         },
+        operands: insn.operands.clone(),
     }]
 }
 
@@ -1172,6 +1198,7 @@ pub fn lift_aarch64_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
             sets_flags,
             sp_delta: None,
         },
+        operands: insn.operands.clone(),
     }]
 }
 
@@ -1365,6 +1392,7 @@ pub fn lift_arm32(insn: &Insn) -> Vec<IrInsn> {
             sets_flags,
             sp_delta: None,
         },
+        operands: insn.operands.clone(),
     }]
 }
 
@@ -1459,7 +1487,94 @@ fn unlifted(insn: &Insn) -> Vec<IrInsn> {
         target: None,
         warning: Some(format!("unlifted '{}'; emitted NOP", insn.mnem)),
         effects: IrEffects::default(),
+        operands: insn.operands.clone(),
     }]
+}
+
+/// One register-indirect site resolved by straight-line constant
+/// propagation: the `call`/`jmp` at `addr` reads `reg`, which held
+/// `value` when the scan reached it.
+///
+/// JSON pairs `addr` with `addr_hex` (see [`crate::addr_hex`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConstTarget {
+    /// Address of the indirect `call`/`jmp`.
+    pub addr: u64,
+    /// Lowercase register read at `addr`.
+    pub reg: String,
+    /// Propagated constant value.
+    pub value: i64,
+}
+
+impl Serialize for ConstTarget {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("ConstTarget", 4)?;
+        st.serialize_field("addr", &self.addr)?;
+        st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
+        st.serialize_field("reg", &self.reg)?;
+        st.serialize_field("value", &self.value)?;
+        st.end()
+    }
+}
+
+/// Resolve register-indirect `call`/`jmp` sites by straight-line constant
+/// propagation over `rows` (in address order).
+///
+/// Tracks `mov reg, imm` (single `Copy` with `[Reg, Imm]` operands) and
+/// `mov reg, reg` chains; any other write to a register (any row naming
+/// it in `outputs`) kills the constant. An indirect `Call`/`Branch`
+/// with no `target` and a single `Reg` operand resolves when that
+/// register is currently constant.
+///
+/// Conservative by design: exact register-name matches only (no
+/// subregister aliasing: `mov eax, 1` does not resolve a later `call
+/// rax`), single straight-line pass (no branches, no memory, no
+/// arithmetic folding, `xor eax, eax` kills rather than resolving to
+/// zero). Callers must scope `rows` to one block; values never cross
+/// control flow.
+#[must_use]
+pub fn resolve_const_indirect(rows: &[IrInsn]) -> Vec<ConstTarget> {
+    let mut consts: HashMap<String, i64> = HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        if row.op == IrOp::Copy {
+            if let [Operand::Reg { reg: dst, .. }, Operand::Imm { value, .. }] =
+                row.operands.as_slice()
+            {
+                consts.insert(dst.clone(), *value);
+                continue;
+            }
+            if let [Operand::Reg { reg: dst, .. }, Operand::Reg { reg: src, .. }] =
+                row.operands.as_slice()
+            {
+                if let Some(v) = consts.get(src).copied() {
+                    consts.insert(dst.clone(), v);
+                } else {
+                    consts.remove(dst);
+                }
+                continue;
+            }
+        }
+        for written in &row.outputs {
+            consts.remove(&written.to_lowercase());
+        }
+        if matches!(row.op, IrOp::Call | IrOp::Branch)
+            && row.target.is_none()
+            && let [Operand::Reg { reg, .. }] = row.operands.as_slice()
+            && let Some(v) = consts.get(reg).copied()
+        {
+            out.push(ConstTarget {
+                addr: row.addr,
+                reg: reg.clone(),
+                value: v,
+            });
+        }
+    }
+    out
 }
 
 /// Whether x86 `mnem` writes EFLAGS in the common integer case.
@@ -2633,6 +2748,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            operands: Vec::new(),
         }
     }
 

@@ -18,7 +18,7 @@ use yaxpeax_arm::armv7::{
     InstDecoder as ArmV7Decoder, Instruction as ArmV7Instruction, Opcode as ArmV7Opcode,
     Operand as ArmV7Operand,
 };
-use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode, Operand};
+use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode, Operand as A64Operand};
 
 use crate::error::{Error, Result};
 
@@ -60,6 +60,115 @@ impl Arch {
             Self::Arm32 => AnyDisasm::Arm32(Arm32Disasm::new()),
             Self::Thumb => AnyDisasm::Thumb(ThumbDisasm::new()),
         }
+    }
+}
+
+/// Structured x86 operand decoded from iced-x86 at disassembly time.
+///
+/// Additive typed form alongside [`Insn::ops`]: the strings stay the
+/// display rendering (and the only cross-arch form), while `operands`
+/// carries decoder facts in assembly order for x86 (`op_count` order).
+/// AArch64/ARM32/Thumb rows report an empty vec: structured decode there
+/// is a follow-up, never a silent mistranslation. Old rows without the
+/// key still deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Operand {
+    /// Register operand: lowercase iced name (`rax`, `eax`, `xmm0`) plus
+    /// width in bits.
+    Reg {
+        /// Lowercase register name.
+        reg: String,
+        /// Width in bits.
+        bits: u32,
+    },
+    /// Immediate operand: signed value plus width in bits. Unsigned
+    /// immediates zero-extend; `imm8to*`/`imm32to64` sign-extend; 64-bit
+    /// immediates wrap into `i64` bit-preservingly.
+    Imm {
+        /// Signed immediate value.
+        value: i64,
+        /// Width in bits.
+        bits: u32,
+    },
+    /// Memory operand: base/index register names (lowercase, `None` when
+    /// absent), scale, signed displacement, access width in bits, and the
+    /// explicit segment prefix (`None` when no prefix; default DS/SS is
+    /// not recorded). Absolute slots have no base/index with the address
+    /// in `disp`; RIP-relative forms keep `base "rip"` with the signed
+    /// offset in `disp`.
+    Mem {
+        /// Lowercase base register, if any.
+        base: Option<String>,
+        /// Lowercase index register, if any.
+        index: Option<String>,
+        /// Index scale (1 when no index).
+        scale: u32,
+        /// Signed displacement.
+        disp: i64,
+        /// Access width in bits (0 when unknown, e.g. `lea`).
+        bits: u32,
+        /// Explicit segment prefix, if any.
+        segment: Option<String>,
+    },
+}
+
+impl Operand {
+    /// Lowercase register name when this is a register operand.
+    #[must_use]
+    pub fn as_reg(&self) -> Option<&str> {
+        match self {
+            Self::Reg { reg, .. } => Some(reg),
+            _ => None,
+        }
+    }
+
+    /// Immediate value when this is an immediate operand.
+    #[must_use]
+    pub fn as_imm(&self) -> Option<i64> {
+        match self {
+            Self::Imm { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// `(base, disp)` when this is a plain base-plus-displacement memory
+    /// operand with no index register.
+    #[must_use]
+    pub fn as_base_disp(&self) -> Option<(&str, i64)> {
+        match self {
+            Self::Mem {
+                base, index, disp, ..
+            } if index.is_none() => base.as_deref().map(|b| (b, *disp)),
+            _ => None,
+        }
+    }
+}
+
+/// `(base, disp, bits)` when `op` is a stack-slot memory operand:
+/// base is `rsp`/`esp`/`rbp`/`ebp` (case-insensitive) with no index
+/// register. Anything else reports `None`.
+#[must_use]
+pub fn stack_slot(op: &Operand) -> Option<(&str, i64, u32)> {
+    match op {
+        Operand::Mem {
+            base,
+            index,
+            disp,
+            bits,
+            ..
+        } if index.is_none() => match base.as_deref() {
+            Some(b)
+                if b.eq_ignore_ascii_case("rsp")
+                    || b.eq_ignore_ascii_case("esp")
+                    || b.eq_ignore_ascii_case("rbp")
+                    || b.eq_ignore_ascii_case("ebp") =>
+            {
+                Some((b, *disp, *bits))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -133,6 +242,12 @@ pub struct Insn {
     /// old rows without the key still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub string: Option<String>,
+    /// Structured x86 operands in decoder (`op_count`) order (see
+    /// [`Operand`]). Empty for AArch64/ARM32/Thumb and for rows decoded
+    /// before typed operands existed. Omitted from JSON when empty so
+    /// old goldens keep passing; `ops` stays the display form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operands: Vec<Operand>,
 }
 
 /// Max characters in an [`Insn::string`] preview (counted after escaping).
@@ -179,6 +294,7 @@ impl Serialize for Insn {
             self.target_name.is_some(),
             self.comment.is_some(),
             self.string.is_some(),
+            !self.operands.is_empty(),
         ] {
             if present {
                 len += 1;
@@ -219,6 +335,11 @@ impl Serialize for Insn {
             st.serialize_field("string", &self.string)?;
         } else {
             st.skip_field("string")?;
+        }
+        if !self.operands.is_empty() {
+            st.serialize_field("operands", &self.operands)?;
+        } else {
+            st.skip_field("operands")?;
         }
         st.end()
     }
@@ -766,6 +887,170 @@ fn disasm_first_x86(bytes: &[u8], va: u64, bitness: u32) -> Result<Option<Insn>>
     })
 }
 
+/// Lowercase iced register name (`rax`, `xmm0`, `rip`).
+fn reg_name(reg: Register) -> String {
+    format!("{reg:?}").to_lowercase()
+}
+
+/// Register width in bits (0 for [`Register::None`]).
+fn reg_bits(reg: Register) -> u32 {
+    u32::try_from(reg.size()).unwrap_or(0).saturating_mul(8)
+}
+
+/// Signed memory displacement for one iced instruction.
+///
+/// Absolute slots (no base, no index) keep the address zero-extended;
+/// every other shape sign-extends per `memory_displ_size`, so
+/// `[rbp-0x10]` reports `-16`.
+fn mem_disp(insn: &Instruction) -> i64 {
+    let base = insn.memory_base();
+    let index = insn.memory_index();
+    if base == Register::None && index == Register::None {
+        return insn.memory_displacement64() as i64;
+    }
+    match insn.memory_displ_size() {
+        0 => 0,
+        1 => i64::from(insn.memory_displacement64() as u8 as i8),
+        2 => i64::from(insn.memory_displacement64() as u16 as i16),
+        4 => i64::from(insn.memory_displacement32() as i32),
+        _ => insn.memory_displacement64() as i64,
+    }
+}
+
+/// Explicit segment prefix, if any (default DS/SS is not recorded).
+fn seg_prefix(insn: &Instruction) -> Option<String> {
+    let seg = insn.segment_prefix();
+    (seg != Register::None).then(|| reg_name(seg))
+}
+
+/// Structured x86 operands in decoder (`op_count`) order.
+///
+/// Maps every iced operand kind: registers, immediates (unsigned kinds
+/// zero-extend, `imm8to*`/`imm32to64` sign-extend, 64-bit wraps), direct
+/// branches (absolute target as an immediate), plain memory (typed
+/// base/index/scale/disp), and the implicit string-operation slots
+/// (`seg:[rsi]`/`es:[rdi]` families) as memory with their fixed base.
+fn x86_operands(insn: &Instruction) -> Vec<Operand> {
+    let mut out = Vec::with_capacity(insn.op_count() as usize);
+    for op in 0..insn.op_count() {
+        let operand = match insn.op_kind(op) {
+            OpKind::Register => {
+                let reg = insn.op_register(op);
+                Operand::Reg {
+                    reg: reg_name(reg),
+                    bits: reg_bits(reg),
+                }
+            }
+            OpKind::Memory => {
+                let base = insn.memory_base();
+                let index = insn.memory_index();
+                let bits = u32::try_from(insn.memory_size().size())
+                    .unwrap_or(0)
+                    .saturating_mul(8);
+                Operand::Mem {
+                    base: (base != Register::None).then(|| reg_name(base)),
+                    index: (index != Register::None).then(|| reg_name(index)),
+                    scale: insn.memory_index_scale(),
+                    disp: mem_disp(insn),
+                    bits,
+                    segment: seg_prefix(insn),
+                }
+            }
+            OpKind::Immediate8 => Operand::Imm {
+                value: i64::from(insn.immediate8()),
+                bits: 8,
+            },
+            OpKind::Immediate8_2nd => Operand::Imm {
+                value: i64::from(insn.immediate8_2nd()),
+                bits: 8,
+            },
+            OpKind::Immediate16 => Operand::Imm {
+                value: i64::from(insn.immediate16()),
+                bits: 16,
+            },
+            OpKind::Immediate32 => Operand::Imm {
+                value: i64::from(insn.immediate32()),
+                bits: 32,
+            },
+            OpKind::Immediate64 => Operand::Imm {
+                value: insn.immediate64() as i64,
+                bits: 64,
+            },
+            OpKind::Immediate8to16 => Operand::Imm {
+                value: i64::from(insn.immediate8to16()),
+                bits: 16,
+            },
+            OpKind::Immediate8to32 => Operand::Imm {
+                value: i64::from(insn.immediate8to32()),
+                bits: 32,
+            },
+            OpKind::Immediate8to64 => Operand::Imm {
+                value: insn.immediate8to64(),
+                bits: 64,
+            },
+            OpKind::Immediate32to64 => Operand::Imm {
+                value: insn.immediate32to64(),
+                bits: 64,
+            },
+            OpKind::NearBranch16 => Operand::Imm {
+                value: insn.near_branch_target() as i64,
+                bits: 16,
+            },
+            OpKind::NearBranch32 => Operand::Imm {
+                value: insn.near_branch_target() as i64,
+                bits: 32,
+            },
+            OpKind::NearBranch64 => Operand::Imm {
+                value: insn.near_branch_target() as i64,
+                bits: 64,
+            },
+            OpKind::FarBranch16 => Operand::Imm {
+                value: i64::from(insn.far_branch16()),
+                bits: 16,
+            },
+            OpKind::FarBranch32 => Operand::Imm {
+                value: i64::from(insn.far_branch32()),
+                bits: 32,
+            },
+            OpKind::MemorySegSI
+            | OpKind::MemorySegESI
+            | OpKind::MemorySegRSI
+            | OpKind::MemorySegDI
+            | OpKind::MemorySegEDI
+            | OpKind::MemorySegRDI
+            | OpKind::MemoryESDI
+            | OpKind::MemoryESEDI
+            | OpKind::MemoryESRDI => {
+                let kind = insn.op_kind(op);
+                let base = match kind {
+                    OpKind::MemorySegSI => "si",
+                    OpKind::MemorySegESI => "esi",
+                    OpKind::MemorySegRSI => "rsi",
+                    OpKind::MemorySegDI => "di",
+                    OpKind::MemorySegEDI => "edi",
+                    OpKind::MemorySegRDI => "rdi",
+                    OpKind::MemoryESDI => "di",
+                    OpKind::MemoryESEDI => "edi",
+                    _ => "rdi",
+                };
+                let bits = u32::try_from(insn.memory_size().size())
+                    .unwrap_or(0)
+                    .saturating_mul(8);
+                Operand::Mem {
+                    base: Some(base.to_string()),
+                    index: None,
+                    scale: 1,
+                    disp: 0,
+                    bits,
+                    segment: seg_prefix(insn),
+                }
+            }
+        };
+        out.push(operand);
+    }
+    out
+}
+
 /// Convert one decoded iced-x86 instruction to [`Insn`].
 ///
 /// Shared by the range prefix decoder and the first-instruction decoder so
@@ -795,6 +1080,7 @@ fn x86_insn(
         None => absolute_target(bitness, insn),
     };
     let table_base = table_base_for(bitness, insn);
+    let operands = x86_operands(insn);
     Insn {
         addr,
         size: insn.len() as u8,
@@ -808,6 +1094,7 @@ fn x86_insn(
         target_name: None,
         comment: None,
         string: None,
+        operands,
     }
 }
 
@@ -996,6 +1283,7 @@ fn aarch64_insn(addr: u64, raw: Vec<u8>, inst: &yaxpeax_arm::armv8::a64::Instruc
         target_name: None,
         comment: None,
         string: None,
+        operands: Vec::new(),
     }
 }
 
@@ -1061,10 +1349,10 @@ fn arm_data_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> Op
         return None;
     }
     inst.operands.iter().find_map(|op| match op {
-        Operand::PCOffset(off) if inst.opcode == Opcode::ADRP => {
+        A64Operand::PCOffset(off) if inst.opcode == Opcode::ADRP => {
             Some((addr & !0xfff).wrapping_add_signed(*off))
         }
-        Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
+        A64Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
         _ => None,
     })
 }
@@ -1085,7 +1373,7 @@ fn arm_branch_target(inst: &yaxpeax_arm::armv8::a64::Instruction, addr: u64) -> 
         return None;
     }
     inst.operands.iter().find_map(|op| match op {
-        Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
+        A64Operand::PCOffset(off) => Some(addr.wrapping_add_signed(*off)),
         _ => None,
     })
 }
@@ -1295,6 +1583,7 @@ fn armv7_insn(addr: u64, raw: Vec<u8>, inst: &ArmV7Instruction) -> Insn {
         target_name: None,
         comment: None,
         string: None,
+        operands: Vec::new(),
     }
 }
 

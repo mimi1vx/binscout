@@ -4536,6 +4536,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            operands: Vec::new(),
         };
         assert_eq!(flow_of(Arch::X86_64, &ret), Flow::Ret);
         let call = Insn {
@@ -4551,6 +4552,7 @@ mod tests {
             target_name: None,
             comment: None,
             string: None,
+            operands: Vec::new(),
         };
         assert_eq!(
             flow_of(Arch::X86_64, &call),
