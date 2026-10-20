@@ -395,10 +395,26 @@ fn thumb_b_and_cbz_branch_targets() {
     let v = thumb(&[0xfe, 0xe7], 0x20000);
     assert_eq!(v[0].mnem, "b");
     assert_eq!(v[0].branch_target, Some(0x20000));
-    // cbz r0, #4 targets PC+4.
+    // cbz r0, #2 targets PC+2 (imm 1, hardware truth).
     let v = thumb(&[0x08, 0xb1], 0x20000);
     assert_eq!(v[0].mnem, "cbz");
-    assert_eq!(v[0].branch_target, Some(0x20008));
+    assert_eq!(v[0].branch_target, Some(0x20006));
+}
+
+#[test]
+fn thumb_cond_branch_and_cbz_use_hardware_pc() {
+    // bhi with imm8 2 @ 0x2 targets 0xA (addr+4+imm*2), not 0xC.
+    let v = thumb(&[0x02, 0xd8], 0x02);
+    assert_eq!(v[0].mnem, "bhi");
+    assert_eq!(v[0].branch_target, Some(0x0A));
+    // cbz r0, #2 @ 0x0 targets 0x6, not 0x8.
+    let v = thumb(&[0x08, 0xb1], 0x00);
+    assert_eq!(v[0].mnem, "cbz");
+    assert_eq!(v[0].branch_target, Some(0x06));
+    // cbnz r0, #2 @ 0x1000 targets 0x1006.
+    let v = thumb(&[0x08, 0xb9], 0x1000);
+    assert_eq!(v[0].mnem, "cbnz");
+    assert_eq!(v[0].branch_target, Some(0x1006));
 }
 
 #[test]

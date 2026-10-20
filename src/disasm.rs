@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use yaxpeax_arch::Decoder as ArmDecoder;
 use yaxpeax_arm::armv7::{
-    InstDecoder as ArmV7Decoder, Instruction as ArmV7Instruction, Opcode as ArmV7Opcode,
-    Operand as ArmV7Operand,
+    ConditionCode as ArmV7Condition, InstDecoder as ArmV7Decoder, Instruction as ArmV7Instruction,
+    Opcode as ArmV7Opcode, Operand as ArmV7Operand,
 };
 use yaxpeax_arm::armv8::a64::{InstDecoder, Opcode, Operand as A64Operand};
 
@@ -1785,7 +1785,10 @@ fn disasm_armv7_partial(
 /// the decoder already folded the architectural PC+8 bias in.
 /// `BranchThumbOffset` counts halfwords (`off * 2`) from PC: `addr + 4` in
 /// Thumb, `addr + 8` in ARM. Thumb `blx` switches to ARM state, so its PC
-/// is aligned (`(addr + 4) & !3`) before adding the offset.
+/// is aligned (`(addr + 4) & !3`) before adding the offset. The 16-bit
+/// conditional branch (`B<cond>`) and `cbz`/`cbnz` forms carry the `+1` in
+/// the decoded offset (the decoder prints `$+imm` with it folded in), so
+/// their PC reads as `addr + 2`.
 fn armv7_branch_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
     if !matches!(
         inst.opcode,
@@ -1796,8 +1799,14 @@ fn armv7_branch_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
     inst.operands.iter().find_map(|op| match op {
         ArmV7Operand::BranchOffset(off) => Some(addr.wrapping_add_signed(i64::from(*off) * 4)),
         ArmV7Operand::BranchThumbOffset(off) if inst.thumb() => {
+            let plus_one = matches!(inst.opcode, ArmV7Opcode::CBZ | ArmV7Opcode::CBNZ)
+                || (inst.opcode == ArmV7Opcode::B
+                    && !inst.wide()
+                    && inst.condition != ArmV7Condition::AL);
             let base = if matches!(inst.opcode, ArmV7Opcode::BLX) {
                 addr.wrapping_add(4) & !3
+            } else if plus_one {
+                addr.wrapping_add(2)
             } else {
                 addr.wrapping_add(4)
             };
