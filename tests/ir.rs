@@ -263,10 +263,10 @@ fn arm32_store_mirrors_load() {
 
 #[test]
 fn thumb_cbz_lifts_cbranch() {
-    // cbz r0, #4 at 0x20000 targets 0x20008.
+    // cbz r0, #2 at 0x20000 targets 0x20006.
     let v = thumb(&[0x08, 0xb1], 0x20000);
     assert_eq!(v[0].op, IrOp::CBranch);
-    assert_eq!(v[0].target, Some(0x20008));
+    assert_eq!(v[0].target, Some(0x20006));
 }
 
 #[test]
