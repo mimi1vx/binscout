@@ -6,7 +6,8 @@ binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch 
 
 `--db` overrides the sidecar database (default `<binary>.rsdbg.redb`).
 `--raw` selects explicit raw mapping for firmware/blob workflows:
-`--arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`;
+`--arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
+`riscv32`, `riscv64`;
 `--base` (and optional `--entry`) parse as addresses. `--arch`/`--base`/`--entry`
 without `--raw` are errors, as are unknown arches, unmapped or
 misaligned entries, and base-plus-length overflow. Without `--raw`,
@@ -55,7 +56,7 @@ See [JSON protocol](json-protocol.md) for the output contract.
 | `symbols` | `binscout symbols fw.elf` | imports, exports, and symbol-table code addresses (`symbols`: one `name`/`address`/`address_hex` row per defined text symbol, locals included, deduplicated by address); Mach-O imports carry the `address`/`address_hex` of their `__stubs`/`__auth_stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function; symbol addresses seed `symbol`-reasoned functions named below debug-info and exports and above stubs |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr`, in-memory/file sizes, Shannon `entropy` (bits per byte), permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
-| `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
+| `ir-coverage` | `binscout ir-coverage x86_64 [fw.elf 0x400000 32]` | machine-readable lift coverage for one arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`); no binary is opened without the range, which adds decoded/lifted/unlifted counts from actual lifts plus a bounded mnemonic summary |
 | `flirt-hints` | `binscout flirt-hints fw.elf [--addr 0x400000] [--sigs sigs.json]` | FLIRT-like library hints (read-only): corpus signature matches over each function's leading bytes, paged under the protocol-1 envelope; `--addr` keeps only the containing function's hints; `--sigs` adds a user signature file (our JSON, as emitted by `sig-gen`, or an IDA `.pat` file by extension); suggested names stay hints, querying never writes a sidecar |
 | `sig-gen` | `binscout sig-gen fw.elf` | Emit a JSON signature document for the binary's named functions (masked leading bytes with `len`/`crc`): the `--sigs` input that `flirt-hints` reads back; read-only, never writes the binary or a sidecar |
 | `go-funcs` | `binscout go-funcs fw.elf` | Recover Go functions from the `pclntab` table (linker names plus exact entry/end ranges) for stripped Go binaries; empty array when no table is located; read-only, never writes the binary or a sidecar |

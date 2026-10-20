@@ -67,7 +67,8 @@ $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin -
 {"analysis_revision":7,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/blob.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
 ```
 
-`arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`;
+`arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
+`riscv32`, `riscv64`;
 `arch` and `base` are required in raw mode, and raw-only options
 without `--raw`/`raw` are errors — as are unknown arches, unmapped
 or misaligned entries, and base-plus-length overflow. Without raw

@@ -661,6 +661,8 @@ fn raw_arch_bytes(arch: &str) -> Vec<u8> {
         "aarch64" => vec![0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6],
         "arm32" => vec![0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1],
         "thumb" => vec![0x00, 0xBF, 0x70, 0x47],
+        // riscv `c.nop; ret` (jalr x0, 0(x1)).
+        "riscv32" | "riscv64" => vec![0x01, 0x00, 0x67, 0x80, 0x00, 0x00],
         _ => unreachable!("test arch"),
     }
 }
@@ -672,13 +674,17 @@ fn raw_arch_base(arch: &str) -> &'static str {
         "aarch64" => "0x10000",
         "arm32" => "0x11000",
         "thumb" => "0x20000",
+        "riscv32" => "0x30000",
+        "riscv64" => "0x31000",
         _ => unreachable!("test arch"),
     }
 }
 
 #[test]
 fn raw_flags_report_mapping_across_arches() {
-    for arch in ["x86_64", "x86_32", "aarch64", "arm32", "thumb"] {
+    for arch in [
+        "x86_64", "x86_32", "aarch64", "arm32", "thumb", "riscv32", "riscv64",
+    ] {
         let dir = tmpdir("cli-raw-parity");
         let base = raw_arch_base(arch);
         let bin = write_bin(&dir, "r.bin", &raw_arch_bytes(arch));

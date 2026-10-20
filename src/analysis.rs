@@ -2671,7 +2671,7 @@ fn range_start_mode(hints: &ArmHints, va: u64) -> Option<Arch> {
 /// [`AnalyzeOptions::pointer_scan`].
 fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<(u64, Arch)> {
     let ptr: usize = match bin.arch {
-        Arch::X86_64 | Arch::Aarch64 => 8,
+        Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 => 8,
         _ => 4,
     };
     let mut out: Vec<(u64, Arch)> = Vec::new();
@@ -2938,7 +2938,7 @@ fn prologue_patterns(arch: Arch) -> &'static [&'static [u8]] {
             &[0xF3, 0x0F, 0x1E, 0xFA],
         ],
         Arch::X86_32 => &[&[0x89, 0xE5], &[0x83, 0xEC], &[0x81, 0xEC]],
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => &[],
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => &[],
     }
 }
 
@@ -2953,6 +2953,9 @@ enum CandMatch {
     /// Thumb 16-bit `push {..., lr}` halfword, else the 32-bit ARM-form
     /// word, at halfword steps.
     Thumb,
+    /// RISC-V `addi sp, sp, <imm>` word under a mask, else the
+    /// `c.addi16sp` halfword (nonzero immediate), at halfword steps.
+    Riscv,
     /// x86 byte patterns with a one-byte `push rbp`/`push ebp` step-back.
     X86,
 }
@@ -2967,7 +2970,9 @@ fn next_x86_first_byte(arch: Arch, data: &[u8], from: usize, limit: usize) -> Op
     let rel = match arch {
         Arch::X86_64 => memchr2(0x48, 0xF3, hay)?,
         Arch::X86_32 => memchr3(0x89, 0x83, 0x81, hay)?,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => {
+            return None;
+        }
     };
     Some(from + rel)
 }
@@ -3002,6 +3007,7 @@ impl<'a> CandStream<'a> {
             Arch::Aarch64 => (CandMatch::Aarch64, 4, 4),
             Arch::Arm32 => (CandMatch::ArmPush, 4, 4),
             Arch::Thumb => (CandMatch::Thumb, 2, 2),
+            Arch::Riscv32 | Arch::Riscv64 => (CandMatch::Riscv, 2, 2),
             Arch::X86_64 | Arch::X86_32 => (CandMatch::X86, 1, 2),
         };
         let len = seg.data.len();
@@ -3126,6 +3132,19 @@ impl<'a> CandStream<'a> {
                     None
                 }
             }
+            CandMatch::Riscv => {
+                let raw = self.data.get(off..off + 2)?;
+                let hw = u16::from_le_bytes(raw.try_into().ok()?);
+                if is_riscv_c_addi16sp(hw) {
+                    Some(va)
+                } else if off + 4 <= self.data.len() {
+                    let raw = self.data.get(off..off + 4)?;
+                    let w = u32::from_le_bytes(raw.try_into().ok()?);
+                    is_riscv_addi_sp(w).then_some(va)
+                } else {
+                    None
+                }
+            }
             CandMatch::X86 => {
                 for pat in prologue_patterns(self.arch) {
                     let Some(win) = self.data.get(off..off + pat.len()) else {
@@ -3149,6 +3168,21 @@ impl<'a> CandStream<'a> {
 /// frame-setup push, also valid as the 32-bit Thumb `push` encoding.
 fn is_arm_push_lr(word: u32) -> bool {
     (word & 0x0FFF_4000) == 0x092D_4000
+}
+
+/// Whether a word is RISC-V `addi sp, sp, <imm>` for any 12-bit immediate:
+/// the standard frame-setup prologue. The low 20 bits are fixed (rs1 and
+/// rd both `sp`, `funct3` zero, `OP-IMM` opcode); the immediate rides in
+/// the high 12.
+fn is_riscv_addi_sp(word: u32) -> bool {
+    word & 0x000F_FFFF == 0x0001_0113
+}
+
+/// Whether a halfword is RISC-V `c.addi16sp <nzimm>` with a nonzero
+/// 16-aligned immediate: the compressed frame-setup prologue. The
+/// all-zero immediate is the reserved encoding, never a prologue.
+fn is_riscv_c_addi16sp(hw: u16) -> bool {
+    hw & 0xEF83 == 0x6101 && hw & 0x107C != 0
 }
 
 /// Recursive-descent worklist state shared across seed rounds.
@@ -3474,7 +3508,7 @@ fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
     match arch {
         Arch::X86_32 => Some(4),
         Arch::X86_64 => Some(8),
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => None,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => None,
     }
 }
 
@@ -3489,7 +3523,7 @@ fn absolute_table_width(arch: Arch) -> Option<usize> {
     match arch {
         Arch::X86_32 => Some(4),
         Arch::X86_64 => Some(8),
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => None,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => None,
     }
 }
 
@@ -3692,7 +3726,7 @@ fn resolve_table_site(
     let bitness = match arch {
         Arch::X86_32 => 32,
         Arch::X86_64 => 64,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => return None,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => return None,
     };
     let iced = x86_insn_at(space, site, bitness)?;
     if iced.mnemonic() != iced_x86::Mnemonic::Jmp {
@@ -5493,6 +5527,24 @@ mod tests {
                 }
                 continue;
             }
+            if arch == Arch::Riscv32 || arch == Arch::Riscv64 {
+                let mut off = 0usize;
+                while off + 2 <= seg.data.len() {
+                    let raw = seg.data.get(off..off + 2).expect("halfword in bounds");
+                    let hw = u16::from_le_bytes(raw.try_into().expect("halfword converts"));
+                    if is_riscv_c_addi16sp(hw) {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    } else if off + 4 <= seg.data.len() {
+                        let raw = seg.data.get(off..off + 4).expect("word in bounds");
+                        let w = u32::from_le_bytes(raw.try_into().expect("word converts"));
+                        if is_riscv_addi_sp(w) {
+                            out.push(seg.vaddr.wrapping_add(off as u64));
+                        }
+                    }
+                    off += 2;
+                }
+                continue;
+            }
             for pat in prologue_patterns(arch) {
                 for (i, win) in seg.data.windows(pat.len()).enumerate() {
                     if win != *pat {
@@ -5564,6 +5616,12 @@ mod tests {
                 &[0x1E, 0xFF, 0x2F, 0xE1],
             ),
             Arch::Thumb => (&[0xF0, 0xB5], &[0xF0, 0xB5], &[0x00, 0xBF]),
+            // `addi sp, sp, -16`; the reserved `c.addi16sp` zero-immediate
+            // form still decodes (no rejected form exists, so U behaves
+            // as a second M, like Aarch64); `c.unimp` junk.
+            Arch::Riscv32 | Arch::Riscv64 => {
+                (&[0x13, 0x01, 0x01, 0xFF], &[0x01, 0x61], &[0x00, 0x00])
+            }
             Arch::X86_64 => (&[0x48, 0x89, 0xE5], &[0x48, 0x89, 0xE5], &[0x90]),
             Arch::X86_32 => (&[0x89, 0xE5], &[0x89, 0xE5], &[0x90]),
         }
@@ -5624,6 +5682,8 @@ mod tests {
             Arch::Thumb,
             Arch::X86_64,
             Arch::X86_32,
+            Arch::Riscv32,
+            Arch::Riscv64,
         ] {
             let bin = seed_test_binary(arch, None, tricky_segments(arch));
             let space = AddrSpace::new(&bin);
@@ -5779,6 +5839,8 @@ mod tests {
             Arch::Thumb,
             Arch::X86_64,
             Arch::X86_32,
+            Arch::Riscv32,
+            Arch::Riscv64,
         ] {
             let (m, _, _) = seed_words(arch);
             let base: u64 = 0x1_0000;

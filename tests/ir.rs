@@ -7,12 +7,14 @@ use std::collections::HashSet;
 
 use common::{cleanup, temp_db, tmpdir, write_bin};
 
-const ALL_ARCHES: [Arch; 5] = [
+const ALL_ARCHES: [Arch; 7] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
     Arch::Arm32,
     Arch::Thumb,
+    Arch::Riscv32,
+    Arch::Riscv64,
 ];
 
 fn arch_name(arch: Arch) -> &'static str {
@@ -22,6 +24,8 @@ fn arch_name(arch: Arch) -> &'static str {
         Arch::Aarch64 => "aarch64",
         Arch::Arm32 => "arm32",
         Arch::Thumb => "thumb",
+        Arch::Riscv32 => "riscv32",
+        Arch::Riscv64 => "riscv64",
     }
 }
 
@@ -69,6 +73,113 @@ fn thumb(bytes: &[u8], va: u64) -> Vec<binscout::ir::IrInsn> {
         .disasm_range(bytes, va)
         .expect("valid thumb must decode");
     lift(Arch::Thumb, &insns[0])
+}
+
+fn riscv64(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
+    disasm_range(Arch::Riscv64, bytes, va, 100).expect("valid riscv64 must decode")
+}
+
+#[test]
+fn riscv_prologue_pattern_lifts_add_with_sp_delta() {
+    // addi sp, sp, -16: the standard frame-setup prologue.
+    let insns = riscv64(&[0x13, 0x01, 0x01, 0xFF], 0x10000);
+    assert_eq!(insns.len(), 1);
+    assert_eq!(insns[0].mnem, "addi");
+    assert_eq!(insns[0].ops, ["sp", "sp", "-16"]);
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Add);
+    assert_eq!(v[0].warning, None);
+    assert_eq!(v[0].effects.sp_delta, Some(-16));
+}
+
+#[test]
+fn riscv_jumps_split_call_branch_return_by_operand() {
+    // jal ra, +8: link register means a call with a direct target.
+    let insns = riscv64(&[0xEF, 0x00, 0x80, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "jal");
+    assert_eq!(insns[0].branch_target, Some(0x10008));
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, Some(0x10008)));
+    // jal x0, +8: no link means a plain branch.
+    let insns = riscv64(&[0x6F, 0x00, 0x80, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "jal");
+    assert_eq!(insns[0].branch_target, Some(0x10008));
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Branch, Some(0x10008)));
+    // jalr x0, 0(x1): return reads ra into x0 (objdump prints `ret`).
+    let insns = riscv64(&[0x67, 0x80, 0x00, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "jalr");
+    assert_eq!(insns[0].branch_target, None);
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!(v[0].op, IrOp::Return);
+    assert_eq!(v[0].warning, None);
+    // jalr ra, 0(t0): link register means an indirect call.
+    let insns = riscv64(&[0xE7, 0x80, 0x02, 0x00], 0x10000);
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, None));
+    // beq carries a direct conditional target.
+    let insns = riscv64(&[0x63, 0x04, 0xB5, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "beq");
+    assert_eq!(insns[0].branch_target, Some(0x10008));
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::CBranch, Some(0x10008)));
+}
+
+#[test]
+fn riscv_data_and_system_instructions_lift() {
+    // auipc resolves its page base as a memory target and a copy.
+    let insns = riscv64(&[0x97, 0x01, 0x01, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "auipc");
+    assert_eq!(insns[0].mem_target, Some(0x20000));
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Copy, None));
+    // Integer and compressed loads/stores.
+    let insns = riscv64(&[0x03, 0x25, 0x01, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "lw");
+    assert_eq!(lift(Arch::Riscv64, &insns[0])[0].op, IrOp::Load);
+    let insns = riscv64(&[0x23, 0x20, 0xA1, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "sw");
+    assert_eq!(lift(Arch::Riscv64, &insns[0])[0].op, IrOp::Store);
+    // Traps mirror x86 int3 as calls; the full fence is a nop.
+    // ebreak is 0x00100073; the byte-swapped 0x00001073 would genuinely
+    // decode as `csrrw x0, fflags, x0`.
+    let insns = riscv64(&[0x73, 0x00, 0x10, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "ebreak");
+    assert_eq!(lift(Arch::Riscv64, &insns[0])[0].op, IrOp::Call);
+    let insns = riscv64(&[0x0F, 0x00, 0xF0, 0x0F], 0x10000);
+    assert_eq!(insns[0].mnem, "fence");
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Nop, None));
+    // Vector extension stays unmapped with a warning.
+    let v = lift(Arch::Riscv64, &synth("vadd.vv", &[]));
+    assert_eq!(v[0].op, IrOp::Nop);
+    assert!(v[0].warning.is_some());
+    // CSR reads lift as copies.
+    let insns = riscv64(&[0x73, 0x11, 0x00, 0xC0], 0x10000);
+    assert_eq!(insns[0].mnem, "csrrw");
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Copy, None));
+}
+
+#[test]
+fn riscv_compressed_forms_decode_and_lift() {
+    // 0x0001 matches the `c.addi` spec before the exact-mask `c.nop`
+    // spec, so it decodes (and lifts) as an `addi` writing `x0`: a
+    // semantic nop through the Add family.
+    let insns = riscv64(&[0x01, 0x00], 0x10000);
+    assert_eq!((insns[0].mnem.as_str(), insns[0].size), ("c.addi", 2));
+    assert_eq!(lift(Arch::Riscv64, &insns[0])[0].op, IrOp::Add);
+    let insns = riscv64(&[0x01, 0x71], 0x10000);
+    assert_eq!(insns[0].mnem, "c.addi16sp");
+    let v = lift(Arch::Riscv64, &insns[0]);
+    assert_eq!(v[0].op, IrOp::Add);
+    // The 10-bit immediate is signed: 0x7101 allocates -512 (dealloc).
+    assert_eq!(v[0].effects.sp_delta, Some(-512));
+    // c.addi decodes as its own mnemonic, not the `li` alias.
+    let insns = riscv64(&[0x05, 0x01], 0x10000);
+    assert_eq!(insns[0].mnem, "c.addi");
+    assert_eq!(lift(Arch::Riscv64, &insns[0])[0].op, IrOp::Add);
 }
 
 #[test]
@@ -303,6 +414,7 @@ fn unmapped_mnem(arch: Arch) -> &'static str {
     match arch {
         Arch::X86_64 | Arch::X86_32 => "cpuid",
         Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => "mrs",
+        Arch::Riscv32 | Arch::Riscv64 => "vadd.vv",
     }
 }
 
@@ -334,10 +446,14 @@ fn coverage_publishes_all_families_limits_and_fallback() {
         assert_eq!(c.fallback.status, CoverageStatus::Unmapped);
         assert!(c.fallback.warning.contains("unlifted"), "{arch:?}");
         assert!(!c.fallback.distinguish.is_empty());
-        // Only ARM32/Thumb read base forms through suffix stripping.
+        // Notes ride on ARM32/Thumb (suffix stripping) and RISC-V
+        // (no-aliases canonical names, atomic suffixes, jump splitting).
         assert_eq!(
             c.arch_note.is_some(),
-            matches!(arch, Arch::Arm32 | Arch::Thumb),
+            matches!(
+                arch,
+                Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64
+            ),
             "{arch:?}"
         );
     }
@@ -433,21 +549,23 @@ fn partial_means_mapped_but_semantically_incomplete() {
     use binscout::ir::CoverageStatus;
     for arch in ALL_ARCHES {
         let c = coverage(arch);
-        // CMP records the comparison; flag effects are unmodeled everywhere.
-        assert_eq!(
-            family(&c, IrOp::Cmp).status,
-            CoverageStatus::Partial,
-            "{arch:?}"
-        );
-        let v = lift(arch, &synth("cmp", &[]));
+        // CMP records the comparison; flag effects are unmodeled everywhere
+        // except RISC-V, which has no flags to model (and no rotates to
+        // approximate as shifts, so Shr is exact there too).
+        let cmp_mnem = match arch {
+            Arch::Riscv32 | Arch::Riscv64 => "slt",
+            _ => "cmp",
+        };
+        let want_status = match arch {
+            Arch::Riscv32 | Arch::Riscv64 => CoverageStatus::Implemented,
+            _ => CoverageStatus::Partial,
+        };
+        assert_eq!(family(&c, IrOp::Cmp).status, want_status, "{arch:?}");
+        let v = lift(arch, &synth(cmp_mnem, &[]));
         assert_eq!(v[0].op, IrOp::Cmp, "{arch:?}");
         assert_eq!(v[0].warning, None, "{arch:?}");
         // Rotates approximate to shifts.
-        assert_eq!(
-            family(&c, IrOp::Shr).status,
-            CoverageStatus::Partial,
-            "{arch:?}"
-        );
+        assert_eq!(family(&c, IrOp::Shr).status, want_status, "{arch:?}");
         // Implemented families still disclaim completeness globally.
         assert!(c.limitations.iter().any(|l| l.contains("SSA")), "{arch:?}");
         assert!(

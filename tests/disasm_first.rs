@@ -12,15 +12,19 @@ fn arch_tag(arch: Arch) -> u64 {
         Arch::Aarch64 => 3,
         Arch::Arm32 => 4,
         Arch::Thumb => 5,
+        Arch::Riscv32 => 6,
+        Arch::Riscv64 => 7,
     }
 }
 
-const ARCHES: [Arch; 5] = [
+const ARCHES: [Arch; 7] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
     Arch::Arm32,
     Arch::Thumb,
+    Arch::Riscv32,
+    Arch::Riscv64,
 ];
 
 /// Pre-fix oracle: the exact shrinking-window algorithm `decode_one` used
@@ -72,6 +76,22 @@ fn oracle_first(arch: Arch, bytes: &[u8], va: u64) -> Option<Insn> {
                 }
             } else {
                 None
+            }
+        }
+        Arch::Riscv32 | Arch::Riscv64 => {
+            // New arch, no legacy window behavior: the oracle mirrors the
+            // strict contract (length from the low two bits, truncated
+            // words fail) over the public range API.
+            let wide = bytes[0] & 0x03 == 0x03;
+            let need = if wide { 4 } else { 2 };
+            if bytes.len() < need {
+                return None;
+            }
+            match disasm_range(arch, &bytes[..need], va, DEFAULT_MAX_INSNS) {
+                Ok(mut v) if !v.is_empty() => Some(v.remove(0)),
+                Ok(_) => None,
+                Err(Error::Invalid(_)) => None,
+                Err(e) => panic!("oracle hit unexpected error: {e:?}"),
             }
         }
     }

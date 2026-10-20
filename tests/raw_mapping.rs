@@ -465,6 +465,8 @@ fn arch_bytes(arch: Arch) -> Vec<u8> {
         Arch::Arm32 => vec![0x01, 0x00, 0xA0, 0xE1, 0x1E, 0xFF, 0x2F, 0xE1],
         // thumb `nop; bx lr`.
         Arch::Thumb => vec![0x00, 0xBF, 0x70, 0x47],
+        // riscv `c.nop; ret` (jalr x0, 0(x1)).
+        Arch::Riscv32 | Arch::Riscv64 => vec![0x01, 0x00, 0x67, 0x80, 0x00, 0x00],
     }
 }
 
@@ -475,6 +477,8 @@ fn arch_base(arch: Arch) -> u64 {
         Arch::Aarch64 => 0x10000,
         Arch::Arm32 => 0x11000,
         Arch::Thumb => 0x20000,
+        Arch::Riscv32 => 0x30000,
+        Arch::Riscv64 => 0x31000,
     }
 }
 
@@ -486,6 +490,8 @@ fn explicit_raw_parity_across_arches() {
         Arch::Aarch64,
         Arch::Arm32,
         Arch::Thumb,
+        Arch::Riscv32,
+        Arch::Riscv64,
     ] {
         let dir = common::tmpdir("raw-parity");
         let bytes = arch_bytes(arch);

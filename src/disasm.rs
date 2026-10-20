@@ -1,4 +1,5 @@
-//! M2 disassembler: x86_64 via iced-x86, AArch64/ARM32/Thumb via yaxpeax-arm.
+//! M2 disassembler: x86_64 via iced-x86, AArch64/ARM32/Thumb via
+//! yaxpeax-arm, RISC-V 32/64 via rvdasm.
 //!
 //! [`Disassembler::disasm_range`] decodes `bytes` assumed loaded at virtual
 //! address `va`. Decoding stops at the first invalid opcode
@@ -11,6 +12,8 @@
 use iced_x86::{
     Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
 };
+use rvdasm::disassembler::{Disassembler as RiscvDecoder, Xlen as RiscvXlen};
+use rvdasm::insn::Insn as RiscvInsn;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use yaxpeax_arch::Decoder as ArmDecoder;
@@ -38,6 +41,10 @@ pub enum Arch {
     Arm32,
     /// 32-bit ARM (Thumb mode, mixed 2/4-byte instructions).
     Thumb,
+    /// 32-bit RISC-V (mixed 2/4-byte instructions with the C extension).
+    Riscv32,
+    /// 64-bit RISC-V (mixed 2/4-byte instructions with the C extension).
+    Riscv64,
 }
 
 impl Arch {
@@ -59,6 +66,8 @@ impl Arch {
             Self::Aarch64 => AnyDisasm::Aarch64(Aarch64Disasm::new()),
             Self::Arm32 => AnyDisasm::Arm32(Arm32Disasm::new()),
             Self::Thumb => AnyDisasm::Thumb(ThumbDisasm::new()),
+            Self::Riscv32 => AnyDisasm::Riscv32(Riscv32Disasm::new()),
+            Self::Riscv64 => AnyDisasm::Riscv64(Riscv64Disasm::new()),
         }
     }
 }
@@ -188,7 +197,8 @@ pub fn stack_slot(op: &Operand) -> Option<(&str, i64, u32)> {
 pub struct Insn {
     /// Virtual address of the first byte.
     pub addr: u64,
-    /// Length in bytes (x86: 1-15, AArch64/ARM32: always 4, Thumb: 2 or 4).
+    /// Length in bytes (x86: 1-15, AArch64/ARM32: always 4, Thumb and
+    /// RISC-V: 2 or 4).
     pub size: u8,
     /// Raw instruction bytes.
     pub bytes: Vec<u8>,
@@ -203,8 +213,8 @@ pub struct Insn {
     /// `push 0x402100`, `mov eax, [0x403000]`; 64-bit non-PIE
     /// `mov edi, <str>` = `bf imm32`, `mov eax, [abs32]`, `lea` with
     /// disp32), AArch64
-    /// `adr`/`adrp`/literal loads, and ARM32/Thumb PC-relative literal
-    /// loads (`ldr r0, [pc, ...]`).
+    /// `adr`/`adrp`/literal loads, ARM32/Thumb PC-relative literal
+    /// loads (`ldr r0, [pc, ...]`), and the RISC-V `auipc` page base.
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
     /// reports its pointer slot here and `None` for `branch_target`.
     pub mem_target: Option<u64>,
@@ -243,7 +253,7 @@ pub struct Insn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub string: Option<String>,
     /// Structured x86 operands in decoder (`op_count`) order (see
-    /// [`Operand`]). Empty for AArch64/ARM32/Thumb and for rows decoded
+    /// [`Operand`]). Empty for AArch64/ARM32/Thumb/RISC-V and for rows decoded
     /// before typed operands existed. Omitted from JSON when empty so
     /// old goldens keep passing; `ops` stays the display form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -444,6 +454,18 @@ pub struct ThumbDisasm {
     max_insns: usize,
 }
 
+/// RISC-V 32-bit disassembler (rvdasm, mixed 2/4-byte with the C extension).
+#[derive(Debug, Clone, Copy)]
+pub struct Riscv32Disasm {
+    max_insns: usize,
+}
+
+/// RISC-V 64-bit disassembler (rvdasm, mixed 2/4-byte with the C extension).
+#[derive(Debug, Clone, Copy)]
+pub struct Riscv64Disasm {
+    max_insns: usize,
+}
+
 impl X86_64Disasm {
     /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
@@ -554,6 +576,50 @@ impl Default for ThumbDisasm {
     }
 }
 
+impl Riscv32Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_insns: DEFAULT_MAX_INSNS,
+        }
+    }
+
+    /// Custom instruction cap.
+    #[must_use]
+    pub fn with_limit(max_insns: usize) -> Self {
+        Self { max_insns }
+    }
+}
+
+impl Default for Riscv32Disasm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Riscv64Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_insns: DEFAULT_MAX_INSNS,
+        }
+    }
+
+    /// Custom instruction cap.
+    #[must_use]
+    pub fn with_limit(max_insns: usize) -> Self {
+        Self { max_insns }
+    }
+}
+
+impl Default for Riscv64Disasm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Disassembler for X86_64Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_x86(bytes, va, self.max_insns, 64)
@@ -604,6 +670,26 @@ impl Disassembler for ThumbDisasm {
     }
 }
 
+impl Disassembler for Riscv32Disasm {
+    fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
+        disasm_riscv(bytes, va, self.max_insns, 32)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_riscv_partial(bytes, va, self.max_insns, 32)
+    }
+}
+
+impl Disassembler for Riscv64Disasm {
+    fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
+        disasm_riscv(bytes, va, self.max_insns, 64)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_riscv_partial(bytes, va, self.max_insns, 64)
+    }
+}
+
 /// Arch-dispatched disassembler (object-safe use of [`Disassembler`]).
 #[derive(Debug, Clone, Copy)]
 pub enum AnyDisasm {
@@ -617,6 +703,10 @@ pub enum AnyDisasm {
     Arm32(Arm32Disasm),
     /// Thumb backend.
     Thumb(ThumbDisasm),
+    /// RISC-V 32-bit backend.
+    Riscv32(Riscv32Disasm),
+    /// RISC-V 64-bit backend.
+    Riscv64(Riscv64Disasm),
 }
 
 impl Disassembler for AnyDisasm {
@@ -627,6 +717,8 @@ impl Disassembler for AnyDisasm {
             Self::Aarch64(d) => d.disasm_range(bytes, va),
             Self::Arm32(d) => d.disasm_range(bytes, va),
             Self::Thumb(d) => d.disasm_range(bytes, va),
+            Self::Riscv32(d) => d.disasm_range(bytes, va),
+            Self::Riscv64(d) => d.disasm_range(bytes, va),
         }
     }
 
@@ -637,6 +729,8 @@ impl Disassembler for AnyDisasm {
             Self::Aarch64(d) => d.disasm_range_partial(bytes, va),
             Self::Arm32(d) => d.disasm_range_partial(bytes, va),
             Self::Thumb(d) => d.disasm_range_partial(bytes, va),
+            Self::Riscv32(d) => d.disasm_range_partial(bytes, va),
+            Self::Riscv64(d) => d.disasm_range_partial(bytes, va),
         }
     }
 }
@@ -649,6 +743,8 @@ pub fn disasm_range(arch: Arch, bytes: &[u8], va: u64, max_insns: usize) -> Resu
         Arch::Aarch64 => disasm_aarch64(bytes, va, max_insns),
         Arch::Arm32 => disasm_arm32(bytes, va, max_insns),
         Arch::Thumb => disasm_thumb(bytes, va, max_insns),
+        Arch::Riscv32 => disasm_riscv(bytes, va, max_insns, 32),
+        Arch::Riscv64 => disasm_riscv(bytes, va, max_insns, 64),
     }
 }
 
@@ -672,6 +768,8 @@ pub fn disasm_range_partial(
         Arch::Aarch64 => disasm_aarch64_partial(bytes, va, max_insns),
         Arch::Arm32 => disasm_arm32_partial(bytes, va, max_insns),
         Arch::Thumb => disasm_thumb_partial(bytes, va, max_insns),
+        Arch::Riscv32 => disasm_riscv_partial(bytes, va, max_insns, 32),
+        Arch::Riscv64 => disasm_riscv_partial(bytes, va, max_insns, 64),
     }
 }
 
@@ -692,6 +790,8 @@ pub fn disasm_first(arch: Arch, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
         Arch::Aarch64 => disasm_first_aarch64(bytes, va),
         Arch::Arm32 => disasm_first_arm32(bytes, va),
         Arch::Thumb => disasm_first_thumb(bytes, va),
+        Arch::Riscv32 => disasm_first_riscv(bytes, va, 32),
+        Arch::Riscv64 => disasm_first_riscv(bytes, va, 64),
     }
 }
 
@@ -1861,6 +1961,163 @@ fn armv7_data_target(inst: &ArmV7Instruction, addr: u64) -> Option<u64> {
             })
         }
         _ => None,
+    })
+}
+
+/// Convert one decoded RISC-V instruction to [`Insn`].
+///
+/// Shared by the range prefix decoder and the first-instruction decoder so
+/// both report identical mnemonics, operands, and branch/memory targets.
+/// Text is rvdasm's `no-aliases` form (canonical mnemonics, ABI register
+/// names, branch targets as absolute `0x` addresses) split by
+/// [`split_asm`]; structured [`Operand`] rows stay empty like the other
+/// non-x86 backends.
+fn riscv_insn(addr: u64, raw: Vec<u8>, inst: &RiscvInsn, xlen: u8) -> Insn {
+    let (mnem, ops) = split_asm(&inst.asm_no_aliases(addr));
+    Insn {
+        addr,
+        size: inst.get_len(),
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target: riscv_branch_target(inst, addr, xlen),
+        mem_target: riscv_mem_target(inst, addr),
+        table_base: None,
+        import: None,
+        target_name: None,
+        comment: None,
+        string: None,
+        operands: Vec::new(),
+        thumb: false,
+    }
+}
+
+/// Absolute target for a direct PC-relative RISC-V branch or jump, else
+/// `None`. rvdasm's `offset` is the already-scaled byte offset for branches,
+/// jumps, and `auipc` alike; indirect jumps (`jalr` family, `ret`) carry no
+/// target. RV32 wraps at 32 bits, matching the hardware PC.
+fn riscv_branch_target(inst: &RiscvInsn, addr: u64, xlen: u8) -> Option<u64> {
+    if !(inst.is_branch() || inst.is_direct_jump()) {
+        return None;
+    }
+    let off = inst.offset;
+    Some(if xlen == 32 {
+        u64::from((addr as u32).wrapping_add_signed(off))
+    } else {
+        addr.wrapping_add_signed(i64::from(off))
+    })
+}
+
+/// Absolute page base produced by `auipc`, else `None`. Loads and stores
+/// need a base register, so only the PC-relative upper-immediate form
+/// resolves; `lui` is not PC-relative. Branch and jump opcodes are excluded
+/// (see [`riscv_branch_target`]).
+fn riscv_mem_target(inst: &RiscvInsn, addr: u64) -> Option<u64> {
+    if inst.get_name() != "auipc" {
+        return None;
+    }
+    let off = i64::from(inst.offset);
+    Some(addr.wrapping_add_signed(off))
+}
+
+/// Decode only the first RISC-V instruction in `bytes` (loaded at `va`).
+///
+/// Reads the leading halfword to pick the 2- or 4-byte form, then decodes
+/// with the same rvdasm decoder and the same [`riscv_insn`] conversion as
+/// [`disasm_riscv_partial`]. Returns [`Error::Invalid`] with the same
+/// message the range decoder reports when the first instruction is
+/// undecodable or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first instruction does not decode.
+fn disasm_first_riscv(bytes: &[u8], va: u64, xlen: u8) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let label = if xlen == 32 { "riscv32" } else { "riscv64" };
+    let wide = bytes[0] & 0x03 == 0x03;
+    let need = if wide { 4 } else { 2 };
+    let Some(win) = bytes.get(..need) else {
+        return Err(Error::Invalid(format!(
+            "{label} decode error at {va:#x}: truncated word"
+        )));
+    };
+    let mut word = [0u8; 4];
+    word[..need].copy_from_slice(win);
+    let decoder = RiscvDecoder::new(if xlen == 32 {
+        RiscvXlen::XLEN32
+    } else {
+        RiscvXlen::XLEN64
+    });
+    let code = u32::from_le_bytes(word);
+    let inst = decoder
+        .disassmeble_one(code)
+        .ok_or_else(|| Error::Invalid(format!("{label} invalid opcode at {va:#x}")))?;
+    let raw = win.to_vec();
+    Ok(Some(riscv_insn(va, raw, &inst, xlen)))
+}
+
+fn disasm_riscv(bytes: &[u8], va: u64, max_insns: usize, xlen: u8) -> Result<Vec<Insn>> {
+    let partial = disasm_riscv_partial(bytes, va, max_insns, xlen)?;
+    match partial.error_at {
+        Some(e) => Err(Error::Invalid(e.message)),
+        None => Ok(partial.insns),
+    }
+}
+
+/// Prefix decode over RISC-V bytes: length follows the low two bits (2 or
+/// 4 bytes with the C extension), so the first bad word ends the prefix
+/// with `error_at`. A short tail (< 2 bytes, or a 4-byte form with only 3)
+/// fails its word decode the same way.
+fn disasm_riscv_partial(
+    bytes: &[u8],
+    va: u64,
+    max_insns: usize,
+    xlen: u8,
+) -> Result<PartialDisasm> {
+    let label = if xlen == 32 { "riscv32" } else { "riscv64" };
+    let decoder = RiscvDecoder::new(if xlen == 32 {
+        RiscvXlen::XLEN32
+    } else {
+        RiscvXlen::XLEN64
+    });
+    let mut out = Vec::new();
+    let mut addr = va;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        if out.len() >= max_insns {
+            return Err(limit_err(max_insns));
+        }
+        let wide = bytes[off] & 0x03 == 0x03;
+        let need = if wide { 4 } else { 2 };
+        let Some(win) = bytes.get(off..off + need) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("{label} decode error at {addr:#x}: truncated word"),
+                }),
+            });
+        };
+        let mut word = [0u8; 4];
+        word[..need].copy_from_slice(win);
+        let code = u32::from_le_bytes(word);
+        let Some(inst) = decoder.disassmeble_one(code) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("{label} invalid opcode at {addr:#x}"),
+                }),
+            });
+        };
+        out.push(riscv_insn(addr, win.to_vec(), &inst, xlen));
+        addr = addr.wrapping_add(need as u64);
+        off += need;
+    }
+    Ok(PartialDisasm {
+        insns: out,
+        error_at: None,
     })
 }
 

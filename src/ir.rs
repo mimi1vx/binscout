@@ -199,6 +199,44 @@
 //!   `wfi`/`sev`/`yield`, `cpsid`/`cpsie`, `setend`, `dbg` (mostly Thumb;
 //!   ARM-mode hints/barriers are outside the decoder).
 //!
+//! `lift_riscv` covers RISC-V mnemonics as rvdasm prints them with
+//! `no-aliases` (canonical names: compressed forms keep their `c.` prefix,
+//! so `c.addi` never prints as `addi` and the `li`/`mv`/`ret`/`nop`
+//! aliases never appear; atomics carry their ordering as `.aq`/`.rl`/
+//! `.aqrl`, stripped before lookup):
+//!
+//! - `COPY`: `lui`, `auipc` (pc-relative add folded away), `c.lui`,
+//!   `c.mv`, `c.li`, CSR `csrrw`/`csrrs`/`csrrc`/`csrrwi`/`csrrsi`/
+//!   `csrrci`, FP moves/converts `fmv`/`fsgnj*`/`fcvt*`. `LOAD`: `lb`/
+//!   `lh`/`lw`/`lbu`/`lhu`/`ld`/`lwu`, FP `flw`/`fld`, the `c.` loads
+//!   (including `sp`-relative), `lr.w`/`lr.d`, read-modify-write atomics
+//!   `amo*` (store half unmodeled). `STORE`: `sb`/`sh`/`sw`/`sd`, FP
+//!   `fsw`/`fsd`, the `c.` stores, `sc.w`/`sc.d`.
+//! - `ADD`: `add`, `addi`, `addw`, `addiw`, the `c.` adds (`c.addi4spn`/
+//!   `c.addi16sp`/`c.addiw`/`c.add`/`c.addw`), FP `fadd`. `SUB`: `sub`,
+//!   `subw`, `c.sub`, `c.subw`, FP `fsub`. `MUL`: `mul`, `mulh`,
+//!   `mulhsu`, `mulhu`, `mulw`, FP `fmul`/`fmadd`/`fmsub`/`fnmadd`/
+//!   `fnmsub` (fused add folded away). `DIV`: `div`, `divu`, `rem`,
+//!   `remu`, `divw`, `divuw`, `remw`, `remuw`, FP `fdiv`. `AND`: `and`,
+//!   `andi`, `c.and`, `c.andi`. `OR`: `or`, `ori`, `c.or`. `XOR`: `xor`,
+//!   `xori`, `c.xor`. `SHL`: `sll`, `slli`, `sllw`, `slliw`, `c.slli`.
+//!   `SHR`: `srl`, `srli`, `sra`, `srai`, `srlw`, `srliw`, `sraw`,
+//!   `sraiw`, `c.srli`, `c.srai`.
+//! - `CMP`: `slt`, `slti`, `sltu`, `sltiu`, FP `feq`/`flt`/`fle`.
+//!   `BRANCH`: `c.j`, plus non-link `jal`/`jalr`/`jr`/`c.jalr`/`c.jr`
+//!   (indirect keeps operands). `CBRANCH`: `beq`, `bne`, `blt`, `bge`,
+//!   `bltu`, `bgeu`, `c.beqz`, `c.bnez`. `CALL`: `c.jal`, link-writing
+//!   `jal`/`jalr`/`c.jalr`, `call`, `tail`, `ecall`, `ebreak` (traps
+//!   mirror x86 `int3`). `RETURN`: operand-dependent (`jalr`-family
+//!   reading `ra` into `x0`, what objdump prints as `ret`). `NOP`:
+//!   `fence`, `unimp`, `c.unimp` (`unimp` is the `csrrw x0, cycle, x0`
+//!   encoding rvdasm names; `nop` also maps, for the cross-arch
+//!   genuine-nop contract, though no-aliases text never prints it).
+//!   Still unmapped by design: the
+//!   V vector extension, Zbb-style bitmanip, FP `fmin`/`fmax`/`fsqrt`/
+//!   `fclass`, and privileged `mret`/`sret`/`sfence`/`hfence`.
+//!
+//!
 //! # Warning semantics
 //!
 //! Lifting never fails: a mnemonic outside all tables (e.g. x86 `cpuid`,
@@ -420,6 +458,7 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
         Arch::X86_64 | Arch::X86_32 => lift_x86(insn),
         Arch::Aarch64 => lift_aarch64(insn),
         Arch::Arm32 | Arch::Thumb => lift_arm32(insn),
+        Arch::Riscv32 | Arch::Riscv64 => lift_riscv(insn),
     };
     if let [row] = rows.as_mut_slice()
         && row.warning.is_none()
@@ -537,6 +576,21 @@ pub fn control_op(arch: Arch, insn: &Insn) -> Option<(IrOp, Option<u64>)> {
                 _ => None,
             }
         }
+        Arch::Riscv32 | Arch::Riscv64 => {
+            let mnem = insn.mnem.as_str();
+            // Same guards and outcomes as `lift_riscv`'s jump arms.
+            if riscv_is_ret(mnem, insn) || mnem == "ret" {
+                Some((IrOp::Return, None))
+            } else if is_riscv_cbranch(mnem) {
+                Some((IrOp::CBranch, insn.branch_target))
+            } else if is_riscv_call(mnem, insn) {
+                Some((IrOp::Call, insn.branch_target))
+            } else if is_riscv_jump(mnem) {
+                Some((IrOp::Branch, insn.branch_target))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -603,6 +657,27 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || is_arm_nop(mnem)
         }
         Arch::Arm32 | Arch::Thumb => arm_base_mnem(split_arm_mnem(mnem).0),
+        Arch::Riscv32 | Arch::Riscv64 => {
+            is_riscv_copy(mnem)
+                || is_riscv_load(mnem)
+                || is_riscv_store(mnem)
+                || is_riscv_alu(mnem, IrOp::Add)
+                || is_riscv_alu(mnem, IrOp::Sub)
+                || is_riscv_alu(mnem, IrOp::Mul)
+                || is_riscv_alu(mnem, IrOp::Div)
+                || is_riscv_alu(mnem, IrOp::And)
+                || is_riscv_alu(mnem, IrOp::Or)
+                || is_riscv_alu(mnem, IrOp::Xor)
+                || is_riscv_alu(mnem, IrOp::Shl)
+                || is_riscv_alu(mnem, IrOp::Shr)
+                || is_riscv_cmp(mnem)
+                || mnem == "c.j"
+                || is_riscv_cbranch(mnem)
+                || RISCV_CALL.contains(&mnem)
+                || is_riscv_jump(mnem)
+                || mnem == "ret"
+                || is_riscv_nop(mnem)
+        }
     }
 }
 
@@ -656,7 +731,8 @@ pub struct FallbackCoverage {
 /// see `limitations` plus each family's `status`/`note`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
-    /// Architecture name (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`).
+    /// Architecture name (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
+    /// `riscv32`, `riscv64`).
     pub arch: String,
     /// Per-operation families in [`IrOp`] declaration order.
     pub families: Vec<FamilyCoverage>,
@@ -1007,6 +1083,99 @@ fn arm32_families() -> Vec<FamilyCoverage> {
     ]
 }
 
+fn riscv_families() -> Vec<FamilyCoverage> {
+    use CoverageStatus::Implemented;
+    vec![
+        fam(
+            IrOp::Copy,
+            Implemented,
+            RISCV_COPY,
+            &[],
+            Some("auipc folds the pc-relative add away; fused FP multiply-adds are under Mul"),
+        ),
+        fam(
+            IrOp::Load,
+            Implemented,
+            RISCV_LOAD,
+            &[],
+            Some(
+                "atomic ordering suffixes (.aq/.rl/.aqrl) strip before lookup; read-modify-write atomics fold the store half away",
+            ),
+        ),
+        fam(
+            IrOp::Store,
+            Implemented,
+            RISCV_STORE,
+            &[],
+            Some("atomic ordering suffixes (.aq/.rl/.aqrl) strip before lookup"),
+        ),
+        fam(
+            IrOp::Add,
+            Implemented,
+            RISCV_ADD,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            RISCV_SUB,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(
+            IrOp::Mul,
+            Implemented,
+            RISCV_MUL,
+            &[],
+            Some("fused FP multiply-adds fold the add away"),
+        ),
+        fam(IrOp::Div, Implemented, RISCV_DIV, &[], None),
+        fam(IrOp::And, Implemented, RISCV_AND, &[], None),
+        fam(IrOp::Or, Implemented, RISCV_OR, &[], None),
+        fam(IrOp::Xor, Implemented, RISCV_XOR, &[], None),
+        fam(IrOp::Shl, Implemented, RISCV_SHL, &[], None),
+        fam(IrOp::Shr, Implemented, RISCV_SHR, &[], None),
+        fam(
+            IrOp::Cmp,
+            Implemented,
+            RISCV_CMP,
+            &[],
+            Some("set-less-than and FP compares record no flags (RISC-V has none)"),
+        ),
+        fam(
+            IrOp::Branch,
+            Implemented,
+            &["c.j"],
+            &[],
+            Some(
+                "plus non-link jal/jalr/jr/c.jalr/c.jr (indirect keeps operands; link forms are Call, ra-targeting forms are Return)",
+            ),
+        ),
+        fam(IrOp::CBranch, Implemented, RISCV_CBRANCH, &[], None),
+        fam(
+            IrOp::Call,
+            Implemented,
+            RISCV_CALL,
+            &[],
+            Some(
+                "plus link-writing jal/jalr/c.jalr (indirect keeps operands); ebreak/c.ebreak mirror x86 int3",
+            ),
+        ),
+        fam(
+            IrOp::Return,
+            Implemented,
+            &["ret"],
+            &[],
+            Some(
+                "operand-dependent: jalr/jr/c.jalr/c.jr reading ra into x0 (what objdump prints as ret)",
+            ),
+        ),
+        phi_family(),
+        fam(IrOp::Nop, Implemented, RISCV_NOP, &[], Some(NOP_NOTE)),
+    ]
+}
+
 /// Machine-readable lift coverage for `arch`, without opening a binary.
 ///
 /// Families publish the same mnemonic slices the dispatch predicates
@@ -1022,6 +1191,12 @@ pub fn coverage(arch: Arch) -> Coverage {
             arm32_families(),
             Some(
                 "mnemonics are base forms: one .w/.n width suffix, one condition suffix, and one flag s are stripped before lookup; a stripped condition turns plain b into CBRANCH",
+            ),
+        ),
+        Arch::Riscv32 | Arch::Riscv64 => (
+            riscv_families(),
+            Some(
+                "mnemonics are rvdasm no-aliases canonical names (c.-prefixed compressed forms kept; li/mv/ret/nop aliases never appear); atomic .aq/.rl/.aqrl suffixes strip before lookup; jal/jalr forms split into Call/Branch/Return by operand (see family notes)",
             ),
         ),
     };
@@ -1200,6 +1375,58 @@ pub fn lift_aarch64_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
         warning: None,
         effects: IrEffects {
             sets_flags,
+            sp_delta: None,
+        },
+        operands: insn.operands.clone(),
+    }]
+}
+
+/// Lift one RISC-V (32- or 64-bit) instruction.
+///
+/// Mode-agnostic by design (one table for both XLENs): RISC-V has no
+/// flags, so `sets_flags` is always false, and frame-pointer effects are
+/// magnitudes, so `sp_delta` is assigned by [`lift`], which owns the arch
+/// context. `jal`/`jalr`-family jumps split by operand: link-writing forms
+/// lift as `Call`, `ra`-into-`x0` forms as `Return`, the rest as `Branch`.
+#[must_use]
+pub fn lift_riscv(insn: &Insn) -> Vec<IrInsn> {
+    let mnem = insn.mnem.as_str();
+    let (op, inputs, outputs, target) = match mnem {
+        s if is_riscv_copy(s) => first_out_rest_in(insn, IrOp::Copy),
+        s if is_riscv_load(s) => first_out_rest_in(insn, IrOp::Load),
+        s if is_riscv_store(s) => (IrOp::Store, insn.ops.clone(), Vec::new(), None),
+        s if is_riscv_alu(s, IrOp::Add) => first_out_rest_in(insn, IrOp::Add),
+        s if is_riscv_alu(s, IrOp::Sub) => first_out_rest_in(insn, IrOp::Sub),
+        s if is_riscv_alu(s, IrOp::Mul) => first_out_rest_in(insn, IrOp::Mul),
+        s if is_riscv_alu(s, IrOp::Div) => first_out_rest_in(insn, IrOp::Div),
+        s if is_riscv_alu(s, IrOp::And) => first_out_rest_in(insn, IrOp::And),
+        s if is_riscv_alu(s, IrOp::Or) => first_out_rest_in(insn, IrOp::Or),
+        s if is_riscv_alu(s, IrOp::Xor) => first_out_rest_in(insn, IrOp::Xor),
+        s if is_riscv_alu(s, IrOp::Shl) => first_out_rest_in(insn, IrOp::Shl),
+        s if is_riscv_alu(s, IrOp::Shr) => first_out_rest_in(insn, IrOp::Shr),
+        s if is_riscv_cmp(s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
+        s if riscv_is_ret(s, insn) => (IrOp::Return, Vec::new(), Vec::new(), None),
+        "c.j" => direct_or_indirect(insn, IrOp::Branch),
+        s if is_riscv_cbranch(s) => (
+            IrOp::CBranch,
+            insn.ops.clone(),
+            Vec::new(),
+            insn.branch_target,
+        ),
+        s if is_riscv_call(s, insn) => direct_or_indirect(insn, IrOp::Call),
+        s if is_riscv_jump(s) => direct_or_indirect(insn, IrOp::Branch),
+        s if is_riscv_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
+        _ => return unlifted(insn),
+    };
+    vec![IrInsn {
+        addr: insn.addr,
+        op,
+        inputs,
+        outputs,
+        target,
+        warning: None,
+        effects: IrEffects {
+            sets_flags: false,
             sp_delta: None,
         },
         operands: insn.operands.clone(),
@@ -1724,6 +1951,15 @@ fn arm32_sets_flags(base: &str, full: &str) -> bool {
 /// (multi-register push/pop need register-list decoding; `bl`/`ret` are
 /// link-register moves with no SP effect).
 fn sp_delta_for(arch: Arch, insn: &Insn) -> Option<i64> {
+    if matches!(arch, Arch::Riscv32 | Arch::Riscv64) {
+        // Frame alloc/dealloc: `addi sp, sp, <imm>` and `c.addi16sp`.
+        // Immediates print decimal in both operand spellings.
+        return match (insn.mnem.as_str(), insn.ops.as_slice()) {
+            ("addi", [dst, src, imm]) if dst == "sp" && src == "sp" => imm.parse::<i64>().ok(),
+            ("c.addi16sp", [dst, imm]) if dst == "sp" => imm.parse::<i64>().ok(),
+            _ => None,
+        };
+    }
     if !matches!(arch, Arch::X86_64 | Arch::X86_32) {
         return None;
     }
@@ -2625,6 +2861,128 @@ const ARM32_NOP: &[&str] = &[
     "cpsie", "setend", "dbg",
 ];
 
+/// Canonical rvdasm `no-aliases` mnemonics (compressed forms keep their
+/// `c.` prefix; `li`/`mv`/`ret`/`nop` aliases never appear).
+const RISCV_COPY: &[&str] = &[
+    "lui",
+    "auipc",
+    "c.lui",
+    "c.mv",
+    "c.li",
+    "csrrw",
+    "csrrs",
+    "csrrc",
+    "csrrwi",
+    "csrrsi",
+    "csrrci",
+    "fmv.s",
+    "fmv.d",
+    "fsgnj.s",
+    "fsgnj.d",
+    "fsgnjn.s",
+    "fsgnjn.d",
+    "fsgnjx.s",
+    "fsgnjx.d",
+    "fcvt.s.d",
+    "fcvt.d.s",
+    "fcvt.s.w",
+    "fcvt.s.wu",
+    "fcvt.s.l",
+    "fcvt.s.lu",
+    "fcvt.d.w",
+    "fcvt.d.wu",
+    "fcvt.d.l",
+    "fcvt.d.lu",
+    "fcvt.w.s",
+    "fcvt.wu.s",
+    "fcvt.l.s",
+    "fcvt.lu.s",
+    "fcvt.w.d",
+    "fcvt.wu.d",
+    "fcvt.l.d",
+    "fcvt.lu.d",
+];
+const RISCV_LOAD: &[&str] = &[
+    "lb",
+    "lh",
+    "lw",
+    "lbu",
+    "lhu",
+    "ld",
+    "lwu",
+    "flw",
+    "fld",
+    "c.lw",
+    "c.ld",
+    "c.flw",
+    "c.fld",
+    "c.lwsp",
+    "c.ldsp",
+    "c.flwsp",
+    "c.fldsp",
+    "lr.w",
+    "lr.d",
+    "amoadd.w",
+    "amoadd.d",
+    "amoxor.w",
+    "amoxor.d",
+    "amoand.w",
+    "amoand.d",
+    "amoor.w",
+    "amoor.d",
+    "amomin.w",
+    "amomin.d",
+    "amomax.w",
+    "amomax.d",
+    "amominu.w",
+    "amominu.d",
+    "amomaxu.w",
+    "amomaxu.d",
+    "amoswap.w",
+    "amoswap.d",
+];
+const RISCV_STORE: &[&str] = &[
+    "sb", "sh", "sw", "sd", "fsw", "fsd", "c.sw", "c.sd", "c.fsw", "c.fsd", "c.swsp", "c.sdsp",
+    "c.fswsp", "c.fsdsp", "sc.w", "sc.d",
+];
+const RISCV_ADD: &[&str] = &[
+    "add",
+    "addi",
+    "addw",
+    "addiw",
+    "c.addi",
+    "c.addiw",
+    "c.add",
+    "c.addw",
+    "c.addi16sp",
+    "c.addi4spn",
+    "fadd.s",
+    "fadd.d",
+];
+const RISCV_SUB: &[&str] = &["sub", "subw", "c.sub", "c.subw", "fsub.s", "fsub.d"];
+const RISCV_MUL: &[&str] = &[
+    "mul", "mulh", "mulhsu", "mulhu", "mulw", "fmul.s", "fmul.d", "fmadd.s", "fmadd.d", "fmsub.s",
+    "fmsub.d", "fnmadd.s", "fnmadd.d", "fnmsub.s", "fnmsub.d",
+];
+const RISCV_DIV: &[&str] = &[
+    "div", "divu", "rem", "remu", "divw", "divuw", "remw", "remuw", "fdiv.s", "fdiv.d",
+];
+const RISCV_AND: &[&str] = &["and", "andi", "c.and", "c.andi"];
+const RISCV_OR: &[&str] = &["or", "ori", "c.or"];
+const RISCV_XOR: &[&str] = &["xor", "xori", "c.xor"];
+const RISCV_SHL: &[&str] = &["sll", "slli", "sllw", "slliw", "c.slli"];
+const RISCV_SHR: &[&str] = &[
+    "srl", "srli", "sra", "srai", "srlw", "srliw", "sraw", "sraiw", "c.srli", "c.srai",
+];
+const RISCV_CMP: &[&str] = &[
+    "slt", "slti", "sltu", "sltiu", "feq.s", "feq.d", "flt.s", "flt.d", "fle.s", "fle.d",
+];
+const RISCV_CBRANCH: &[&str] = &[
+    "beq", "bne", "blt", "bge", "bltu", "bgeu", "c.beqz", "c.bnez",
+];
+const RISCV_CALL: &[&str] = &["c.jal", "call", "tail", "ecall", "ebreak", "c.ebreak"];
+const RISCV_NOP: &[&str] = &["nop", "fence", "unimp", "c.unimp"];
+
 fn is_x86_jcc(s: &str) -> bool {
     X86_JCC.contains(&s)
 }
@@ -2752,6 +3110,96 @@ fn is_arm32_stm(s: &str) -> bool {
 
 fn is_arm32_nop(s: &str) -> bool {
     ARM32_NOP.contains(&s)
+}
+
+/// Strip a RISC-V atomic ordering suffix (`.aq`, `.rl`, `.aqrl`): the
+/// tables list the bare mnemonic, and only load/store families consult
+/// suffixed forms.
+fn strip_riscv_atomic(s: &str) -> &str {
+    s.strip_suffix(".aqrl")
+        .or_else(|| s.strip_suffix(".aq"))
+        .or_else(|| s.strip_suffix(".rl"))
+        .unwrap_or(s)
+}
+
+/// Base register of an `imm(rs1)` memory operand, if it has that shape.
+fn riscv_mem_base(slot: &str) -> Option<&str> {
+    slot.split_once('(')?.1.strip_suffix(')')
+}
+
+/// Whether a RISC-V jump writes a link register (`ra`/`t0`): the call
+/// forms of `jal`/`jalr`. Compressed `c.jal` has no destination operand
+/// and always links `ra`, so it is matched statically instead.
+fn riscv_writes_link(insn: &Insn) -> bool {
+    matches!(insn.ops.first().map(String::as_str), Some("ra" | "t0"))
+}
+
+/// Whether a RISC-V indirect jump is a return: `jalr x0, 0(ra)` and its
+/// `jr`/`c.jr`/`c.jalr` spellings (what objdump prints as `ret`).
+fn riscv_is_ret(mnem: &str, insn: &Insn) -> bool {
+    if mnem == "ret" {
+        return true;
+    }
+    if !matches!(mnem, "jalr" | "jr" | "c.jalr" | "c.jr") {
+        return false;
+    }
+    match insn.ops.as_slice() {
+        [rd, slot] => rd == "zero" && riscv_mem_base(slot) == Some("ra"),
+        [rs1] => mnem == "c.jr" && rs1 == "ra",
+        _ => false,
+    }
+}
+
+/// Whether `mnem` is a RISC-V jump mnemonic handled by [`lift_riscv`]'s
+/// explicit control-flow arms (never a link-writing call or a return).
+fn is_riscv_jump(mnem: &str) -> bool {
+    matches!(mnem, "jal" | "jalr" | "jr" | "c.jalr" | "c.jr" | "c.j")
+}
+
+/// Whether `mnem` is a RISC-V call: the static trap/pseudo forms, or a
+/// link-writing `jal`/`jalr`/`c.jalr`.
+fn is_riscv_call(mnem: &str, insn: &Insn) -> bool {
+    RISCV_CALL.contains(&mnem)
+        || (matches!(mnem, "jal" | "jalr" | "c.jalr") && riscv_writes_link(insn))
+}
+
+fn is_riscv_copy(s: &str) -> bool {
+    RISCV_COPY.contains(&s)
+}
+
+fn is_riscv_load(s: &str) -> bool {
+    RISCV_LOAD.contains(&strip_riscv_atomic(s))
+}
+
+fn is_riscv_store(s: &str) -> bool {
+    RISCV_STORE.contains(&strip_riscv_atomic(s))
+}
+
+fn is_riscv_alu(s: &str, op: IrOp) -> bool {
+    match op {
+        IrOp::Add => RISCV_ADD.contains(&s),
+        IrOp::Sub => RISCV_SUB.contains(&s),
+        IrOp::Mul => RISCV_MUL.contains(&s),
+        IrOp::Div => RISCV_DIV.contains(&s),
+        IrOp::And => RISCV_AND.contains(&s),
+        IrOp::Or => RISCV_OR.contains(&s),
+        IrOp::Xor => RISCV_XOR.contains(&s),
+        IrOp::Shl => RISCV_SHL.contains(&s),
+        IrOp::Shr => RISCV_SHR.contains(&s),
+        _ => false,
+    }
+}
+
+fn is_riscv_cmp(s: &str) -> bool {
+    RISCV_CMP.contains(&s)
+}
+
+fn is_riscv_cbranch(s: &str) -> bool {
+    RISCV_CBRANCH.contains(&s)
+}
+
+fn is_riscv_nop(s: &str) -> bool {
+    RISCV_NOP.contains(&s)
 }
 
 #[cfg(test)]

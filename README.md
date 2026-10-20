@@ -57,7 +57,7 @@ binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch 
 appended to the full file name so `foo.exe` and `foo.dll` never share
 one). `--raw`
 selects explicit raw mapping for firmware/blob workflows (`arch` is one
-of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`); without it,
+of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`); without it,
 container auto-detection applies. `--fat-arch` selects a slice of a
 fat Mach-O container (`x86_64`, `x86_32`, `aarch64`, `arm32`, plus
 `lipo` aliases like `arm64`, case-insensitive); it is required for fat

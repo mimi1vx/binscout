@@ -181,6 +181,7 @@ dependencies = [
  "redb",
  "regex",
  "rmcp",
+ "rvdasm",
  "schemars",
  "serde",
  "serde_json",
@@ -1583,6 +1584,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "rvdasm"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0d4b4601a68154f5af591cf4401ab8b120947e8ca3cf51cbf090c8c9e46474d"
+dependencies = [
+ "once_cell",
+ "serde",
 ]
 
 [[package]]
