@@ -2671,7 +2671,7 @@ fn range_start_mode(hints: &ArmHints, va: u64) -> Option<Arch> {
 /// [`AnalyzeOptions::pointer_scan`].
 fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<(u64, Arch)> {
     let ptr: usize = match bin.arch {
-        Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 => 8,
+        Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 | Arch::Ppc64 => 8,
         _ => 4,
     };
     let mut out: Vec<(u64, Arch)> = Vec::new();
@@ -2938,7 +2938,13 @@ fn prologue_patterns(arch: Arch) -> &'static [&'static [u8]] {
             &[0xF3, 0x0F, 0x1E, 0xFA],
         ],
         Arch::X86_32 => &[&[0x89, 0xE5], &[0x83, 0xEC], &[0x81, 0xEC]],
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => &[],
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::Thumb
+        | Arch::Riscv32
+        | Arch::Riscv64
+        | Arch::Ppc32
+        | Arch::Ppc64 => &[],
     }
 }
 
@@ -2956,6 +2962,9 @@ enum CandMatch {
     /// RISC-V `addi sp, sp, <imm>` word under a mask, else the
     /// `c.addi16sp` halfword (nonzero immediate), at halfword steps.
     Riscv,
+    /// PowerPC: no prologue shape modeled yet (follow-up: `stwu r1, ..`
+    /// plus `mflr`/`stw` LR spill); never matches.
+    Ppc,
     /// x86 byte patterns with a one-byte `push rbp`/`push ebp` step-back.
     X86,
 }
@@ -2970,7 +2979,13 @@ fn next_x86_first_byte(arch: Arch, data: &[u8], from: usize, limit: usize) -> Op
     let rel = match arch {
         Arch::X86_64 => memchr2(0x48, 0xF3, hay)?,
         Arch::X86_32 => memchr3(0x89, 0x83, 0x81, hay)?,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => {
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::Thumb
+        | Arch::Riscv32
+        | Arch::Riscv64
+        | Arch::Ppc32
+        | Arch::Ppc64 => {
             return None;
         }
     };
@@ -3008,6 +3023,7 @@ impl<'a> CandStream<'a> {
             Arch::Arm32 => (CandMatch::ArmPush, 4, 4),
             Arch::Thumb => (CandMatch::Thumb, 2, 2),
             Arch::Riscv32 | Arch::Riscv64 => (CandMatch::Riscv, 2, 2),
+            Arch::Ppc32 | Arch::Ppc64 => (CandMatch::Ppc, 4, 4),
             Arch::X86_64 | Arch::X86_32 => (CandMatch::X86, 1, 2),
         };
         let len = seg.data.len();
@@ -3160,6 +3176,8 @@ impl<'a> CandStream<'a> {
                 }
                 None
             }
+            // No PowerPC prologue shape modeled yet; see [`CandMatch::Ppc`].
+            CandMatch::Ppc => None,
         }
     }
 }
@@ -3508,7 +3526,13 @@ fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
     match arch {
         Arch::X86_32 => Some(4),
         Arch::X86_64 => Some(8),
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => None,
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::Thumb
+        | Arch::Riscv32
+        | Arch::Riscv64
+        | Arch::Ppc32
+        | Arch::Ppc64 => None,
     }
 }
 
@@ -3523,7 +3547,13 @@ fn absolute_table_width(arch: Arch) -> Option<usize> {
     match arch {
         Arch::X86_32 => Some(4),
         Arch::X86_64 => Some(8),
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => None,
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::Thumb
+        | Arch::Riscv32
+        | Arch::Riscv64
+        | Arch::Ppc32
+        | Arch::Ppc64 => None,
     }
 }
 
@@ -3726,7 +3756,13 @@ fn resolve_table_site(
     let bitness = match arch {
         Arch::X86_32 => 32,
         Arch::X86_64 => 64,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => return None,
+        Arch::Aarch64
+        | Arch::Arm32
+        | Arch::Thumb
+        | Arch::Riscv32
+        | Arch::Riscv64
+        | Arch::Ppc32
+        | Arch::Ppc64 => return None,
     };
     let iced = x86_insn_at(space, site, bitness)?;
     if iced.mnemonic() != iced_x86::Mnemonic::Jmp {
@@ -5622,6 +5658,14 @@ mod tests {
             Arch::Riscv32 | Arch::Riscv64 => {
                 (&[0x13, 0x01, 0x01, 0xFF], &[0x01, 0x61], &[0x00, 0x00])
             }
+            // No PPC prologue shape modeled yet (see `CandMatch::Ppc`):
+            // any valid word stands in for M, the empty primary opcode
+            // for U, and a lone x86 nop for J.
+            Arch::Ppc32 | Arch::Ppc64 => (
+                &[0x48, 0x00, 0x00, 0x00],
+                &[0x00, 0x00, 0x00, 0x00],
+                &[0x90],
+            ),
             Arch::X86_64 => (&[0x48, 0x89, 0xE5], &[0x48, 0x89, 0xE5], &[0x90]),
             Arch::X86_32 => (&[0x89, 0xE5], &[0x89, 0xE5], &[0x90]),
         }

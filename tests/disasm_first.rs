@@ -14,10 +14,12 @@ fn arch_tag(arch: Arch) -> u64 {
         Arch::Thumb => 5,
         Arch::Riscv32 => 6,
         Arch::Riscv64 => 7,
+        Arch::Ppc32 => 8,
+        Arch::Ppc64 => 9,
     }
 }
 
-const ARCHES: [Arch; 7] = [
+const ARCHES: [Arch; 9] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
@@ -25,6 +27,8 @@ const ARCHES: [Arch; 7] = [
     Arch::Thumb,
     Arch::Riscv32,
     Arch::Riscv64,
+    Arch::Ppc32,
+    Arch::Ppc64,
 ];
 
 /// Pre-fix oracle: the exact shrinking-window algorithm `decode_one` used
@@ -48,6 +52,19 @@ fn oracle_first(arch: Arch, bytes: &[u8], va: u64) -> Option<Insn> {
             }
         }
         Arch::Aarch64 | Arch::Arm32 => {
+            if bytes.len() < 4 {
+                return None;
+            }
+            match disasm_range(arch, &bytes[..4], va, DEFAULT_MAX_INSNS) {
+                Ok(mut v) if !v.is_empty() => Some(v.remove(0)),
+                Ok(_) => None,
+                Err(Error::Invalid(_)) => None,
+                Err(e) => panic!("oracle hit unexpected error: {e:?}"),
+            }
+        }
+        // PowerPC mirrors the fixed-width shape: one big-endian word or
+        // nothing; short tails and illegal words end the path.
+        Arch::Ppc32 | Arch::Ppc64 => {
             if bytes.len() < 4 {
                 return None;
             }
@@ -199,6 +216,21 @@ fn invalid_first_opcode_agrees_on_all_arches() {
     );
     assert_agree(Arch::Arm32, &[0x01, 0x00], 0x10000);
     assert_eq!(new_first(Arch::Arm32, &[0x01, 0x00], 0x10000), None);
+    // PowerPC: opcode-0 word is illegal, short tails decode nothing.
+    // (`0xff..` decodes as a valid extended floating-point form, so the
+    // illegal probe uses the empty primary opcode instead.)
+    assert_agree(Arch::Ppc32, &[0x00, 0x00, 0x00, 0x00], 0x10000);
+    assert_eq!(
+        new_first(Arch::Ppc32, &[0x00, 0x00, 0x00, 0x00], 0x10000),
+        None
+    );
+    assert_agree(Arch::Ppc64, &[0x00, 0x00, 0x00, 0x00], 0x10000);
+    assert_eq!(
+        new_first(Arch::Ppc64, &[0x00, 0x00, 0x00, 0x00], 0x10000),
+        None
+    );
+    assert_agree(Arch::Ppc32, &[0x48, 0x00, 0x01], 0x10000);
+    assert_eq!(new_first(Arch::Ppc32, &[0x48, 0x00, 0x01], 0x10000), None);
     // Lone first halfword of a 32-bit Thumb instruction.
     assert_agree(Arch::Thumb, &[0x00, 0xf0], 0x20000);
     assert_eq!(new_first(Arch::Thumb, &[0x00, 0xf0], 0x20000), None);

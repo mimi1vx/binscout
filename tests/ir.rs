@@ -26,6 +26,8 @@ fn arch_name(arch: Arch) -> &'static str {
         Arch::Thumb => "thumb",
         Arch::Riscv32 => "riscv32",
         Arch::Riscv64 => "riscv64",
+        Arch::Ppc32 => "ppc32",
+        Arch::Ppc64 => "ppc64",
     }
 }
 
@@ -415,6 +417,9 @@ fn unmapped_mnem(arch: Arch) -> &'static str {
         Arch::X86_64 | Arch::X86_32 => "cpuid",
         Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => "mrs",
         Arch::Riscv32 | Arch::Riscv64 => "vadd.vv",
+        // Skeleton: everything is unmapped on PPC; any base mnemonic
+        // qualifies (`add` will stay unmapped until ALU lifting lands).
+        Arch::Ppc32 | Arch::Ppc64 => "add",
     }
 }
 

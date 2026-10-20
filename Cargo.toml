@@ -23,6 +23,7 @@ msvc-demangler = "0.11"
 object = "0.40"
 pdb = "0.8"
 petgraph = "0.8"
+powerpc = "0.4"
 redb = "4.3"
 regex = "1"
 rmcp = { version = "3.5", features = ["transport-io"] }

@@ -178,6 +178,7 @@ dependencies = [
  "object 0.40.0",
  "pdb",
  "petgraph",
+ "powerpc",
  "redb",
  "regex",
  "rmcp",
@@ -1326,6 +1327,12 @@ dependencies = [
  "embedded-io 0.6.1",
  "serde",
 ]
+
+[[package]]
+name = "powerpc"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9cac36a8d92f3c9d38ebfa606e3bbbbec229a8d757f03de0999898522856e33"
 
 [[package]]
 name = "proc-macro2"

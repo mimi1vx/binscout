@@ -342,7 +342,7 @@ pub struct FileSignature {
     /// Suggested function name this pattern identifies.
     pub name: String,
     /// Decode arch (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
-    /// `riscv32`, `riscv64`; case-insensitive) or null for any x86 mode.
+    /// `riscv32`, `riscv64`, `ppc32`, `ppc64`; case-insensitive) or null for any x86 mode.
     pub arch: Option<String>,
     /// Whitespace-separated bytes: two hex digits or `??` wildcards.
     pub bytes: String,

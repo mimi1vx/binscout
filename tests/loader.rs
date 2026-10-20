@@ -326,13 +326,15 @@ fn coff_i386_maps_to_x86_32() {
 }
 
 #[test]
-fn coff_unsupported_arch_errors_without_raw_fallback() {
-    // PowerPC COFF: recognized container, but no disassembler.
+fn coff_ppc_maps_to_ppc32() {
+    // Same headers with a PowerPC machine id: parses to the PPC32 target
+    // (rsdbg-9syq spike; was the unsupported-arch probe before PPC mapped).
     let mut bytes = common::fixture_bytes(builders::COFF_NAME);
     put16(&mut bytes, 0, 0x1F0);
     assert!(binscout::loader::is_recognized(&bytes));
-    let err = load(&bytes).unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    let bin = load(&bytes).expect("ppc COFF must load");
+    assert_eq!(bin.format, BinaryFormat::Coff);
+    assert_eq!(bin.arch, Arch::Ppc32);
 }
 
 #[test]

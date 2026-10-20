@@ -181,6 +181,8 @@ pub fn arch_name(arch: Arch) -> &'static str {
         Arch::Thumb => "thumb",
         Arch::Riscv32 => "riscv32",
         Arch::Riscv64 => "riscv64",
+        Arch::Ppc32 => "ppc32",
+        Arch::Ppc64 => "ppc64",
     }
 }
 
@@ -197,6 +199,8 @@ pub fn parse_arch(s: &str) -> Result<Arch> {
         "thumb" => Ok(Arch::Thumb),
         "riscv32" => Ok(Arch::Riscv32),
         "riscv64" => Ok(Arch::Riscv64),
+        "ppc32" => Ok(Arch::Ppc32),
+        "ppc64" => Ok(Arch::Ppc64),
         other => Err(Error::Storage(format!(
             "unknown arch in project db: {other}"
         ))),
@@ -2458,6 +2462,8 @@ mod tests {
             Arch::Thumb,
             Arch::Riscv32,
             Arch::Riscv64,
+            Arch::Ppc32,
+            Arch::Ppc64,
         ] {
             assert_eq!(parse_arch(arch_name(a)).unwrap(), a);
         }

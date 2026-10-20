@@ -1,5 +1,5 @@
 //! M2 disassembler: x86_64 via iced-x86, AArch64/ARM32/Thumb via
-//! yaxpeax-arm, RISC-V 32/64 via rvdasm.
+//! yaxpeax-arm, RISC-V 32/64 via rvdasm, PowerPC 32/64 via powerpc.
 //!
 //! [`Disassembler::disasm_range`] decodes `bytes` assumed loaded at virtual
 //! address `va`. Decoding stops at the first invalid opcode
@@ -12,6 +12,7 @@
 use iced_x86::{
     Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
 };
+use powerpc::{Extensions as PpcExtensions, Ins as PpcIns};
 use rvdasm::disassembler::{Disassembler as RiscvDecoder, Xlen as RiscvXlen};
 use rvdasm::insn::Insn as RiscvInsn;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,10 @@ pub enum Arch {
     Riscv32,
     /// 64-bit RISC-V (mixed 2/4-byte instructions with the C extension).
     Riscv64,
+    /// 32-bit PowerPC (fixed 4-byte big-endian instructions, base ISA).
+    Ppc32,
+    /// 64-bit PowerPC (fixed 4-byte big-endian instructions, base ISA).
+    Ppc64,
 }
 
 impl Arch {
@@ -68,6 +73,8 @@ impl Arch {
             Self::Thumb => AnyDisasm::Thumb(ThumbDisasm::new()),
             Self::Riscv32 => AnyDisasm::Riscv32(Riscv32Disasm::new()),
             Self::Riscv64 => AnyDisasm::Riscv64(Riscv64Disasm::new()),
+            Self::Ppc32 => AnyDisasm::Ppc32(Ppc32Disasm::new()),
+            Self::Ppc64 => AnyDisasm::Ppc64(Ppc64Disasm::new()),
         }
     }
 }
@@ -197,8 +204,8 @@ pub fn stack_slot(op: &Operand) -> Option<(&str, i64, u32)> {
 pub struct Insn {
     /// Virtual address of the first byte.
     pub addr: u64,
-    /// Length in bytes (x86: 1-15, AArch64/ARM32: always 4, Thumb and
-    /// RISC-V: 2 or 4).
+    /// Length in bytes (x86: 1-15, AArch64/ARM32/PowerPC: always 4,
+    /// Thumb and RISC-V: 2 or 4).
     pub size: u8,
     /// Raw instruction bytes.
     pub bytes: Vec<u8>,
@@ -466,6 +473,18 @@ pub struct Riscv64Disasm {
     max_insns: usize,
 }
 
+/// PowerPC 32-bit disassembler (powerpc crate, fixed 4-byte big-endian).
+#[derive(Debug, Clone, Copy)]
+pub struct Ppc32Disasm {
+    max_insns: usize,
+}
+
+/// PowerPC 64-bit disassembler (powerpc crate, fixed 4-byte big-endian).
+#[derive(Debug, Clone, Copy)]
+pub struct Ppc64Disasm {
+    max_insns: usize,
+}
+
 impl X86_64Disasm {
     /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
@@ -620,6 +639,50 @@ impl Default for Riscv64Disasm {
     }
 }
 
+impl Ppc32Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_insns: DEFAULT_MAX_INSNS,
+        }
+    }
+
+    /// Custom instruction cap.
+    #[must_use]
+    pub fn with_limit(max_insns: usize) -> Self {
+        Self { max_insns }
+    }
+}
+
+impl Default for Ppc32Disasm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ppc64Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_insns: DEFAULT_MAX_INSNS,
+        }
+    }
+
+    /// Custom instruction cap.
+    #[must_use]
+    pub fn with_limit(max_insns: usize) -> Self {
+        Self { max_insns }
+    }
+}
+
+impl Default for Ppc64Disasm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Disassembler for X86_64Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_x86(bytes, va, self.max_insns, 64)
@@ -690,6 +753,26 @@ impl Disassembler for Riscv64Disasm {
     }
 }
 
+impl Disassembler for Ppc32Disasm {
+    fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
+        disasm_ppc(bytes, va, self.max_insns, false)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_ppc_partial(bytes, va, self.max_insns, false)
+    }
+}
+
+impl Disassembler for Ppc64Disasm {
+    fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
+        disasm_ppc(bytes, va, self.max_insns, true)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_ppc_partial(bytes, va, self.max_insns, true)
+    }
+}
+
 /// Arch-dispatched disassembler (object-safe use of [`Disassembler`]).
 #[derive(Debug, Clone, Copy)]
 pub enum AnyDisasm {
@@ -707,6 +790,10 @@ pub enum AnyDisasm {
     Riscv32(Riscv32Disasm),
     /// RISC-V 64-bit backend.
     Riscv64(Riscv64Disasm),
+    /// PowerPC 32-bit backend.
+    Ppc32(Ppc32Disasm),
+    /// PowerPC 64-bit backend.
+    Ppc64(Ppc64Disasm),
 }
 
 impl Disassembler for AnyDisasm {
@@ -719,6 +806,8 @@ impl Disassembler for AnyDisasm {
             Self::Thumb(d) => d.disasm_range(bytes, va),
             Self::Riscv32(d) => d.disasm_range(bytes, va),
             Self::Riscv64(d) => d.disasm_range(bytes, va),
+            Self::Ppc32(d) => d.disasm_range(bytes, va),
+            Self::Ppc64(d) => d.disasm_range(bytes, va),
         }
     }
 
@@ -731,6 +820,8 @@ impl Disassembler for AnyDisasm {
             Self::Thumb(d) => d.disasm_range_partial(bytes, va),
             Self::Riscv32(d) => d.disasm_range_partial(bytes, va),
             Self::Riscv64(d) => d.disasm_range_partial(bytes, va),
+            Self::Ppc32(d) => d.disasm_range_partial(bytes, va),
+            Self::Ppc64(d) => d.disasm_range_partial(bytes, va),
         }
     }
 }
@@ -745,6 +836,8 @@ pub fn disasm_range(arch: Arch, bytes: &[u8], va: u64, max_insns: usize) -> Resu
         Arch::Thumb => disasm_thumb(bytes, va, max_insns),
         Arch::Riscv32 => disasm_riscv(bytes, va, max_insns, 32),
         Arch::Riscv64 => disasm_riscv(bytes, va, max_insns, 64),
+        Arch::Ppc32 => disasm_ppc(bytes, va, max_insns, false),
+        Arch::Ppc64 => disasm_ppc(bytes, va, max_insns, true),
     }
 }
 
@@ -770,6 +863,8 @@ pub fn disasm_range_partial(
         Arch::Thumb => disasm_thumb_partial(bytes, va, max_insns),
         Arch::Riscv32 => disasm_riscv_partial(bytes, va, max_insns, 32),
         Arch::Riscv64 => disasm_riscv_partial(bytes, va, max_insns, 64),
+        Arch::Ppc32 => disasm_ppc_partial(bytes, va, max_insns, false),
+        Arch::Ppc64 => disasm_ppc_partial(bytes, va, max_insns, true),
     }
 }
 
@@ -792,6 +887,8 @@ pub fn disasm_first(arch: Arch, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
         Arch::Thumb => disasm_first_thumb(bytes, va),
         Arch::Riscv32 => disasm_first_riscv(bytes, va, 32),
         Arch::Riscv64 => disasm_first_riscv(bytes, va, 64),
+        Arch::Ppc32 => disasm_first_ppc(bytes, va, false),
+        Arch::Ppc64 => disasm_first_ppc(bytes, va, true),
     }
 }
 
@@ -2114,6 +2211,150 @@ fn disasm_riscv_partial(
         out.push(riscv_insn(addr, win.to_vec(), &inst, xlen));
         addr = addr.wrapping_add(need as u64);
         off += need;
+    }
+    Ok(PartialDisasm {
+        insns: out,
+        error_at: None,
+    })
+}
+
+/// Extensions decoded per PowerPC mode: base ISA only (32-bit), plus the
+/// 64-bit extension on 64-bit. AltiVec, paired-singles, and VMX128 stay
+/// off: their opcodes decode as [`powerpc::Opcode::Illegal`] and end the
+/// prefix, never as silent mistranslations. Enabling them is a follow-up.
+fn ppc_extensions(is64: bool) -> PpcExtensions {
+    if is64 {
+        PpcExtensions::from_extension(powerpc::Extension::Ppc64)
+    } else {
+        PpcExtensions::none()
+    }
+}
+
+/// Convert one decoded PowerPC instruction to [`Insn`].
+///
+/// Text is the powerpc crate's `simplified` form (canonical mnemonics with
+/// LK/AA/BO folded in, e.g. `bl`, `bne`, `blr`) split by [`split_asm`];
+/// structured [`Operand`] rows stay empty like the other non-x86 backends.
+fn ppc_insn(addr: u64, raw: Vec<u8>, ins: &PpcIns, is64: bool) -> Insn {
+    let (mnem, ops) = split_asm(&ins.simplified().to_string());
+    Insn {
+        addr,
+        size: 4,
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target: ppc_branch_target(ins, addr, is64),
+        mem_target: None,
+        table_base: None,
+        import: None,
+        target_name: None,
+        comment: None,
+        string: None,
+        operands: Vec::new(),
+        thumb: false,
+    }
+}
+
+/// Absolute target for a direct PowerPC branch (`b`/`bc` family), else
+/// `None`. Register-indirect forms (`blr`, `bctr` and friends) carry no
+/// target. 32-bit targets wrap at 32 bits, matching the hardware NIA;
+/// 64-bit targets sign-extend like the 64-bit NIA.
+fn ppc_branch_target(ins: &PpcIns, addr: u64, is64: bool) -> Option<u64> {
+    let off = ins.branch_offset()?;
+    if ins.field_aa() {
+        return Some(if is64 {
+            (i64::from(off)) as u64
+        } else {
+            u64::from(off as u32)
+        });
+    }
+    Some(if is64 {
+        addr.wrapping_add_signed(i64::from(off))
+    } else {
+        u64::from((addr as u32).wrapping_add_signed(off))
+    })
+}
+
+/// Decode a raw PowerPC word: `None` for undecodable opcodes.
+fn ppc_decode_word(code: u32, is64: bool) -> Option<PpcIns> {
+    use powerpc::Opcode as PpcOpcode;
+    let ins = PpcIns::new(code, ppc_extensions(is64));
+    (ins.op != PpcOpcode::Illegal).then_some(ins)
+}
+
+/// Decode only the first PowerPC instruction in `bytes` (loaded at `va`).
+///
+/// Reads one big-endian word and converts with the same [`ppc_insn`]
+/// mapping as [`disasm_ppc_partial`]. Returns [`Error::Invalid`] with the
+/// same message the range decoder reports when the first word is
+/// undecodable or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first instruction does not decode.
+fn disasm_first_ppc(bytes: &[u8], va: u64, is64: bool) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let label = if is64 { "ppc64" } else { "ppc32" };
+    let Some(win) = bytes.get(..4) else {
+        return Err(Error::Invalid(format!(
+            "{label} decode error at {va:#x}: truncated word"
+        )));
+    };
+    let code = u32::from_be_bytes(win.try_into().expect("word converts"));
+    let Some(ins) = ppc_decode_word(code, is64) else {
+        return Err(Error::Invalid(format!("{label} invalid opcode at {va:#x}")));
+    };
+    Ok(Some(ppc_insn(va, win.to_vec(), &ins, is64)))
+}
+
+fn disasm_ppc(bytes: &[u8], va: u64, max_insns: usize, is64: bool) -> Result<Vec<Insn>> {
+    let partial = disasm_ppc_partial(bytes, va, max_insns, is64)?;
+    match partial.error_at {
+        Some(e) => Err(Error::Invalid(e.message)),
+        None => Ok(partial.insns),
+    }
+}
+
+/// Prefix decode over PowerPC bytes: fixed 4-byte big-endian words, so the
+/// first [`powerpc::Opcode::Illegal`] word ends the prefix with `error_at`.
+/// A short tail (< 4 bytes) fails its word decode the same way.
+fn disasm_ppc_partial(
+    bytes: &[u8],
+    va: u64,
+    max_insns: usize,
+    is64: bool,
+) -> Result<PartialDisasm> {
+    let label = if is64 { "ppc64" } else { "ppc32" };
+    let mut out = Vec::new();
+    let mut addr = va;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        if out.len() >= max_insns {
+            return Err(limit_err(max_insns));
+        }
+        let Some(win) = bytes.get(off..off + 4) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("{label} decode error at {addr:#x}: truncated word"),
+                }),
+            });
+        };
+        let code = u32::from_be_bytes(win.try_into().expect("word converts"));
+        let Some(ins) = ppc_decode_word(code, is64) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("{label} invalid opcode at {addr:#x}"),
+                }),
+            });
+        };
+        out.push(ppc_insn(addr, win.to_vec(), &ins, is64));
+        addr = addr.wrapping_add(4);
+        off += 4;
     }
     Ok(PartialDisasm {
         insns: out,

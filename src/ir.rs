@@ -459,6 +459,7 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
         Arch::Aarch64 => lift_aarch64(insn),
         Arch::Arm32 | Arch::Thumb => lift_arm32(insn),
         Arch::Riscv32 | Arch::Riscv64 => lift_riscv(insn),
+        Arch::Ppc32 | Arch::Ppc64 => lift_ppc(insn),
     };
     if let [row] = rows.as_mut_slice()
         && row.warning.is_none()
@@ -591,6 +592,9 @@ pub fn control_op(arch: Arch, insn: &Insn) -> Option<(IrOp, Option<u64>)> {
                 None
             }
         }
+        // Skeleton (rsdbg-9syq spike): no control op modeled yet; every
+        // instruction lifts to fallback NOP, so nothing is control flow.
+        Arch::Ppc32 | Arch::Ppc64 => None,
     }
 }
 
@@ -678,6 +682,9 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || mnem == "ret"
                 || is_riscv_nop(mnem)
         }
+        // Skeleton (rsdbg-9syq spike): nothing lifts yet, so nothing is
+        // mapped; exactly predicts `lift_ppc`'s fallback warnings.
+        Arch::Ppc32 | Arch::Ppc64 => false,
     }
 }
 
@@ -1176,6 +1183,13 @@ fn riscv_families() -> Vec<FamilyCoverage> {
     ]
 }
 
+/// Skeleton PowerPC families (rsdbg-9syq spike): empty until `lift_ppc`
+/// models control flow; [`coverage`] then advertises the same branch
+/// slices the predicates consult.
+fn ppc_families() -> Vec<FamilyCoverage> {
+    Vec::new()
+}
+
 /// Machine-readable lift coverage for `arch`, without opening a binary.
 ///
 /// Families publish the same mnemonic slices the dispatch predicates
@@ -1197,6 +1211,12 @@ pub fn coverage(arch: Arch) -> Coverage {
             riscv_families(),
             Some(
                 "mnemonics are rvdasm no-aliases canonical names (c.-prefixed compressed forms kept; li/mv/ret/nop aliases never appear); atomic .aq/.rl/.aqrl suffixes strip before lookup; jal/jalr forms split into Call/Branch/Return by operand (see family notes)",
+            ),
+        ),
+        Arch::Ppc32 | Arch::Ppc64 => (
+            ppc_families(),
+            Some(
+                "skeleton (rsdbg-9syq spike): no families lift yet; mnemonics are powerpc-crate simplified names when lifting lands",
             ),
         ),
     };
@@ -1431,6 +1451,17 @@ pub fn lift_riscv(insn: &Insn) -> Vec<IrInsn> {
         },
         operands: insn.operands.clone(),
     }]
+}
+
+/// Skeleton PowerPC lifter (rsdbg-9syq spike): every instruction lifts to
+/// fallback [`IrOp::Nop`] with a warning (see `unlifted`). Direct-branch
+/// targets already decode in [`Insn::branch_target`]; classifying
+/// `b`/`bc`/`blr`/`bctr` into Branch/CBranch/Call/Return is a follow-up,
+/// at which point [`is_mapped`] and [`control_op`] gain PPC arms together
+/// so the fallback contract keeps holding.
+#[must_use]
+pub fn lift_ppc(insn: &Insn) -> Vec<IrInsn> {
+    unlifted(insn)
 }
 
 fn first_out_rest_in(insn: &Insn, op: IrOp) -> (IrOp, Vec<String>, Vec<String>, Option<u64>) {

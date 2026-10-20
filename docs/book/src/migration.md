@@ -68,7 +68,7 @@ $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin -
 ```
 
 `arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
-`riscv32`, `riscv64`;
+`riscv32`, `riscv64`, `ppc32`, `ppc64`;
 `arch` and `base` are required in raw mode, and raw-only options
 without `--raw`/`raw` are errors — as are unknown arches, unmapped
 or misaligned entries, and base-plus-length overflow. Without raw

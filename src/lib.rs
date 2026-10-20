@@ -47,7 +47,7 @@ pub fn version() -> &'static str {
 /// Parse an explicit raw architecture name.
 ///
 /// Accepts the seven disassembler modes (`x86_64`, `x86_32`, `aarch64`,
-/// `arm32`, `thumb`, `riscv32`, `riscv64`), case-insensitively.
+/// `arm32`, `thumb`, `riscv32`, `riscv64`, `ppc32`, `ppc64`), case-insensitively.
 ///
 /// # Errors
 /// [`Error::Invalid`] for anything else.
@@ -60,8 +60,10 @@ pub fn parse_raw_arch(s: &str) -> Result<crate::disasm::Arch> {
         "thumb" => Ok(crate::disasm::Arch::Thumb),
         "riscv32" => Ok(crate::disasm::Arch::Riscv32),
         "riscv64" => Ok(crate::disasm::Arch::Riscv64),
+        "ppc32" => Ok(crate::disasm::Arch::Ppc32),
+        "ppc64" => Ok(crate::disasm::Arch::Ppc64),
         _ => Err(Error::Invalid(format!(
-            "unknown arch: {s:?} (expected one of x86_64, x86_32, aarch64, arm32, thumb, riscv32, riscv64)"
+            "unknown arch: {s:?} (expected one of x86_64, x86_32, aarch64, arm32, thumb, riscv32, riscv64, ppc32, ppc64)"
         ))),
     }
 }
@@ -1365,7 +1367,8 @@ fn bytes_view_of(
         BytesAs::Ptr => match bin.arch {
             crate::disasm::Arch::X86_64
             | crate::disasm::Arch::Aarch64
-            | crate::disasm::Arch::Riscv64 => 8,
+            | crate::disasm::Arch::Riscv64
+            | crate::disasm::Arch::Ppc64 => 8,
             _ => 4,
         },
     };
