@@ -5408,7 +5408,9 @@ pub fn analyze_with_options(
     // too; the page-base row above is retained as the strict fallback.
     // ARM32 `movw`/`movt` pairs behave the same way (see
     // `resolve_movw_pair`): the low half rides in the first row, the high
-    // half in the second.
+    // half in the second. MIPS32 `lui` pairs behave the same way too (see
+    // `resolve_mips_pair`): the high half rides in the first row, the low
+    // half in the second (`addiu`/`addu`/load/store).
     for f in functions.values() {
         for block in f.blocks.values() {
             for pair in block.insns.windows(2) {

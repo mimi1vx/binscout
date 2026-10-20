@@ -235,8 +235,9 @@ pub struct Insn {
     /// `mov edi, <str>` = `bf imm32`, `mov eax, [abs32]`, `lea` with
     /// disp32), AArch64
     /// `adr`/`adrp`/literal loads, ARM32/Thumb PC-relative literal
-    /// loads (`ldr r0, [pc, ...]`), and the RISC-V `auipc` page base.
-    /// MIPS32 reports `None` here: it has no PC-relative data access.
+    /// loads (`ldr r0, [pc, ...]`), the RISC-V `auipc` page base, and the
+    /// MIPS32 `lui` high-halfword base (pairs resolve the exact address
+    /// via `resolve_mips_pair`). MIPS32 has no PC-relative access.
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
     /// reports its pointer slot here and `None` for `branch_target`.
     pub mem_target: Option<u64>,
@@ -1800,11 +1801,14 @@ pub(crate) fn arm_base_mnem(mnem: &str) -> &str {
 }
 
 /// Final address of a two-instruction constant pair ending at `second`,
-/// if any: an AArch64 `adrp`+`add`/`ldr` pair or an ARM32 `movw`+`movt`
-/// pair (see [`resolve_adrp_pair`] and [`resolve_movw_pair`). The two
-/// arches never share a row, so trying both never double-resolves.
+/// if any: an AArch64 `adrp`+`add`/`ldr` pair, an ARM32 `movw`+`movt`
+/// pair (see [`resolve_adrp_pair`] and [`resolve_movw_pair`), or a
+/// MIPS32 `lui` pair (see [`resolve_mips_pair`]). The arches never share
+/// a row, so trying each in turn never double-resolves.
 pub(crate) fn resolve_const_pair(first: &Insn, second: &Insn) -> Option<u64> {
-    resolve_adrp_pair(first, second).or_else(|| resolve_movw_pair(first, second))
+    resolve_adrp_pair(first, second)
+        .or_else(|| resolve_movw_pair(first, second))
+        .or_else(|| resolve_mips_pair(first, second))
 }
 
 /// Decode exactly one ARMv7 instruction from the start of `bytes`
@@ -2310,6 +2314,7 @@ fn mips_insn(addr: u64, raw: Vec<u8>, inst: &MipsInstruction) -> Insn {
     let flags = mips_display_flags();
     let text = inst.display::<&str>(&flags, None, 0).to_string();
     let (mnem, ops) = split_asm(&text);
+    let mem_target = mips_lui_base(&mnem, &ops);
     Insn {
         addr,
         size: 4,
@@ -2317,7 +2322,7 @@ fn mips_insn(addr: u64, raw: Vec<u8>, inst: &MipsInstruction) -> Insn {
         mnem,
         ops,
         branch_target: mips_branch_target(inst),
-        mem_target: None,
+        mem_target,
         table_base: None,
         import: None,
         target_name: None,
@@ -2437,6 +2442,129 @@ fn mips_branch_target(inst: &MipsInstruction) -> Option<u64> {
     inst.get_instr_index_as_vram()
         .or_else(|| inst.get_branch_vram_generic())
         .map(|vram| u64::from(vram.inner()))
+}
+
+/// Base address materialized by a MIPS32 `lui`, if any.
+///
+/// `lui $dst, 0x1234` writes `0x12340000`: the high halfword of an
+/// absolute address, like the RISC-V `auipc` page base (see
+/// [`Insn::mem_target`]). The low half rides in the following
+/// instruction (see [`resolve_mips_pair`]). Anything else (wrong
+/// mnemonic, wrong operand count, unparseable or wide immediates)
+/// reports `None`.
+fn mips_lui_base(mnem: &str, ops: &[String]) -> Option<u64> {
+    if mnem != "lui" || ops.len() != 2 {
+        return None;
+    }
+    let hi = parse_bare_imm(&ops[1])?;
+    if hi > 0xffff {
+        return None;
+    }
+    Some(u64::from((hi as u32) << 16))
+}
+
+/// MIPS32 mnemonics with an `off($base)` memory operand: the integer and
+/// coprocessor load/store families (mirrors the `MIPS_LOAD`/`MIPS_STORE`
+/// lift tables in [`crate::ir`]).
+const MIPS_PAIR_MEM: &[&str] = &[
+    "lb", "lh", "lw", "lbu", "lhu", "lwl", "lwr", "ll", "lwc1", "ldc1", "ld", "lld", "ldl", "ldr",
+    "lwu", "sb", "sh", "sw", "swl", "swr", "sc", "swc1", "sdc1", "sd", "scd", "sdl", "sdr",
+];
+
+/// Signed MIPS32 16-bit immediate as printed (`0x10`, `-0x10`):
+/// rabbitizer prints hex with an optional `-` sign for sign-extended
+/// fields. Anything else (unparseable, wider than 16 bits) is `None`.
+fn parse_mips_simm(op: &str) -> Option<i32> {
+    let (neg, digits) = match op.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, op),
+    };
+    let mag = parse_bare_imm(digits)?;
+    if mag > 0xffff {
+        return None;
+    }
+    let v = mag as i32;
+    Some(if neg { -v } else { v })
+}
+
+/// Split a MIPS32 `off($base)` memory operand into its signed offset and
+/// base register: `0x10($t0)` splits to `(0x10, "$t0")`. A bare `($base)`
+/// reads as a zero offset. Anything else is `None`.
+fn parse_mips_mem(op: &str) -> Option<(i32, &str)> {
+    let (off, rest) = op.split_once('(')?;
+    let reg = rest.strip_suffix(')')?;
+    if reg.is_empty() || reg.contains(['(', ')']) {
+        return None;
+    }
+    let off = if off.is_empty() {
+        0
+    } else {
+        parse_mips_simm(off)?
+    };
+    Some((off, reg))
+}
+
+/// Final address of a MIPS32 `lui` pair, if any.
+///
+/// `lui` materializes only the high halfword (see [`mips_lui_base`]);
+/// the low half rides in the next instruction, so the referenced address
+/// spans two instructions — the MIPS32 equivalent of
+/// [`resolve_adrp_pair`]. Returns the `lui` base combined with the second
+/// instruction's low part when `first` is a `lui` and `second` consumes
+/// the same register:
+///
+/// - `addiu`/`addi` (plus `daddiu`/`daddi`): `addiu $dst, $base, $simm`
+///   with exactly three operands; the immediate is signed, added with
+///   32-bit wraparound like the hardware ALU;
+/// - `addu`/`add` (plus `daddu`/`dadd`): the `move` idiom
+///   `addu $dst, $base, $zero` (either operand order), copying the base;
+/// - loads and stores (`lw`, `sw`, and the rest of [`MIPS_PAIR_MEM`]):
+///   `lw $dst, off($base)` with a signed offset.
+///
+/// Anything else (wrong mnemonics, register mismatch, unparseable
+/// immediates, wide `lui` halves) returns `None`; the function never
+/// guesses. Pairing (adjacency, same block) is the caller's job.
+pub(crate) fn resolve_mips_pair(first: &Insn, second: &Insn) -> Option<u64> {
+    if first.mnem != "lui" || first.ops.len() != 2 {
+        return None;
+    }
+    let base_reg = first.ops.first()?;
+    let hi = parse_bare_imm(&first.ops[1])?;
+    if hi > 0xffff {
+        return None;
+    }
+    let base = (hi as u32) << 16;
+    match second.mnem.as_str() {
+        "addiu" | "addi" | "daddiu" | "daddi" => {
+            if second.ops.len() != 3 || second.ops[1] != *base_reg {
+                return None;
+            }
+            let lo = parse_mips_simm(&second.ops[2])?;
+            Some(u64::from(base.wrapping_add_signed(lo)))
+        }
+        "addu" | "add" | "daddu" | "dadd" => {
+            if second.ops.len() != 3 {
+                return None;
+            }
+            let (src, other) = (&second.ops[1], &second.ops[2]);
+            if (src == base_reg && other == "$zero") || (src == "$zero" && other == base_reg) {
+                Some(u64::from(base))
+            } else {
+                None
+            }
+        }
+        s if MIPS_PAIR_MEM.contains(&s) => {
+            if second.ops.len() != 2 {
+                return None;
+            }
+            let (off, reg) = parse_mips_mem(&second.ops[1])?;
+            if reg != base_reg.as_str() {
+                return None;
+            }
+            Some(u64::from(base.wrapping_add_signed(off)))
+        }
+        _ => None,
+    }
 }
 
 /// Decode only the first MIPS32 instruction in `bytes` (loaded at `va`).
@@ -2898,5 +3026,103 @@ mod tests {
         bad_ldr.mnem = "ldr".to_string();
         bad_ldr.ops = vec!["x0".to_string(), "[x1".to_string(), "#0x8]".to_string()];
         assert_eq!(resolve_adrp_pair(&v[0], &bad_ldr), None);
+    }
+
+    fn mips_pair(bytes: &[u8], va: u64) -> Vec<Insn> {
+        disasm_mips(bytes, va, 8).expect("mips pair must decode")
+    }
+
+    #[test]
+    fn mips_lui_reports_high_halfword_base() {
+        // lui $t0, 0x1234 writes 0x12340000; the low half rides in the
+        // next row, so the row itself carries only the base.
+        let v = mips_pair(&[0x34, 0x12, 0x08, 0x3C], 0x10000);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].mnem, "lui");
+        assert_eq!(v[0].ops, ["$t0", "0x1234"]);
+        assert_eq!(v[0].mem_target, Some(0x1234_0000));
+        // A non-lui row carries no base.
+        let v = mips_pair(&[0x10, 0x00, 0x08, 0x25], 0x10000);
+        assert_eq!(v[0].mnem, "addiu");
+        assert_eq!(v[0].mem_target, None);
+    }
+
+    #[test]
+    fn mips_lui_addiu_pair_resolves_final_address() {
+        // lui $t0, 0x4; addiu $t0, $t0, 0x10 -> 0x40010.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x08, 0x25], 0x40000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].mem_target, Some(0x40000));
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40010));
+        // A negative low part wraps at 32 bits: -0x10 off 0x40000.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0xF0, 0xFF, 0x08, 0x25], 0x40000);
+        assert_eq!(v[1].ops, ["$t0", "$t0", "-0x10"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x3FFF0));
+        // Cross-destination addiu still resolves: addiu $t1, $t0, 0x10.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x09, 0x25], 0x40000);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40010));
+    }
+
+    #[test]
+    fn mips_lui_addu_move_pair_resolves_base() {
+        // lui $t0, 0x4; addu $t1, $t0, $zero copies the base.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x21, 0x48, 0x00, 0x01], 0x40000);
+        assert_eq!(v[1].mnem, "addu");
+        assert_eq!(v[1].ops, ["$t1", "$t0", "$zero"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40000));
+        // Either operand order copies: addu $t1, $zero, $t0.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x21, 0x48, 0x08, 0x00], 0x40000);
+        assert_eq!(v[1].ops, ["$t1", "$zero", "$t0"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40000));
+        // A real add of two live registers is not exact.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x21, 0x40, 0x09, 0x01], 0x40000);
+        assert_eq!(v[1].ops, ["$t0", "$t0", "$t1"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), None);
+    }
+
+    #[test]
+    fn mips_lui_mem_pair_resolves_final_address() {
+        // lui $t0, 0x4; lw $t1, 0x10($t0) -> 0x40010.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x09, 0x8D], 0x40000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].ops, ["$t1", "0x10($t0)"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40010));
+        // Negative offsets wrap too: lw $t1, -0x10($t0) -> 0x3FFF0.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0xF0, 0xFF, 0x09, 0x8D], 0x40000);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x3FFF0));
+        // Stores reference their slot the same way: sw $t1, 0x20($t0).
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x20, 0x00, 0x09, 0xAD], 0x40000);
+        assert_eq!(v[1].mnem, "sw");
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), Some(0x40020));
+    }
+
+    #[test]
+    fn mips_pair_rejects_non_pairs() {
+        // Register mismatch: addiu reads $t1, not the lui $t0.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x29, 0x25], 0x40000);
+        assert_eq!(v[1].ops, ["$t1", "$t1", "0x10"]);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), None);
+        // Wrong second mnemonic: subu $t0, $t0, $t1.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x23, 0x40, 0x09, 0x01], 0x40000);
+        assert_eq!(v[1].mnem, "subu");
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), None);
+        // First instruction is not lui.
+        let v = mips_pair(&[0x10, 0x00, 0x08, 0x25, 0x10, 0x00, 0x08, 0x25], 0x40000);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), None);
+        // Memory base mismatch: lw through $t1.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x29, 0x8D], 0x40000);
+        assert_eq!(resolve_mips_pair(&v[0], &v[1]), None);
+        // Unparseable immediates never resolve, never panic.
+        let v = mips_pair(&[0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x08, 0x25], 0x40000);
+        let mut bad = v[1].clone();
+        bad.ops[2] = "r1".to_string();
+        assert_eq!(resolve_mips_pair(&v[0], &bad), None);
+        let mut wide = v[0].clone();
+        wide.ops[1] = "0x1_0000".to_string();
+        assert_eq!(resolve_mips_pair(&wide, &v[1]), None);
+        let mut bad_mem = v[1].clone();
+        bad_mem.mnem = "lw".to_string();
+        bad_mem.ops = vec!["$t1".to_string(), "0x10($t1)".to_string()];
+        assert_eq!(resolve_mips_pair(&v[0], &bad_mem), None);
     }
 }

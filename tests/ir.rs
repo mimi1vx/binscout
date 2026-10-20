@@ -272,6 +272,32 @@ fn mips_data_and_system_instructions_lift() {
 }
 
 #[test]
+fn mips_lui_pair_resolves_exact_target() {
+    // lui $t0, 0x4; addiu $t0, $t0, 0x10: the add carries the exact address.
+    let bytes = [0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x08, 0x25];
+    let insns = disasm_range(Arch::Mips32, &bytes, 0x40000, 8).expect("mips decodes");
+    assert_eq!(insns.len(), 2);
+    assert_eq!(insns[0].mem_target, Some(0x40000));
+    let rows = lift_range(Arch::Mips32, &insns);
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].op, rows[0].target), (IrOp::Copy, None));
+    assert_eq!((rows[1].op, rows[1].target), (IrOp::Add, Some(0x40010)));
+    // lui $t0, 0x4; lw $t1, 0x10($t0): the load carries the exact address.
+    let bytes = [0x04, 0x00, 0x08, 0x3C, 0x10, 0x00, 0x09, 0x8D];
+    let insns = disasm_range(Arch::Mips32, &bytes, 0x40000, 8).expect("mips decodes");
+    let rows = lift_range(Arch::Mips32, &insns);
+    assert_eq!((rows[1].op, rows[1].target), (IrOp::Load, Some(0x40010)));
+    // Without the predecessor the same row keeps no target.
+    let rows = lift(Arch::Mips32, &insns[1]);
+    assert_eq!((rows[0].op, rows[0].target), (IrOp::Load, None));
+    // A gap between the rows breaks the pair.
+    let mut split = insns.clone();
+    split[1].addr = 0x40008;
+    let rows = lift_range(Arch::Mips32, &split);
+    assert_eq!((rows[1].op, rows[1].target), (IrOp::Load, None));
+}
+
+#[test]
 fn riscv_prologue_pattern_lifts_add_with_sp_delta() {
     // addi sp, sp, -16: the standard frame-setup prologue.
     let insns = riscv64(&[0x13, 0x01, 0x01, 0xFF], 0x10000);

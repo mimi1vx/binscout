@@ -209,7 +209,8 @@ pub fn render_rows(rows: &[IrInsn]) -> PseudoRender {
 /// instruction lifted for `arch` (see [`crate::ir::lift`]) and rendered.
 ///
 /// An `add`/`ldr` immediately following its `adrp` in the same block keeps
-/// the pair's resolved final address as a `// => 0x...` suffix on its line;
+/// the pair's resolved final address as a `// => 0x...` suffix on its line,
+/// as do `movt` after `movw` and `addiu`/`addu`/load/store after `lui`;
 /// anything else renders unchanged.
 ///
 /// [`crate::Project::pseudo_of`] enriches these rows further at render

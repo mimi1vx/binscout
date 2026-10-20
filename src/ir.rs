@@ -331,7 +331,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::disasm::{Arch, Insn, Operand, resolve_adrp_pair, resolve_movw_pair};
+use crate::disasm::{Arch, Insn, Operand, resolve_adrp_pair, resolve_mips_pair, resolve_movw_pair};
 
 pub use crate::disasm::{Operand as IrOperand, stack_slot};
 
@@ -556,13 +556,15 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
 /// second row carries its resolved address (see
 /// [`lift_aarch64_with_prev`]); ARM32/Thumb pairs thread it so a
 /// `movw`+`movt` second row carries its resolved address (see
-/// [`lift_arm32_with_prev`]); every other arch lifts each instruction
-/// independently.
+/// [`lift_arm32_with_prev`]); MIPS32 pairs thread it so a `lui` pair
+/// second row carries its exact address (see [`lift_mips_with_prev`]);
+/// every other arch lifts each instruction independently.
 #[must_use]
 pub fn lift_range(arch: Arch, insns: &[Insn]) -> Vec<IrInsn> {
     let lift_prev: fn(&Insn, Option<&Insn>) -> Vec<IrInsn> = match arch {
         Arch::Aarch64 => lift_aarch64_with_prev,
         Arch::Arm32 | Arch::Thumb => lift_arm32_with_prev,
+        Arch::Mips32 => lift_mips_with_prev,
         _ => return insns.iter().flat_map(|i| lift(arch, i)).collect(),
     };
     let mut out = Vec::new();
@@ -1869,6 +1871,26 @@ pub fn lift_mips(insn: &Insn) -> Vec<IrInsn> {
         },
         operands: insn.operands.clone(),
     }]
+}
+
+/// Lift one MIPS32 instruction with its immediate predecessor, if any.
+///
+/// When `prev` ends where `insn` begins and the two form a `lui` pair
+/// resolving to a final address, the second row's `target` carries that
+/// address; otherwise the row is identical to [`lift_mips`].
+/// Nonadjacent or unresolvable pairs keep current behavior exactly.
+#[must_use]
+pub fn lift_mips_with_prev(insn: &Insn, prev: Option<&Insn>) -> Vec<IrInsn> {
+    let mut rows = lift_mips(insn);
+    if let [row] = rows.as_mut_slice()
+        && row.target.is_none()
+        && let Some(first) = prev
+        && first.addr.wrapping_add(u64::from(first.size)) == insn.addr
+        && let Some(resolved) = resolve_mips_pair(first, insn)
+    {
+        row.target = Some(resolved);
+    }
+    rows
 }
 
 fn first_out_rest_in(insn: &Insn, op: IrOp) -> (IrOp, Vec<String>, Vec<String>, Option<u64>) {
