@@ -8,12 +8,23 @@
 # failing on any match. Only yanked remains configurable.
 yanked = "deny"
 
+# bincode 2.0.1 enters exclusively via yara-x (optional `yara` feature); the
+# bincode team ceased development permanently, so no fixed version exists and
+# only a yara-x release dropping bincode can resolve this. Revisit after
+# `cargo update` moves bincode out of the graph.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[advisories.ignore]]
+id = "RUSTSEC-2025-0141"
+reason = "unmaintained bincode 2.0.1 enters only via yara-x; no fixed version exists upstream, revisit after yara-x drops bincode"
+
 [licenses]
 # Exact set reported by `cargo deny list`. Every license in the graph is
 # allowed; any new license fails the check and needs an explicit addition.
 allow = [
   "0BSD",
   "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
   "BSL-1.0",
   "LGPL-2.1-or-later",
   "MIT",
@@ -49,26 +60,216 @@ name = "syn"
 version = "3"
 reason = "major-version split: clap_derive/darling/serde/thiserror/tokio-macros ecosystem has moved to syn 3 while tracing/windows chains still pin syn 2; unresolvable by cargo update, revisit after upstream releases"
 
-# hashbrown 0.15 vs 0.17 is pinned by upstream crates, not fixable by
-# `cargo update` (verified 2026-10-16: `cargo update` locks 0 packages; both
-# parents already at latest). hashbrown 0.15.5 enters directly via petgraph
-# 0.8.3 <- binscout; hashbrown 0.17.1 enters via indexmap 2.14.2 <- petgraph
-# 0.8.3 and <- rmcp 3.5.1 <- binscout. The split is internal to petgraph's own
-# dependency set (direct hashbrown pin vs indexmap range), so only a petgraph
-# release unifying its hashbrown usage can converge them. Scoped to the two
-# exact versions (0.x minors are semver-major, a "0" line spec would overmatch).
-# Revisit after `cargo update` moves one hashbrown out of the graph
-# (cargo-deny warns on unused skip entries).
+# hashbrown 0.14/0.15/0.16/0.17 lines are pinned by upstream crates, not
+# fixable by `cargo update`. 0.14 enters via rowan 0.17.0 <- yara-x-parser;
+# 0.15 enters directly via petgraph 0.8.3 <- binscout; 0.16 enters via gimli
+# 0.33 <- binscout (and cranelift 0.135); 0.17 enters via wasmtime-internal-core
+# 48 <- yara-x (and indexmap 2.x <- petgraph/rmcp). Scoped to the 0.minor
+# lines (a bare "0" spec would overmatch). Revisit the skips after
+# `cargo update` moves a hashbrown line out of the graph (cargo-deny warns on
+# unused skip entries).
 # Upstream: https://github.com/petgraph/petgraph
 [[bans.skip]]
 name = "hashbrown"
-version = "=0.15.5"
-reason = "blocked on upstream: petgraph 0.8.3 pins hashbrown 0.15 directly while indexmap 2.14.2 (via petgraph/rmcp) pulls hashbrown 0.17; unresolvable by cargo update, revisit after petgraph unifies its hashbrown usage"
+version = "0.14"
+reason = "blocked on upstream: rowan 0.17.0 (via yara-x-parser) pins hashbrown 0.14 while the rest of the graph is on newer lines; unresolvable by cargo update"
 
 [[bans.skip]]
 name = "hashbrown"
-version = "=0.17.1"
-reason = "blocked on upstream: indexmap 2.14.2 (via petgraph 0.8.3/rmcp 3.5.1) pulls hashbrown 0.17 while petgraph pins hashbrown 0.15 directly; unresolvable by cargo update, revisit after petgraph unifies its hashbrown usage"
+version = "0.15"
+reason = "blocked on upstream: petgraph 0.8.3 pins hashbrown 0.15 directly while the rest of the graph is on newer lines; unresolvable by cargo update, revisit after petgraph unifies its hashbrown usage"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "0.16"
+reason = "blocked on upstream: gimli 0.33 (and cranelift 0.135) pull hashbrown 0.16 while petgraph pins 0.15 and the yara-x subtree pulls 0.14/0.17; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "0.17"
+reason = "blocked on upstream: wasmtime-internal-core 48 (via yara-x) and indexmap 2.x pull hashbrown 0.17 while petgraph pins 0.15; unresolvable by cargo update"
+
+# sha2 0.10 vs 0.11 (with the digest 0.10/0.11, block-buffer, cpufeatures,
+# crypto-common lines carried along): wasmtime 48 / cranelift 0.135 pin
+# sha2 0.10 while binscout depends on sha2 0.11 directly. Major-line split,
+# unfixable by `cargo update`; revisit after wasmtime moves to sha2 0.11.
+# Upstream: https://github.com/bytecodealliance/wasmtime
+[[bans.skip]]
+name = "sha2"
+version = "0.10"
+reason = "blocked on upstream: wasmtime 48 / cranelift 0.135 pin sha2 0.10 while binscout uses sha2 0.11 directly; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "sha2"
+version = "0.11"
+reason = "blocked on upstream: binscout uses sha2 0.11 directly while wasmtime 48 / cranelift 0.135 pin sha2 0.10; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "digest"
+version = "0.10"
+reason = "blocked on upstream: carried by wasmtime 48's sha2 0.10 pin while binscout's sha2 0.11 pulls digest 0.11; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "digest"
+version = "0.11"
+reason = "blocked on upstream: pulled by binscout's sha2 0.11 while wasmtime 48 pins the digest 0.10 line; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "block-buffer"
+version = "0.10"
+reason = "blocked on upstream: carried by wasmtime 48's digest 0.10 pin; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "block-buffer"
+version = "0.12"
+reason = "blocked on upstream: pulled by binscout's digest 0.11 while wasmtime 48 pins the block-buffer 0.10 line; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "0.1"
+reason = "blocked on upstream: carried by wasmtime 48's digest 0.10 pin; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "0.2"
+reason = "blocked on upstream: pulled by binscout's digest 0.11 while wasmtime 48 pins the crypto-common 0.1 line; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "0.2"
+reason = "blocked on upstream: carried by wasmtime 48's sha2 0.10 pin; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "0.3"
+reason = "blocked on upstream: pulled by binscout's sha2 0.11 while wasmtime 48 pins the cpufeatures 0.2 line; unresolvable by cargo update"
+
+# itertools 0.14 vs 0.15 and object 0.39 vs 0.40: both splits are internal to
+# the yara-x 1.22 subtree (wasmtime-internal-cranelift pins itertools 0.14
+# while yara-x uses 0.15; wasmtime 48 pins object 0.39 while binscout uses
+# 0.40 directly). Unfixable by `cargo update`.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "itertools"
+version = "0.14"
+reason = "blocked on upstream: wasmtime-internal-cranelift 48 pins itertools 0.14 while yara-x 1.22 uses 0.15; split is internal to the yara-x subtree, unresolvable by cargo update"
+
+[[bans.skip]]
+name = "itertools"
+version = "0.15"
+reason = "blocked on upstream: yara-x 1.22 uses itertools 0.15 while wasmtime-internal-cranelift 48 pins 0.14; split is internal to the yara-x subtree, unresolvable by cargo update"
+
+[[bans.skip]]
+name = "object"
+version = "0.39"
+reason = "blocked on upstream: wasmtime 48 pins object 0.39 while binscout uses object 0.40 directly; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "object"
+version = "0.40"
+reason = "blocked on upstream: binscout uses object 0.40 directly while wasmtime 48 pins object 0.39; unresolvable by cargo update"
+
+# wasm-encoder / wasmparser 0.245 vs 0.254: walrus 0.27 (via yara-x) pins the
+# 0.245 line while wasmtime-environ 48 pulls 0.254. Split is internal to the
+# yara-x subtree, unfixable by `cargo update`.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "wasm-encoder"
+version = "0.245"
+reason = "blocked on upstream: walrus 0.27 (via yara-x) pins wasm-encoder 0.245 while wasmtime-environ 48 pulls 0.254; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "wasm-encoder"
+version = "0.254"
+reason = "blocked on upstream: wasmtime-environ 48 pulls wasm-encoder 0.254 while walrus 0.27 (via yara-x) pins 0.245; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "wasmparser"
+version = "0.245"
+reason = "blocked on upstream: walrus 0.27 (via yara-x) pins wasmparser 0.245 while wasmtime-environ 48 pulls 0.254; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "wasmparser"
+version = "0.254"
+reason = "blocked on upstream: wasmtime-environ 48 pulls wasmparser 0.254 while walrus 0.27 (via yara-x) pins 0.245; unresolvable by cargo update"
+
+# gimli 0.32 vs 0.33: walrus 0.27 (via yara-x) pins gimli 0.32 while binscout
+# uses gimli 0.33 directly. Unfixable by `cargo update`.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "gimli"
+version = "0.32"
+reason = "blocked on upstream: walrus 0.27 (via yara-x) pins gimli 0.32 while binscout uses gimli 0.33 directly; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "gimli"
+version = "0.33"
+reason = "blocked on upstream: binscout uses gimli 0.33 directly while walrus 0.27 (via yara-x) pins gimli 0.32; unresolvable by cargo update"
+
+# thiserror 1 vs 2 (+ thiserror-impl): protobuf 3.7 (via yara-x) pins
+# thiserror 1 while binscout and the rest of the graph are on thiserror 2.
+# Major-version ecosystem split, unfixable by `cargo update`.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "thiserror"
+version = "1"
+reason = "major-version split: protobuf 3.7 (via yara-x) pins thiserror 1 while binscout and the rest of the graph use thiserror 2; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "thiserror"
+version = "2"
+reason = "major-version split: binscout and the rest of the graph use thiserror 2 while protobuf 3.7 (via yara-x) pins thiserror 1; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "1"
+reason = "major-version split: carried by protobuf 3.7's thiserror 1 pin (via yara-x); unresolvable by cargo update"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "2"
+reason = "major-version split: carried by binscout's thiserror 2 while protobuf 3.7 (via yara-x) pins thiserror 1; unresolvable by cargo update"
+
+# rustc-hash 1 vs 2: rowan 0.17 (via yara-x-parser) pins rustc-hash 1 while
+# cranelift 0.135 pulls rustc-hash 2. Unfixable by `cargo update`.
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "rustc-hash"
+version = "1"
+reason = "blocked on upstream: rowan 0.17 (via yara-x-parser) pins rustc-hash 1 while cranelift 0.135 pulls rustc-hash 2; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "rustc-hash"
+version = "2"
+reason = "blocked on upstream: cranelift 0.135 pulls rustc-hash 2 while rowan 0.17 (via yara-x-parser) pins rustc-hash 1; unresolvable by cargo update"
+
+# fallible-iterator 0.2 vs 0.3: pdb 0.8 and binscout pin 0.2 while gimli 0.32
+# (via walrus/yara-x) pulls 0.3. Unfixable by `cargo update` (bumping
+# binscout's own pin cannot move pdb's).
+# Upstream: https://github.com/VirtuosoAI/yara-x
+[[bans.skip]]
+name = "fallible-iterator"
+version = "0.2"
+reason = "blocked on upstream: pdb 0.8 and binscout pin fallible-iterator 0.2 while gimli 0.32 (via walrus/yara-x) pulls 0.3; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "fallible-iterator"
+version = "0.3"
+reason = "blocked on upstream: gimli 0.32 (via walrus/yara-x) pulls fallible-iterator 0.3 while pdb 0.8 and binscout pin 0.2; unresolvable by cargo update"
+
+# foldhash 0.1 vs 0.2 is fallout of the hashbrown multi-line split above:
+# hashbrown 0.15 (via petgraph) pulls foldhash 0.1 while hashbrown 0.16/0.17
+# pull foldhash 0.2. Unfixable by `cargo update`.
+# Upstream: https://github.com/petgraph/petgraph
+[[bans.skip]]
+name = "foldhash"
+version = "0.1"
+reason = "blocked on upstream: fallout of the hashbrown split, hashbrown 0.15 (via petgraph) pulls foldhash 0.1; unresolvable by cargo update"
+
+[[bans.skip]]
+name = "foldhash"
+version = "0.2"
+reason = "blocked on upstream: fallout of the hashbrown split, hashbrown 0.16/0.17 pull foldhash 0.2; unresolvable by cargo update"
 
 [sources]
 unknown-registry = "deny"
