@@ -2521,8 +2521,8 @@ impl Project {
     /// Fill a listing row's additive annotation fields in place.
     ///
     /// `prev` is the address-ordered predecessor for const-pair
-    /// resolution (`None` at a page start degrades to the row's own
-    /// `mem_target`). Only absent fields are filled, so stored rows keep
+    /// resolution (`adrp`/`movw`/`lui`/`auipc`; `None` at a page start
+    /// degrades to the row's own `mem_target`). Only absent fields are filled, so stored rows keep
     /// their decoded values and repeated reads agree. Never persists.
     fn enrich_insn(&self, ctx: &EnrichCtx, insn: &mut Insn, prev: Option<&Insn>) {
         if insn.import.is_none()

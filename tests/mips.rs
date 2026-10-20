@@ -11,7 +11,7 @@
 
 mod common;
 
-use binscout::analysis::{DiscoveryReason, analyze};
+use binscout::analysis::{DiscoveryReason, XrefKind, analyze, analyze_raw};
 use binscout::disasm::{Arch, disasm_range};
 use binscout::loader::{BinaryFormat, LoadedBinary, Segment, load};
 
@@ -272,4 +272,60 @@ fn mips_traps_and_canonical_names_decode() {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].mnem, mnem, "{bytes:02x?}");
     }
+}
+
+#[test]
+fn mips_lui_addiu_pair_links_string_at_final_address() {
+    // lui $t0, 0x4 (base 0x40000); addiu $t0, $t0, 0x10; jr ra;
+    // delay slot; "hello!\0" at 0x40010. The pair resolves to the string
+    // start while the base row is retained.
+    let mut b = vec![
+        0x04, 0x00, 0x08, 0x3C, // lui $t0, 0x4
+        0x10, 0x00, 0x08, 0x25, // addiu $t0, $t0, 0x10
+        0x08, 0x00, 0xE0, 0x03, // jr ra
+        0x00, 0x00, 0x00, 0x00, // delay slot
+    ];
+    b.extend(*b"hello!\0");
+    let va = 0x40000u64;
+    assert_eq!(va + b.len() as u64, 0x40017);
+    let a = analyze_raw(&b, va, Arch::Mips32, Some(va)).expect("mips blob analyzes");
+    assert!(
+        a.strings
+            .iter()
+            .any(|h| h.value == "hello!" && h.vaddr == Some(0x40010)),
+        "string at the pair final address: {:?}",
+        a.strings
+    );
+    let data = a.xrefs_page(Some(XrefKind::Data), 0, 64);
+    assert!(
+        data.iter().any(|x| x.from == va + 4 && x.to == 0x40010),
+        "pair final address from the addiu: {data:?}"
+    );
+    assert!(
+        data.iter().any(|x| x.from == va && x.to == va),
+        "lui base row retained: {data:?}"
+    );
+    let srefs = a.xrefs_page(Some(XrefKind::String), 0, 64);
+    assert!(srefs.iter().any(|x| x.from == va + 4 && x.to == 0x40010));
+}
+
+#[test]
+fn mips_lui_lw_pair_links_data() {
+    // lui $t0, 0x4; lw $t1, 0x10($t0); jr ra; delay slot; data at 0x40010.
+    // The load references the exact address 0x40010, not just the base.
+    let mut b = vec![
+        0x04, 0x00, 0x08, 0x3C, // lui $t0, 0x4
+        0x10, 0x00, 0x09, 0x8D, // lw $t1, 0x10($t0)
+        0x08, 0x00, 0xE0, 0x03, // jr ra
+        0x00, 0x00, 0x00, 0x00, // delay slot
+    ];
+    b.extend(*b"hello!\0");
+    let va = 0x40000u64;
+    assert_eq!(va + b.len() as u64, 0x40017);
+    let a = analyze_raw(&b, va, Arch::Mips32, Some(va)).expect("mips blob analyzes");
+    let data = a.xrefs_page(Some(XrefKind::Data), 0, 64);
+    assert!(
+        data.iter().any(|x| x.from == va + 4 && x.to == 0x40010),
+        "pair final address from the lw: {data:?}"
+    );
 }
