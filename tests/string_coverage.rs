@@ -235,9 +235,9 @@ fn rolling_xor_multi_byte_key_decodes() {
         "--include-code",
     ]);
     assert!(ok, "{v}");
-    let vals: Vec<&str> = v
+    let vals: Vec<&str> = v["items"]
         .as_array()
-        .expect("array")
+        .expect("items")
         .iter()
         .filter(|r| r["encoding"] == "Ascii")
         .map(|r| r["value"].as_str().expect("row value"))
@@ -302,9 +302,9 @@ fn base64_decoded_view_reports_plaintext() {
         "--include-code",
     ]);
     assert!(ok, "{v}");
-    let mut vals: Vec<&str> = v
+    let mut vals: Vec<&str> = v["items"]
         .as_array()
-        .expect("array")
+        .expect("items")
         .iter()
         .map(|r| r["value"].as_str().expect("row value"))
         .collect();

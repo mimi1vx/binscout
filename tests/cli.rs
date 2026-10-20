@@ -105,8 +105,11 @@ fn query_results_have_expected_shape() {
     let d = db.as_str();
     let (ok, v) = run(&["--db", d, "functions", &bin]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("functions is an array").len(), 1);
-    assert_eq!(v[0]["entry"], 0);
+    assert_eq!(
+        v["items"].as_array().expect("functions is an array").len(),
+        1
+    );
+    assert_eq!(v["items"][0]["entry"], 0);
 
     let (ok, v) = run(&["--db", d, "func", &bin, "0x0"]);
     assert!(ok, "{v}");
@@ -306,7 +309,7 @@ fn annotate_round_trip_and_binary_untouched() {
     // Rename resolves through function listings.
     let (ok, v) = run(&["--db", &db, "functions", &bin_s]);
     assert!(ok, "{v}");
-    assert_eq!(v[0]["name"], "main");
+    assert_eq!(v["items"][0]["name"], "main");
 
     // Clearing drops the annotation.
     let (ok, _) = run(&["--db", &db, "annotate", &bin_s, "0x0", "--rename", ""]);
@@ -407,30 +410,30 @@ fn functions_caller_callee_and_range_filters() {
 
     let (ok, v) = run(&["--db", d, "functions", &bin_s]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("functions array").len(), 2);
+    assert_eq!(v["items"].as_array().expect("functions array").len(), 2);
 
     // --caller keeps functions that call the anchor: only 0x0 calls 0x10.
     let (ok, v) = run(&["--db", d, "functions", &bin_s, "--caller", "0x10"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["entry"], 0);
+    assert_eq!(v["items"].as_array().expect("array").len(), 1);
+    assert_eq!(v["items"][0]["entry"], 0);
 
     // --callee keeps functions called by the anchor: 0x0 calls 0x10.
     let (ok, v) = run(&["--db", d, "functions", &bin_s, "--callee", "0"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["entry"], 0x10);
+    assert_eq!(v["items"].as_array().expect("array").len(), 1);
+    assert_eq!(v["items"][0]["entry"], 0x10);
 
     // --range bounds entries, inclusive on both ends.
     let (ok, v) = run(&["--db", d, "functions", &bin_s, "--range", "0x10", "0x10"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["entry"], 0x10);
+    assert_eq!(v["items"].as_array().expect("array").len(), 1);
+    assert_eq!(v["items"][0]["entry"], 0x10);
 
     // Reversed bounds normalize instead of matching nothing.
     let (ok, v) = run(&["--db", d, "functions", &bin_s, "--range", "0x10", "0x0"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 2);
+    assert_eq!(v["items"].as_array().expect("array").len(), 2);
 
     // Paging applies after filtering.
     let (ok, v) = run(&[
@@ -447,13 +450,13 @@ fn functions_caller_callee_and_range_filters() {
         "1",
     ]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["entry"], 0x10);
+    assert_eq!(v["items"].as_array().expect("array").len(), 1);
+    assert_eq!(v["items"][0]["entry"], 0x10);
 
     // An anchor in no function matches nothing (still success, empty page).
     let (ok, v) = run(&["--db", d, "functions", &bin_s, "--caller", "0xdead"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 0);
+    assert_eq!(v["items"].as_array().expect("array").len(), 0);
     cleanup(&dir);
 }
 
@@ -466,12 +469,12 @@ fn functions_query_matches_resolved_names() {
     // Case-insensitive substring over the rename.
     let (ok, v) = run(&["--db", &db, "functions", &bin, "--query", "MAI"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["name"], "main");
+    assert_eq!(v["items"].as_array().expect("array").len(), 1);
+    assert_eq!(v["items"][0]["name"], "main");
 
     let (ok, v) = run(&["--db", &db, "functions", &bin, "--query", "zzz"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 0);
+    assert_eq!(v["items"].as_array().expect("array").len(), 0);
     cleanup(&dir);
 
     // Export names match too: pe32-basic.exe exports `basic_entry`.
@@ -481,7 +484,7 @@ fn functions_query_matches_resolved_names() {
     let db = temp_db(&dir, "basic").display().to_string();
     let (ok, v) = run(&["--db", &db, "functions", &bin_s, "--query", "basic"]);
     assert!(ok, "{v}");
-    let rows = v.as_array().expect("array");
+    let rows = v["items"].as_array().expect("array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["entry"], 0x401000);
     cleanup(&dir);
@@ -730,7 +733,7 @@ fn raw_flags_report_mapping_across_arches() {
             &bin_s,
         ]);
         assert!(ok, "{arch}: {f}");
-        assert_eq!(f.as_array().expect("array").len(), 1, "{arch}");
+        assert_eq!(f["items"].as_array().expect("array").len(), 1, "{arch}");
         let (ok, s) = run(&[
             "--db", d, "--raw", "--arch", arch, "--base", base, "stats", &bin_s,
         ]);
@@ -1424,7 +1427,7 @@ fn annotations_export_import_round_trip_across_dbs() {
     // The annotations resolve through the interface on the new DB.
     let (ok, v) = run(&["--db", &db_b, "functions", &bin_s]);
     assert!(ok, "{v}");
-    assert_eq!(v[0]["name"], "ported_entry");
+    assert_eq!(v["items"][0]["name"], "ported_entry");
     let (ok, v) = run(&["--db", &db_b, "annotate", &bin_s, &string_hex]);
     assert!(ok, "{v}");
     assert_eq!(v["comment"], "ported note");

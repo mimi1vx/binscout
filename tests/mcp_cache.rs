@@ -242,7 +242,7 @@ fn reads_do_not_create_sidecars() {
     let (r2, _) = sess.call("functions", json!({"binary": bin, "db": db}));
     sess.close();
     assert!(ok_payload(&r1)["functions"] == 1);
-    assert_eq!(ok_payload(&r2).as_array().expect("array").len(), 1);
+    assert_eq!(ok_payload(&r2)["items"].as_array().expect("array").len(), 1);
     assert!(!db_path.exists(), "cached reads never create the sidecar");
 
     tool_once(10, "strings", json!({"binary": bin, "db": db}));
@@ -273,8 +273,8 @@ fn mappings_stay_isolated() {
         "functions",
         json!({"binary": bin, "db": db_b, "raw": raw_b}),
     );
-    assert_eq!(ok_payload(&fa)[0]["entry"], 0x1000);
-    assert_eq!(ok_payload(&fb)[0]["entry"], 0x2000);
+    assert_eq!(ok_payload(&fa)["items"][0]["entry"], 0x1000);
+    assert_eq!(ok_payload(&fb)["items"][0]["entry"], 0x2000);
 
     // Rename under mapping A; mapping B still resolves the export-free
     // fallback name (null), proving entries do not share annotations.
@@ -287,12 +287,18 @@ fn mappings_stay_isolated() {
         "functions",
         json!({"binary": bin, "db": db_a, "raw": raw_a, "query": "mapped_main"}),
     );
-    assert_eq!(ok_payload(&fa2).as_array().expect("array").len(), 1);
+    assert_eq!(
+        ok_payload(&fa2)["items"].as_array().expect("array").len(),
+        1
+    );
     let (fb2, _) = sess.call(
         "functions",
         json!({"binary": bin, "db": db_b, "raw": raw_b, "query": "mapped_main"}),
     );
-    assert_eq!(ok_payload(&fb2).as_array().expect("array").len(), 0);
+    assert_eq!(
+        ok_payload(&fb2)["items"].as_array().expect("array").len(),
+        0
+    );
     sess.close();
     cleanup(&dir);
 }
@@ -346,7 +352,13 @@ fn cached_call_survives_unreadable_binary() {
         first["result"], second["result"],
         "cached call must not re-read the binary"
     );
-    assert_eq!(ok_payload(&second).as_array().expect("array").len(), 1);
+    assert_eq!(
+        ok_payload(&second)["items"]
+            .as_array()
+            .expect("array")
+            .len(),
+        1
+    );
     cleanup(&dir);
 }
 
@@ -380,7 +392,7 @@ fn second_functions_call_is_ten_times_faster() {
     let v1 = ok_payload(&r1);
     assert_eq!(v1, ok_payload(&r2));
     assert_eq!(v1, ok_payload(&r3));
-    assert_eq!(v1.as_array().expect("array").len(), 1);
+    assert_eq!(v1["items"].as_array().expect("array").len(), 1);
 
     let cached = t2.min(t3);
     eprintln!(

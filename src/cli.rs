@@ -84,11 +84,8 @@ pub enum Cmd {
         offset: usize,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Wrap matches in the protocol-1 page envelope with an exact
-        /// `total` and compact `calls_count` rows (opt-in preview of the
-        /// planned functions-shape migration; default stays a bare array
-        /// with the full `calls` target array).
-        #[arg(long)]
+        /// Deprecated, ignored: output is always the page envelope.
+        #[arg(long, hide = true)]
         envelope: bool,
     },
     /// Compact metadata of one function: entry, name, and block/insn/call
@@ -267,10 +264,8 @@ pub enum Cmd {
         /// never writes the binary.
         #[arg(long)]
         decode: Option<String>,
-        /// Wrap matches in the protocol-1 page envelope with an exact
-        /// `total` (opt-in preview of the planned strings-shape
-        /// migration; default stays a bare array).
-        #[arg(long)]
+        /// Deprecated, ignored: output is always the page envelope.
+        #[arg(long, hide = true)]
         envelope: bool,
     },
     /// Recovered stack-constructed strings: runs of
@@ -1039,19 +1034,13 @@ fn functions(
     filter: &binscout::FunctionFilter,
     offset: usize,
     limit: usize,
-    envelope: bool,
+    _envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch, debug)?;
-    if envelope {
-        Ok(
-            serde_json::to_value(p.functions_envelope(filter, offset, limit))
-                .expect("functions envelope serializes"),
-        )
-    } else {
-        Ok(serde_json::Value::Array(
-            p.functions_filtered(filter, offset, limit),
-        ))
-    }
+    Ok(
+        serde_json::to_value(p.functions_envelope(filter, offset, limit))
+            .expect("functions envelope serializes"),
+    )
 }
 
 fn func(
@@ -1346,17 +1335,15 @@ fn strings(
     filter: &binscout::analysis::StringsFilter,
     with_xrefs: bool,
     decode: Option<binscout::loader::strings::DecodeSpec>,
-    envelope: bool,
+    _envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
     if with_xrefs {
         let p = open(binary, db, raw, fat_arch, debug)?;
-        return strings_from_project(&p, filter, decode, envelope, true);
+        return strings_from_project(&p, filter, decode, true);
     }
     match open_loader(binary, db, raw, fat_arch, debug)? {
-        binscout::LoaderOpened::Cached(p) => strings_from_loader(&p, filter, decode, envelope),
-        binscout::LoaderOpened::Fresh(p) => {
-            strings_from_project(&p, filter, decode, envelope, false)
-        }
+        binscout::LoaderOpened::Cached(p) => strings_from_loader(&p, filter, decode),
+        binscout::LoaderOpened::Fresh(p) => strings_from_project(&p, filter, decode, false),
     }
 }
 
@@ -1364,41 +1351,25 @@ fn strings_from_loader(
     p: &binscout::LoaderProject,
     filter: &binscout::analysis::StringsFilter,
     decode: Option<binscout::loader::strings::DecodeSpec>,
-    envelope: bool,
 ) -> binscout::error::Result<serde_json::Value> {
-    if envelope {
-        let page = match decode {
-            Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
-            None => p.query_strings_envelope(filter)?,
-        };
-        return Ok(serde_json::to_value(page).expect("strings envelope serializes"));
-    }
-    let rows = match decode {
-        Some(spec) => p.query_strings_decoded(filter, spec)?,
-        None => p.query_strings(filter)?,
+    let page = match decode {
+        Some(spec) => p.query_strings_decoded_envelope(filter, spec)?,
+        None => p.query_strings_envelope(filter)?,
     };
-    Ok(serde_json::to_value(rows).expect("strings serialize"))
+    Ok(serde_json::to_value(page).expect("strings envelope serializes"))
 }
 
 fn strings_from_project(
     p: &binscout::Project,
     filter: &binscout::analysis::StringsFilter,
     decode: Option<binscout::loader::strings::DecodeSpec>,
-    envelope: bool,
     with_xrefs: bool,
 ) -> binscout::error::Result<serde_json::Value> {
-    if envelope {
-        let page = match decode {
-            Some(spec) => p.query_strings_decoded_rows_envelope(filter, spec, with_xrefs)?,
-            None => p.query_strings_rows_envelope(filter, with_xrefs)?,
-        };
-        return Ok(serde_json::to_value(page).expect("strings envelope serializes"));
-    }
-    let rows = match decode {
-        Some(spec) => p.query_strings_decoded_rows(filter, spec, with_xrefs)?,
-        None => p.query_strings_rows(filter, with_xrefs)?,
+    let page = match decode {
+        Some(spec) => p.query_strings_decoded_rows_envelope(filter, spec, with_xrefs)?,
+        None => p.query_strings_rows_envelope(filter, with_xrefs)?,
     };
-    Ok(serde_json::to_value(rows).expect("strings serialize"))
+    Ok(serde_json::to_value(page).expect("strings envelope serializes"))
 }
 
 fn symbols(

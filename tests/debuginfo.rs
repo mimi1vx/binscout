@@ -559,7 +559,7 @@ fn cli_pdb_flag_names_pe_functions() {
     );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout is one JSON value");
-    let rows = v.as_array().expect("functions is an array");
+    let rows = v["items"].as_array().expect("functions is an array");
     assert!(
         rows.iter()
             .any(|r| r["name"].as_str().is_some_and(|n| n.contains("main")))

@@ -326,7 +326,10 @@ fn cli_xrefs_carry_context_and_strings_with_xrefs() {
 
     let (ok, v) = run(&["--db", d, "strings", &bin_s, "--pattern", "SAVE"]);
     assert!(ok, "{v}");
-    assert!(v[0].get("xrefs").is_none(), "flag off omits the list: {v}");
+    assert!(
+        v["items"][0].get("xrefs").is_none(),
+        "flag off omits the list: {v}"
+    );
 
     let (ok, v) = run(&[
         "--db",
@@ -338,7 +341,7 @@ fn cli_xrefs_carry_context_and_strings_with_xrefs() {
         "--with-xrefs",
     ]);
     assert!(ok, "{v}");
-    let refs = v[0]["xrefs"].as_array().expect("xrefs list");
+    let refs = v["items"][0]["xrefs"].as_array().expect("xrefs list");
     assert_eq!(refs.len(), 2);
     assert_eq!(refs[0]["from_func_name"], builders::BASIC_EXPORT);
     cleanup(&dir);

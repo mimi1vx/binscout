@@ -3311,9 +3311,10 @@ impl Project {
     /// Every present [`FunctionFilter`] field must match; filtering happens
     /// before paging so `offset`/`limit` apply to the matching rows. Rows
     /// carry the full `calls` target array (unbounded for large callers);
-    /// [`Project::functions_envelope`] is the opt-in preview that wraps
-    /// the same matches in the protocol-1 [`Page`] envelope with compact
-    /// `calls_count` rows instead.
+    /// the CLI/MCP `functions` default output is
+    /// [`Project::functions_envelope`], which wraps the same matches in
+    /// the protocol-1 [`Page`] envelope with compact `calls_count` rows
+    /// instead.
     #[must_use]
     pub fn functions_filtered(
         &self,
@@ -3340,8 +3341,8 @@ impl Project {
 
     /// Entries matching [`Project::functions_filtered`], in entry order.
     ///
-    /// Shared by the legacy bare-array list, the exact count, and the
-    /// opt-in envelope so all three agree on the match set.
+    /// Shared by the bare-array list, the exact count, and the
+    /// envelope so all three agree on the match set.
     fn matching_function_entries(&self, filter: &FunctionFilter) -> Vec<u64> {
         // Resolve anchor addresses once: None = filter disabled,
         // Some(None) = anchor lies in no function (matches nothing).
@@ -3389,7 +3390,7 @@ impl Project {
     /// Exact count of [`Project::functions_filtered`] matches, before paging.
     ///
     /// Lets agents learn the function count without paging to the end;
-    /// the opt-in [`Project::functions_envelope`] reports this as `total`.
+    /// [`Project::functions_envelope`] reports this as `total`.
     #[must_use]
     pub fn count_functions_filtered(&self, filter: &FunctionFilter) -> usize {
         self.matching_function_entries(filter).len()
@@ -3397,13 +3398,12 @@ impl Project {
 
     /// Filtered function matches under the protocol-1 [`Page`] envelope.
     ///
-    /// Opt-in preview of the planned functions-shape migration (see
-    /// `docs/book/src/migration.md`): `total` is the exact match count
-    /// and rows are compact — `calls_count` replaces the unbounded
-    /// `calls` target array, so the page stays bounded for arbitrarily
-    /// large callers. Direct callees remain one `callees` query away
-    /// (`depth` 1). The legacy [`Project::functions_filtered`] bare array
-    /// keeps the `calls` array unchanged.
+    /// Default `functions` output on the CLI and MCP surfaces: `total` is
+    /// the exact match count and rows are compact — `calls_count` replaces
+    /// the unbounded `calls` target array, so the page stays bounded for
+    /// arbitrarily large callers. Direct callees remain one `callees`
+    /// query away (`depth` 1). The [`Project::functions_filtered`] bare
+    /// array keeps the `calls` array unchanged.
     #[must_use]
     pub fn functions_envelope(
         &self,
@@ -4253,9 +4253,8 @@ impl Project {
 
     /// Extracted strings, filtered then paged under the protocol-1 envelope.
     ///
-    /// Opt-in preview of the planned strings-shape migration (see
-    /// `docs/book/src/migration.md`): `total` is the exact filtered count
-    /// and `items` holds the requested page. The legacy
+    /// Default `strings` output on the CLI and MCP surfaces: `total` is
+    /// the exact filtered count and `items` holds the requested page. The
     /// [`Project::query_strings`] bare array is unchanged.
     ///
     /// # Errors
@@ -4340,7 +4339,7 @@ impl Project {
 
     /// Decoded-view strings under the protocol-1 envelope.
     ///
-    /// Same opt-in preview as [`Project::query_strings_envelope`] over the
+    /// Same envelope as [`Project::query_strings_envelope`] over the
     /// in-memory decoded view (see [`Project::query_strings_decoded`]).
     ///
     /// # Errors

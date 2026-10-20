@@ -343,9 +343,7 @@ pub struct StringsParams {
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
-    /// Wrap matches in the protocol-1 page envelope with an exact `total`
-    /// (opt-in preview of the planned strings-shape migration; default
-    /// stays a bare array).
+    /// Deprecated, ignored: output is always the page envelope.
     pub envelope: Option<bool>,
     /// Case-sensitive substring, or `regex:`-prefixed expression.
     pub pattern: Option<String>,
@@ -402,10 +400,7 @@ pub struct FunctionsParams {
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
     pub limit: Option<usize>,
-    /// Wrap matches in the protocol-1 page envelope with an exact `total`
-    /// and compact `calls_count` rows (opt-in preview of the planned
-    /// functions-shape migration; default stays a bare array with the
-    /// full `calls` target array).
+    /// Deprecated, ignored: output is always the page envelope.
     pub envelope: Option<bool>,
 }
 
@@ -1267,20 +1262,15 @@ fn run_batch_op(
                     }
                 },
             };
-            if a.envelope.unwrap_or(false) {
-                Ok(serde_json::to_value(proj.functions_envelope(
-                    &filter,
-                    a.offset.unwrap_or(0),
-                    a.limit.unwrap_or(50),
-                ))
-                .expect("functions envelope serializes"))
-            } else {
-                Ok(serde_json::Value::Array(proj.functions_filtered(
-                    &filter,
-                    a.offset.unwrap_or(0),
-                    a.limit.unwrap_or(50),
-                )))
+            if a.envelope == Some(false) {
+                eprintln!("warning: functions envelope is always on; envelope:false is ignored");
             }
+            Ok(serde_json::to_value(proj.functions_envelope(
+                &filter,
+                a.offset.unwrap_or(0),
+                a.limit.unwrap_or(50),
+            ))
+            .expect("functions envelope serializes"))
         }
         "xrefs" => {
             let a: BatchXrefs = parse_op(tool, params)?;
@@ -1328,23 +1318,17 @@ fn run_batch_op(
                 limit: a.limit.unwrap_or(50),
             };
             let with_xrefs = a.with_xrefs.unwrap_or(false);
-            if a.envelope.unwrap_or(false) {
-                let page = match decode {
-                    Some(spec) => {
-                        proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs)
-                    }
-                    None => proj.query_strings_rows_envelope(&filter, with_xrefs),
-                }
-                .map_err(invalid_msg)?;
-                Ok(serde_json::to_value(page).expect("strings envelope serializes"))
-            } else {
-                let rows = match decode {
-                    Some(spec) => proj.query_strings_decoded_rows(&filter, spec, with_xrefs),
-                    None => proj.query_strings_rows(&filter, with_xrefs),
-                }
-                .map_err(invalid_msg)?;
-                Ok(serde_json::to_value(rows).expect("strings serialize"))
+            if a.envelope == Some(false) {
+                eprintln!("warning: strings envelope is always on; envelope:false is ignored");
             }
+            let page = match decode {
+                Some(spec) => {
+                    proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs)
+                }
+                None => proj.query_strings_rows_envelope(&filter, with_xrefs),
+            }
+            .map_err(invalid_msg)?;
+            Ok(serde_json::to_value(page).expect("strings envelope serializes"))
         }
         "stack_strings" => {
             Ok(serde_json::to_value(proj.stack_strings()).expect("stack strings serialize"))
@@ -1655,7 +1639,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "functions",
-        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit. Range is inclusive (entry >= lo and <= hi); range_start/range_end are deprecated aliases of range_lo/range_hi. envelope:true wraps matches in the protocol-1 page envelope with an exact total and compact calls_count rows"
+        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit. Range is inclusive (entry >= lo and <= hi); range_start/range_end are deprecated aliases of range_lo/range_hi. Result is the protocol-1 page envelope with an exact total; rows carry calls_count, and direct callees are one callees query away (depth 1)"
     )]
     async fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1665,20 +1649,12 @@ impl BinscoutMcp {
         if p.range_end.is_some() {
             eprintln!("warning: functions range_end is deprecated, use range_hi");
         }
+        if p.envelope == Some(false) {
+            eprintln!("warning: functions envelope is always on; envelope:false is ignored");
+        }
         // Cloned before the move into the open so filter errors keep their
         // post-open precedence (a missing binary still reports first).
-        let (
-            query,
-            caller,
-            callee,
-            range_lo,
-            range_hi,
-            alias_lo,
-            alias_hi,
-            offset,
-            limit,
-            envelope,
-        ) = (
+        let (query, caller, callee, range_lo, range_hi, alias_lo, alias_hi, offset, limit) = (
             p.query.clone(),
             p.caller.clone(),
             p.callee.clone(),
@@ -1688,7 +1664,6 @@ impl BinscoutMcp {
             p.range_end.clone(),
             p.offset,
             p.limit,
-            p.envelope.unwrap_or(false),
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
@@ -1711,17 +1686,12 @@ impl BinscoutMcp {
                 }
             },
         };
-        if envelope {
-            ok(serde_json::to_value(proj.functions_envelope(
-                &filter,
-                offset.unwrap_or(0),
-                limit.unwrap_or(50),
-            ))
-            .expect("functions envelope serializes"))
-        } else {
-            let rows = proj.functions_filtered(&filter, offset.unwrap_or(0), limit.unwrap_or(50));
-            ok(serde_json::Value::Array(rows))
-        }
+        ok(serde_json::to_value(proj.functions_envelope(
+            &filter,
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
+        ))
+        .expect("functions envelope serializes"))
     }
 
     #[tool(
@@ -1976,12 +1946,15 @@ impl BinscoutMcp {
 
     #[tool(
         name = "strings",
-        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only obfuscated view: xor:<byte>, xor:0x<HEXKEY> (rolling multi-byte key), add:<byte>, rot:<0-7>, or bare base64 (blob plaintext). offset is a deprecated alias of start. envelope:true wraps matches in the protocol-1 page envelope with an exact total. With with_xrefs, each row carries its bounded referencing-instruction list"
+        description = "Extracted strings ordered by address, filtered by pattern/min-len/section, paged by start/limit. Hits in executable memory are hidden unless pattern, section, or include_code is given. Decode renders a read-only obfuscated view: xor:<byte>, xor:0x<HEXKEY> (rolling multi-byte key), add:<byte>, rot:<0-7>, or bare base64 (blob plaintext). offset is a deprecated alias of start. Result is the protocol-1 page envelope with an exact total. With with_xrefs, each row carries its bounded referencing-instruction list"
     )]
     async fn strings(&self, p: Parameters<StringsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         if p.offset.is_some() {
             eprintln!("warning: strings offset is deprecated, use start");
+        }
+        if p.envelope == Some(false) {
+            eprintln!("warning: strings envelope is always on; envelope:false is ignored");
         }
         let decode = p
             .decode
@@ -1991,7 +1964,7 @@ impl BinscoutMcp {
             .map_err(error_data)?;
         // Cloned before the move into the open; the decode error above keeps
         // its pre-open precedence.
-        let (pattern, min_len, section, include_code, start, offset, limit, envelope, with_xrefs) = (
+        let (pattern, min_len, section, include_code, start, offset, limit, with_xrefs) = (
             p.pattern.clone(),
             p.min_len,
             p.section.clone(),
@@ -1999,7 +1972,6 @@ impl BinscoutMcp {
             p.start,
             p.offset,
             p.limit,
-            p.envelope.unwrap_or(false),
             p.with_xrefs.unwrap_or(false),
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
@@ -2012,20 +1984,12 @@ impl BinscoutMcp {
             start: start.or(offset).unwrap_or(0),
             limit: limit.unwrap_or(50),
         };
-        if envelope {
-            let page = match decode {
-                Some(spec) => proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs),
-                None => proj.query_strings_rows_envelope(&filter, with_xrefs),
-            }
-            .map_err(error_data)?;
-            return ok(serde_json::to_value(page).expect("strings envelope serializes"));
-        }
-        let rows = match decode {
-            Some(spec) => proj.query_strings_decoded_rows(&filter, spec, with_xrefs),
-            None => proj.query_strings_rows(&filter, with_xrefs),
+        let page = match decode {
+            Some(spec) => proj.query_strings_decoded_rows_envelope(&filter, spec, with_xrefs),
+            None => proj.query_strings_rows_envelope(&filter, with_xrefs),
         }
         .map_err(error_data)?;
-        ok(serde_json::to_value(rows).expect("strings serialize"))
+        ok(serde_json::to_value(page).expect("strings envelope serializes"))
     }
 
     #[tool(

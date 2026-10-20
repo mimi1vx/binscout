@@ -371,7 +371,7 @@ fn all_tools_return_json_over_stdio() {
     );
 
     let funcs: Value = serde_json::from_str(tool_text(by_id[&11])).expect("functions json");
-    assert_eq!(funcs.as_array().expect("array").len(), 1);
+    assert_eq!(funcs["items"].as_array().expect("array").len(), 1);
 
     // Compact func: counts only, no embedded block/insn arrays.
     let func: Value = serde_json::from_str(tool_text(by_id[&12])).expect("func json");
@@ -519,7 +519,7 @@ fn define_undefine_round_trip() {
     assert_eq!(v["excluded"], true);
 
     let funcs = tool_once(13, "functions", json!({"binary": bin, "db": db}));
-    assert_eq!(funcs.as_array().expect("array").len(), 1);
+    assert_eq!(funcs["items"].as_array().expect("array").len(), 1);
 
     assert_eq!(
         std::fs::read(dir.join("m.bin")).expect("reread"),
@@ -648,19 +648,19 @@ fn functions_filters_and_mid_function_snap() {
         .collect();
 
     let q: Value = serde_json::from_str(tool_text(by_id[&10])).expect("query json");
-    assert_eq!(q.as_array().expect("array").len(), 1);
-    assert_eq!(q[0]["entry"], 0x401000);
+    assert_eq!(q["items"].as_array().expect("array").len(), 1);
+    assert_eq!(q["items"][0]["entry"], 0x401000);
 
     let q: Value = serde_json::from_str(tool_text(by_id[&11])).expect("query json");
-    assert_eq!(q.as_array().expect("array").len(), 0);
+    assert_eq!(q["items"].as_array().expect("array").len(), 0);
 
     let q: Value = serde_json::from_str(tool_text(by_id[&12])).expect("range json");
-    assert_eq!(q.as_array().expect("array").len(), 1);
+    assert_eq!(q["items"].as_array().expect("array").len(), 1);
 
     // The single-function fixture calls nothing, so nothing calls the entry:
     // empty page, still success.
     let q: Value = serde_json::from_str(tool_text(by_id[&13])).expect("caller json");
-    assert_eq!(q.as_array().expect("array").len(), 0);
+    assert_eq!(q["items"].as_array().expect("array").len(), 0);
 
     // 0x401001 is mid-function (inside the entry block): snaps instead of
     // reporting not-found. Compact func carries counts, no snap twin.
@@ -673,6 +673,37 @@ fn functions_filters_and_mid_function_snap() {
     let c: Value = serde_json::from_str(tool_text(by_id[&15])).expect("cfg json");
     assert_eq!(c["entry"], 0x401000);
     assert_eq!(c["containing_entry"], 0x401000);
+    cleanup(&dir);
+}
+
+// `envelope:false` is deprecated and ignored: `functions` and `strings`
+// still return the protocol-1 page envelope on the MCP surface.
+#[test]
+fn envelope_false_is_ignored() {
+    let dir = tmpdir("mcp-envelope-false");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+
+    let v = tool_once(
+        10,
+        "functions",
+        json!({"binary": bin, "db": db, "envelope": false}),
+    );
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert!(items[0]["calls_count"].is_number(), "{v}");
+    assert!(items[0].get("calls").is_none(), "{v}");
+
+    let v = tool_once(
+        11,
+        "strings",
+        json!({"binary": bin, "db": db, "pattern": "SAVE", "envelope": false}),
+    );
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["items"].as_array().expect("items array").len(), 1);
     cleanup(&dir);
 }
 
@@ -821,12 +852,12 @@ fn strings_filters_pattern_section_and_paging() {
         .collect();
 
     let found: Value = serde_json::from_str(tool_text(by_id[&10])).expect("pattern json");
-    assert_eq!(found.as_array().expect("array").len(), 1);
-    assert_eq!(found[0]["value"], common::builders::BASIC_STRING);
+    assert_eq!(found["items"].as_array().expect("array").len(), 1);
+    assert_eq!(found["items"][0]["value"], common::builders::BASIC_STRING);
 
     let sec: Value = serde_json::from_str(tool_text(by_id[&11])).expect("section json");
-    assert_eq!(sec.as_array().expect("array").len(), 1);
-    assert_eq!(sec[0]["section"], ".rdata");
+    assert_eq!(sec["items"].as_array().expect("array").len(), 1);
+    assert_eq!(sec["items"][0]["section"], ".rdata");
 
     let via_start: Value = serde_json::from_str(tool_text(by_id[&12])).expect("start json");
     let via_offset: Value = serde_json::from_str(tool_text(by_id[&13])).expect("offset json");
@@ -836,7 +867,7 @@ fn strings_filters_pattern_section_and_paging() {
     );
 
     let noise: Value = serde_json::from_str(tool_text(by_id[&14])).expect("garbage json");
-    assert_eq!(noise.as_array().expect("array").len(), 0);
+    assert_eq!(noise["items"].as_array().expect("array").len(), 0);
 
     // A bad regex is a protocol-level error, not a result.
     assert!(by_id[&15].get("error").is_some(), "{:?}", by_id[&15]);
@@ -935,14 +966,17 @@ fn xrefs_carry_context_and_strings_with_xrefs() {
         "strings",
         json!({"binary": bin, "db": db, "pattern": "SAVE"}),
     );
-    assert!(v[0].get("xrefs").is_none(), "flag off omits the list: {v}");
+    assert!(
+        v["items"][0].get("xrefs").is_none(),
+        "flag off omits the list: {v}"
+    );
 
     let v = tool_once(
         12,
         "strings",
         json!({"binary": bin, "db": db, "pattern": "SAVE", "with_xrefs": true}),
     );
-    let refs = v[0]["xrefs"].as_array().expect("xrefs list");
+    let refs = v["items"][0]["xrefs"].as_array().expect("xrefs list");
     assert_eq!(refs.len(), 2);
     assert_eq!(refs[0]["from_func_name"], common::builders::BASIC_EXPORT);
     cleanup(&dir);
@@ -995,7 +1029,7 @@ fn annotate_round_trip_rename_comment_reopen_clear() {
         "functions",
         json!({"binary": bin, "db": db, "query": "mcp_renamed"}),
     );
-    let rows = v.as_array().expect("functions array");
+    let rows = v["items"].as_array().expect("functions array");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["entry"].as_u64(), Some(entry));
     assert_eq!(rows[0]["name"], "mcp_renamed");
@@ -1024,7 +1058,7 @@ fn annotate_round_trip_rename_comment_reopen_clear() {
         "functions",
         json!({"binary": bin, "db": db, "query": "mcp_renamed"}),
     );
-    assert_eq!(v.as_array().expect("array").len(), 0);
+    assert_eq!(v["items"].as_array().expect("array").len(), 0);
     let v = tool_once(
         17,
         "func",
@@ -1081,7 +1115,7 @@ fn raw_mapping_reports_across_arches() {
             "functions",
             json!({"binary": bin, "db": db, "raw": {"arch": arch, "base": base}}),
         );
-        assert_eq!(funcs.as_array().expect("array").len(), 1, "{arch}");
+        assert_eq!(funcs["items"].as_array().expect("array").len(), 1, "{arch}");
 
         let stats = tool_once(
             12,
@@ -1157,7 +1191,7 @@ fn raw_reads_do_not_write_sidecars() {
         "functions",
         json!({"binary": bin, "db": db, "raw": {"arch": "x86_64", "base": "0x1000"}}),
     );
-    assert_eq!(funcs.as_array().expect("array").len(), 1);
+    assert_eq!(funcs["items"].as_array().expect("array").len(), 1);
     assert!(!db_path.exists(), "raw reads never create the sidecar");
     cleanup(&dir);
 }

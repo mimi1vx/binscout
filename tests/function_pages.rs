@@ -12,11 +12,13 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::process::Command;
 
 use binscout::disasm::Arch;
 use binscout::error::Error;
 use binscout::loader::RawOptions;
 use binscout::{Page, Project, WIRE_PROTOCOL};
+use serde_json::Value;
 
 thread_local! {
     static THREAD_ALLOC_BYTES: Cell<usize> = const { Cell::new(0) };
@@ -112,6 +114,47 @@ fn two_funcs() -> Vec<u8> {
 
 fn is_not_found<T>(r: binscout::error::Result<T>) -> bool {
     matches!(r, Err(Error::NotFound(_)))
+}
+
+/// Run the CLI; returns exit success and parsed stdout JSON.
+fn run_cli(args: &[&str]) -> (bool, Value) {
+    let out = Command::new(common::binscout_bin())
+        .args(args)
+        .output()
+        .expect("spawn binscout");
+    let text = String::from_utf8(out.stdout).expect("stdout is utf-8");
+    let value: Value = serde_json::from_str(text.trim_end())
+        .unwrap_or_else(|_| panic!("stdout must be one JSON value, got: {text:?}"));
+    (out.status.success(), value)
+}
+
+#[test]
+fn cli_functions_defaults_to_the_page_envelope() {
+    let dir = common::tmpdir("func-pages-cli");
+    let bin = common::write_bin(&dir, "two.bin", &two_funcs())
+        .display()
+        .to_string();
+    let db = common::temp_db(&dir, "two").display().to_string();
+
+    // No flag: the protocol-1 page envelope with an exact numeric total.
+    let (ok, v) = run_cli(&["--db", &db, "functions", &bin, "--limit", "1"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], WIRE_PROTOCOL);
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["offset"], 0);
+    assert_eq!(v["limit"], 1);
+    assert_eq!(v["next_offset"], 1);
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    // Compact rows: `calls_count` instead of the unbounded `calls` array.
+    assert!(items[0]["calls_count"].is_number(), "{v}");
+    assert!(items[0].get("calls").is_none(), "{v}");
+
+    // The hidden `--envelope` flag is a no-op: same document as no-flag.
+    let (ok, flagged) = run_cli(&["--db", &db, "functions", &bin, "--limit", "1", "--envelope"]);
+    assert!(ok, "{flagged}");
+    assert_eq!(v, flagged, "--envelope must not change the output");
+    common::cleanup(&dir);
 }
 
 #[test]

@@ -1954,7 +1954,7 @@ impl Analysis {
 
     /// Exact count of [`Analysis::strings_page_filtered`] matches, before
     /// paging. Lets agents learn the string count without paging to the
-    /// end; the opt-in envelope reports this as `total`.
+    /// end; the envelope reports this as `total`.
     ///
     /// # Errors
     /// Same as [`Analysis::strings_page_filtered`].

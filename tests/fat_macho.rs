@@ -585,7 +585,7 @@ fn cli_fat_arch_flag_selects_slice() {
     let (ok, f) = cli_run(&["--db", d, "--fat-arch", "arm64", "functions", &bin_s]);
     assert!(ok, "{f}");
     assert_eq!(
-        f.as_array().expect("functions array").len() as u64,
+        f["items"].as_array().expect("functions array").len() as u64,
         v["functions"].as_u64().expect("functions count"),
         "functions read must agree with load"
     );

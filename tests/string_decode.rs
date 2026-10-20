@@ -180,9 +180,9 @@ fn cli_decode_flag_and_bad_spec_envelope() {
         "--include-code",
     ]);
     assert!(ok, "{v}");
-    let vals: Vec<&str> = v
+    let vals: Vec<&str> = v["items"]
         .as_array()
-        .expect("array")
+        .expect("items")
         .iter()
         .filter(|r| r["encoding"] == "Ascii")
         .map(|r| r["value"].as_str().expect("row value"))

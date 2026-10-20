@@ -167,7 +167,7 @@ fn range_aliases_and_semantics() {
         "functions",
         json!({"binary": bin_s, "db": db, "range_lo": entry_hex, "range_hi": entry_hex}),
     );
-    assert_eq!(canon.as_array().expect("array").len(), 1);
+    assert_eq!(canon["items"].as_array().expect("items").len(), 1);
     let alias = tool_once(
         11,
         "functions",
@@ -216,29 +216,21 @@ fn range_aliases_and_semantics() {
     cleanup(&dir);
 }
 
-// Items 6+7: the opt-in envelope wraps the same matches with an exact
-// total; `functions` envelope rows carry `calls_count` instead of the
-// unbounded `calls` array. Legacy defaults stay byte-identical.
+// Items 6+7: the page envelope is the default `functions` output on both
+// surfaces; rows carry `calls_count` instead of the unbounded `calls`
+// array. The hidden `--envelope` flag and `envelope:true` are no-ops;
+// `envelope:false` is ignored (stderr warning) and still returns the
+// envelope.
 #[test]
-fn envelope_opt_in_with_compact_calls() {
+fn envelope_is_default_with_compact_calls() {
     let dir = tmpdir("parity-envelope");
     let bin = write_bin(&dir, "three.bin", &three_site_blob())
         .display()
         .to_string();
     let db = temp_db(&dir, "e").display().to_string();
 
-    // Legacy defaults: bare arrays, full `calls` target array.
-    let (ok, legacy) = run(&["--db", &db, "functions", &bin]);
-    assert!(ok, "{legacy}");
-    let rows = legacy.as_array().expect("bare array");
-    assert_eq!(rows.len(), 2);
-    assert!(rows[0].get("calls").is_some(), "{rows:?}");
-    assert!(rows[0].get("calls_count").is_none(), "{rows:?}");
-    let legacy_mcp = tool_once(10, "functions", json!({"binary": bin, "db": db}));
-    assert_eq!(legacy, legacy_mcp);
-
-    // Opt-in envelope: same match set, exact total, compact rows.
-    let (ok, env) = run(&["--db", &db, "functions", &bin, "--envelope"]);
+    // Default: envelope with exact total and compact rows.
+    let (ok, env) = run(&["--db", &db, "functions", &bin]);
     assert!(ok, "{env}");
     assert_eq!(env["protocol"], 1);
     assert_eq!(env["total"], 2);
@@ -249,17 +241,29 @@ fn envelope_opt_in_with_compact_calls() {
         assert!(item.get("calls").is_none(), "{item}");
         assert!(item["calls_count"].is_number(), "{item}");
     }
-    // Compact count matches the legacy array length for the same row.
-    assert_eq!(
-        env["items"][0]["calls_count"],
-        legacy[0]["calls"].as_array().expect("calls").len()
-    );
-    let env_mcp = tool_once(
+    let env_mcp = tool_once(10, "functions", json!({"binary": bin, "db": db}));
+    assert_eq!(env, env_mcp, "CLI and MCP defaults must agree");
+
+    // Opt-in spellings are no-ops: hidden `--envelope`, `envelope:true`.
+    let (ok, flagged) = run(&["--db", &db, "functions", &bin, "--envelope"]);
+    assert!(ok, "{flagged}");
+    assert_eq!(env, flagged, "--envelope must not change the output");
+    let flagged_mcp = tool_once(
         11,
         "functions",
         json!({"binary": bin, "db": db, "envelope": true}),
     );
-    assert_eq!(env, env_mcp, "CLI and MCP envelopes must agree");
+    assert_eq!(env, flagged_mcp);
+
+    // `envelope:false` is ignored and still returns the envelope.
+    let denied = tool_once(
+        14,
+        "functions",
+        json!({"binary": bin, "db": db, "envelope": false}),
+    );
+    assert_eq!(denied["protocol"], 1);
+    assert_eq!(denied["total"], 2);
+    assert_eq!(denied["items"].as_array().expect("items").len(), 2);
 
     // Cross-check: `calls_count` of the root equals its depth-1 callees.
     let entry = env["items"][0]["entry"].as_u64().expect("entry");
@@ -274,44 +278,32 @@ fn envelope_opt_in_with_compact_calls() {
     );
 
     // paging still works under the envelope; limit 0 reports the total.
-    let (ok, page) = run(&["--db", &db, "functions", &bin, "--envelope", "--limit", "1"]);
+    let (ok, page) = run(&["--db", &db, "functions", &bin, "--limit", "1"]);
     assert!(ok, "{page}");
     assert_eq!(page["total"], 2);
     assert_eq!(page["items"].as_array().expect("items").len(), 1);
     assert_eq!(page["next_offset"], 1);
-    let (ok, zero) = run(&["--db", &db, "functions", &bin, "--envelope", "--limit", "0"]);
+    let (ok, zero) = run(&["--db", &db, "functions", &bin, "--limit", "0"]);
     assert!(ok, "{zero}");
     assert_eq!(zero["total"], 2);
     assert!(zero["items"].as_array().expect("items").is_empty());
 
-    // Filtered envelope: the query total matches the legacy array length.
-    let (ok, q) = run(&[
-        "--db",
-        &db,
-        "functions",
-        &bin,
-        "--query",
-        "zzz",
-        "--envelope",
-    ]);
+    // Filtered envelope: the query total matches the items page.
+    let (ok, q) = run(&["--db", &db, "functions", &bin, "--query", "zzz"]);
     assert!(ok, "{q}");
     assert_eq!(q["total"], 0);
     assert!(q["items"].as_array().expect("items").is_empty());
     assert!(q["next_offset"].is_null());
 
-    // Strings envelope: total matches the legacy array, rows identical.
-    let (ok, slegacy) = run(&["--db", &db, "strings", &bin]);
-    assert!(ok, "{slegacy}");
-    let (ok, senv) = run(&["--db", &db, "strings", &bin, "--envelope"]);
+    // Strings default: envelope on both surfaces, total exact.
+    let (ok, senv) = run(&["--db", &db, "strings", &bin]);
     assert!(ok, "{senv}");
     assert_eq!(senv["protocol"], 1);
-    assert_eq!(senv["total"], slegacy.as_array().expect("array").len());
-    assert_eq!(senv["items"], slegacy);
-    let senv_mcp = tool_once(
-        13,
-        "strings",
-        json!({"binary": bin, "db": db, "envelope": true}),
+    assert_eq!(
+        senv["total"].as_u64(),
+        Some(senv["items"].as_array().expect("items").len() as u64)
     );
+    let senv_mcp = tool_once(13, "strings", json!({"binary": bin, "db": db}));
     assert_eq!(senv, senv_mcp, "CLI and MCP envelopes must agree");
     cleanup(&dir);
 }

@@ -295,16 +295,16 @@ fn cli_pattern_and_defaults_behave() {
         "6",
     ]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 1);
-    assert_eq!(v[0]["value"], builders::BASIC_STRING);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1);
+    assert_eq!(v["items"][0]["value"], builders::BASIC_STRING);
 
     let (ok, v, _) = run_cli(&["--db", &garbage_db, "strings", &garbage_s]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 0);
+    assert_eq!(v["items"].as_array().expect("items").len(), 0);
 
     let (ok, v, _) = run_cli(&["--db", &garbage_db, "strings", &garbage_s, "--include-code"]);
     assert!(ok, "{v}");
-    assert_eq!(v.as_array().expect("array").len(), 2);
+    assert_eq!(v["items"].as_array().expect("items").len(), 2);
     cleanup(&dir);
 }
 
@@ -346,5 +346,36 @@ fn cli_bad_regex_is_a_json_envelope() {
     let (ok, v, _) = run_cli(&["--db", &db, "strings", &bin_s, "--pattern", "regex:(["]);
     assert!(!ok, "bad regex must fail, got {v}");
     assert!(v.get("error").is_some(), "{v}");
+    cleanup(&dir);
+}
+
+#[test]
+fn cli_strings_defaults_to_the_page_envelope() {
+    let dir = tmpdir("strings-envelope");
+    let bin = write_fixture(&dir, builders::BASIC_NAME);
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+
+    // No flag: the protocol-1 page envelope with an exact numeric total.
+    let (ok, v, _) = run_cli(&["--db", &db, "strings", &bin_s, "--pattern", "SAVE"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 1);
+    let items = v["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["value"], builders::BASIC_STRING);
+
+    // The hidden `--envelope` flag is a no-op: same document as no-flag.
+    let (ok, flagged, _) = run_cli(&[
+        "--db",
+        &db,
+        "strings",
+        &bin_s,
+        "--pattern",
+        "SAVE",
+        "--envelope",
+    ]);
+    assert!(ok, "{flagged}");
+    assert_eq!(v, flagged, "--envelope must not change the output");
     cleanup(&dir);
 }
