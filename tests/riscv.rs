@@ -5,12 +5,16 @@
 //!   with `jal`/`jalr` split into call/branch/return by operand.
 //! - `addi sp, sp, <imm>` prologue seeds discovery when no entry is set.
 //! - Traps and compressed forms decode under their canonical names.
+//! - `auipc`+`addi`/`lw`/`sw` pairs resolve exact globals with data and
+//!   string xrefs, plus IR/pseudo annotation like the `adrp` path.
 
 mod common;
 
-use binscout::analysis::{DiscoveryReason, analyze};
+use binscout::analysis::{DiscoveryReason, XrefKind, analyze};
 use binscout::disasm::{Arch, disasm_range};
+use binscout::ir::lift_range;
 use binscout::loader::{BinaryFormat, LoadedBinary, Segment, load};
+use binscout::pseudo::render_function;
 
 fn text_seg(vaddr: u64, code: Vec<u8>) -> Segment {
     Segment {
@@ -24,11 +28,28 @@ fn text_seg(vaddr: u64, code: Vec<u8>) -> Segment {
 }
 
 fn rv64_bin(entry: Option<u64>, code: Vec<u8>) -> LoadedBinary {
+    rv64_bin_segs(entry, vec![text_seg(0x10000, code)])
+}
+
+fn data_seg(vaddr: u64, size: usize, at: usize, bytes: &[u8]) -> Segment {
+    let mut data = vec![0u8; size];
+    data[at..at + bytes.len()].copy_from_slice(bytes);
+    Segment {
+        vaddr,
+        mem_size: data.len() as u64,
+        data,
+        readable: true,
+        writable: true,
+        executable: false,
+    }
+}
+
+fn rv64_bin_segs(entry: Option<u64>, segments: Vec<Segment>) -> LoadedBinary {
     LoadedBinary {
         format: BinaryFormat::Elf,
         arch: Arch::Riscv64,
         entry,
-        segments: vec![text_seg(0x10000, code)],
+        segments,
         sections: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),
@@ -102,6 +123,12 @@ fn riscv_prologue_seeds_discovery_without_entry() {
     );
 }
 
+fn has_xref(a: &binscout::analysis::Analysis, from: u64, kind: XrefKind, to: u64) -> bool {
+    a.xrefs
+        .iter()
+        .any(|x| x.from == from && x.kind == kind && x.to == to)
+}
+
 #[test]
 fn riscv_trap_and_compressed_decode() {
     // ecall traps; ebreak and c.ebreak are its breakpoint forms.
@@ -114,4 +141,60 @@ fn riscv_trap_and_compressed_decode() {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].mnem, mnem, "{bytes:02x?}");
     }
+}
+
+#[test]
+fn auipc_pairs_yield_data_and_string_xrefs() {
+    // Three pairs resolve the same string global at 0x12034; each auipc
+    // row keeps its page fallback.
+    let text = vec![
+        0x17, 0x25, 0x00, 0x00, // 0x10000: auipc a0, 2 (page 0x12000)
+        0x03, 0x25, 0x45, 0x03, // 0x10004: lw a0, 52(a0) -> 0x12034
+        0x97, 0x25, 0x00, 0x00, // 0x10008: auipc a1, 2 (page 0x12008)
+        0x93, 0x85, 0xC5, 0x02, // 0x1000c: addi a1, a1, 44 -> 0x12034
+        0x17, 0x26, 0x00, 0x00, // 0x10010: auipc a2, 2 (page 0x12010)
+        0x23, 0x22, 0xA6, 0x02, // 0x10014: sw a0, 36(a2) -> 0x12034
+        0x67, 0x80, 0x00, 0x00, // 0x10018: ret
+    ];
+    let bin = rv64_bin_segs(
+        Some(0x10000),
+        vec![
+            text_seg(0x10000, text),
+            data_seg(0x12000, 0x100, 0x34, b"riscv-pair-string\0"),
+        ],
+    );
+    let a = analyze(&bin).expect("rv64 analyzes");
+    assert_eq!(a.functions.len(), 1);
+    assert!(
+        has_xref(&a, 0x10000, XrefKind::Data, 0x12000),
+        "auipc page fallback"
+    );
+    for site in [0x10004, 0x1000c, 0x10014] {
+        assert!(
+            has_xref(&a, site, XrefKind::Data, 0x12034),
+            "pair at {site:#x} references the combined address"
+        );
+        assert!(
+            has_xref(&a, site, XrefKind::String, 0x12034),
+            "combined address inside a string yields a string ref"
+        );
+    }
+    let f = a.functions.get(&0x10000).expect("function");
+    let owned: Vec<binscout::disasm::Insn> =
+        f.blocks.values().flat_map(|b| b.insns.clone()).collect();
+    let rows = lift_range(Arch::Riscv64, &owned);
+    assert_eq!(rows.len(), owned.len());
+    for (idx, row) in [(1, 0x10004), (3, 0x1000c), (5, 0x10014)] {
+        assert_eq!(
+            rows[idx].target,
+            Some(0x12034),
+            "second pair row at {row:#x} lifts with the resolved address"
+        );
+    }
+    let render = render_function(Arch::Riscv64, f);
+    assert!(
+        render.text.contains("// => 0x12034"),
+        "pseudo annotates the pair address, got:\n{}",
+        render.text
+    );
 }

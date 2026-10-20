@@ -1,5 +1,5 @@
 use binscout::disasm::{Arch, Disassembler, disasm_range};
-use binscout::ir::{IrOp, control_op, coverage, is_mapped, lift, lift_range};
+use binscout::ir::{IrOp, control_op, coverage, is_mapped, lift, lift_range, lift_riscv_with_prev};
 
 mod common;
 
@@ -375,6 +375,37 @@ fn riscv_compressed_forms_decode_and_lift() {
 }
 
 #[test]
+fn riscv_auipc_pair_lifts_exact_address() {
+    // auipc a0, 2 at 0x10000 (page 0x12000); addi a0, a0, 52.
+    let insns = riscv64(&[0x17, 0x25, 0x00, 0x00, 0x13, 0x05, 0x45, 0x03], 0x10000);
+    assert_eq!(insns.len(), 2);
+    assert_eq!(
+        (insns[0].mnem.as_str(), insns[1].mnem.as_str()),
+        ("auipc", "addi")
+    );
+    let v = lift_range(Arch::Riscv64, &insns);
+    assert_eq!(v.len(), 2);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Copy, None));
+    assert_eq!((v[1].op, v[1].target), (IrOp::Add, Some(0x12034)));
+    // Single-row lift keeps current behavior: no predecessor, no target.
+    assert_eq!(lift(Arch::Riscv64, &insns[1])[0].target, None);
+    // A nonadjacent predecessor never resolves.
+    let mut gapped = insns[0].clone();
+    gapped.addr = 0x20000;
+    assert_eq!(
+        lift_riscv_with_prev(&insns[1], Some(&gapped))[0].target,
+        None
+    );
+    // Loads and stores resolve through the same path.
+    let insns = riscv64(&[0x17, 0x25, 0x00, 0x00, 0x03, 0x25, 0x45, 0x03], 0x10000);
+    let v = lift_range(Arch::Riscv64, &insns);
+    assert_eq!((v[1].op, v[1].target), (IrOp::Load, Some(0x12034)));
+    let insns = riscv64(&[0x17, 0x26, 0x00, 0x00, 0x23, 0x22, 0xA6, 0x02], 0x10010);
+    let v = lift_range(Arch::Riscv64, &insns);
+    assert_eq!((v[1].op, v[1].target), (IrOp::Store, Some(0x12034)));
+}
+
+#[test]
 fn x86_mov_lifts_copy() {
     let v = x86(&[0x48, 0x89, 0xd8], 0x1000);
     assert_eq!(v.len(), 1);
@@ -623,7 +654,7 @@ fn family(c: &binscout::ir::Coverage, op: IrOp) -> &binscout::ir::FamilyCoverage
 
 #[test]
 fn coverage_publishes_all_families_limits_and_fallback() {
-    use binscout::ir::{COVERAGE_LIMITATIONS, CoverageStatus};
+    use binscout::ir::{CoverageStatus, COVERAGE_LIMITATIONS};
     for arch in ALL_ARCHES {
         let c = coverage(arch);
         assert_eq!(c.arch, arch_name(arch));

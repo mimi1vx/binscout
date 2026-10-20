@@ -5408,7 +5408,9 @@ pub fn analyze_with_options(
     // too; the page-base row above is retained as the strict fallback.
     // ARM32 `movw`/`movt` pairs behave the same way (see
     // `resolve_movw_pair`): the low half rides in the first row, the high
-    // half in the second.
+    // half in the second. RISC-V `auipc` pairs behave the same way too
+    // (see `resolve_auipc_pair`): the page rides in `auipc`, the low 12
+    // bits in the next `addi`/`addiw`/`lw`/`ld`/`sw`.
     for f in functions.values() {
         for block in f.blocks.values() {
             for pair in block.insns.windows(2) {
