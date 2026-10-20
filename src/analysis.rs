@@ -874,10 +874,10 @@ impl Function {
 
         let mut ifs: Vec<IfInfo> = Vec::new();
         for (start, block) in &self.blocks {
-            let Some(last) = block.insns.last() else {
+            let Some(ctrl) = block_control(arch, block) else {
                 continue;
             };
-            let Some((IrOp::CBranch, target)) = crate::ir::control_op(arch, last) else {
+            let Some((IrOp::CBranch, target)) = crate::ir::control_op(arch, ctrl) else {
                 continue;
             };
             let mut succs = self.successors(*start);
@@ -2195,6 +2195,21 @@ fn flow_of(arch: Arch, insn: &Insn) -> Flow {
     }
 }
 
+/// Control instruction of `block`: the last row, except on MIPS32 where a
+/// block ends with its branch's delay slot (see Pass B), so the branch —
+/// second-to-last — carries the control flow. A trailing sequential row
+/// that is not a delay slot has a sequential predecessor as well, so the
+/// fallback reads the same flow there.
+fn block_control(arch: Arch, block: &BasicBlock) -> Option<&Insn> {
+    let last = block.insns.last()?;
+    if arch == Arch::Mips32 && block.insns.len() >= 2 && crate::ir::control_op(arch, last).is_none()
+    {
+        block.insns.get(block.insns.len() - 2)
+    } else {
+        Some(last)
+    }
+}
+
 /// Whether `name` is a known-noreturn import: `exit`, `abort`, `_exit`,
 /// `__assert_fail`, `__stack_chk_fail`, `ExitProcess`, and similar across
 /// glibc, msvcrt, kernel32, and libSystem.
@@ -2943,6 +2958,7 @@ fn prologue_patterns(arch: Arch) -> &'static [&'static [u8]] {
         | Arch::Thumb
         | Arch::Riscv32
         | Arch::Riscv64
+        | Arch::Mips32
         | Arch::Ppc32
         | Arch::Ppc64 => &[],
     }
@@ -2962,6 +2978,8 @@ enum CandMatch {
     /// RISC-V `addi sp, sp, <imm>` word under a mask, else the
     /// `c.addi16sp` halfword (nonzero immediate), at halfword steps.
     Riscv,
+    /// MIPS32 `addiu sp, sp, <imm>` word under a mask, at word steps.
+    Mips,
     /// PowerPC: no prologue shape modeled yet (follow-up: `stwu r1, ..`
     /// plus `mflr`/`stw` LR spill); never matches.
     Ppc,
@@ -2984,6 +3002,7 @@ fn next_x86_first_byte(arch: Arch, data: &[u8], from: usize, limit: usize) -> Op
         | Arch::Thumb
         | Arch::Riscv32
         | Arch::Riscv64
+        | Arch::Mips32
         | Arch::Ppc32
         | Arch::Ppc64 => {
             return None;
@@ -3023,6 +3042,7 @@ impl<'a> CandStream<'a> {
             Arch::Arm32 => (CandMatch::ArmPush, 4, 4),
             Arch::Thumb => (CandMatch::Thumb, 2, 2),
             Arch::Riscv32 | Arch::Riscv64 => (CandMatch::Riscv, 2, 2),
+            Arch::Mips32 => (CandMatch::Mips, 4, 4),
             Arch::Ppc32 | Arch::Ppc64 => (CandMatch::Ppc, 4, 4),
             Arch::X86_64 | Arch::X86_32 => (CandMatch::X86, 1, 2),
         };
@@ -3161,6 +3181,11 @@ impl<'a> CandStream<'a> {
                     None
                 }
             }
+            CandMatch::Mips => {
+                let raw = self.data.get(off..off + 4)?;
+                let w = u32::from_le_bytes(raw.try_into().ok()?);
+                is_mips_addiu_sp(w).then_some(va)
+            }
             CandMatch::X86 => {
                 for pat in prologue_patterns(self.arch) {
                     let Some(win) = self.data.get(off..off + pat.len()) else {
@@ -3201,6 +3226,14 @@ fn is_riscv_addi_sp(word: u32) -> bool {
 /// all-zero immediate is the reserved encoding, never a prologue.
 fn is_riscv_c_addi16sp(hw: u16) -> bool {
     hw & 0xEF83 == 0x6101 && hw & 0x107C != 0
+}
+
+/// Whether a word is MIPS32 `addiu sp, sp, <imm>` for any 16-bit
+/// immediate: the standard frame-setup prologue. The high 16 bits are
+/// fixed (opcode `addiu`, rs and rt both `sp`); the immediate rides in
+/// the low 16.
+fn is_mips_addiu_sp(word: u32) -> bool {
+    word & 0xFFFF_0000 == 0x27BD_0000
 }
 
 /// Recursive-descent worklist state shared across seed rounds.
@@ -3425,7 +3458,60 @@ impl<'a> Walker<'a> {
                 }
                 _ => {}
             }
-            let next = va.wrapping_add(u64::from(insn.size));
+            let mut next = va.wrapping_add(u64::from(insn.size));
+            if item_arch == Arch::Mips32 && flow.ends_block() {
+                // MIPS executes the word after a branch even when the
+                // branch is taken (delay slot): decode it as part of this
+                // step and continue from the word after it, so the delay
+                // slot never starts its own block (see Pass B). A branch
+                // in the delay slot is UNPREDICTABLE hardware behavior
+                // (assemblers forbid it); its target still joins the walk
+                // so coverage stays over- rather than under-approximate.
+                let delay = va.wrapping_add(4);
+                let mut delay_ok = self.decoded.contains_key(&delay);
+                if !delay_ok
+                    && let Some(bytes) = self.space.code_bytes(delay).filter(|b| !b.is_empty())
+                {
+                    match crate::disasm::disasm_first(item_arch, bytes, delay) {
+                        Ok(Some(dinsn)) => {
+                            let dflow = flow_of(item_arch, &dinsn);
+                            match dflow {
+                                Flow::Branch { target: Some(t) }
+                                | Flow::CBranch { target: Some(t) } => {
+                                    self.jump_targets.insert(t);
+                                    stack.push((t, item_arch));
+                                }
+                                Flow::Call { target: Some(t) } => {
+                                    self.jump_targets.insert(t);
+                                    self.call_targets.insert(t);
+                                    stack.push((t, item_arch));
+                                }
+                                _ => {}
+                            }
+                            self.decoded.insert(
+                                delay,
+                                Decoded {
+                                    insn: dinsn,
+                                    flow: dflow,
+                                    arch: item_arch,
+                                },
+                            );
+                            delay_ok = true;
+                        }
+                        Ok(None) => {}
+                        Err(Error::Invalid(_)) => {
+                            self.diagnostics.insert(Diagnostic {
+                                addr: delay,
+                                kind: DiagnosticKind::DecodeFailure,
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if delay_ok {
+                    next = delay.wrapping_add(4);
+                }
+            }
             match flow {
                 Flow::Seq => self.push_fallthrough(&mut stack, next, item_arch),
                 Flow::Branch { target } => {
@@ -3531,6 +3617,7 @@ fn indirect_slot_width(arch: Arch, format: BinaryFormat) -> Option<usize> {
         | Arch::Thumb
         | Arch::Riscv32
         | Arch::Riscv64
+        | Arch::Mips32
         | Arch::Ppc32
         | Arch::Ppc64 => None,
     }
@@ -3552,6 +3639,7 @@ fn absolute_table_width(arch: Arch) -> Option<usize> {
         | Arch::Thumb
         | Arch::Riscv32
         | Arch::Riscv64
+        | Arch::Mips32
         | Arch::Ppc32
         | Arch::Ppc64 => None,
     }
@@ -3761,6 +3849,7 @@ fn resolve_table_site(
         | Arch::Thumb
         | Arch::Riscv32
         | Arch::Riscv64
+        | Arch::Mips32
         | Arch::Ppc32
         | Arch::Ppc64 => return None,
     };
@@ -4914,6 +5003,24 @@ pub fn analyze_with_options(
     starts.extend(entries.iter().copied());
     starts.extend(jump_targets.iter().copied());
     starts.extend(fallthroughs.iter().copied());
+    // MIPS delay slots never start a block: the word after a control
+    // instruction executes as part of its branch (see `Walker::run`), so
+    // it joins the branch's block instead of splitting it. Function
+    // entries keep their start (a call into a delay slot is pathological
+    // input, and entries must stay addressable).
+    let delay_slots: BTreeSet<u64> = if arch == Arch::Mips32 {
+        decoded
+            .iter()
+            .filter(|(_, d)| d.flow.ends_block())
+            .map(|(&va, d)| va.wrapping_add(u64::from(d.insn.size)))
+            .filter(|next| decoded.contains_key(next) && !entries.contains(next))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    for slot in &delay_slots {
+        starts.remove(slot);
+    }
     let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
     let mut cur_start: Option<u64> = None;
     let mut cur: Vec<Insn> = Vec::new();
@@ -4939,7 +5046,10 @@ pub fn analyze_with_options(
             cur_start = Some(va);
         }
         cur.push(d.insn.clone());
-        if d.flow.ends_block() {
+        // A MIPS control instruction holds its block open for the delay
+        // slot; the flush lands after the slot instead.
+        let continues = delay_slots.contains(&va.wrapping_add(u64::from(d.insn.size)));
+        if d.flow.ends_block() && !continues {
             flush(&mut cur_start, &mut cur, &mut blocks);
         }
     }
@@ -5083,13 +5193,13 @@ pub fn analyze_with_options(
     let mut flows: BTreeMap<(u64, u64), Flow> = BTreeMap::new();
     for (entry, f) in &functions {
         for (start, block) in &f.blocks {
-            if let Some(last) = block.insns.last() {
+            if let Some(ctrl) = block_control(arch, block) {
                 flows.insert(
                     (*entry, *start),
                     decoded
-                        .get(&last.addr)
+                        .get(&ctrl.addr)
                         .map(|d| d.flow)
-                        .unwrap_or_else(|| flow_of(arch, last)),
+                        .unwrap_or_else(|| flow_of(arch, ctrl)),
                 );
             }
         }
@@ -5115,16 +5225,18 @@ pub fn analyze_with_options(
             continue;
         };
         for (start, block) in &f.blocks {
-            let Some(last) = block.insns.last() else {
+            let Some(ctrl) = block_control(arch, block) else {
                 continue;
             };
             // Stored walker flow, never a fresh flow_of: Thumb instructions
             // inside an IT block decode without a condition suffix, so only
-            // the walker's predicated flow keeps the fallthrough edge.
+            // the walker's predicated flow keeps the fallthrough edge. On
+            // MIPS32 `ctrl` is the branch (see `block_control`), whose
+            // stored flow is the branch's own.
             let flow = decoded
-                .get(&last.addr)
+                .get(&ctrl.addr)
                 .map(|d| d.flow)
-                .unwrap_or_else(|| flow_of(arch, last));
+                .unwrap_or_else(|| flow_of(arch, ctrl));
             let end = block.end();
             match flow {
                 Flow::Branch { target: Some(t) } => {
@@ -5581,6 +5693,18 @@ mod tests {
                 }
                 continue;
             }
+            if arch == Arch::Mips32 {
+                let mut off = 0usize;
+                while off + 4 <= seg.data.len() {
+                    let raw = seg.data.get(off..off + 4).expect("word in bounds");
+                    let w = u32::from_le_bytes(raw.try_into().expect("word converts"));
+                    if is_mips_addiu_sp(w) {
+                        out.push(seg.vaddr.wrapping_add(off as u64));
+                    }
+                    off += 4;
+                }
+                continue;
+            }
             for pat in prologue_patterns(arch) {
                 for (i, win) in seg.data.windows(pat.len()).enumerate() {
                     if win != *pat {
@@ -5658,6 +5782,14 @@ mod tests {
             Arch::Riscv32 | Arch::Riscv64 => {
                 (&[0x13, 0x01, 0x01, 0xFF], &[0x01, 0x61], &[0x00, 0x00])
             }
+            // `addiu sp, sp, -16`; every masked word decodes (no rejected
+            // form exists, so U behaves as a second M, like Aarch64);
+            // all-set junk.
+            Arch::Mips32 => (
+                &[0xF0, 0xFF, 0xBD, 0x27],
+                &[0xF0, 0xFF, 0xBD, 0x27],
+                &[0xFF, 0xFF, 0xFF, 0xFF],
+            ),
             // No PPC prologue shape modeled yet (see `CandMatch::Ppc`):
             // any valid word stands in for M, the empty primary opcode
             // for U, and a lone x86 nop for J.
@@ -5728,6 +5860,7 @@ mod tests {
             Arch::X86_32,
             Arch::Riscv32,
             Arch::Riscv64,
+            Arch::Mips32,
         ] {
             let bin = seed_test_binary(arch, None, tricky_segments(arch));
             let space = AddrSpace::new(&bin);
@@ -5885,6 +6018,7 @@ mod tests {
             Arch::X86_32,
             Arch::Riscv32,
             Arch::Riscv64,
+            Arch::Mips32,
         ] {
             let (m, _, _) = seed_words(arch);
             let base: u64 = 0x1_0000;

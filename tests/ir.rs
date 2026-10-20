@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use common::{cleanup, temp_db, tmpdir, write_bin};
 
-const ALL_ARCHES: [Arch; 7] = [
+const ALL_ARCHES: [Arch; 8] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
@@ -15,6 +15,7 @@ const ALL_ARCHES: [Arch; 7] = [
     Arch::Thumb,
     Arch::Riscv32,
     Arch::Riscv64,
+    Arch::Mips32,
 ];
 
 fn arch_name(arch: Arch) -> &'static str {
@@ -26,6 +27,7 @@ fn arch_name(arch: Arch) -> &'static str {
         Arch::Thumb => "thumb",
         Arch::Riscv32 => "riscv32",
         Arch::Riscv64 => "riscv64",
+        Arch::Mips32 => "mips32",
         Arch::Ppc32 => "ppc32",
         Arch::Ppc64 => "ppc64",
     }
@@ -79,6 +81,94 @@ fn thumb(bytes: &[u8], va: u64) -> Vec<binscout::ir::IrInsn> {
 
 fn riscv64(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::Riscv64, bytes, va, 100).expect("valid riscv64 must decode")
+}
+
+fn mips32(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
+    disasm_range(Arch::Mips32, bytes, va, 100).expect("valid mips32 must decode")
+}
+
+#[test]
+fn mips_prologue_pattern_lifts_add_with_sp_delta() {
+    // addiu sp, sp, -16: the standard frame-setup prologue.
+    let insns = mips32(&[0xF0, 0xFF, 0xBD, 0x27], 0x10000);
+    assert_eq!(insns.len(), 1);
+    assert_eq!(insns[0].mnem, "addiu");
+    assert_eq!(insns[0].ops, ["$sp", "$sp", "-0x10"]);
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Add);
+    assert_eq!(v[0].warning, None);
+    assert_eq!(v[0].effects.sp_delta, Some(-16));
+}
+
+#[test]
+fn mips_jumps_split_call_branch_return_by_operand() {
+    // jal +8: link means a call with a direct target.
+    let insns = mips32(&[0x02, 0x40, 0x00, 0x0C], 0x10000);
+    assert_eq!(insns[0].mnem, "jal");
+    assert_eq!(insns[0].branch_target, Some(0x10008));
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, Some(0x10008)));
+    // j +8: no link means a plain branch.
+    let insns = mips32(&[0x02, 0x40, 0x00, 0x08], 0x10000);
+    assert_eq!(insns[0].mnem, "j");
+    assert_eq!(insns[0].branch_target, Some(0x10008));
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Branch, Some(0x10008)));
+    // jr ra: the standard return reads the return register.
+    let insns = mips32(&[0x08, 0x00, 0xE0, 0x03], 0x10000);
+    assert_eq!(insns[0].mnem, "jr");
+    assert_eq!(insns[0].branch_target, None);
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!(v[0].op, IrOp::Return);
+    assert_eq!(v[0].warning, None);
+    // jalr t9: no link target in text means an indirect call.
+    let insns = mips32(&[0x09, 0xF8, 0x20, 0x03], 0x10000);
+    assert_eq!(insns[0].mnem, "jalr");
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, None));
+    // jalr zero, ra: no link written means a return, not a call.
+    let insns = mips32(&[0x09, 0x00, 0xE0, 0x03], 0x10000);
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!(v[0].op, IrOp::Return);
+    // beq carries a direct conditional target.
+    let insns = mips32(&[0x02, 0x00, 0x84, 0x10], 0x10000);
+    assert_eq!(insns[0].mnem, "beq");
+    assert_eq!(insns[0].branch_target, Some(0x1000c));
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::CBranch, Some(0x1000c)));
+    // beq zero, zero is an unconditional branch, not a CBranch.
+    let insns = mips32(&[0x03, 0x00, 0x00, 0x10], 0x10000);
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Branch, Some(0x10010)));
+}
+
+#[test]
+fn mips_data_and_system_instructions_lift() {
+    // Integer loads/stores.
+    let insns = mips32(&[0x10, 0x00, 0xA4, 0x8F], 0x10000);
+    assert_eq!(insns[0].mnem, "lw");
+    assert_eq!(lift(Arch::Mips32, &insns[0])[0].op, IrOp::Load);
+    let insns = mips32(&[0x14, 0x00, 0xBF, 0xAF], 0x10000);
+    assert_eq!(insns[0].mnem, "sw");
+    assert_eq!(lift(Arch::Mips32, &insns[0])[0].op, IrOp::Store);
+    // Traps mirror x86 int3 as calls; sync is a barrier nop.
+    let insns = mips32(&[0x0C, 0x00, 0x00, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "syscall");
+    assert_eq!(lift(Arch::Mips32, &insns[0])[0].op, IrOp::Call);
+    let insns = mips32(&[0x0F, 0x00, 0x00, 0x00], 0x10000);
+    assert_eq!(insns[0].mnem, "sync");
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Nop, None));
+    // sqrt stays unmapped with a warning.
+    let v = lift(Arch::Mips32, &synth("sqrt.s", &[]));
+    assert_eq!(v[0].op, IrOp::Nop);
+    assert!(v[0].warning.is_some());
+    // Coprocessor moves lift as copies.
+    let insns = mips32(&[0x00, 0x60, 0x08, 0x40], 0x10000);
+    assert_eq!(insns[0].mnem, "mfc0");
+    let v = lift(Arch::Mips32, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Copy, None));
 }
 
 #[test]
@@ -417,6 +507,8 @@ fn unmapped_mnem(arch: Arch) -> &'static str {
         Arch::X86_64 | Arch::X86_32 => "cpuid",
         Arch::Aarch64 | Arch::Arm32 | Arch::Thumb => "mrs",
         Arch::Riscv32 | Arch::Riscv64 => "vadd.vv",
+        // `sqrt.s` stays unmapped by design (see the lift docs).
+        Arch::Mips32 => "sqrt.s",
         // Skeleton: everything is unmapped on PPC; any base mnemonic
         // qualifies (`add` will stay unmapped until ALU lifting lands).
         Arch::Ppc32 | Arch::Ppc64 => "add",
@@ -451,13 +543,14 @@ fn coverage_publishes_all_families_limits_and_fallback() {
         assert_eq!(c.fallback.status, CoverageStatus::Unmapped);
         assert!(c.fallback.warning.contains("unlifted"), "{arch:?}");
         assert!(!c.fallback.distinguish.is_empty());
-        // Notes ride on ARM32/Thumb (suffix stripping) and RISC-V
-        // (no-aliases canonical names, atomic suffixes, jump splitting).
+        // Notes ride on ARM32/Thumb (suffix stripping), RISC-V
+        // (no-aliases canonical names, atomic suffixes, jump splitting),
+        // and MIPS32 (canonical names, delay slots, jump splitting).
         assert_eq!(
             c.arch_note.is_some(),
             matches!(
                 arch,
-                Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64
+                Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 | Arch::Mips32
             ),
             "{arch:?}"
         );
@@ -555,14 +648,15 @@ fn partial_means_mapped_but_semantically_incomplete() {
     for arch in ALL_ARCHES {
         let c = coverage(arch);
         // CMP records the comparison; flag effects are unmodeled everywhere
-        // except RISC-V, which has no flags to model (and no rotates to
-        // approximate as shifts, so Shr is exact there too).
+        // except RISC-V and MIPS32, which have no flags to model (and no
+        // rotates to approximate as shifts, so Shr is exact there too).
         let cmp_mnem = match arch {
             Arch::Riscv32 | Arch::Riscv64 => "slt",
+            Arch::Mips32 => "slt",
             _ => "cmp",
         };
         let want_status = match arch {
-            Arch::Riscv32 | Arch::Riscv64 => CoverageStatus::Implemented,
+            Arch::Riscv32 | Arch::Riscv64 | Arch::Mips32 => CoverageStatus::Implemented,
             _ => CoverageStatus::Partial,
         };
         assert_eq!(family(&c, IrOp::Cmp).status, want_status, "{arch:?}");
@@ -1148,7 +1242,7 @@ fn synth_target(mnem: &str, ops: &[&str], target: Option<u64>) -> binscout::disa
 
 #[test]
 fn control_op_matches_lift() {
-    use Arch::{Aarch64, Arm32, Thumb, X86_32, X86_64};
+    use Arch::{Aarch64, Arm32, Mips32, Thumb, X86_32, X86_64};
     // Every control-flow arm of each lifter, direct (with target) and
     // indirect (without), plus fallthrough samples and unmapped mnemonics.
     let cases: &[(Arch, &str, &[&str], Option<u64>)] = &[
@@ -1253,6 +1347,23 @@ fn control_op_matches_lift() {
         (Thumb, "it", &["tt"], None),
         (Thumb, "movs", &["r0", "r1"], None),
         (Thumb, "nop", &[], None),
+        (Mips32, "j", &[". + 0x8"], Some(0x1008)),
+        (Mips32, "jal", &[". + 0x8"], Some(0x1008)),
+        (Mips32, "jalr", &["$t9"], None),
+        (Mips32, "jalr", &["$zero", "$t9"], None),
+        (Mips32, "jalr", &["$zero", "$ra"], None),
+        (Mips32, "jr", &["$ra"], None),
+        (Mips32, "jr", &["$t9"], None),
+        (Mips32, "beq", &["$a0", "$a1", ". + 0x8"], Some(0x1008)),
+        (Mips32, "beq", &["$zero", "$zero", ". + 0x8"], Some(0x1008)),
+        (Mips32, "bne", &["$a0", "$a1", ". + 0x8"], Some(0x1008)),
+        (Mips32, "bgezal", &["$zero", ". + 0x8"], Some(0x1008)),
+        (Mips32, "syscall", &["0"], None),
+        (Mips32, "break", &["0"], None),
+        (Mips32, "eret", &[], None),
+        (Mips32, "addiu", &["$sp", "$sp", "-0x10"], None),
+        (Mips32, "nop", &[], None),
+        (Mips32, "sqrt.s", &["$fv0", "$fv1"], None),
     ];
     for (arch, mnem, ops, target) in cases {
         let insn = synth_target(mnem, ops, *target);
@@ -1353,4 +1464,35 @@ fn control_op_matches_lift() {
     for insn in &insns {
         assert_control_matches_lift(Thumb, insn);
     }
+    // MIPS blob with delay slots (each control word is followed by its
+    // `nop` slot): j, beq, jal, jalr, jr, syscall, plus Seq filler.
+    // Delay slots decode as Seq rows, so every row must still agree.
+    let mips_blob: &[u8] = &[
+        0x09, 0x40, 0x00, 0x0C, // jal 0x10024
+        0x00, 0x00, 0x00, 0x00, // delay slot
+        0x02, 0x00, 0x84, 0x10, // beq a0, a0, +2
+        0x00, 0x00, 0x00, 0x00, // delay slot
+        0x00, 0x40, 0x00, 0x08, // j 0x10000
+        0x00, 0x00, 0x00, 0x00, // delay slot
+        0x09, 0xF8, 0x20, 0x03, // jalr t9
+        0x00, 0x00, 0x00, 0x00, // delay slot
+        0x08, 0x00, 0xE0, 0x03, // jr ra
+        0x00, 0x00, 0x00, 0x00, // delay slot
+        0x0C, 0x00, 0x00, 0x00, // syscall
+        0x01, 0x00, 0x84, 0x24, // addiu a0, a0, 1
+    ];
+    let insns = disasm_range(Mips32, mips_blob, 0x10000, 100).expect("mips decodes");
+    assert_eq!(insns.len(), 12);
+    let mut saw_control = 0;
+    let mut saw_seq = 0;
+    for insn in &insns {
+        assert_control_matches_lift(Mips32, insn);
+        if control_op(Mips32, insn).is_some() {
+            saw_control += 1;
+        } else {
+            saw_seq += 1;
+        }
+    }
+    assert_eq!(saw_control, 6, "{saw_control}");
+    assert_eq!(saw_seq, 6, "{saw_seq}");
 }

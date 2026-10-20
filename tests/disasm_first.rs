@@ -14,12 +14,13 @@ fn arch_tag(arch: Arch) -> u64 {
         Arch::Thumb => 5,
         Arch::Riscv32 => 6,
         Arch::Riscv64 => 7,
-        Arch::Ppc32 => 8,
-        Arch::Ppc64 => 9,
+        Arch::Mips32 => 8,
+        Arch::Ppc32 => 9,
+        Arch::Ppc64 => 10,
     }
 }
 
-const ARCHES: [Arch; 9] = [
+const ARCHES: [Arch; 10] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
@@ -27,6 +28,7 @@ const ARCHES: [Arch; 9] = [
     Arch::Thumb,
     Arch::Riscv32,
     Arch::Riscv64,
+    Arch::Mips32,
     Arch::Ppc32,
     Arch::Ppc64,
 ];
@@ -105,6 +107,19 @@ fn oracle_first(arch: Arch, bytes: &[u8], va: u64) -> Option<Insn> {
                 return None;
             }
             match disasm_range(arch, &bytes[..need], va, DEFAULT_MAX_INSNS) {
+                Ok(mut v) if !v.is_empty() => Some(v.remove(0)),
+                Ok(_) => None,
+                Err(Error::Invalid(_)) => None,
+                Err(e) => panic!("oracle hit unexpected error: {e:?}"),
+            }
+        }
+        Arch::Mips32 => {
+            // Fixed 4-byte words: the oracle mirrors the strict contract
+            // (truncated words fail) over the public range API.
+            if bytes.len() < 4 {
+                return None;
+            }
+            match disasm_range(arch, &bytes[..4], va, DEFAULT_MAX_INSNS) {
                 Ok(mut v) if !v.is_empty() => Some(v.remove(0)),
                 Ok(_) => None,
                 Err(Error::Invalid(_)) => None,

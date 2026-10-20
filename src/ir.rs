@@ -236,6 +236,37 @@
 //!   V vector extension, Zbb-style bitmanip, FP `fmin`/`fmax`/`fsqrt`/
 //!   `fclass`, and privileged `mret`/`sret`/`sfence`/`hfence`.
 //!
+//! `lift_mips` covers MIPS32 mnemonics as rabbitizer prints them with
+//! pseudos disabled (canonical base names: `beq`, not `beqz`; `bgezal`,
+//! not `bal`; the `b`/`move`/`li` aliases never appear):
+//!
+//! - `COPY`: `lui`, `nor` (OR+NOT folded away), conditional `movn`/
+//!   `movz`, HI/LO and coprocessor moves (`mfhi`/`mflo`, `mfc*`/`cfc*`,
+//!   coprocessor-out `mtc*`/`ctc*`/`mth*` keep operands as inputs), FP
+//!   moves/converts (`mov`/`abs`/`neg`, `cvt*`, `round`/`trunc`/`ceil`/
+//!   `floor`). `LOAD`: `lb`/`lh`/`lw`/`lbu`/`lhu`/`lwl`/`lwr`, FP
+//!   `lwc1`/`ldc1`, `ll`, 64-bit `ld`/`lld`/`ldl`/`ldr`/`lwu`. `STORE`:
+//!   `sb`/`sh`/`sw`/`swl`/`swr`, FP `swc1`/`sdc1`, `sc`, 64-bit `sd`/
+//!   `scd`/`sdl`/`sdr`.
+//! - `ADD`: `add`, `addu`, `addi`, `addiu`, 64-bit `dadd*`, FP `add.s`/
+//!   `add.d`. `SUB`: `sub`, `subu`, 64-bit `dsub*`, FP `sub.s`/`sub.d`.
+//!   `MUL`: `mult`, `multu`, 64-bit `dmult*`, FP `mul.s`/`mul.d`. `DIV`:
+//!   `div`, `divu`, 64-bit `ddiv*`, FP `div.s`/`div.d`. `AND`: `and`,
+//!   `andi`. `OR`: `or`, `ori`. `XOR`: `xor`, `xori`. `SHL`: `sll`,
+//!   `sllv`, 64-bit `dsll*`. `SHR`: `srl`, `srlv`, `sra`, `srav`,
+//!   64-bit `dsr*`.
+//! - `CMP`: `slt`, `slti`, `sltu`, `sltiu`, FP `c.*`. `BRANCH`: `j`,
+//!   plus non-link `jr` and `$zero`-destination `jalr`, plus zero-zero
+//!   `beq` (indirect keeps operands). `CBRANCH`: `beq`, `bne`, `blez`,
+//!   `bgtz` and `-likely` forms, `bltz`/`bgez` and `-likely`/`-link`
+//!   forms, FP `bc1*`. `CALL`: `jal`, link branches (`bgezal`,
+//!   `bgezall`, `bltzal`, `bltzall`), link-writing `jalr`,
+//!   `syscall`/`break`/traps (mirror x86 `int3`). `RETURN`:
+//!   operand-dependent (`jr $ra`, `jalr $zero, $ra`) plus `eret`.
+//!   `NOP`: `nop`, `sync`, `pref`, `cache`. Still unmapped by design:
+//!   FP `sqrt`, privileged TLB ops (`tlbr`/`tlbwi`/`tlbwr`/`tlbp`,
+//!   `rfe`), and MIPS32r2 bit operations (no rabbitizer opcode).
+//!
 //!
 //! # Warning semantics
 //!
@@ -459,6 +490,7 @@ pub fn lift(arch: Arch, insn: &Insn) -> Vec<IrInsn> {
         Arch::Aarch64 => lift_aarch64(insn),
         Arch::Arm32 | Arch::Thumb => lift_arm32(insn),
         Arch::Riscv32 | Arch::Riscv64 => lift_riscv(insn),
+        Arch::Mips32 => lift_mips(insn),
         Arch::Ppc32 | Arch::Ppc64 => lift_ppc(insn),
     };
     if let [row] = rows.as_mut_slice()
@@ -592,6 +624,25 @@ pub fn control_op(arch: Arch, insn: &Insn) -> Option<(IrOp, Option<u64>)> {
                 None
             }
         }
+        Arch::Mips32 => {
+            let mnem = insn.mnem.as_str();
+            // Same guards and outcomes as `lift_mips`'s jump arms; the
+            // zero-zero `beq` reads as unconditional before the CBranch
+            // table claims it.
+            if mips_is_ret(mnem, insn) {
+                Some((IrOp::Return, None))
+            } else if mips_is_uncond_branch(mnem, insn) {
+                Some((IrOp::Branch, insn.branch_target))
+            } else if is_mips_cbranch(mnem) {
+                Some((IrOp::CBranch, insn.branch_target))
+            } else if is_mips_call(mnem, insn) {
+                Some((IrOp::Call, insn.branch_target))
+            } else if is_mips_jump(mnem, insn) {
+                Some((IrOp::Branch, insn.branch_target))
+            } else {
+                None
+            }
+        }
         // Skeleton (rsdbg-9syq spike): no control op modeled yet; every
         // instruction lifts to fallback NOP, so nothing is control flow.
         Arch::Ppc32 | Arch::Ppc64 => None,
@@ -682,6 +733,25 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || mnem == "ret"
                 || is_riscv_nop(mnem)
         }
+        Arch::Mips32 => {
+            is_mips_copy(mnem)
+                || is_mips_load(mnem)
+                || is_mips_store(mnem)
+                || is_mips_alu(mnem, IrOp::Add)
+                || is_mips_alu(mnem, IrOp::Sub)
+                || is_mips_alu(mnem, IrOp::Mul)
+                || is_mips_alu(mnem, IrOp::Div)
+                || is_mips_alu(mnem, IrOp::And)
+                || is_mips_alu(mnem, IrOp::Or)
+                || is_mips_alu(mnem, IrOp::Xor)
+                || is_mips_alu(mnem, IrOp::Shl)
+                || is_mips_alu(mnem, IrOp::Shr)
+                || is_mips_cmp(mnem)
+                || matches!(mnem, "j" | "jr" | "jalr" | "eret")
+                || is_mips_cbranch(mnem)
+                || MIPS_CALL.contains(&mnem)
+                || is_mips_nop(mnem)
+        }
         // Skeleton (rsdbg-9syq spike): nothing lifts yet, so nothing is
         // mapped; exactly predicts `lift_ppc`'s fallback warnings.
         Arch::Ppc32 | Arch::Ppc64 => false,
@@ -739,7 +809,7 @@ pub struct FallbackCoverage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     /// Architecture name (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
-    /// `riscv32`, `riscv64`).
+    /// `riscv32`, `riscv64`, `mips32`).
     pub arch: String,
     /// Per-operation families in [`IrOp`] declaration order.
     pub families: Vec<FamilyCoverage>,
@@ -1190,6 +1260,79 @@ fn ppc_families() -> Vec<FamilyCoverage> {
     Vec::new()
 }
 
+fn mips_families() -> Vec<FamilyCoverage> {
+    use CoverageStatus::Implemented;
+    vec![
+        fam(
+            IrOp::Copy,
+            Implemented,
+            MIPS_COPY,
+            &[],
+            Some(
+                "nor folds the OR+NOT away; coprocessor-out moves (mtc/mth) keep operands as inputs",
+            ),
+        ),
+        fam(IrOp::Load, Implemented, MIPS_LOAD, &[], None),
+        fam(IrOp::Store, Implemented, MIPS_STORE, &[], None),
+        fam(
+            IrOp::Add,
+            Implemented,
+            MIPS_ADD,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            MIPS_SUB,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(IrOp::Mul, Implemented, MIPS_MUL, &[], None),
+        fam(IrOp::Div, Implemented, MIPS_DIV, &[], None),
+        fam(IrOp::And, Implemented, MIPS_AND, &[], None),
+        fam(IrOp::Or, Implemented, MIPS_OR, &[], None),
+        fam(IrOp::Xor, Implemented, MIPS_XOR, &[], None),
+        fam(IrOp::Shl, Implemented, MIPS_SHL, &[], None),
+        fam(IrOp::Shr, Implemented, MIPS_SHR, &[], None),
+        fam(
+            IrOp::Cmp,
+            Implemented,
+            MIPS_CMP,
+            &[],
+            Some("set-less-than and FP compares record no flags (MIPS has none)"),
+        ),
+        fam(
+            IrOp::Branch,
+            Implemented,
+            &["j"],
+            &[],
+            Some(
+                "plus non-link jr and rd-zero jalr (indirect keeps operands); beq $zero,$zero is unconditional",
+            ),
+        ),
+        fam(IrOp::CBranch, Implemented, MIPS_CBRANCH, &[], None),
+        fam(
+            IrOp::Call,
+            Implemented,
+            MIPS_CALL,
+            &[],
+            Some(
+                "plus link-writing jalr (indirect keeps operands); syscall/break/traps mirror x86 int3",
+            ),
+        ),
+        fam(
+            IrOp::Return,
+            Implemented,
+            &["eret"],
+            &[],
+            Some("operand-dependent: jr $ra and jalr $zero,$ra"),
+        ),
+        phi_family(),
+        fam(IrOp::Nop, Implemented, MIPS_NOP, &[], Some(NOP_NOTE)),
+    ]
+}
+
 /// Machine-readable lift coverage for `arch`, without opening a binary.
 ///
 /// Families publish the same mnemonic slices the dispatch predicates
@@ -1211,6 +1354,12 @@ pub fn coverage(arch: Arch) -> Coverage {
             riscv_families(),
             Some(
                 "mnemonics are rvdasm no-aliases canonical names (c.-prefixed compressed forms kept; li/mv/ret/nop aliases never appear); atomic .aq/.rl/.aqrl suffixes strip before lookup; jal/jalr forms split into Call/Branch/Return by operand (see family notes)",
+            ),
+        ),
+        Arch::Mips32 => (
+            mips_families(),
+            Some(
+                "mnemonics are rabbitizer canonical names (pseudos disabled: b/bal/beqz/mov/li aliases never appear); j/jal/jalr/jr forms split into Call/Branch/Return by operand, beq $zero,$zero is an unconditional Branch (see family notes)",
             ),
         ),
         Arch::Ppc32 | Arch::Ppc64 => (
@@ -1462,6 +1611,66 @@ pub fn lift_riscv(insn: &Insn) -> Vec<IrInsn> {
 #[must_use]
 pub fn lift_ppc(insn: &Insn) -> Vec<IrInsn> {
     unlifted(insn)
+}
+
+/// Lift one MIPS32 instruction.
+///
+/// No flags on MIPS either, so `sets_flags` is always false and
+/// `sp_delta` is assigned by [`lift`]. `j`/`jal`/`jalr`/`jr` split by
+/// operand: link-writing forms lift as `Call`, `jr $ra` and
+/// `jalr $zero, $ra` as `Return`, the rest as `Branch`; a zero-zero
+/// `beq` is an unconditional `Branch`. Coprocessor-out moves (`mtc*`,
+/// `mth*`) keep their operands as inputs.
+#[must_use]
+pub fn lift_mips(insn: &Insn) -> Vec<IrInsn> {
+    let mnem = insn.mnem.as_str();
+    let (op, inputs, outputs, target) = match mnem {
+        s if is_mips_copy(s) => first_out_rest_in(insn, IrOp::Copy),
+        s if is_mips_cop_out(s) => (IrOp::Copy, insn.ops.clone(), Vec::new(), None),
+        s if is_mips_load(s) => first_out_rest_in(insn, IrOp::Load),
+        s if is_mips_store(s) => (IrOp::Store, insn.ops.clone(), Vec::new(), None),
+        s if is_mips_alu(s, IrOp::Add) => first_out_rest_in(insn, IrOp::Add),
+        s if is_mips_alu(s, IrOp::Sub) => first_out_rest_in(insn, IrOp::Sub),
+        s if is_mips_alu(s, IrOp::Mul) => first_out_rest_in(insn, IrOp::Mul),
+        s if is_mips_alu(s, IrOp::Div) => first_out_rest_in(insn, IrOp::Div),
+        s if is_mips_alu(s, IrOp::And) => first_out_rest_in(insn, IrOp::And),
+        s if is_mips_alu(s, IrOp::Or) => first_out_rest_in(insn, IrOp::Or),
+        s if is_mips_alu(s, IrOp::Xor) => first_out_rest_in(insn, IrOp::Xor),
+        s if is_mips_alu(s, IrOp::Shl) => first_out_rest_in(insn, IrOp::Shl),
+        s if is_mips_alu(s, IrOp::Shr) => first_out_rest_in(insn, IrOp::Shr),
+        s if is_mips_cmp(s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
+        s if mips_is_ret(s, insn) => (IrOp::Return, Vec::new(), Vec::new(), None),
+        "j" => direct_or_indirect(insn, IrOp::Branch),
+        s if mips_is_uncond_branch(s, insn) => (
+            IrOp::Branch,
+            insn.ops.clone(),
+            Vec::new(),
+            insn.branch_target,
+        ),
+        s if is_mips_cbranch(s) => (
+            IrOp::CBranch,
+            insn.ops.clone(),
+            Vec::new(),
+            insn.branch_target,
+        ),
+        s if is_mips_call(s, insn) => direct_or_indirect(insn, IrOp::Call),
+        s if is_mips_jump(s, insn) => direct_or_indirect(insn, IrOp::Branch),
+        s if is_mips_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
+        _ => return unlifted(insn),
+    };
+    vec![IrInsn {
+        addr: insn.addr,
+        op,
+        inputs,
+        outputs,
+        target,
+        warning: None,
+        effects: IrEffects {
+            sets_flags: false,
+            sp_delta: None,
+        },
+        operands: insn.operands.clone(),
+    }]
 }
 
 fn first_out_rest_in(insn: &Insn, op: IrOp) -> (IrOp, Vec<String>, Vec<String>, Option<u64>) {
@@ -1988,6 +2197,14 @@ fn sp_delta_for(arch: Arch, insn: &Insn) -> Option<i64> {
         return match (insn.mnem.as_str(), insn.ops.as_slice()) {
             ("addi", [dst, src, imm]) if dst == "sp" && src == "sp" => imm.parse::<i64>().ok(),
             ("c.addi16sp", [dst, imm]) if dst == "sp" => imm.parse::<i64>().ok(),
+            _ => None,
+        };
+    }
+    if arch == Arch::Mips32 {
+        // Frame alloc/dealloc: `addiu $sp, $sp, <imm>`, printed `-0x10`
+        // or `0x...` style (never plain decimal).
+        return match (insn.mnem.as_str(), insn.ops.as_slice()) {
+            ("addiu", [dst, src, imm]) if dst == "$sp" && src == "$sp" => parse_mips_imm(imm),
             _ => None,
         };
     }
@@ -3013,6 +3230,209 @@ const RISCV_CBRANCH: &[&str] = &[
 ];
 const RISCV_CALL: &[&str] = &["c.jal", "call", "tail", "ecall", "ebreak", "c.ebreak"];
 const RISCV_NOP: &[&str] = &["nop", "fence", "unimp", "c.unimp"];
+
+/// Canonical rabbitizer mnemonics (pseudos disabled: `b`/`bal`/`beqz`/
+/// `move`/`li` aliases never appear; `nop` still prints for the all-zero
+/// word). Coprocessor-out moves (`mtc*`, `mth*`) lift through
+/// [`is_mips_cop_out`] with operands as inputs.
+const MIPS_COPY: &[&str] = &[
+    "lui",
+    "nor",
+    "movn",
+    "movz",
+    "mfhi",
+    "mflo",
+    "mfc0",
+    "dmfc0",
+    "cfc0",
+    "mfc1",
+    "dmfc1",
+    "cfc1",
+    "mtc0",
+    "dmtc0",
+    "ctc0",
+    "mtc1",
+    "dmtc1",
+    "ctc1",
+    "mthi",
+    "mtlo",
+    "mov.s",
+    "mov.d",
+    "abs.s",
+    "abs.d",
+    "neg.s",
+    "neg.d",
+    "cvt.s.d",
+    "cvt.d.s",
+    "cvt.w.s",
+    "cvt.w.d",
+    "cvt.l.s",
+    "cvt.l.d",
+    "cvt.s.w",
+    "cvt.d.w",
+    "cvt.s.l",
+    "cvt.d.l",
+    "round.w.s",
+    "round.l.s",
+    "round.w.d",
+    "round.l.d",
+    "trunc.w.s",
+    "trunc.l.s",
+    "trunc.w.d",
+    "trunc.l.d",
+    "ceil.w.s",
+    "ceil.l.s",
+    "ceil.w.d",
+    "ceil.l.d",
+    "floor.w.s",
+    "floor.l.s",
+    "floor.w.d",
+    "floor.l.d",
+];
+const MIPS_LOAD: &[&str] = &[
+    "lb", "lh", "lw", "lbu", "lhu", "lwl", "lwr", "ll", "lwc1", "ldc1", "ld", "lld", "ldl", "ldr",
+    "lwu",
+];
+const MIPS_STORE: &[&str] = &[
+    "sb", "sh", "sw", "swl", "swr", "sc", "swc1", "sdc1", "sd", "scd", "sdl", "sdr",
+];
+const MIPS_ADD: &[&str] = &[
+    "add", "addu", "addi", "addiu", "dadd", "daddu", "daddi", "daddiu", "add.s", "add.d",
+];
+const MIPS_SUB: &[&str] = &["sub", "subu", "dsub", "dsubu", "sub.s", "sub.d"];
+const MIPS_MUL: &[&str] = &["mult", "multu", "dmult", "dmultu", "mul.s", "mul.d"];
+const MIPS_DIV: &[&str] = &["div", "divu", "ddiv", "ddivu", "div.s", "div.d"];
+const MIPS_AND: &[&str] = &["and", "andi"];
+const MIPS_OR: &[&str] = &["or", "ori"];
+const MIPS_XOR: &[&str] = &["xor", "xori"];
+const MIPS_SHL: &[&str] = &["sll", "sllv", "dsll", "dsllv", "dsll32"];
+const MIPS_SHR: &[&str] = &[
+    "srl", "srlv", "sra", "srav", "dsrl", "dsrlv", "dsrl32", "dsra", "dsrav", "dsra32",
+];
+const MIPS_CMP: &[&str] = &[
+    "slt", "slti", "sltu", "sltiu", "c.f.s", "c.un.s", "c.eq.s", "c.ueq.s", "c.olt.s", "c.ult.s",
+    "c.ole.s", "c.ule.s", "c.sf.s", "c.ngle.s", "c.seq.s", "c.ngl.s", "c.lt.s", "c.nge.s",
+    "c.le.s", "c.ngt.s", "c.f.d", "c.un.d", "c.eq.d", "c.ueq.d", "c.olt.d", "c.ult.d", "c.ole.d",
+    "c.ule.d", "c.sf.d", "c.ngle.d", "c.seq.d", "c.ngl.d", "c.lt.d", "c.nge.d", "c.le.d",
+    "c.ngt.d",
+];
+const MIPS_CBRANCH: &[&str] = &[
+    "beq", "bne", "blez", "bgtz", "beql", "bnel", "blezl", "bgtzl", "bltz", "bgez", "bltzl",
+    "bgezl", "bc1f", "bc1t", "bc1fl", "bc1tl",
+];
+const MIPS_CALL: &[&str] = &[
+    "jal", "bgezal", "bgezall", "bltzal", "bltzall", "syscall", "break", "teq", "tge", "tgeu",
+    "tlt", "tltu", "tne", "teqi", "tgei", "tgeiu", "tlti", "tltiu", "tnei",
+];
+const MIPS_NOP: &[&str] = &["nop", "sync", "pref", "cache"];
+
+/// Whether `s` is a MIPS32 coprocessor-out move (`mtc*`, `mth*`): lifts as
+/// [`IrOp::Copy`] with all operands as inputs (the destination lives in
+/// coprocessor state, not in a named GPR).
+fn is_mips_cop_out(s: &str) -> bool {
+    matches!(
+        s,
+        "mtc0" | "dmtc0" | "ctc0" | "mtc1" | "dmtc1" | "ctc1" | "mthi" | "mtlo"
+    )
+}
+
+/// Whether a MIPS32 jump is a return: `jr $ra`, `jalr $zero, $ra`, or the
+/// exception return `eret`.
+fn mips_is_ret(mnem: &str, insn: &Insn) -> bool {
+    if mnem == "eret" {
+        return true;
+    }
+    if mnem == "jr" {
+        return insn.ops.as_slice() == ["$ra"];
+    }
+    if mnem == "jalr" {
+        return insn.ops.as_slice() == ["$zero", "$ra"];
+    }
+    false
+}
+
+/// Whether `mnem` is an unconditional MIPS32 branch by operand: only the
+/// zero-zero `beq` (what the `b` pseudo prints as with pseudos off).
+fn mips_is_uncond_branch(mnem: &str, insn: &Insn) -> bool {
+    if mnem != "beq" {
+        return false;
+    }
+    matches!(insn.ops.as_slice(), [rs, rt, _] if rs == "$zero" && rt == "$zero")
+}
+
+/// Whether `insn` is a `jalr` writing `$zero`: no link is written, so the
+/// `ra`-targeting shape is a return and any other target is an indirect
+/// jump rather than a call.
+fn is_mips_jalr_branch_shape(insn: &Insn) -> bool {
+    matches!(insn.ops.as_slice(), [rd, _] if rd == "$zero")
+}
+
+/// Whether `mnem` is a MIPS32 jump handled by [`lift_mips`]'s branch arm
+/// (never a link-writing call or a return).
+fn is_mips_jump(mnem: &str, insn: &Insn) -> bool {
+    match mnem {
+        "j" | "jr" => true,
+        "jalr" => is_mips_jalr_branch_shape(insn),
+        _ => false,
+    }
+}
+
+/// Whether `mnem` is a MIPS32 call: the static trap/link forms, or a
+/// link-writing `jalr`.
+fn is_mips_call(mnem: &str, insn: &Insn) -> bool {
+    MIPS_CALL.contains(&mnem) || (mnem == "jalr" && !is_mips_jalr_branch_shape(insn))
+}
+
+fn is_mips_copy(s: &str) -> bool {
+    MIPS_COPY.contains(&s)
+}
+
+fn is_mips_load(s: &str) -> bool {
+    MIPS_LOAD.contains(&s)
+}
+
+fn is_mips_store(s: &str) -> bool {
+    MIPS_STORE.contains(&s)
+}
+
+fn is_mips_alu(s: &str, op: IrOp) -> bool {
+    match op {
+        IrOp::Add => MIPS_ADD.contains(&s),
+        IrOp::Sub => MIPS_SUB.contains(&s),
+        IrOp::Mul => MIPS_MUL.contains(&s),
+        IrOp::Div => MIPS_DIV.contains(&s),
+        IrOp::And => MIPS_AND.contains(&s),
+        IrOp::Or => MIPS_OR.contains(&s),
+        IrOp::Xor => MIPS_XOR.contains(&s),
+        IrOp::Shl => MIPS_SHL.contains(&s),
+        IrOp::Shr => MIPS_SHR.contains(&s),
+        _ => false,
+    }
+}
+
+fn is_mips_cmp(s: &str) -> bool {
+    MIPS_CMP.contains(&s)
+}
+
+fn is_mips_cbranch(s: &str) -> bool {
+    MIPS_CBRANCH.contains(&s)
+}
+
+fn is_mips_nop(s: &str) -> bool {
+    MIPS_NOP.contains(&s)
+}
+
+/// Parse a rabbitizer MIPS immediate: `-0x10`/`0x5` hex or plain decimal
+/// (`syscall` codes, shift amounts).
+fn parse_mips_imm(s: &str) -> Option<i64> {
+    if let Some(hex) = s.strip_prefix("-0x").or_else(|| s.strip_prefix("-0X")) {
+        i64::from_str_radix(hex, 16).ok().map(|v| -v)
+    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<i64>().ok()
+    }
+}
 
 fn is_x86_jcc(s: &str) -> bool {
     X86_JCC.contains(&s)

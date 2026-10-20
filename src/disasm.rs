@@ -1,5 +1,6 @@
 //! M2 disassembler: x86_64 via iced-x86, AArch64/ARM32/Thumb via
-//! yaxpeax-arm, RISC-V 32/64 via rvdasm, PowerPC 32/64 via powerpc.
+//! yaxpeax-arm, RISC-V 32/64 via rvdasm, MIPS32 via rabbitizer,
+//! PowerPC 32/64 via powerpc.
 //!
 //! [`Disassembler::disasm_range`] decodes `bytes` assumed loaded at virtual
 //! address `va`. Decoding stops at the first invalid opcode
@@ -8,11 +9,21 @@
 //! [`disasm_range_partial`]) instead return the valid prefix plus
 //! [`PartialDisasm::error_at`], so agents keep the decodable instructions
 //! rather than losing them to the first bad opcode.
+//!
+//! MIPS32 decodes fixed 4-byte little-endian words (big-endian containers
+//! are rejected at load). Branch delay slots stay plain sequential rows
+//! here; [`crate::analysis`] keeps each delay slot in its branch's block.
 
 use iced_x86::{
     Decoder, DecoderOptions, Formatter as _, Instruction, IntelFormatter, OpKind, Register,
 };
 use powerpc::{Extensions as PpcExtensions, Ins as PpcIns};
+use rabbitizer::isa::IsaVersion as MipsIsa;
+use rabbitizer::operands::DefaultLabelDisplay as MipsLabelDisplay;
+use rabbitizer::{
+    Instruction as MipsInstruction, InstructionDisplayFlags as MipsDisplayFlags,
+    InstructionFlags as MipsFlags, Vram as MipsVram,
+};
 use rvdasm::disassembler::{Disassembler as RiscvDecoder, Xlen as RiscvXlen};
 use rvdasm::insn::Insn as RiscvInsn;
 use serde::{Deserialize, Serialize};
@@ -46,6 +57,8 @@ pub enum Arch {
     Riscv32,
     /// 64-bit RISC-V (mixed 2/4-byte instructions with the C extension).
     Riscv64,
+    /// 32-bit MIPS (fixed 4-byte little-endian instructions).
+    Mips32,
     /// 32-bit PowerPC (fixed 4-byte big-endian instructions, base ISA).
     Ppc32,
     /// 64-bit PowerPC (fixed 4-byte big-endian instructions, base ISA).
@@ -73,6 +86,7 @@ impl Arch {
             Self::Thumb => AnyDisasm::Thumb(ThumbDisasm::new()),
             Self::Riscv32 => AnyDisasm::Riscv32(Riscv32Disasm::new()),
             Self::Riscv64 => AnyDisasm::Riscv64(Riscv64Disasm::new()),
+            Self::Mips32 => AnyDisasm::Mips32(Mips32Disasm::new()),
             Self::Ppc32 => AnyDisasm::Ppc32(Ppc32Disasm::new()),
             Self::Ppc64 => AnyDisasm::Ppc64(Ppc64Disasm::new()),
         }
@@ -204,7 +218,7 @@ pub fn stack_slot(op: &Operand) -> Option<(&str, i64, u32)> {
 pub struct Insn {
     /// Virtual address of the first byte.
     pub addr: u64,
-    /// Length in bytes (x86: 1-15, AArch64/ARM32/PowerPC: always 4,
+    /// Length in bytes (x86: 1-15, AArch64/ARM32/MIPS32/PowerPC: always 4,
     /// Thumb and RISC-V: 2 or 4).
     pub size: u8,
     /// Raw instruction bytes.
@@ -222,6 +236,7 @@ pub struct Insn {
     /// disp32), AArch64
     /// `adr`/`adrp`/literal loads, ARM32/Thumb PC-relative literal
     /// loads (`ldr r0, [pc, ...]`), and the RISC-V `auipc` page base.
+    /// MIPS32 reports `None` here: it has no PC-relative data access.
     /// Distinct from [`Insn::branch_target`]: an indirect `call [rip+..]`
     /// reports its pointer slot here and `None` for `branch_target`.
     pub mem_target: Option<u64>,
@@ -260,8 +275,8 @@ pub struct Insn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub string: Option<String>,
     /// Structured x86 operands in decoder (`op_count`) order (see
-    /// [`Operand`]). Empty for AArch64/ARM32/Thumb/RISC-V and for rows decoded
-    /// before typed operands existed. Omitted from JSON when empty so
+    /// [`Operand`]). Empty for AArch64/ARM32/Thumb/RISC-V/MIPS32 and for
+    /// rows decoded before typed operands existed. Omitted from JSON when empty so
     /// old goldens keep passing; `ops` stays the display form.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operands: Vec<Operand>,
@@ -473,6 +488,12 @@ pub struct Riscv64Disasm {
     max_insns: usize,
 }
 
+/// MIPS32 disassembler (rabbitizer, fixed 4-byte little-endian words).
+#[derive(Debug, Clone, Copy)]
+pub struct Mips32Disasm {
+    max_insns: usize,
+}
+
 /// PowerPC 32-bit disassembler (powerpc crate, fixed 4-byte big-endian).
 #[derive(Debug, Clone, Copy)]
 pub struct Ppc32Disasm {
@@ -639,6 +660,28 @@ impl Default for Riscv64Disasm {
     }
 }
 
+impl Mips32Disasm {
+    /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_insns: DEFAULT_MAX_INSNS,
+        }
+    }
+
+    /// Custom instruction cap.
+    #[must_use]
+    pub fn with_limit(max_insns: usize) -> Self {
+        Self { max_insns }
+    }
+}
+
+impl Default for Mips32Disasm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ppc32Disasm {
     /// Default instruction cap ([`DEFAULT_MAX_INSNS`]).
     #[must_use]
@@ -753,6 +796,16 @@ impl Disassembler for Riscv64Disasm {
     }
 }
 
+impl Disassembler for Mips32Disasm {
+    fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
+        disasm_mips(bytes, va, self.max_insns)
+    }
+
+    fn disasm_range_partial(&self, bytes: &[u8], va: u64) -> Result<PartialDisasm> {
+        disasm_mips_partial(bytes, va, self.max_insns)
+    }
+}
+
 impl Disassembler for Ppc32Disasm {
     fn disasm_range(&self, bytes: &[u8], va: u64) -> Result<Vec<Insn>> {
         disasm_ppc(bytes, va, self.max_insns, false)
@@ -790,6 +843,8 @@ pub enum AnyDisasm {
     Riscv32(Riscv32Disasm),
     /// RISC-V 64-bit backend.
     Riscv64(Riscv64Disasm),
+    /// MIPS32 backend.
+    Mips32(Mips32Disasm),
     /// PowerPC 32-bit backend.
     Ppc32(Ppc32Disasm),
     /// PowerPC 64-bit backend.
@@ -806,6 +861,7 @@ impl Disassembler for AnyDisasm {
             Self::Thumb(d) => d.disasm_range(bytes, va),
             Self::Riscv32(d) => d.disasm_range(bytes, va),
             Self::Riscv64(d) => d.disasm_range(bytes, va),
+            Self::Mips32(d) => d.disasm_range(bytes, va),
             Self::Ppc32(d) => d.disasm_range(bytes, va),
             Self::Ppc64(d) => d.disasm_range(bytes, va),
         }
@@ -820,6 +876,7 @@ impl Disassembler for AnyDisasm {
             Self::Thumb(d) => d.disasm_range_partial(bytes, va),
             Self::Riscv32(d) => d.disasm_range_partial(bytes, va),
             Self::Riscv64(d) => d.disasm_range_partial(bytes, va),
+            Self::Mips32(d) => d.disasm_range_partial(bytes, va),
             Self::Ppc32(d) => d.disasm_range_partial(bytes, va),
             Self::Ppc64(d) => d.disasm_range_partial(bytes, va),
         }
@@ -836,6 +893,7 @@ pub fn disasm_range(arch: Arch, bytes: &[u8], va: u64, max_insns: usize) -> Resu
         Arch::Thumb => disasm_thumb(bytes, va, max_insns),
         Arch::Riscv32 => disasm_riscv(bytes, va, max_insns, 32),
         Arch::Riscv64 => disasm_riscv(bytes, va, max_insns, 64),
+        Arch::Mips32 => disasm_mips(bytes, va, max_insns),
         Arch::Ppc32 => disasm_ppc(bytes, va, max_insns, false),
         Arch::Ppc64 => disasm_ppc(bytes, va, max_insns, true),
     }
@@ -863,6 +921,7 @@ pub fn disasm_range_partial(
         Arch::Thumb => disasm_thumb_partial(bytes, va, max_insns),
         Arch::Riscv32 => disasm_riscv_partial(bytes, va, max_insns, 32),
         Arch::Riscv64 => disasm_riscv_partial(bytes, va, max_insns, 64),
+        Arch::Mips32 => disasm_mips_partial(bytes, va, max_insns),
         Arch::Ppc32 => disasm_ppc_partial(bytes, va, max_insns, false),
         Arch::Ppc64 => disasm_ppc_partial(bytes, va, max_insns, true),
     }
@@ -887,6 +946,7 @@ pub fn disasm_first(arch: Arch, bytes: &[u8], va: u64) -> Result<Option<Insn>> {
         Arch::Thumb => disasm_first_thumb(bytes, va),
         Arch::Riscv32 => disasm_first_riscv(bytes, va, 32),
         Arch::Riscv64 => disasm_first_riscv(bytes, va, 64),
+        Arch::Mips32 => disasm_first_mips(bytes, va),
         Arch::Ppc32 => disasm_first_ppc(bytes, va, false),
         Arch::Ppc64 => disasm_first_ppc(bytes, va, true),
     }
@@ -2218,6 +2278,56 @@ fn disasm_riscv_partial(
     })
 }
 
+/// Decode flags for MIPS32: ISA level IV with pseudo-instructions
+/// disabled.
+///
+/// Level IV covers the MIPS32r1 user-mode set over plain MIPS I:
+/// branch-likely forms, `ll`/`sc`, `movn`/`movz`, `sync`, `pref`, and
+/// `cache`. Disabling pseudos prints canonical base names (`beq`, not
+/// `beqz`; `bgezal`, not `bal`), like the RISC-V `no-aliases` form, so
+/// the lift tables stay small. MIPS32r2 bit operations (`seb`, `wsb`,
+/// `ext`, `ins`, `rotr`) have no rabbitizer opcode and stay invalid.
+fn mips_flags() -> MipsFlags {
+    MipsFlags::new(MipsIsa::MIPS_IV).with_enable_pseudos(false)
+}
+
+/// Display flags for MIPS32: single-space opcode separator, `$`-prefixed
+/// ABI register names, and branch/jump targets as `. + <offset>` relative
+/// expressions (absolute labels would invent synthetic `func_...` names).
+fn mips_display_flags() -> MipsDisplayFlags {
+    MipsDisplayFlags::new()
+        .with_opcode_ljust(0)
+        .with_branch_default_label_display(MipsLabelDisplay::Computed)
+        .with_jump_default_label_display(MipsLabelDisplay::Computed)
+}
+
+/// Convert one decoded MIPS32 instruction to [`Insn`].
+///
+/// Shared by the range prefix decoder and the first-instruction decoder so
+/// both report identical mnemonics, operands, and branch targets.
+/// Structured [`Operand`] rows stay empty like the other non-x86 backends.
+fn mips_insn(addr: u64, raw: Vec<u8>, inst: &MipsInstruction) -> Insn {
+    let flags = mips_display_flags();
+    let text = inst.display::<&str>(&flags, None, 0).to_string();
+    let (mnem, ops) = split_asm(&text);
+    Insn {
+        addr,
+        size: 4,
+        bytes: raw,
+        mnem,
+        ops,
+        branch_target: mips_branch_target(inst),
+        mem_target: None,
+        table_base: None,
+        import: None,
+        target_name: None,
+        comment: None,
+        string: None,
+        operands: Vec::new(),
+        thumb: false,
+    }
+}
+
 /// Extensions decoded per PowerPC mode: base ISA only (32-bit), plus the
 /// 64-bit extension on 64-bit. AltiVec, paired-singles, and VMX128 stay
 /// off: their opcodes decode as [`powerpc::Opcode::Illegal`] and end the
@@ -2314,6 +2424,100 @@ fn disasm_ppc(bytes: &[u8], va: u64, max_insns: usize, is64: bool) -> Result<Vec
         Some(e) => Err(Error::Invalid(e.message)),
         None => Ok(partial.insns),
     }
+}
+
+/// Absolute target for a direct MIPS32 jump or branch, else `None`.
+///
+/// `j`/`jal` carry their target in the instr-index field (upper bits from
+/// the delay-slot address, per hardware semantics); conditional branches
+/// and link-branches (`bgezal`) resolve through the generic branch
+/// offset. Indirect jumps (`jr`/`jalr`) and non-control instructions
+/// report `None`.
+fn mips_branch_target(inst: &MipsInstruction) -> Option<u64> {
+    inst.get_instr_index_as_vram()
+        .or_else(|| inst.get_branch_vram_generic())
+        .map(|vram| u64::from(vram.inner()))
+}
+
+/// Decode only the first MIPS32 instruction in `bytes` (loaded at `va`).
+///
+/// Decodes the leading 4-byte little-endian word with the same flags and
+/// the same [`mips_insn`] conversion as [`disasm_mips_partial`]; trailing
+/// bytes cannot change the first word decode. Returns [`Error::Invalid`]
+/// with the same message the range decoder reports when the first word is
+/// undecodable or truncated.
+///
+/// # Errors
+/// [`Error::Invalid`] when the first word does not decode.
+fn disasm_first_mips(bytes: &[u8], va: u64) -> Result<Option<Insn>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let Some(win) = bytes.get(..4) else {
+        return Err(Error::Invalid(format!(
+            "mips32 decode error at {va:#x}: truncated word"
+        )));
+    };
+    let word = u32::from_le_bytes(win.try_into().expect("four bytes convert"));
+    // MIPS32 addresses are 32-bit: the truncation matches hardware PC
+    // semantics (RISC-V 32-bit wraps the same way).
+    let vram = MipsVram::new(va as u32);
+    let Some(inst) = MipsInstruction::new_checked(word, vram, mips_flags()) else {
+        return Err(Error::Invalid(format!("mips32 invalid opcode at {va:#x}")));
+    };
+    Ok(Some(mips_insn(va, win.to_vec(), &inst)))
+}
+
+fn disasm_mips(bytes: &[u8], va: u64, max_insns: usize) -> Result<Vec<Insn>> {
+    let partial = disasm_mips_partial(bytes, va, max_insns)?;
+    match partial.error_at {
+        Some(e) => Err(Error::Invalid(e.message)),
+        None => Ok(partial.insns),
+    }
+}
+
+/// Prefix decode over MIPS32 bytes: fixed 4-byte little-endian words
+/// decode independently, so the first bad word ends the prefix with
+/// `error_at`. A short tail (< 4 bytes) fails its word decode the same
+/// way.
+fn disasm_mips_partial(bytes: &[u8], va: u64, max_insns: usize) -> Result<PartialDisasm> {
+    let flags = mips_flags();
+    let mut out = Vec::new();
+    let mut addr = va;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        if out.len() >= max_insns {
+            return Err(limit_err(max_insns));
+        }
+        let Some(win) = bytes.get(off..off + 4) else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("mips32 decode error at {addr:#x}: truncated word"),
+                }),
+            });
+        };
+        let word = u32::from_le_bytes(win.try_into().expect("four bytes convert"));
+        // See `disasm_first_mips`: 32-bit truncation matches hardware PC.
+        let Some(inst) = MipsInstruction::new_checked(word, MipsVram::new(addr as u32), flags)
+        else {
+            return Ok(PartialDisasm {
+                insns: out,
+                error_at: Some(DecodeError {
+                    addr,
+                    message: format!("mips32 invalid opcode at {addr:#x}"),
+                }),
+            });
+        };
+        out.push(mips_insn(addr, win.to_vec(), &inst));
+        addr = addr.wrapping_add(4);
+        off += 4;
+    }
+    Ok(PartialDisasm {
+        insns: out,
+        error_at: None,
+    })
 }
 
 /// Prefix decode over PowerPC bytes: fixed 4-byte big-endian words, so the

@@ -36,7 +36,7 @@ use crate::{FunctionFilter, Project, parse_addr, parse_xref_kind};
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct RawParams {
     /// Raw arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`,
-    /// `ppc32`, `ppc64`.
+    /// `mips32`, `ppc32`, `ppc64`.
     pub arch: Option<String>,
     /// Raw base address (`0x`-hex or decimal string).
     pub base: Option<String>,
@@ -566,7 +566,7 @@ pub struct XrefsParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IrCoverageParams {
     /// Coverage arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`,
-    /// `ppc32`, `ppc64`.
+    /// `mips32`, `ppc32`, `ppc64`.
     pub arch: String,
     /// Path to the analyzed binary (needs `addr` and `len` for a range).
     pub binary: Option<String>,

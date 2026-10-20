@@ -24,6 +24,7 @@ object = "0.40"
 pdb = "0.8"
 petgraph = "0.8"
 powerpc = "0.4"
+rabbitizer = { version = "2.0.0-alpha.9", features = ["MIPS_IV"] }
 redb = "4.3"
 regex = "1"
 rmcp = { version = "3.5", features = ["transport-io"] }

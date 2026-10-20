@@ -27,7 +27,7 @@ pub struct Cli {
     pub raw: bool,
 
     /// Raw arch: `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`,
-    /// `ppc32`, `ppc64` (requires `--raw`).
+    /// `mips32`, `ppc32`, `ppc64` (requires `--raw`).
     #[arg(long, global = true)]
     pub arch: Option<String>,
 

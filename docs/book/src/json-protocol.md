@@ -247,7 +247,7 @@ binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch 
 
 MCP: optional `raw: {"arch": ..., "base": ..., "entry"?}` object on
 every binary-taking tool. `arch` is one of `x86_64`, `x86_32`,
-`aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`, `ppc32`, `ppc64`; `base`/`entry` parse as addresses.
+`aarch64`, `arm32`, `thumb`, `riscv32`, `riscv64`, `mips32`, `ppc32`, `ppc64`; `base`/`entry` parse as addresses.
 `arch` and `base` are required in raw mode; raw-only options without
 `--raw`/`raw` are errors, as are unknown arches, unmapped or
 misaligned entries, and base-plus-length overflow. Without raw mode,

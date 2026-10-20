@@ -654,7 +654,7 @@ fn merged_exec_ranges(sections: &[Section], segments: &[Segment]) -> Vec<(u64, u
 }
 
 /// Canonical raw arch name for diagnostics (`x86_64`, `x86_32`, `aarch64`,
-/// `arm32`, `thumb`, `riscv32`, `riscv64`, `ppc32`, `ppc64`).
+/// `arm32`, `thumb`, `riscv32`, `riscv64`, `mips32`, `ppc32`, `ppc64`).
 #[must_use]
 pub fn raw_arch_name(arch: Arch) -> &'static str {
     match arch {
@@ -665,6 +665,7 @@ pub fn raw_arch_name(arch: Arch) -> &'static str {
         Arch::Thumb => "thumb",
         Arch::Riscv32 => "riscv32",
         Arch::Riscv64 => "riscv64",
+        Arch::Mips32 => "mips32",
         Arch::Ppc32 => "ppc32",
         Arch::Ppc64 => "ppc64",
     }
@@ -672,15 +673,15 @@ pub fn raw_arch_name(arch: Arch) -> &'static str {
 
 /// Required entry alignment in bytes for a raw [`Arch`].
 ///
-/// x86 targets decode from any byte; AArch64/ARM32/PowerPC need 4-byte
-/// words; Thumb and RISC-V need 2-byte halfwords (their 4-byte forms still
-/// require 4-byte alignment, enforced by the decoder, not the entry).
+/// x86 targets decode from any byte; AArch64/ARM32/MIPS32/PowerPC need
+/// 4-byte words; Thumb and RISC-V need 2-byte halfwords (their 4-byte forms
+/// still require 4-byte alignment, enforced by the decoder, not the entry).
 /// Bases accept any alignment: only the entry must satisfy the mode.
 #[must_use]
 pub fn raw_entry_alignment(arch: Arch) -> u64 {
     match arch {
         Arch::X86_64 | Arch::X86_32 => 1,
-        Arch::Aarch64 | Arch::Arm32 | Arch::Ppc32 | Arch::Ppc64 => 4,
+        Arch::Aarch64 | Arch::Arm32 | Arch::Mips32 | Arch::Ppc32 | Arch::Ppc64 => 4,
         Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 => 2,
     }
 }
@@ -779,6 +780,10 @@ pub fn arch_from_object(arch: object::Architecture) -> Result<Arch> {
         A::Arm => Ok(Arch::Arm32),
         A::Riscv32 => Ok(Arch::Riscv32),
         A::Riscv64 => Ok(Arch::Riscv64),
+        // 32-bit MIPS ELF (both endiannesses report `Mips`); the decoder
+        // only reads little-endian words, so big-endian containers are
+        // rejected at load (see `load_object`).
+        A::Mips => Ok(Arch::Mips32),
         A::PowerPc => Ok(Arch::Ppc32),
         A::PowerPc64 => Ok(Arch::Ppc64),
         other => Err(Error::Unsupported(format!("architecture {other:?}"))),
@@ -1262,6 +1267,14 @@ fn load_object(
     let file =
         object::File::parse(bytes).map_err(|e| Error::Invalid(format!("object parse: {e}")))?;
     let arch = arch_from_object(file.architecture())?;
+    // MIPS32 decodes little-endian words only: a big-endian MIPS
+    // container would decode as garbage, so it is rejected instead.
+    if arch == Arch::Mips32 && file.endianness() != object::Endianness::Little {
+        return Err(Error::Unsupported(
+            "big-endian MIPS is not supported (mips32 decodes little-endian words only)"
+                .to_string(),
+        ));
+    }
     // Owned-name budget shared by sections/imports/exports below; counted
     // before each copy so repeated long names fail fast instead of OOMing.
     let mut meta_bytes: u64 = 0;
@@ -2150,6 +2163,8 @@ fn elf_got_slots<'a>(
         Arch::Arm32 | Arch::Thumb => 22,
         Arch::Aarch64 => 1026,
         Arch::Riscv32 | Arch::Riscv64 => 5,
+        // `R_MIPS_JUMP_SLOT` (127) per the MIPS ELF ABI.
+        Arch::Mips32 => 127,
         // `R_PPC_JUMP_SLOT` / `R_PPC64_JMP_SLOT` (both 21) per the PPC ELF ABI.
         Arch::Ppc32 | Arch::Ppc64 => 21,
     };
@@ -3492,10 +3507,11 @@ mod tests {
         assert_eq!(arch_from_object(A::Arm).unwrap(), Arch::Arm32);
         assert_eq!(arch_from_object(A::Riscv32).unwrap(), Arch::Riscv32);
         assert_eq!(arch_from_object(A::Riscv64).unwrap(), Arch::Riscv64);
+        assert_eq!(arch_from_object(A::Mips).unwrap(), Arch::Mips32);
         assert_eq!(arch_from_object(A::PowerPc).unwrap(), Arch::Ppc32);
         assert_eq!(arch_from_object(A::PowerPc64).unwrap(), Arch::Ppc64);
         assert!(matches!(
-            arch_from_object(A::Mips).unwrap_err(),
+            arch_from_object(A::Mips64).unwrap_err(),
             Error::Unsupported(_)
         ));
     }
