@@ -46,7 +46,7 @@ pub fn version() -> &'static str {
 
 /// Parse an explicit raw architecture name.
 ///
-/// Accepts the nine disassembler modes (`x86_64`, `x86_32`, `aarch64`,
+/// Accepts the ten disassembler modes (`x86_64`, `x86_32`, `aarch64`,
 /// `arm32`, `thumb`, `riscv32`, `riscv64`, `mips32`, `ppc32`, `ppc64`), case-insensitively.
 /// `mips32` decodes little-endian words (see [`crate::disasm`]).
 ///

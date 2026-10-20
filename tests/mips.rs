@@ -113,9 +113,9 @@ fn minimal_elf_mips(class: u8, data: u8, machine: u16) -> Vec<u8> {
 /// - `0x10004`: `jal leaf` (leaf at `0x10024`)
 /// - `0x10008`: delay slot
 /// - `0x1000c`: `lw a0, 0(sp)`
-/// - `0x10010`: delay slot
+/// - `0x10010`: `nop` (padding, not a delay slot: `lw` is sequential)
 /// - `0x10014`: `addiu sp, sp, 16`
-/// - `0x10018`: delay slot
+/// - `0x10018`: `nop` (padding, not a delay slot)
 /// - `0x1001c`: `jr ra`
 /// - `0x10020`: delay slot
 /// - `0x10024` (leaf): `addiu a0, a0, 1; jr ra` plus delay slot.
