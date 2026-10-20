@@ -267,6 +267,55 @@
 //!   FP `sqrt`, privileged TLB ops (`tlbr`/`tlbwi`/`tlbwr`/`tlbp`,
 //!   `rfe`), and MIPS32r2 bit operations (no rabbitizer opcode).
 //!
+//! `lift_ppc` covers PowerPC base-ISA mnemonics as the powerpc crate prints
+//! them in `simplified` form (LK/AA/BO folded into the mnemonic, e.g. `bl`,
+//! `bne`, `blr`; `ori r0,r0,0` prints as `nop`, `or` with matching sources
+//! as `mr`, `addi` with a zero base as `li`, negative immediates as
+//! `subi`/`subis`):
+//!
+//! - `COPY`: `mr`, `li`, `lis`, SPR moves (`mflr`/`mfctr`/`mfcr`/`mfxer`/
+//!   `mftb`/`mfmsr`/`mfocrf`/`mfspr` and `mtlr`/`mtctr`/`mtcrf`/`mtxer`/
+//!   `mtspr`/`mtmsr`/`mtmsrd`, `mcrf`), CR moves (`crmove`/`crclr`/
+//!   `crset`/`crnot`), FP `fmr`/`fabs`/`fnabs`. `LOAD`: `lbz`/`lbzu`/
+//!   `lbzx`/`lbzux`, `lhz`/`lhzu`/`lhzx`/`lhzux`, `lha`/`lhau`/`lhax`/
+//!   `lhaux`, `lwz`/`lwzu`/`lwzx`/`lwzux`, `lmw`, `lswi`/`lswx`, `lwarx`,
+//!   `lwbrx`/`lhbrx`, FP `lfd`/`lfdu`/`lfdx`/`lfdux`/`lfs`/`lfsu`/`lfsx`/
+//!   `lfsux`, 64-bit `ld`/`ldu`/`ldx`/`ldux`/`lwa`/`lwax`/`lwaux`/
+//!   `ldarx`. `STORE`: `stb`/`stbu`/`stbx`/`stbux`, `sth`/`sthu`/`sthx`/
+//!   `sthux`, `stw`/`stwu`/`stwx`/`stwux`, `stmw`, `stswi`/`stswx`,
+//!   `stwcx.`/`stwbrx`/`sthbrx`, FP `stfd`/`stfdu`/`stfdx`/`stfdux`/
+//!   `stfs`/`stfsu`/`stfsx`/`stfsux`/`stfiwx`, 64-bit `std`/`stdu`/`stdx`/
+//!   `stdux`/`stdcx.`.
+//! - `ADD`: `add`, `addc`, `adde`, `addi`, `addic`, `addic.`, `addis`,
+//!   `addme`, `addze`, FP `fadd`/`fadds`. `SUB`: `subf`, `subfc`, `subfe`,
+//!   `subfic`, `subi`, `subic`, `subic.`, `subis`, `subfme`, `subfze`,
+//!   `neg`, FP `fsub`/`fsubs`. `MUL`: `mullw`, `mulhw`, `mulhwu`, `mulli`,
+//!   FP `fmul`/`fmuls`/`fmadd`/`fmadds`/`fmsub`/`fmsubs`/`fnmadd`/
+//!   `fnmadds`/`fnmsub`/`fnmsubs` (fused add folded away). `DIV`: `divw`,
+//!   `divwu`, FP `fdiv`/`fdivs`. `AND`: `and`, `andc`, `andi`, `andis`,
+//!   `nand`. `OR`: `or`, `orc`, `ori`, `oris`, `nor`. `XOR`: `xor`,
+//!   `xori`, `xoris`, `eqv`. `SHL`: `slw`, `rlwimi`, `rlwinm`, `rlwnm`
+//!   and the `rlwinm` clear/extend/rotate aliases (`clrlwi`, `clrrwi`,
+//!   `extlwi`, `extrwi`, `rotlwi`, `rotrwi`, `slwi`, `srwi`, `rotlw`).
+//!   `SHR`: `srw`, `sraw`, `srawi`.
+//! - `CMP`: `cmpw`, `cmpwi`, `cmplw`, `cmplwi` (plus `cmp`/`cmpi`/`cmpl`/
+//!   `cmpli` spellings), 64-bit `cmpd`/`cmpdi`/`cmpld`/`cmpldi`, FP
+//!   `fcmpo`/`fcmpu`. `BRANCH`: `b`, `ba`, `bctr` (indirect keeps
+//!   operands). `CBRANCH`: `bc` family (`bne`, `beq`, `blt`, `ble`,
+//!   `bge`, `bgt`, `bso`, `bns`, `bdnz*`, `bdz*`, generic `bc`) and LR/CTR
+//!   forms (`bnelr`, `beqlr`, `bdnzlr`, `bdzlr`, generic `bclr`; `beqctr`,
+//!   generic `bcctr`) — each with optional `l` (link: lifts as `CALL`),
+//!   `a` (absolute), `lr`/`ctr`, and `+`/`-` hint suffixes. `CALL`:
+//!   `bl`, `bla`, link (`l`-suffixed) conditionals (`bnel`, `bltl`, ...),
+//!   indirect-link forms (`blrl`, `bctrl`, `bnelrl`, `beqctrl`, `bcctrl`,
+//!   `bclrl`), traps (`sc`, `tw*`, `td*`, `trap`, mirror x86 `int3`).
+//!   `RETURN`: `blr`, `rfi`, `rfid`. `NOP`: `nop`, `sync`, `lwsync`,
+//!   `ptesync`, `eieio`, `isync`. Still unmapped by design: AltiVec/
+//!   paired-singles/VMX128 (decode as `Illegal`), FP converts/roundings
+//!   (`fctiw*`, `fcfid`, `frsp`, `fres`, `frsqrte`, `fsel`, `fsqrt`),
+//!   cache/TLB ops (`dcb*`, `icbi`, `tlbie`, `tlbsync`), CR logicals
+//!   beyond moves (`crand`, `cror`, `crxor`, ...), and privileged
+//!   MMU/debug SPRs.
 //!
 //! # Warning semantics
 //!
@@ -643,9 +692,21 @@ pub fn control_op(arch: Arch, insn: &Insn) -> Option<(IrOp, Option<u64>)> {
                 None
             }
         }
-        // Skeleton (rsdbg-9syq spike): no control op modeled yet; every
-        // instruction lifts to fallback NOP, so nothing is control flow.
-        Arch::Ppc32 | Arch::Ppc64 => None,
+        Arch::Ppc32 | Arch::Ppc64 => {
+            let mnem = insn.mnem.as_str();
+            // Same guards and outcomes as `lift_ppc`'s control arms.
+            if ppc_is_ret(mnem) {
+                Some((IrOp::Return, None))
+            } else if ppc_is_branch(mnem) {
+                Some((IrOp::Branch, insn.branch_target))
+            } else if ppc_is_cbranch(mnem) {
+                Some((IrOp::CBranch, insn.branch_target))
+            } else if ppc_is_call(mnem) {
+                Some((IrOp::Call, insn.branch_target))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -752,9 +813,27 @@ pub fn is_mapped(arch: Arch, mnem: &str) -> bool {
                 || MIPS_CALL.contains(&mnem)
                 || is_mips_nop(mnem)
         }
-        // Skeleton (rsdbg-9syq spike): nothing lifts yet, so nothing is
-        // mapped; exactly predicts `lift_ppc`'s fallback warnings.
-        Arch::Ppc32 | Arch::Ppc64 => false,
+        Arch::Ppc32 | Arch::Ppc64 => {
+            let base = ppc_base_mnem(mnem);
+            is_ppc_copy(base)
+                || is_ppc_load(base)
+                || is_ppc_store(base)
+                || is_ppc_alu(base, IrOp::Add)
+                || is_ppc_alu(base, IrOp::Sub)
+                || is_ppc_alu(base, IrOp::Mul)
+                || is_ppc_alu(base, IrOp::Div)
+                || is_ppc_alu(base, IrOp::And)
+                || is_ppc_alu(base, IrOp::Or)
+                || is_ppc_alu(base, IrOp::Xor)
+                || is_ppc_alu(base, IrOp::Shl)
+                || is_ppc_alu(base, IrOp::Shr)
+                || is_ppc_cmp(base)
+                || ppc_is_branch(mnem)
+                || ppc_is_cbranch(mnem)
+                || ppc_is_call(mnem)
+                || ppc_is_ret(mnem)
+                || is_ppc_nop(base)
+        }
     }
 }
 
@@ -809,7 +888,7 @@ pub struct FallbackCoverage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coverage {
     /// Architecture name (`x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
-    /// `riscv32`, `riscv64`, `mips32`).
+    /// `riscv32`, `riscv64`, `mips32`, `ppc32`, `ppc64`).
     pub arch: String,
     /// Per-operation families in [`IrOp`] declaration order.
     pub families: Vec<FamilyCoverage>,
@@ -1253,11 +1332,87 @@ fn riscv_families() -> Vec<FamilyCoverage> {
     ]
 }
 
-/// Skeleton PowerPC families (rsdbg-9syq spike): empty until `lift_ppc`
-/// models control flow; [`coverage`] then advertises the same branch
-/// slices the predicates consult.
+/// PowerPC base-ISA families (rsdbg-9syq): the `is_ppc_*` predicates
+/// consult these tables (after `ppc_base_mnem` strips one `o` overflow
+/// suffix and one `.` record suffix), and [`coverage`] publishes the same
+/// slices so the report cannot drift from the lifters. Branch suffixes
+/// (`l` link, `a` absolute, `lr`/`ctr`, `+`/`-` hints) are handled by the
+/// control helpers, not the tables: the published control lists hold the
+/// unconditional spellings plus the condition bases, and the arch note
+/// documents the suffix rule.
 fn ppc_families() -> Vec<FamilyCoverage> {
-    Vec::new()
+    use CoverageStatus::Implemented;
+    vec![
+        fam(IrOp::Copy, Implemented, PPC_COPY, &[], None),
+        fam(IrOp::Load, Implemented, PPC_LOAD, &[], None),
+        fam(IrOp::Store, Implemented, PPC_STORE, &[], None),
+        fam(
+            IrOp::Add,
+            Implemented,
+            PPC_ADD,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(
+            IrOp::Sub,
+            Implemented,
+            PPC_SUB,
+            &[],
+            Some("no flag effects on any integer or FP form"),
+        ),
+        fam(IrOp::Mul, Implemented, PPC_MUL, &[], None),
+        fam(IrOp::Div, Implemented, PPC_DIV, &[], None),
+        fam(IrOp::And, Implemented, PPC_AND, &[], None),
+        fam(IrOp::Or, Implemented, PPC_OR, &[], None),
+        fam(IrOp::Xor, Implemented, PPC_XOR, &[], None),
+        fam(
+            IrOp::Shl,
+            Implemented,
+            PPC_SHL,
+            &[],
+            Some("rotates approximate to shifts; exact bit motion is out of scope"),
+        ),
+        fam(IrOp::Shr, Implemented, PPC_SHR, &[], None),
+        fam(
+            IrOp::Cmp,
+            Implemented,
+            PPC_CMP,
+            &[],
+            Some("integer and FP compares record no flags (PPC CR effects unmodeled)"),
+        ),
+        fam(
+            IrOp::Branch,
+            Implemented,
+            PPC_BRANCH,
+            &[],
+            Some("plus unconditional lr/ctr spellings via suffix rule (see arch note)"),
+        ),
+        fam(
+            IrOp::CBranch,
+            Implemented,
+            PPC_CBRANCH,
+            &[],
+            Some("condition bases; l-suffixed forms lift as Call (see arch note)"),
+        ),
+        fam(
+            IrOp::Call,
+            Implemented,
+            PPC_CALL,
+            &[],
+            Some(
+                "plus l-suffixed conditionals and indirect-link lr/ctr forms; traps mirror x86 int3",
+            ),
+        ),
+        fam(
+            IrOp::Return,
+            Implemented,
+            PPC_RETURN,
+            &[],
+            Some("exact: blr plus rfi/rfid"),
+        ),
+        phi_family(),
+        fam(IrOp::Nop, Implemented, PPC_NOP, &[], Some(NOP_NOTE)),
+    ]
 }
 
 fn mips_families() -> Vec<FamilyCoverage> {
@@ -1365,7 +1520,7 @@ pub fn coverage(arch: Arch) -> Coverage {
         Arch::Ppc32 | Arch::Ppc64 => (
             ppc_families(),
             Some(
-                "skeleton (rsdbg-9syq spike): no families lift yet; mnemonics are powerpc-crate simplified names when lifting lands",
+                "mnemonics are powerpc-crate simplified names (LK/AA/BO folded in: bl, bne, blr); one overflow o and one record . strip before lookup; branch l (link), a (absolute), lr/ctr, and +/- hint suffixes split b/bl/bc/bclr/bcctr forms into Branch/CBranch/Call/Return (see family notes)",
             ),
         ),
     };
@@ -1602,15 +1757,58 @@ pub fn lift_riscv(insn: &Insn) -> Vec<IrInsn> {
     }]
 }
 
-/// Skeleton PowerPC lifter (rsdbg-9syq spike): every instruction lifts to
-/// fallback [`IrOp::Nop`] with a warning (see `unlifted`). Direct-branch
-/// targets already decode in [`Insn::branch_target`]; classifying
-/// `b`/`bc`/`blr`/`bctr` into Branch/CBranch/Call/Return is a follow-up,
-/// at which point [`is_mapped`] and [`control_op`] gain PPC arms together
-/// so the fallback contract keeps holding.
+/// Lift one PowerPC (32- or 64-bit) instruction.
+///
+/// Mode-agnostic by design (one table for both modes): PowerPC has no
+/// flags in the IR sense (CR/XER effects unmodeled), so `sets_flags` is
+/// always false, and `sp_delta` is assigned by [`lift`]. Data tables
+/// consult `ppc_base_mnem` (one overflow `o` and one record `.`
+/// stripped); control splits by suffix: `l`-suffixed direct branches and
+/// indirect-link `lr`/`ctr` forms lift as `Call`, `blr`/`rfi`/`rfid` as
+/// `Return`, the rest as `Branch`/`CBranch` (see `ppc_is_call`).
 #[must_use]
 pub fn lift_ppc(insn: &Insn) -> Vec<IrInsn> {
-    unlifted(insn)
+    let mnem = insn.mnem.as_str();
+    let base = ppc_base_mnem(mnem);
+    let (op, inputs, outputs, target) = match base {
+        s if is_ppc_copy(s) => first_out_rest_in(insn, IrOp::Copy),
+        s if is_ppc_load(s) => first_out_rest_in(insn, IrOp::Load),
+        s if is_ppc_store(s) => (IrOp::Store, insn.ops.clone(), Vec::new(), None),
+        s if is_ppc_alu(s, IrOp::Add) => first_out_rest_in(insn, IrOp::Add),
+        s if is_ppc_alu(s, IrOp::Sub) => first_out_rest_in(insn, IrOp::Sub),
+        s if is_ppc_alu(s, IrOp::Mul) => first_out_rest_in(insn, IrOp::Mul),
+        s if is_ppc_alu(s, IrOp::Div) => first_out_rest_in(insn, IrOp::Div),
+        s if is_ppc_alu(s, IrOp::And) => first_out_rest_in(insn, IrOp::And),
+        s if is_ppc_alu(s, IrOp::Or) => first_out_rest_in(insn, IrOp::Or),
+        s if is_ppc_alu(s, IrOp::Xor) => first_out_rest_in(insn, IrOp::Xor),
+        s if is_ppc_alu(s, IrOp::Shl) => first_out_rest_in(insn, IrOp::Shl),
+        s if is_ppc_alu(s, IrOp::Shr) => first_out_rest_in(insn, IrOp::Shr),
+        s if is_ppc_cmp(s) => (IrOp::Cmp, insn.ops.clone(), Vec::new(), None),
+        _ if ppc_is_ret(mnem) => (IrOp::Return, Vec::new(), Vec::new(), None),
+        _ if ppc_is_branch(mnem) => direct_or_indirect(insn, IrOp::Branch),
+        _ if ppc_is_cbranch(mnem) => (
+            IrOp::CBranch,
+            insn.ops.clone(),
+            Vec::new(),
+            insn.branch_target,
+        ),
+        _ if ppc_is_call(mnem) => direct_or_indirect(insn, IrOp::Call),
+        s if is_ppc_nop(s) => (IrOp::Nop, Vec::new(), Vec::new(), None),
+        _ => return unlifted(insn),
+    };
+    vec![IrInsn {
+        addr: insn.addr,
+        op,
+        inputs,
+        outputs,
+        target,
+        warning: None,
+        effects: IrEffects {
+            sets_flags: false,
+            sp_delta: None,
+        },
+        operands: insn.operands.clone(),
+    }]
 }
 
 /// Lift one MIPS32 instruction.
@@ -2205,6 +2403,15 @@ fn sp_delta_for(arch: Arch, insn: &Insn) -> Option<i64> {
         // or `0x...` style (never plain decimal).
         return match (insn.mnem.as_str(), insn.ops.as_slice()) {
             ("addiu", [dst, src, imm]) if dst == "$sp" && src == "$sp" => parse_mips_imm(imm),
+            _ => None,
+        };
+    }
+    if matches!(arch, Arch::Ppc32 | Arch::Ppc64) {
+        // Frame alloc/dealloc: `stwu r1, <imm>(r1)` stores the old stack
+        // pointer and updates `r1` in one word; the immediate prints
+        // `-0x10(r1)`/`0x10(r1)` hex with a `(r1)` base.
+        return match (insn.mnem.as_str(), insn.ops.as_slice()) {
+            ("stwu", [dst, slot]) if dst == "r1" => parse_ppc_stwu_imm(slot),
             _ => None,
         };
     }
@@ -3432,6 +3639,262 @@ fn parse_mips_imm(s: &str) -> Option<i64> {
     } else {
         s.parse::<i64>().ok()
     }
+}
+
+/// Parse a powerpc `stwu` stack immediate: `-0x10(r1)`/`0x10(r1)` hex
+/// with a `(r1)` base. Anything else is `None`.
+fn parse_ppc_stwu_imm(op: &str) -> Option<i64> {
+    let (imm, base) = op.split_once('(')?;
+    if base != "r1)" {
+        return None;
+    }
+    if let Some(hex) = imm.strip_prefix("-0x").or_else(|| imm.strip_prefix("-0X")) {
+        i64::from_str_radix(hex, 16).ok().map(|v| -v)
+    } else if let Some(hex) = imm.strip_prefix("0x").or_else(|| imm.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()
+    } else {
+        imm.parse::<i64>().ok()
+    }
+}
+
+/// Reduce a PowerPC mnemonic to its base: one record `.` suffix, then one
+/// overflow `o` suffix, each stripped only when the remainder is a known
+/// base (so `eieio`, `sync`, `isync` survive: `eiei`, `syn`, `isyn` are
+/// not bases).
+fn ppc_base_mnem(mnem: &str) -> &str {
+    let no_dot = mnem.strip_suffix('.').unwrap_or(mnem);
+    if let Some(no_o) = no_dot.strip_suffix('o')
+        && ppc_base_known(no_o)
+    {
+        return no_o;
+    }
+    // A bare `.`-strip that leaves an unknown stem (e.g. `andi.` whose
+    // table holds `andi`) still resolves through the tables below; only
+    // fall back to the full mnemonic when neither stem is known.
+    if ppc_base_known(no_dot) || !ppc_base_known(mnem) {
+        return no_dot;
+    }
+    mnem
+}
+
+/// Whether `s` is a PowerPC base mnemonic: any data table, compare,
+/// nop, or control word matched inline by the lifter.
+fn ppc_base_known(s: &str) -> bool {
+    is_ppc_copy(s)
+        || is_ppc_load(s)
+        || is_ppc_store(s)
+        || is_ppc_alu(s, IrOp::Add)
+        || is_ppc_alu(s, IrOp::Sub)
+        || is_ppc_alu(s, IrOp::Mul)
+        || is_ppc_alu(s, IrOp::Div)
+        || is_ppc_alu(s, IrOp::And)
+        || is_ppc_alu(s, IrOp::Or)
+        || is_ppc_alu(s, IrOp::Xor)
+        || is_ppc_alu(s, IrOp::Shl)
+        || is_ppc_alu(s, IrOp::Shr)
+        || is_ppc_cmp(s)
+        || is_ppc_nop(s)
+        || matches!(
+            s,
+            "b" | "ba"
+                | "bl"
+                | "bla"
+                | "blr"
+                | "blrl"
+                | "bctr"
+                | "bctrl"
+                | "bc"
+                | "bclr"
+                | "bcctr"
+                | "sc"
+                | "rfi"
+                | "rfid"
+                | "trap"
+        )
+        || PPC_CBRANCH_BASES.contains(&s)
+}
+
+/// Condition bases of the powerpc `simplified` branch mnemonics (link `l`,
+/// absolute `a`, `lr`/`ctr`, and `+`/`-` hints stripped by the control
+/// helpers; see [`ppc_control_core`]).
+const PPC_CBRANCH_BASES: &[&str] = &[
+    "blt", "ble", "beq", "bge", "bgt", "bso", "bns", "bdnz", "bdnzt", "bdnzf", "bdz", "bdzt",
+    "bdzf", "bne",
+];
+
+/// Strip one `+`/`-` branch-prediction hint.
+fn ppc_strip_hint(mnem: &str) -> &str {
+    mnem.strip_suffix(['+', '-']).unwrap_or(mnem)
+}
+
+/// Core of a branch mnemonic after stripping hint, absolute `a`, link
+/// `l`, and `lr`/`ctr` suffixes: `(core, has_link)`, or `None` when the
+/// shape is not a branch form. `blr`/`blrl`/`bctr`/`bctrl` and the `b`/
+/// `bl`/`ba`/`bla` unconditional forms are handled by the exact matches
+/// in the callers, never here.
+fn ppc_control_core(mnem: &str) -> Option<(&str, bool)> {
+    let s = ppc_strip_hint(mnem);
+    // Indirect `lr` forms: `beqlr` (no link) vs `beqlrl` (link).
+    if let Some(core) = s.strip_suffix("lrl") {
+        return Some((core, true));
+    }
+    if let Some(core) = s.strip_suffix("lr") {
+        return Some((core, false));
+    }
+    // Indirect `ctr` forms: `beqctr` vs `beqctrl`.
+    if let Some(core) = s.strip_suffix("ctrl") {
+        return Some((core, true));
+    }
+    if let Some(core) = s.strip_suffix("ctr") {
+        return Some((core, false));
+    }
+    // Direct forms: optional absolute `a`, then optional link `l`.
+    let s = s.strip_suffix('a').unwrap_or(s);
+    if let Some(core) = s.strip_suffix('l') {
+        return Some((core, true));
+    }
+    Some((s, false))
+}
+
+/// Whether `mnem` is an unconditional PowerPC return: exactly `blr`
+/// (branch to LR, no link) or the interrupt returns `rfi`/`rfid`.
+fn ppc_is_ret(mnem: &str) -> bool {
+    matches!(ppc_strip_hint(mnem), "blr" | "rfi" | "rfid")
+}
+
+/// Whether `mnem` is an unconditional PowerPC branch: `b`/`ba` direct or
+/// `bctr` indirect (each with an optional hint, no link).
+fn ppc_is_branch(mnem: &str) -> bool {
+    matches!(ppc_strip_hint(mnem), "b" | "ba" | "bctr")
+}
+
+/// Whether `mnem` is a conditional PowerPC branch: a `bc`-family
+/// condition, `lr`, or `ctr` form without link (direct forms carry
+/// `branch_target`; indirect forms keep operands).
+fn ppc_is_cbranch(mnem: &str) -> bool {
+    if ppc_is_ret(mnem) || ppc_is_branch(mnem) || ppc_is_call(mnem) {
+        return false;
+    }
+    let Some((core, link)) = ppc_control_core(mnem) else {
+        return false;
+    };
+    if link {
+        return false;
+    }
+    core == "bc" || PPC_CBRANCH_BASES.contains(&core)
+}
+
+/// Whether `mnem` is a PowerPC call: unconditional-link `bl`/`bla`,
+/// indirect-link `blrl`/`bctrl`, link-suffixed conditionals (`bnel`,
+/// `bltl`, `bnelrl`, `beqctrl`, `bcctrl`, `bclrl`), or traps (`sc`,
+/// `tw*`, `td*`, `trap`, mirror x86 `int3`).
+fn ppc_is_call(mnem: &str) -> bool {
+    let s = ppc_strip_hint(mnem);
+    if matches!(s, "bl" | "bla" | "blrl" | "bctrl" | "sc" | "trap") {
+        return true;
+    }
+    if s == "tw" || s == "td" || s.starts_with("twi") || s.starts_with("tdi") {
+        return true;
+    }
+    if s.starts_with("tw") || s.starts_with("td") {
+        // `tweq`, `twgti`, `tdge`, ... (simplified_tw/twi/td/tdi aliases).
+        return true;
+    }
+    let Some((core, link)) = ppc_control_core(mnem) else {
+        return false;
+    };
+    link && (core == "bc" || PPC_CBRANCH_BASES.contains(&core))
+}
+
+/// Canonical powerpc `simplified` mnemonics (base forms before
+/// `ppc_base_mnem` strips one overflow `o` and one record `.`;
+/// `andi`/`andis` only ever print dotted, so the tables hold the
+/// stripped stems like the ARM base forms).
+const PPC_COPY: &[&str] = &[
+    "mr", "li", "lis", "mflr", "mfctr", "mfcr", "mfxer", "mftb", "mfmsr", "mfocrf", "mfspr",
+    "mtlr", "mtctr", "mtcrf", "mtxer", "mtspr", "mtmsr", "mtmsrd", "mcrf", "crmove", "crclr",
+    "crset", "crnot", "fmr", "fabs", "fnabs",
+];
+const PPC_LOAD: &[&str] = &[
+    "lbz", "lbzu", "lbzx", "lbzux", "lhz", "lhzu", "lhzx", "lhzux", "lha", "lhau", "lhax", "lhaux",
+    "lwz", "lwzu", "lwzx", "lwzux", "lmw", "lswi", "lswx", "lwarx", "lwbrx", "lhbrx", "lfd",
+    "lfdu", "lfdx", "lfdux", "lfs", "lfsu", "lfsx", "lfsux", "ld", "ldu", "ldx", "ldux", "lwa",
+    "lwax", "lwaux", "ldarx",
+];
+const PPC_STORE: &[&str] = &[
+    "stb", "stbu", "stbx", "stbux", "sth", "sthu", "sthx", "sthux", "stw", "stwu", "stwx", "stwux",
+    "stmw", "stswi", "stswx", "stwcx", "stwbrx", "sthbrx", "stfd", "stfdu", "stfdx", "stfdux",
+    "stfs", "stfsu", "stfsx", "stfsux", "stfiwx", "std", "stdu", "stdx", "stdux", "stdcx",
+];
+const PPC_ADD: &[&str] = &[
+    "add", "addc", "adde", "addi", "addic", "addis", "addme", "addze", "fadd", "fadds",
+];
+const PPC_SUB: &[&str] = &[
+    "subf", "subfc", "subfe", "subfic", "subi", "subic", "subis", "subfme", "subfze", "neg",
+    "fsub", "fsubs",
+];
+const PPC_MUL: &[&str] = &[
+    "mullw", "mulhw", "mulhwu", "mulli", "fmul", "fmuls", "fmadd", "fmadds", "fmsub", "fmsubs",
+    "fnmadd", "fnmadds", "fnmsub", "fnmsubs",
+];
+const PPC_DIV: &[&str] = &["divw", "divwu", "fdiv", "fdivs"];
+const PPC_AND: &[&str] = &["and", "andc", "andi", "andis", "nand"];
+const PPC_OR: &[&str] = &["or", "orc", "ori", "oris", "nor"];
+const PPC_XOR: &[&str] = &["xor", "xori", "xoris", "eqv"];
+const PPC_SHL: &[&str] = &[
+    "slw", "rlwimi", "rlwinm", "rlwnm", "clrlwi", "clrrwi", "clrlslwi", "extlwi", "extrwi",
+    "rotlwi", "rotrwi", "slwi", "srwi", "rotlw",
+];
+const PPC_SHR: &[&str] = &["srw", "sraw", "srawi"];
+const PPC_CMP: &[&str] = &[
+    "cmp", "cmpi", "cmpl", "cmpli", "cmpw", "cmpwi", "cmplw", "cmplwi", "cmpd", "cmpdi", "cmpld",
+    "cmpldi", "fcmpo", "fcmpu",
+];
+/// Unconditional PowerPC spellings published by the Branch family; the
+/// conditional `CBRANCH` bases live in [`PPC_CBRANCH_BASES`] and the
+/// link/trap call spellings in [`PPC_CALL`].
+const PPC_BRANCH: &[&str] = &["b", "ba", "bctr"];
+const PPC_CBRANCH: &[&str] = &[
+    "bc", "blt", "ble", "beq", "bge", "bgt", "bso", "bns", "bdnz", "bdnzt", "bdnzf", "bdz", "bdzt",
+    "bdzf", "bne",
+];
+const PPC_CALL: &[&str] = &["bl", "bla", "blrl", "bctrl", "sc", "trap"];
+const PPC_RETURN: &[&str] = &["blr", "rfi", "rfid"];
+const PPC_NOP: &[&str] = &["nop", "sync", "lwsync", "ptesync", "eieio", "isync"];
+
+fn is_ppc_copy(s: &str) -> bool {
+    PPC_COPY.contains(&s)
+}
+
+fn is_ppc_load(s: &str) -> bool {
+    PPC_LOAD.contains(&s)
+}
+
+fn is_ppc_store(s: &str) -> bool {
+    PPC_STORE.contains(&s)
+}
+
+fn is_ppc_alu(s: &str, op: IrOp) -> bool {
+    match op {
+        IrOp::Add => PPC_ADD.contains(&s),
+        IrOp::Sub => PPC_SUB.contains(&s),
+        IrOp::Mul => PPC_MUL.contains(&s),
+        IrOp::Div => PPC_DIV.contains(&s),
+        IrOp::And => PPC_AND.contains(&s),
+        IrOp::Or => PPC_OR.contains(&s),
+        IrOp::Xor => PPC_XOR.contains(&s),
+        IrOp::Shl => PPC_SHL.contains(&s),
+        IrOp::Shr => PPC_SHR.contains(&s),
+        _ => false,
+    }
+}
+
+fn is_ppc_cmp(s: &str) -> bool {
+    PPC_CMP.contains(&s)
+}
+
+fn is_ppc_nop(s: &str) -> bool {
+    PPC_NOP.contains(&s)
 }
 
 fn is_x86_jcc(s: &str) -> bool {

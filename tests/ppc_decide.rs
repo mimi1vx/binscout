@@ -6,9 +6,11 @@
 //! (`blr`/`bctr` carry no target), 32-bit NIA wrapping, prefix decode,
 //! and the ELF machine mapping (`EM_PPC`/`EM_PPC64`).
 //!
-//! The lifter is still a skeleton ([`binscout::ir::lift_ppc`] emits
-//! fallback NOP for everything), so these tests pin the disassembler
-//! contract only: mnemonics are the powerpc crate's `simplified` names.
+//! The lifter maps the base ISA ([`binscout::ir::lift_ppc`] classifies
+//! `b`/`bl`/`bc`/`blr`/`bctr` into Branch/CBranch/Call/Return with the
+//! `l`/`a`/`lr`/`ctr`/`+`/`-` suffix rule); these tests pin the
+//! disassembler contract (mnemonics are the powerpc crate's `simplified`
+//! names) plus the control-flow mapping.
 
 use binscout::disasm::{Arch, disasm_first, disasm_range, disasm_range_partial};
 use binscout::ir::{control_op, is_mapped, lift};
@@ -122,15 +124,18 @@ fn ppc_prefix_decode_and_first_word() {
 }
 
 #[test]
-fn ppc_lifter_skeleton_falls_back() {
-    // Until control-flow lifting lands, every PPC row is fallback NOP:
-    // `is_mapped` stays false so the fallback contract holds exactly.
+fn ppc_lifter_maps_control_flow() {
+    // Control flow lifts with no warning: `bl` is a call with its direct
+    // target, `blr` a return; `is_mapped` predicts the warning exactly.
     let insns = disasm_range(Arch::Ppc32, &w(0x4800_0101), 0x0, 16).unwrap();
     assert_eq!(insns[0].mnem, "bl");
-    assert!(!is_mapped(Arch::Ppc32, "bl"));
-    assert!(!is_mapped(Arch::Ppc64, "blr"));
+    assert!(is_mapped(Arch::Ppc32, "bl"));
+    assert!(is_mapped(Arch::Ppc64, "blr"));
     let rows = lift(Arch::Ppc32, &insns[0]);
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].warning.is_some());
-    assert_eq!(control_op(Arch::Ppc32, &insns[0]), None);
+    assert_eq!(rows[0].warning, None);
+    assert_eq!(
+        control_op(Arch::Ppc32, &insns[0]),
+        Some((binscout::ir::IrOp::Call, Some(0x100)))
+    );
 }

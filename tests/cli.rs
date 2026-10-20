@@ -665,6 +665,8 @@ fn raw_arch_bytes(arch: &str) -> Vec<u8> {
         "riscv32" | "riscv64" => vec![0x01, 0x00, 0x67, 0x80, 0x00, 0x00],
         // mips `nop; jr ra`.
         "mips32" => vec![0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0xE0, 0x03],
+        // ppc `nop; blr` (big-endian words).
+        "ppc32" | "ppc64" => vec![0x60, 0x00, 0x00, 0x00, 0x4E, 0x80, 0x00, 0x20],
         _ => unreachable!("test arch"),
     }
 }
@@ -679,6 +681,8 @@ fn raw_arch_base(arch: &str) -> &'static str {
         "riscv32" => "0x30000",
         "riscv64" => "0x31000",
         "mips32" => "0x32000",
+        "ppc32" => "0x40000",
+        "ppc64" => "0x41000",
         _ => unreachable!("test arch"),
     }
 }
@@ -686,7 +690,8 @@ fn raw_arch_base(arch: &str) -> &'static str {
 #[test]
 fn raw_flags_report_mapping_across_arches() {
     for arch in [
-        "x86_64", "x86_32", "aarch64", "arm32", "thumb", "riscv32", "riscv64", "mips32",
+        "x86_64", "x86_32", "aarch64", "arm32", "thumb", "riscv32", "riscv64", "mips32", "ppc32",
+        "ppc64",
     ] {
         let dir = tmpdir("cli-raw-parity");
         let base = raw_arch_base(arch);

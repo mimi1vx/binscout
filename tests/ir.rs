@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use common::{cleanup, temp_db, tmpdir, write_bin};
 
-const ALL_ARCHES: [Arch; 8] = [
+const ALL_ARCHES: [Arch; 10] = [
     Arch::X86_64,
     Arch::X86_32,
     Arch::Aarch64,
@@ -16,6 +16,8 @@ const ALL_ARCHES: [Arch; 8] = [
     Arch::Riscv32,
     Arch::Riscv64,
     Arch::Mips32,
+    Arch::Ppc32,
+    Arch::Ppc64,
 ];
 
 fn arch_name(arch: Arch) -> &'static str {
@@ -85,6 +87,104 @@ fn riscv64(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
 
 fn mips32(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
     disasm_range(Arch::Mips32, bytes, va, 100).expect("valid mips32 must decode")
+}
+
+fn ppc32(bytes: &[u8], va: u64) -> Vec<binscout::disasm::Insn> {
+    disasm_range(Arch::Ppc32, bytes, va, 100).expect("valid ppc32 must decode")
+}
+
+#[test]
+fn ppc_prologue_pattern_lifts_store_with_sp_delta() {
+    // stwu r1, -16(r1): the standard frame-setup prologue.
+    let insns = ppc32(&[0x94, 0x21, 0xFF, 0xF0], 0x10000);
+    assert_eq!(insns.len(), 1);
+    assert_eq!(insns[0].mnem, "stwu");
+    assert_eq!(insns[0].ops, ["r1", "-0x10(r1)"]);
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].op, IrOp::Store);
+    assert_eq!(v[0].warning, None);
+    assert_eq!(v[0].effects.sp_delta, Some(-16));
+}
+
+#[test]
+fn ppc_jumps_split_call_branch_return_by_suffix() {
+    // bl +8: link means a call with a direct target.
+    let insns = ppc32(&[0x48, 0x00, 0x00, 0x11], 0x10000);
+    assert_eq!(insns[0].mnem, "bl");
+    assert_eq!(insns[0].branch_target, Some(0x10010));
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, Some(0x10010)));
+    // b +8: no link means a plain branch.
+    let insns = ppc32(&[0x48, 0x00, 0x00, 0x10], 0x10000);
+    assert_eq!(insns[0].mnem, "b");
+    assert_eq!(insns[0].branch_target, Some(0x10010));
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Branch, Some(0x10010)));
+    // blr: the standard return carries no target.
+    let insns = ppc32(&[0x4E, 0x80, 0x00, 0x20], 0x10000);
+    assert_eq!(insns[0].mnem, "blr");
+    assert_eq!(insns[0].branch_target, None);
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!(v[0].op, IrOp::Return);
+    assert_eq!(v[0].warning, None);
+    // bctr: an indirect branch through CTR, no target.
+    let insns = ppc32(&[0x4E, 0x80, 0x04, 0x20], 0x10000);
+    assert_eq!(insns[0].mnem, "bctr");
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Branch, None));
+    // bctrl: link through CTR means an indirect call.
+    let insns = ppc32(&[0x4E, 0x80, 0x04, 0x21], 0x10000);
+    assert_eq!(insns[0].mnem, "bctrl");
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, None));
+    // bne carries a direct conditional target.
+    let insns = ppc32(&[0x40, 0x82, 0x00, 0x40], 0x10000);
+    assert_eq!(insns[0].mnem, "bne");
+    assert_eq!(insns[0].branch_target, Some(0x10040));
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::CBranch, Some(0x10040)));
+    // bnel (link) is a conditional call, not a CBranch.
+    let insns = ppc32(&[0x40, 0x82, 0x00, 0x41], 0x10000);
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::Call, Some(0x10040)));
+    // bnelr is a conditional indirect branch (return shape), no target.
+    let insns = ppc32(&[0x4C, 0x82, 0x00, 0x20], 0x10000);
+    assert_eq!(insns[0].mnem, "bnelr");
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].target), (IrOp::CBranch, None));
+}
+
+#[test]
+fn ppc_data_and_system_instructions_lift() {
+    // Integer loads/stores.
+    let insns = ppc32(&[0x80, 0x61, 0x00, 0x10], 0x10000);
+    assert_eq!(insns[0].mnem, "lwz");
+    assert_eq!(lift(Arch::Ppc32, &insns[0])[0].op, IrOp::Load);
+    let insns = ppc32(&[0x90, 0x61, 0x00, 0x10], 0x10000);
+    assert_eq!(insns[0].mnem, "stw");
+    assert_eq!(lift(Arch::Ppc32, &insns[0])[0].op, IrOp::Store);
+    // Dotted/record forms lift through the stripped base.
+    let insns = ppc32(&[0x7C, 0x64, 0x1A, 0x15], 0x10000);
+    assert_eq!(insns[0].mnem, "add.");
+    assert_eq!(lift(Arch::Ppc32, &insns[0])[0].op, IrOp::Add);
+    // Traps mirror x86 int3 as calls; sync is a barrier nop.
+    let insns = ppc32(&[0x44, 0x00, 0x00, 0x02], 0x10000);
+    assert_eq!(insns[0].mnem, "sc");
+    assert_eq!(lift(Arch::Ppc32, &insns[0])[0].op, IrOp::Call);
+    let insns = ppc32(&[0x7C, 0x00, 0x04, 0xAC], 0x10000);
+    assert_eq!(insns[0].mnem, "sync");
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Nop, None));
+    // AltiVec stays unmapped with a warning.
+    let v = lift(Arch::Ppc32, &synth("vaddfp", &[]));
+    assert_eq!(v[0].op, IrOp::Nop);
+    assert!(v[0].warning.is_some());
+    // SPR moves lift as copies.
+    let insns = ppc32(&[0x7C, 0x08, 0x02, 0xA6], 0x10000);
+    assert_eq!(insns[0].mnem, "mflr");
+    let v = lift(Arch::Ppc32, &insns[0]);
+    assert_eq!((v[0].op, v[0].warning.clone()), (IrOp::Copy, None));
 }
 
 #[test]
@@ -509,9 +609,8 @@ fn unmapped_mnem(arch: Arch) -> &'static str {
         Arch::Riscv32 | Arch::Riscv64 => "vadd.vv",
         // `sqrt.s` stays unmapped by design (see the lift docs).
         Arch::Mips32 => "sqrt.s",
-        // Skeleton: everything is unmapped on PPC; any base mnemonic
-        // qualifies (`add` will stay unmapped until ALU lifting lands).
-        Arch::Ppc32 | Arch::Ppc64 => "add",
+        // AltiVec stays unmapped by design (decodes as Illegal).
+        Arch::Ppc32 | Arch::Ppc64 => "vaddfp",
     }
 }
 
@@ -545,12 +644,19 @@ fn coverage_publishes_all_families_limits_and_fallback() {
         assert!(!c.fallback.distinguish.is_empty());
         // Notes ride on ARM32/Thumb (suffix stripping), RISC-V
         // (no-aliases canonical names, atomic suffixes, jump splitting),
-        // and MIPS32 (canonical names, delay slots, jump splitting).
+        // MIPS32 (canonical names, delay slots, jump splitting), and
+        // PowerPC (simplified names, o/dot stripping, branch suffixes).
         assert_eq!(
             c.arch_note.is_some(),
             matches!(
                 arch,
-                Arch::Arm32 | Arch::Thumb | Arch::Riscv32 | Arch::Riscv64 | Arch::Mips32
+                Arch::Arm32
+                    | Arch::Thumb
+                    | Arch::Riscv32
+                    | Arch::Riscv64
+                    | Arch::Mips32
+                    | Arch::Ppc32
+                    | Arch::Ppc64
             ),
             "{arch:?}"
         );
@@ -648,15 +754,19 @@ fn partial_means_mapped_but_semantically_incomplete() {
     for arch in ALL_ARCHES {
         let c = coverage(arch);
         // CMP records the comparison; flag effects are unmodeled everywhere
-        // except RISC-V and MIPS32, which have no flags to model (and no
-        // rotates to approximate as shifts, so Shr is exact there too).
+        // except RISC-V, MIPS32, and PowerPC, which have no flags to model
+        // (and no rotates to approximate as shifts, so Shr is exact there
+        // too).
         let cmp_mnem = match arch {
             Arch::Riscv32 | Arch::Riscv64 => "slt",
             Arch::Mips32 => "slt",
+            Arch::Ppc32 | Arch::Ppc64 => "cmpw",
             _ => "cmp",
         };
         let want_status = match arch {
-            Arch::Riscv32 | Arch::Riscv64 | Arch::Mips32 => CoverageStatus::Implemented,
+            Arch::Riscv32 | Arch::Riscv64 | Arch::Mips32 | Arch::Ppc32 | Arch::Ppc64 => {
+                CoverageStatus::Implemented
+            }
             _ => CoverageStatus::Partial,
         };
         assert_eq!(family(&c, IrOp::Cmp).status, want_status, "{arch:?}");
@@ -1242,7 +1352,7 @@ fn synth_target(mnem: &str, ops: &[&str], target: Option<u64>) -> binscout::disa
 
 #[test]
 fn control_op_matches_lift() {
-    use Arch::{Aarch64, Arm32, Mips32, Thumb, X86_32, X86_64};
+    use Arch::{Aarch64, Arm32, Mips32, Ppc32, Ppc64, Thumb, X86_32, X86_64};
     // Every control-flow arm of each lifter, direct (with target) and
     // indirect (without), plus fallthrough samples and unmapped mnemonics.
     let cases: &[(Arch, &str, &[&str], Option<u64>)] = &[
@@ -1364,6 +1474,39 @@ fn control_op_matches_lift() {
         (Mips32, "addiu", &["$sp", "$sp", "-0x10"], None),
         (Mips32, "nop", &[], None),
         (Mips32, "sqrt.s", &["$fv0", "$fv1"], None),
+        (Ppc32, "b", &["0x1008"], Some(0x1008)),
+        (Ppc32, "ba", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bl", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bla", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bne", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bnel", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bnea", &["0x1008"], Some(0x1008)),
+        (Ppc32, "blt", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bdnz", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bdnzl", &["0x1008"], Some(0x1008)),
+        (Ppc32, "bc", &["20", "eq", "0x1008"], Some(0x1008)),
+        (Ppc32, "bclr", &["20", "eq"], None),
+        (Ppc32, "blr", &[], None),
+        (Ppc32, "blrl", &[], None),
+        (Ppc32, "bnelr", &[], None),
+        (Ppc32, "bnelrl", &[], None),
+        (Ppc32, "bctr", &[], None),
+        (Ppc32, "bctrl", &[], None),
+        (Ppc32, "beqctr", &[], None),
+        (Ppc32, "beqctrl", &[], None),
+        (Ppc32, "bcctr", &["20", "eq"], None),
+        (Ppc64, "b", &["0x1008"], Some(0x1008)),
+        (Ppc64, "bl", &["0x1008"], Some(0x1008)),
+        (Ppc64, "blr", &[], None),
+        (Ppc32, "sc", &[], None),
+        (Ppc32, "tw", &["3", "r4", "r0"], None),
+        (Ppc32, "rfi", &[], None),
+        (Ppc32, "add", &["r3", "r4", "r5"], None),
+        (Ppc32, "add.", &["r3", "r4", "r5"], None),
+        (Ppc32, "addo", &["r3", "r4", "r5"], None),
+        (Ppc32, "stwu", &["r1", "-0x10(r1)"], None),
+        (Ppc32, "nop", &[], None),
+        (Ppc32, "vaddfp", &["v0", "v1", "v2"], None),
     ];
     for (arch, mnem, ops, target) in cases {
         let insn = synth_target(mnem, ops, *target);
@@ -1495,4 +1638,34 @@ fn control_op_matches_lift() {
     }
     assert_eq!(saw_control, 6, "{saw_control}");
     assert_eq!(saw_seq, 6, "{saw_seq}");
+    // PPC blob (big-endian words): b, bl, bne, bnel, blr, bctr, bctrl,
+    // sc, plus Seq filler (nop, addi, stwu). Every row must agree.
+    let ppc_blob: &[u8] = &[
+        0x48, 0x00, 0x00, 0x10, // b +0x10
+        0x48, 0x00, 0x00, 0x11, // bl +0x10
+        0x40, 0x82, 0x00, 0x40, // bne +0x40
+        0x40, 0x82, 0x00, 0x41, // bnel +0x40
+        0x4E, 0x80, 0x00, 0x20, // blr
+        0x4E, 0x80, 0x04, 0x20, // bctr
+        0x4E, 0x80, 0x04, 0x21, // bctrl
+        0x44, 0x00, 0x00, 0x02, // sc
+        0x60, 0x00, 0x00, 0x00, // nop
+        0x38, 0x64, 0x00, 0x01, // addi r3, r4, 1
+        0x94, 0x21, 0xFF, 0xF0, // stwu r1, -16(r1)
+        0x7C, 0x64, 0x00, 0x38, // and (unmapped? no: mapped And)
+    ];
+    let insns = disasm_range(Ppc32, ppc_blob, 0x10000, 100).expect("ppc decodes");
+    assert_eq!(insns.len(), 12);
+    let mut saw_control = 0;
+    let mut saw_seq = 0;
+    for insn in &insns {
+        assert_control_matches_lift(Ppc32, insn);
+        if control_op(Ppc32, insn).is_some() {
+            saw_control += 1;
+        } else {
+            saw_seq += 1;
+        }
+    }
+    assert_eq!(saw_control, 8, "{saw_control}");
+    assert_eq!(saw_seq, 4, "{saw_seq}");
 }

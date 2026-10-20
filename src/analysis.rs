@@ -2980,8 +2980,8 @@ enum CandMatch {
     Riscv,
     /// MIPS32 `addiu sp, sp, <imm>` word under a mask, at word steps.
     Mips,
-    /// PowerPC: no prologue shape modeled yet (follow-up: `stwu r1, ..`
-    /// plus `mflr`/`stw` LR spill); never matches.
+    /// PowerPC `stwu rS, <imm>(r1)` big-endian word under a mask, at word
+    /// steps (any source register; the base is always the stack pointer).
     Ppc,
     /// x86 byte patterns with a one-byte `push rbp`/`push ebp` step-back.
     X86,
@@ -3201,8 +3201,11 @@ impl<'a> CandStream<'a> {
                 }
                 None
             }
-            // No PowerPC prologue shape modeled yet; see [`CandMatch::Ppc`].
-            CandMatch::Ppc => None,
+            CandMatch::Ppc => {
+                let raw = self.data.get(off..off + 4)?;
+                let w = u32::from_be_bytes(raw.try_into().ok()?);
+                is_ppc_stwu_sp(w).then_some(va)
+            }
         }
     }
 }
@@ -3234,6 +3237,15 @@ fn is_riscv_c_addi16sp(hw: u16) -> bool {
 /// the low 16.
 fn is_mips_addiu_sp(word: u32) -> bool {
     word & 0xFFFF_0000 == 0x27BD_0000
+}
+
+/// Whether a big-endian word is PowerPC `stwu rS, <imm>(r1)` for any
+/// source register and any 16-bit immediate: the standard frame-setup
+/// prologue (store with update off the stack pointer `r1`). The opcode
+/// (`stwu`) and base register (`r1`) are fixed; the source register and
+/// immediate ride in the remaining fields.
+fn is_ppc_stwu_sp(word: u32) -> bool {
+    word & 0xFC1F_0000 == 0x9401_0000
 }
 
 /// Recursive-descent worklist state shared across seed rounds.
@@ -5790,13 +5802,13 @@ mod tests {
                 &[0xF0, 0xFF, 0xBD, 0x27],
                 &[0xFF, 0xFF, 0xFF, 0xFF],
             ),
-            // No PPC prologue shape modeled yet (see `CandMatch::Ppc`):
-            // any valid word stands in for M, the empty primary opcode
-            // for U, and a lone x86 nop for J.
+            // `stwu r1, -16(r1)` big-endian; every masked word decodes (no
+            // rejected form exists, so U behaves as a second M, like
+            // Aarch64); all-set junk.
             Arch::Ppc32 | Arch::Ppc64 => (
-                &[0x48, 0x00, 0x00, 0x00],
-                &[0x00, 0x00, 0x00, 0x00],
-                &[0x90],
+                &[0x94, 0x21, 0xFF, 0xF0],
+                &[0x94, 0x21, 0xFF, 0xF0],
+                &[0xFF, 0xFF, 0xFF, 0xFF],
             ),
             Arch::X86_64 => (&[0x48, 0x89, 0xE5], &[0x48, 0x89, 0xE5], &[0x90]),
             Arch::X86_32 => (&[0x89, 0xE5], &[0x89, 0xE5], &[0x90]),

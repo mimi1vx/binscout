@@ -1275,6 +1275,20 @@ fn load_object(
                 .to_string(),
         ));
     }
+    // PowerPC decodes big-endian words only: a little-endian ELF
+    // container (notably ppc64le) would decode as garbage, so it is
+    // rejected instead. COFF headers are always little-endian
+    // regardless of code endianness (PPC COFF code stays big-endian),
+    // so relocatable COFF objects skip this gate.
+    if matches!(arch, Arch::Ppc32 | Arch::Ppc64)
+        && format != BinaryFormat::Coff
+        && file.endianness() != object::Endianness::Big
+    {
+        return Err(Error::Unsupported(
+            "little-endian PowerPC is not supported (ppc32/ppc64 decode big-endian words only)"
+                .to_string(),
+        ));
+    }
     // Owned-name budget shared by sections/imports/exports below; counted
     // before each copy so repeated long names fail fast instead of OOMing.
     let mut meta_bytes: u64 = 0;
