@@ -270,9 +270,15 @@ pub enum Cmd {
     },
     /// Recovered stack-constructed strings: runs of
     /// `mov [rsp/rbp+off], imm` within one block, reassembled with
-    /// function and address. Read-only: never writes the binary or
-    /// the sidecar.
-    StackStrings { binary: PathBuf },
+    /// function and address, paged under the protocol-1 envelope.
+    /// Read-only: never writes the binary or the sidecar.
+    StackStrings {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Imports and exports.
     Symbols { binary: PathBuf },
     /// Section table: name, virtual address, in-memory and file sizes,
@@ -321,9 +327,15 @@ pub enum Cmd {
     /// a sidecar.
     SigGen { binary: PathBuf },
     /// Recover Go functions from the `pclntab` table (linker names plus
-    /// exact boundaries). Empty array when no table is located.
+    /// exact boundaries), paged under the protocol-1 envelope.
     /// Read-only: never writes the binary or a sidecar.
-    GoFuncs { binary: PathBuf },
+    GoFuncs {
+        binary: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
     /// Storage stats: binary size, sidecar DB size, and analysis counts.
     Stats { binary: PathBuf },
     /// Header metadata: triage staples (PE mitigations/imphash/PDB, ELF
@@ -695,7 +707,11 @@ impl Cli {
                 )
             }
             Cmd::Symbols { binary } => symbols(&binary, db, raw_opts, fat_arch, &debug),
-            Cmd::StackStrings { binary } => stack_strings(&binary, db, raw_opts, fat_arch, &debug),
+            Cmd::StackStrings {
+                binary,
+                offset,
+                limit,
+            } => stack_strings(&binary, db, raw_opts, fat_arch, &debug, offset, limit),
             Cmd::Sections { binary } => sections(&binary, db, raw_opts, fat_arch, &debug),
             Cmd::Ir { binary, addr, len } => {
                 ir(&binary, db, raw_opts, fat_arch, &debug, &addr, len)
@@ -735,7 +751,11 @@ impl Cli {
                 limit,
             ),
             Cmd::SigGen { binary } => sig_gen(&binary, db, raw_opts, fat_arch, &debug),
-            Cmd::GoFuncs { binary } => go_funcs(&binary, db, raw_opts, fat_arch, &debug),
+            Cmd::GoFuncs {
+                binary,
+                offset,
+                limit,
+            } => go_funcs(&binary, db, raw_opts, fat_arch, &debug, offset, limit),
             Cmd::Annotate {
                 binary,
                 addr,
@@ -1385,17 +1405,23 @@ fn symbols(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors subcommand args plus shared db/raw/fat-arch/debug"
+)]
 fn stack_strings(
     binary: &std::path::Path,
     db: Option<&std::path::Path>,
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
     debug: &binscout::DebugOptions,
+    offset: usize,
+    limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
-    Ok(
-        serde_json::to_value(open(binary, db, raw, fat_arch, debug)?.stack_strings())
-            .expect("stack strings serialize"),
+    Ok(serde_json::to_value(
+        open(binary, db, raw, fat_arch, debug)?.stack_strings_page(offset, limit),
     )
+    .expect("stack strings serialize"))
 }
 
 fn sections(
@@ -1524,9 +1550,11 @@ fn go_funcs(
     raw: Option<binscout::loader::RawOptions>,
     fat_arch: Option<&str>,
     debug: &binscout::DebugOptions,
+    offset: usize,
+    limit: usize,
 ) -> binscout::error::Result<serde_json::Value> {
     let p = open(binary, db, raw, fat_arch, debug)?;
-    Ok(serde_json::to_value(p.go_funcs()?).expect("go funcs serialize"))
+    Ok(serde_json::to_value(p.go_funcs_page(offset, limit)?).expect("go funcs serialize"))
 }
 
 #[allow(

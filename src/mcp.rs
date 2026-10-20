@@ -325,6 +325,24 @@ pub struct BinaryParams {
     pub fat_arch: Option<String>,
 }
 
+/// Parameters for paged single-binary tools (`stack_strings`, `go_funcs`).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PagedBinaryParams {
+    /// Path to the analyzed binary.
+    pub binary: String,
+    /// Explicit project DB path.
+    pub db: Option<String>,
+    /// Optional explicit raw mapping (`arch`/`base` required, `entry` optional).
+    pub raw: Option<RawParams>,
+    /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
+    /// or a `lipo` alias like `arm64`); required for fat containers.
+    pub fat_arch: Option<String>,
+    /// First row to return.
+    pub offset: Option<usize>,
+    /// Max rows (capped at 1024).
+    pub limit: Option<usize>,
+}
+
 /// Parameters for the `strings` tool: filtered, paged string search.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StringsParams {
@@ -1067,6 +1085,12 @@ struct BatchFlirt {
 }
 
 #[derive(serde::Deserialize)]
+struct BatchPage {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize)]
 struct BatchIrCoverage {
     arch: String,
     addr: Option<String>,
@@ -1331,7 +1355,11 @@ fn run_batch_op(
             Ok(serde_json::to_value(page).expect("strings envelope serializes"))
         }
         "stack_strings" => {
-            Ok(serde_json::to_value(proj.stack_strings()).expect("stack strings serialize"))
+            let a: BatchPage = parse_op(tool, params)?;
+            Ok(serde_json::to_value(
+                proj.stack_strings_page(a.offset.unwrap_or(0), a.limit.unwrap_or(50)),
+            )
+            .expect("stack strings serialize"))
         }
         "callees" | "callers" => {
             let a: BatchCallgraph = parse_op(tool, params)?;
@@ -1406,10 +1434,12 @@ fn run_batch_op(
         }
         "sig_gen" => Ok(serde_json::to_value(proj.generate_signatures())
             .expect("signature document serializes")),
-        "go_funcs" => proj
-            .go_funcs()
-            .map_err(|e| e.to_string())
-            .map(|funcs| serde_json::to_value(funcs).expect("go funcs serialize")),
+        "go_funcs" => {
+            let a: BatchPage = parse_op(tool, params)?;
+            proj.go_funcs_page(a.offset.unwrap_or(0), a.limit.unwrap_or(50))
+                .map_err(|e| e.to_string())
+                .map(|page| serde_json::to_value(page).expect("go funcs serialize"))
+        }
         "ir_coverage" => {
             let a: BatchIrCoverage = parse_op(tool, params)?;
             let arch = crate::parse_raw_arch(&a.arch).map_err(|e| e.to_string())?;
@@ -1994,13 +2024,17 @@ impl BinscoutMcp {
 
     #[tool(
         name = "stack_strings",
-        description = "Recovered stack-constructed strings: runs of mov [rsp/rbp+off], imm within one block, reassembled with function and address; read-only, never writes the binary or the sidecar"
+        description = "Recovered stack-constructed strings: runs of mov [rsp/rbp+off], imm within one block, reassembled with function and address; paged under the protocol-1 envelope"
     )]
-    async fn stack_strings(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+    async fn stack_strings(&self, p: Parameters<PagedBinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
-        ok(serde_json::to_value(entry.lock_project().stack_strings())
-            .expect("stack strings serialize"))
+        ok(serde_json::to_value(
+            entry
+                .lock_project()
+                .stack_strings_page(p.offset.unwrap_or(0), p.limit.unwrap_or(50)),
+        )
+        .expect("stack strings serialize"))
     }
 
     #[tool(
@@ -2374,15 +2408,15 @@ impl BinscoutMcp {
 
     #[tool(
         name = "go_funcs",
-        description = "Recover Go functions from the pclntab table: linker names plus exact entry/end ranges for stripped Go binaries. Empty array when no table is located; read-only, never writes the binary or the sidecar"
+        description = "Recover Go functions from the pclntab table: linker names plus exact entry/end ranges for stripped Go binaries; paged under the protocol-1 envelope"
     )]
-    async fn go_funcs(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
+    async fn go_funcs(&self, p: Parameters<PagedBinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        proj.go_funcs()
+        proj.go_funcs_page(p.offset.unwrap_or(0), p.limit.unwrap_or(50))
             .map_err(error_data)
-            .and_then(|funcs| ok(serde_json::to_value(funcs).expect("go funcs serialize")))
+            .and_then(|page| ok(serde_json::to_value(page).expect("go funcs serialize")))
     }
 
     #[tool(

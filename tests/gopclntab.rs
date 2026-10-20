@@ -164,7 +164,9 @@ fn new_format_magics_recover_names_and_boundaries() {
         let dir = tmpdir(&format!("go-{tag}"));
         let (ok, v) = go_funcs_cli(&dir, tag, &raw_with_table(&build_new(magic)));
         assert!(ok, "{v}");
-        let funcs = v.as_array().expect("array");
+        assert_eq!(v["protocol"], 1);
+        assert_eq!(v["total"], 2);
+        let funcs = v["items"].as_array().expect("items");
         assert_eq!(funcs.len(), 2, "{v}");
         assert_eq!(funcs[0]["name"], "main.main");
         assert_eq!(funcs[0]["entry"], BASE + 0x100);
@@ -183,7 +185,9 @@ fn old_format_magics_recover_names_and_boundaries() {
     let dir = tmpdir("go-old");
     let (ok, v) = go_funcs_cli(&dir, "go116", &raw_with_table(&build_go116()));
     assert!(ok, "{v}");
-    let funcs = v.as_array().expect("array");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 2);
+    let funcs = v["items"].as_array().expect("items");
     assert_eq!(funcs.len(), 2, "{v}");
     assert_eq!(funcs[0]["name"], "go16.a");
     assert_eq!(funcs[0]["entry"], BASE + 0x100);
@@ -192,7 +196,9 @@ fn old_format_magics_recover_names_and_boundaries() {
 
     let (ok, v) = go_funcs_cli(&dir, "go12", &raw_with_table(&build_go12()));
     assert!(ok, "{v}");
-    let funcs = v.as_array().expect("array");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 2);
+    let funcs = v["items"].as_array().expect("items");
     assert_eq!(funcs.len(), 2, "{v}");
     assert_eq!(funcs[0]["name"], "go12.a");
     assert_eq!(funcs[0]["entry"], BASE + 0x100);
@@ -207,7 +213,9 @@ fn truncated_table_scans_clean() {
     table.truncate(40); // magic + partial header: no valid table
     let (ok, v) = go_funcs_cli(&dir, "trunc", &raw_with_table(&table));
     assert!(ok, "{v}");
-    assert_eq!(v, Value::Array(vec![]));
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 0);
+    assert!(v["items"].as_array().expect("items").is_empty());
     cleanup(&dir);
 }
 
@@ -287,7 +295,9 @@ fn section_path_serves_stripped_style_binaries() {
     let args: Vec<&str> = vec!["--db", &db_s, "go-funcs", &bin_s];
     let (ok, v) = run(&args);
     assert!(ok, "{v}");
-    let funcs = v.as_array().expect("array");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 2);
+    let funcs = v["items"].as_array().expect("items");
     assert_eq!(funcs.len(), 2, "{v}");
     assert_eq!(funcs[0]["name"], "main.main");
     assert_eq!(funcs[0]["entry"], BASE + 0x100);

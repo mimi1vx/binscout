@@ -369,6 +369,8 @@ fn cli_go_funcs_empty_on_non_go() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let (ok, v) = run(&args);
     assert!(ok, "{v}");
-    assert_eq!(v, Value::Array(vec![]), "non-Go blob recovers nothing");
+    assert_eq!(v["protocol"], 1, "non-Go blob recovers nothing: {v}");
+    assert_eq!(v["total"], 0);
+    assert!(v["items"].as_array().expect("items").is_empty());
     cleanup(&dir);
 }

@@ -409,3 +409,27 @@ fn batch_output_cap_skips_tail() {
     );
     cleanup(&dir);
 }
+
+#[test]
+fn batch_stack_strings_pages_envelope() {
+    let dir = tmpdir("mcp-batch-stack");
+    // Same mov-built blob as tests/stack_strings.rs: three recoveries.
+    let blob = vec![
+        0xC6, 0x44, 0x24, 0x00, 0x48, 0xC6, 0x44, 0x24, 0x01, 0x65, 0xC6, 0x44, 0x24, 0x02, 0x79,
+        0xC6, 0x44, 0x24, 0x03, 0x21, 0xC7, 0x44, 0x24, 0x08, 0x74, 0x65, 0x73, 0x74, 0xC6, 0x40,
+        0x10, 0x41, 0xB8, 0x41, 0x00, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x20, 0x5A, 0xC7, 0x45, 0xF0,
+        0x61, 0x62, 0x63, 0x64, 0xC3,
+    ];
+    let bin = write_bin(&dir, "stack.bin", &blob).display().to_string();
+    let db = temp_db(&dir, "stack").display().to_string();
+    let ops = vec![op("stack_strings", json!({"limit": 1}))];
+    let batch = tool_once(10, "batch", json!({"binary": bin, "db": db, "ops": ops}));
+    let results = batch["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    let page = &results[0]["ok"];
+    assert_eq!(page["protocol"], 1);
+    assert!(page["total"].as_u64().expect("total") >= 2);
+    assert_eq!(page["items"].as_array().expect("items").len(), 1);
+    assert_eq!(page["next_offset"], 1);
+    cleanup(&dir);
+}

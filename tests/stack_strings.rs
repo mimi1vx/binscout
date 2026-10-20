@@ -63,16 +63,33 @@ fn mov_runs_reassemble_with_func_and_addr() {
 }
 
 #[test]
-fn cli_stack_strings_is_one_json_array() {
+fn cli_stack_strings_is_paged_envelope() {
     let dir = tmpdir("stackstr-cli");
     let bin = write_bin(&dir, "stack.bin", &stack_blob());
     let bin_s = bin.display().to_string();
     let db = temp_db(&dir, "stack").display().to_string();
     let (ok, v) = run_cli(&["--db", &db, "stack-strings", &bin_s]);
     assert!(ok, "{v}");
-    let rows = v.as_array().expect("array");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["total"], 3);
+    let rows = v["items"].as_array().expect("items");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["value"], "Hey!");
     assert_eq!(rows[2]["value"], "abcd");
+    cleanup(&dir);
+}
+
+#[test]
+fn cli_stack_strings_paging_returns_first_row() {
+    let dir = tmpdir("stackstr-page");
+    let bin = write_bin(&dir, "stack.bin", &stack_blob());
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "stack").display().to_string();
+    let (ok, v) = run_cli(&["--db", &db, "stack-strings", &bin_s, "--limit", "1"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert!(v["total"].as_u64().expect("total") >= 2);
+    assert_eq!(v["items"].as_array().expect("items").len(), 1);
+    assert_eq!(v["next_offset"], 1);
     cleanup(&dir);
 }

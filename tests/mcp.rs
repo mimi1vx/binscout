@@ -365,8 +365,10 @@ fn all_tools_return_json_over_stdio() {
     assert!(headers["pe"].is_null());
 
     let stack: Value = serde_json::from_str(tool_text(by_id[&34])).expect("stack_strings json");
+    assert_eq!(stack["protocol"], 1);
+    assert_eq!(stack["total"], 0);
     assert!(
-        stack.as_array().expect("array").is_empty(),
+        stack["items"].as_array().expect("items").is_empty(),
         "clean blob builds no stack strings"
     );
 
@@ -1950,8 +1952,64 @@ fn sig_gen_go_funcs_and_sigs_param_over_mcp() {
         "user signature hints: {hints}"
     );
 
-    // No Go table in this blob: empty array, not an error.
+    // No Go table in this blob: empty page, not an error.
     let go: Value = tool_once(64, "go_funcs", json!({"binary": bin, "db": db, "raw": raw}));
-    assert_eq!(go, Value::Array(vec![]), "{go}");
+    assert_eq!(go["protocol"], 1, "{go}");
+    assert_eq!(go["total"], 0);
+    assert!(go["items"].as_array().expect("items").is_empty(), "{go}");
+    cleanup(&dir);
+}
+
+#[test]
+fn mcp_go_funcs_pages_table() {
+    let dir = tmpdir("mcp-gofuncs");
+    // Synthetic 1.18+ table: magic plus two functab entries.
+    let mut table = vec![0u8; 8 + 8 * 8];
+    table[0..4].copy_from_slice(&0xfffffff1u32.to_le_bytes());
+    table[6] = 1;
+    table[7] = 8;
+    let ptr = 8usize;
+    let word = |t: &mut Vec<u8>, i: usize, v: u64| {
+        t[8 + i * ptr..8 + i * ptr + 8].copy_from_slice(&v.to_le_bytes());
+    };
+    let functab_off = (8 + 8 * ptr) as u64;
+    let names_off = functab_off + 5 * 4 + 2 * 12;
+    word(&mut table, 0, 2);
+    word(&mut table, 1, 1);
+    word(&mut table, 2, 0);
+    word(&mut table, 3, names_off);
+    word(&mut table, 4, names_off);
+    word(&mut table, 5, names_off);
+    word(&mut table, 6, names_off);
+    word(&mut table, 7, functab_off);
+    for v in [0x100u32, 20, 0x140, 32, 0x180] {
+        table.extend_from_slice(&v.to_le_bytes());
+    }
+    table.extend_from_slice(&0x100u32.to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(&0x140u32.to_le_bytes());
+    table.extend_from_slice(&10u32.to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(b"main.main\0main.helper\0");
+    const TAB_OFF: usize = 0x200;
+    const BASE: u64 = 0x400_000;
+    let mut blob = vec![0x90u8; TAB_OFF + table.len() + 0x40];
+    blob[0] = 0xC3;
+    blob[TAB_OFF..TAB_OFF + table.len()].copy_from_slice(&table);
+    let bin = write_bin(&dir, "go.bin", &blob).display().to_string();
+    let db = temp_db(&dir, "go").display().to_string();
+    let raw = serde_json::json!({"arch": "x86_64", "base": "0x400000", "entry": "0x400000"});
+    let go: Value = tool_once(
+        60,
+        "go_funcs",
+        serde_json::json!({"binary": bin, "db": db, "raw": raw}),
+    );
+    assert_eq!(go["protocol"], 1, "{go}");
+    assert_eq!(go["total"], 2);
+    let items = go["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["name"], "main.main");
+    assert_eq!(items[0]["entry"], BASE + 0x100);
     cleanup(&dir);
 }

@@ -4368,6 +4368,27 @@ impl Project {
         crate::stackstrings::recover(&self.analysis)
     }
 
+    /// Recovered stack-constructed strings, paged under the protocol-1 envelope; read-only.
+    ///
+    /// Same rows as [`Project::stack_strings`], with `total` the full
+    /// recovery count and `items` the requested page. Never writes the
+    /// binary or the sidecar.
+    #[must_use]
+    pub fn stack_strings_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Page<crate::stackstrings::StackString> {
+        let all = crate::stackstrings::recover(&self.analysis);
+        let total = all.len();
+        let items: Vec<crate::stackstrings::StackString> = all
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .collect();
+        page_envelope(total, offset, limit, items)
+    }
+
     /// Search mapped file bytes for a literal/wildcard pattern, paged.
     ///
     /// `pattern` is whitespace-separated full-byte tokens, each two hex
@@ -4684,6 +4705,30 @@ impl Project {
     /// [`Error::Unsupported`] on a big-endian table.
     pub fn go_funcs(&self) -> Result<Vec<crate::gopclntab::GoFunc>> {
         crate::gopclntab::recover(&self.binary)
+    }
+
+    /// Recovered Go functions, paged under the protocol-1 envelope; read-only.
+    ///
+    /// Same rows as [`Project::go_funcs`], with `total` the full table
+    /// count and `items` the requested page. Never writes the binary or
+    /// the sidecar.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] on a corrupt located table,
+    /// [`Error::Unsupported`] on a big-endian table.
+    pub fn go_funcs_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<crate::gopclntab::GoFunc>> {
+        let all = crate::gopclntab::recover(&self.binary)?;
+        let total = all.len();
+        let items: Vec<crate::gopclntab::GoFunc> = all
+            .into_iter()
+            .skip(offset)
+            .take(limit.min(MAX_ROWS))
+            .collect();
+        Ok(page_envelope(total, offset, limit, items))
     }
 }
 
