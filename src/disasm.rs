@@ -1800,11 +1800,14 @@ pub(crate) fn arm_base_mnem(mnem: &str) -> &str {
 }
 
 /// Final address of a two-instruction constant pair ending at `second`,
-/// if any: an AArch64 `adrp`+`add`/`ldr` pair or an ARM32 `movw`+`movt`
-/// pair (see [`resolve_adrp_pair`] and [`resolve_movw_pair`). The two
-/// arches never share a row, so trying both never double-resolves.
+/// if any: an AArch64 `adrp`+`add`/`ldr` pair, an ARM32 `movw`+`movt`
+/// pair (see [`resolve_adrp_pair`] and [`resolve_movw_pair`]), or a
+/// RISC-V `auipc` pair (see [`resolve_auipc_pair`]). The arches never
+/// share a row, so trying each in turn never double-resolves.
 pub(crate) fn resolve_const_pair(first: &Insn, second: &Insn) -> Option<u64> {
-    resolve_adrp_pair(first, second).or_else(|| resolve_movw_pair(first, second))
+    resolve_adrp_pair(first, second)
+        .or_else(|| resolve_movw_pair(first, second))
+        .or_else(|| resolve_auipc_pair(first, second))
 }
 
 /// Decode exactly one ARMv7 instruction from the start of `bytes`
@@ -2175,6 +2178,75 @@ fn riscv_mem_target(inst: &RiscvInsn, addr: u64) -> Option<u64> {
     }
     let off = i64::from(inst.offset);
     Some(addr.wrapping_add_signed(off))
+}
+
+/// Final address of an `auipc` + second-instruction pair, if any.
+///
+/// `auipc` materializes only the PC-relative page base (see
+/// [`Insn::mem_target`]); the low 12 bits ride in the next instruction,
+/// so the referenced address spans two instructions. Returns the `auipc`
+/// page plus the second instruction's signed offset when `first` is an
+/// `auipc` with a decoded page base and `second` consumes the same
+/// register:
+///
+/// - `addi`/`addiw <dst>, <base>, <simm>` with exactly three operands
+///   (`<base>` equals the `auipc` destination; `<dst>` may differ) and
+/// - `lw`/`ld` loads `<dst>, <simm>(<base>)` plus `sw` stores `<src>,
+///   <simm>(<base>)` (the final address is the referenced global).
+///
+/// These are the linker-relaxation shapes (`PCREL_HI20` paired with
+/// `PCREL_LO12_I/S`: what `la` and global data accesses expand to).
+/// Anything else (wrong mnemonics, register mismatch, unparseable
+/// offsets, missing page base) returns `None`; the function never
+/// guesses. Pairing (adjacency, same block) is the caller's job.
+pub(crate) fn resolve_auipc_pair(first: &Insn, second: &Insn) -> Option<u64> {
+    if first.mnem != "auipc" {
+        return None;
+    }
+    let page = first.mem_target?;
+    let base = first.ops.first()?;
+    match second.mnem.as_str() {
+        "addi" | "addiw" => {
+            if second.ops.len() != 3 || second.ops[1] != *base {
+                return None;
+            }
+            let off = parse_riscv_simm(&second.ops[2])?;
+            Some(page.wrapping_add_signed(off))
+        }
+        "lw" | "ld" | "sw" => {
+            if second.ops.len() != 2 {
+                return None;
+            }
+            let (off, reg) = split_riscv_offset(&second.ops[1])?;
+            if reg != base.as_str() {
+                return None;
+            }
+            Some(page.wrapping_add_signed(off))
+        }
+        _ => None,
+    }
+}
+
+/// Signed RISC-V immediate as printed (`52`, `-4`, `0x34`): an optional
+/// sign, then decimal or `0x`-hex digits. Anything else is `None`.
+fn parse_riscv_simm(op: &str) -> Option<i64> {
+    let (neg, digits) = match op.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, op.strip_prefix('+').unwrap_or(op)),
+    };
+    let mag = i64::try_from(parse_digits(digits)?).ok()?;
+    Some(if neg { mag.wrapping_neg() } else { mag })
+}
+
+/// Signed offset and base register of an `off(base)` memory operand, if
+/// it has that shape.
+fn split_riscv_offset(slot: &str) -> Option<(i64, &str)> {
+    let (off, rest) = slot.split_once('(')?;
+    let reg = rest.strip_suffix(')')?;
+    if reg.is_empty() || reg.contains(['(', ')']) {
+        return None;
+    }
+    Some((parse_riscv_simm(off)?, reg))
 }
 
 /// Decode only the first RISC-V instruction in `bytes` (loaded at `va`).
@@ -2795,6 +2867,10 @@ mod tests {
         disasm_arm32(bytes, va, 8).expect("movw pair must decode")
     }
 
+    fn auipc_pair(bytes: &[u8], va: u64) -> Vec<Insn> {
+        disasm_riscv(bytes, va, 8, 64).expect("auipc pair must decode")
+    }
+
     #[test]
     fn movw_movt_pair_resolves_final_address() {
         // movw r0, #0x9000; movt r0, #0x0 -> 0x9000.
@@ -2898,5 +2974,78 @@ mod tests {
         bad_ldr.mnem = "ldr".to_string();
         bad_ldr.ops = vec!["x0".to_string(), "[x1".to_string(), "#0x8]".to_string()];
         assert_eq!(resolve_adrp_pair(&v[0], &bad_ldr), None);
+    }
+
+    #[test]
+    fn auipc_addi_pair_resolves_final_address() {
+        // auipc a0, 2 at 0x10000 (page 0x12000); addi a0, a0, 52.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x13, 0x05, 0x45, 0x03], 0x10000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].mem_target, Some(0x12000));
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+        // addiw decodes the same shape and resolves identically.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x9B, 0x05, 0x45, 0x03], 0x10000);
+        assert_eq!(v[1].ops, ["a1", "a0", "52"]);
+        assert_eq!(v[1].mnem, "addiw");
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+        // Negative offsets sign-extend: addi a0, a0, -1 off the page.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x13, 0x05, 0xF5, 0xFF], 0x10000);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x11FFF));
+        // Cross-destination addi still resolves: only the base must match.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x93, 0x05, 0x45, 0x03], 0x10000);
+        assert_eq!(v[1].ops, ["a1", "a0", "52"]);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+    }
+
+    #[test]
+    fn auipc_load_store_pair_resolves_final_address() {
+        // auipc a0, 2 at 0x10000 (page 0x12000); lw a0, 52(a0).
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x03, 0x25, 0x45, 0x03], 0x10000);
+        assert_eq!(v.len(), 2);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+        // ld resolves the same slot shape.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x03, 0x35, 0x45, 0x03], 0x10000);
+        assert_eq!(v[1].mnem, "ld");
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+        // sw references the stored-to global the same way.
+        let v = auipc_pair(&[0x17, 0x26, 0x00, 0x00, 0x23, 0x22, 0xA6, 0x02], 0x10010);
+        assert_eq!(v[0].mem_target, Some(0x12010));
+        assert_eq!(v[1].mnem, "sw");
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x12034));
+        // Negative load offsets sign-extend: lw a0, -4(a0) off the page.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x03, 0x25, 0xC5, 0xFF], 0x10000);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), Some(0x11FFC));
+    }
+
+    #[test]
+    fn auipc_pair_rejects_non_pairs() {
+        // Base mismatch: auipc a0 but addi a1, a1, 52.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x93, 0x85, 0x45, 0x03], 0x10000);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), None);
+        // Wrong second mnemonic: register-register add never resolves.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x33, 0x05, 0xB5, 0x00], 0x10000);
+        assert_eq!(v[1].mnem, "add");
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), None);
+        // Load base mismatch: lw a0, 52(a1).
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x03, 0xA5, 0x45, 0x03], 0x10000);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), None);
+        // First instruction is not auipc.
+        let v = auipc_pair(&[0x13, 0x05, 0x45, 0x03, 0x13, 0x05, 0x45, 0x03], 0x10000);
+        assert_eq!(resolve_auipc_pair(&v[0], &v[1]), None);
+        // Missing page base never resolves.
+        let v = auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x13, 0x05, 0x45, 0x03], 0x10000);
+        let mut no_page = v[0].clone();
+        no_page.mem_target = None;
+        assert_eq!(resolve_auipc_pair(&no_page, &v[1]), None);
+        // Unparseable offsets never resolve, never panic.
+        let mut bad_imm = v[1].clone();
+        bad_imm.ops[2] = "zz".to_string();
+        assert_eq!(resolve_auipc_pair(&v[0], &bad_imm), None);
+        let mut bad_slot =
+            auipc_pair(&[0x17, 0x25, 0x00, 0x00, 0x03, 0x25, 0x45, 0x03], 0x10000)[1].clone();
+        bad_slot.ops[1] = "52a0)".to_string();
+        assert_eq!(resolve_auipc_pair(&v[0], &bad_slot), None);
+        bad_slot.ops[1] = "52()".to_string();
+        assert_eq!(resolve_auipc_pair(&v[0], &bad_slot), None);
     }
 }

@@ -208,8 +208,9 @@ pub fn render_rows(rows: &[IrInsn]) -> PseudoRender {
 /// Render one function's pseudo-C: blocks in ascending start order, each
 /// instruction lifted for `arch` (see [`crate::ir::lift`]) and rendered.
 ///
-/// An `add`/`ldr` immediately following its `adrp` in the same block keeps
-/// the pair's resolved final address as a `// => 0x...` suffix on its line;
+/// An instruction ending a const-materialization pair (`adrp`, `movw`,
+/// or `auipc`, with its follower in the same block) keeps the pair's
+/// resolved final address as a `// => 0x...` suffix on its line;
 /// anything else renders unchanged.
 ///
 /// [`crate::Project::pseudo_of`] enriches these rows further at render
