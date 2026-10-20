@@ -553,7 +553,7 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     assert!(ok, "{n}");
     assert_eq!(h, n, "hex and decimal must filter identically");
     assert_eq!(h["total"], 4);
-    assert_eq!(h["xrefs"].as_array().expect("xrefs array").len(), 4);
+    assert_eq!(h["items"].as_array().expect("items array").len(), 4);
 
     for (a, b) in [("String", "string"), ("DATA", "data")] {
         let (ok, upper) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--kind", a]);
@@ -566,9 +566,9 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     assert!(ok, "{s}");
     assert_eq!(s["total"], 2);
     assert!(
-        s["xrefs"]
+        s["items"]
             .as_array()
-            .expect("xrefs array")
+            .expect("items array")
             .iter()
             .all(|x| x["kind"] == "String"),
         "{s}"
@@ -578,12 +578,31 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     let (ok, p) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--limit", "1"]);
     assert!(ok, "{p}");
     assert_eq!(p["total"], 4);
-    assert_eq!(p["xrefs"].as_array().expect("xrefs array").len(), 1);
+    assert_eq!(p["items"].as_array().expect("items array").len(), 1);
 
     // Bad kind stays a JSON error envelope.
     let (ok, v) = run(&["--db", d, "xrefs", &bin_s, "--kind", "nope"]);
     assert!(!ok);
     assert!(v.get("error").is_some(), "{v}");
+    cleanup(&dir);
+}
+
+#[test]
+fn xrefs_page_envelope_shape() {
+    let dir = tmpdir("xrefs-envelope");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "x").display().to_string();
+    let d = db.as_str();
+    let va = common::builders::BASIC_STRING_VA;
+    let hex = format!("{va:#x}");
+
+    let (ok, v) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--limit", "1"]);
+    assert!(ok, "{v}");
+    assert!(v["total"].as_u64().expect("total") > 1, "{v}");
+    assert_eq!(v["protocol"], 1);
+    assert_eq!(v["items"].as_array().expect("items array").len(), 1);
+    assert_eq!(v["next_offset"], 1);
     cleanup(&dir);
 }
 

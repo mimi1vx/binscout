@@ -473,8 +473,8 @@ fn cli_xrefs_accepts_import_kind() {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout is one JSON value");
     assert_eq!(v["total"], 1);
-    assert_eq!(v["xrefs"][0]["from"], PE64_ENTRY);
-    assert_eq!(v["xrefs"][0]["kind"], "Import");
+    assert_eq!(v["items"][0]["from"], PE64_ENTRY);
+    assert_eq!(v["items"][0]["kind"], "Import");
     cleanup(&dir);
 }
 

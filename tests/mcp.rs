@@ -927,7 +927,7 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
     let n: Value = serde_json::from_str(tool_text(by_id[&11])).expect("dec json");
     assert_eq!(h, n, "hex and decimal must filter identically");
     assert_eq!(h["total"], 4);
-    assert_eq!(h["xrefs"].as_array().expect("xrefs array").len(), 4);
+    assert_eq!(h["items"].as_array().expect("items array").len(), 4);
 
     let upper: Value = serde_json::from_str(tool_text(by_id[&12])).expect("kind json");
     let lower: Value = serde_json::from_str(tool_text(by_id[&13])).expect("kind json");
@@ -936,7 +936,7 @@ fn xrefs_hex_equals_decimal_kind_case_insensitive_with_total() {
 
     let paged: Value = serde_json::from_str(tool_text(by_id[&14])).expect("paged json");
     assert_eq!(paged["total"], 4);
-    assert_eq!(paged["xrefs"].as_array().expect("xrefs array").len(), 1);
+    assert_eq!(paged["items"].as_array().expect("items array").len(), 1);
     cleanup(&dir);
 }
 
@@ -956,7 +956,7 @@ fn xrefs_carry_context_and_strings_with_xrefs() {
         json!({"binary": bin, "db": db, "to": hex, "kind": "string"}),
     );
     assert_eq!(v["total"], 2);
-    for row in v["xrefs"].as_array().expect("xrefs array") {
+    for row in v["items"].as_array().expect("items array") {
         assert_eq!(row["from_func"], common::builders::BASIC_ENTRY_VA);
         assert_eq!(row["from_func_name"], common::builders::BASIC_EXPORT);
         assert_eq!(row["to_name"], Value::Null);

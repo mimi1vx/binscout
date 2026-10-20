@@ -147,9 +147,9 @@ fn nopie_absolute_refs_visible_via_cli() {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout is one JSON value");
     assert_eq!(v["total"], 6, "{v}");
-    let kinds: Vec<String> = v["xrefs"]
+    let kinds: Vec<String> = v["items"]
         .as_array()
-        .expect("xrefs array")
+        .expect("items array")
         .iter()
         .map(|x| x["kind"].as_str().expect("kind string").to_string())
         .collect();

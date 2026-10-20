@@ -316,7 +316,7 @@ fn cli_xrefs_carry_context_and_strings_with_xrefs() {
     let (ok, v) = run(&["--db", d, "xrefs", &bin_s, "--to", &hex, "--kind", "string"]);
     assert!(ok, "{v}");
     assert_eq!(v["total"], 2);
-    for row in v["xrefs"].as_array().expect("xrefs array") {
+    for row in v["items"].as_array().expect("items array") {
         assert_eq!(row["from_func"], builders::BASIC_ENTRY_VA);
         assert_eq!(row["from_func_hex"], "0x401000");
         assert_eq!(row["from_func_name"], builders::BASIC_EXPORT);

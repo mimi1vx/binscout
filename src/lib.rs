@@ -4022,7 +4022,7 @@ impl Project {
 
     /// Xrefs filtered by endpoint/kind with the pre-page count, in one pass.
     ///
-    /// The single call behind the CLI/MCP `xrefs` envelope: `total` is the
+    /// The single call behind the CLI/MCP `xrefs` page envelope: `total` is the
     /// exact match count and `items` the requested page, computed in one
     /// index-narrowed pass instead of separate count and page scans. `limit`
     /// clips to `MAX_ROWS`, as in [`Project::query_xrefs`].
@@ -4053,7 +4053,7 @@ impl Project {
     }
 
     /// Count of xrefs matching the [`Project::query_xrefs`] filters, before
-    /// paging. The CLI/MCP `xrefs` envelope reports this as `total` so
+    /// paging. The CLI/MCP `xrefs` page envelope reports this as `total` so
     /// large result sets page without scanning blind.
     #[must_use]
     pub fn count_xrefs(&self, to: Option<u64>, from: Option<u64>, kind: Option<XrefKind>) -> usize {
@@ -4062,7 +4062,7 @@ impl Project {
 
     /// Xrefs filtered by endpoint/kind with listing context, in one pass.
     ///
-    /// The enriched single call behind the CLI/MCP `xrefs` envelope:
+    /// The enriched single call behind the CLI/MCP `xrefs` page envelope:
     /// `total` is the exact match count and `items` the requested page of
     /// [`XrefRow`] rows, computed in one index-narrowed pass like
     /// [`Project::query_xrefs_page`]. The listing context (render-time
@@ -4088,6 +4088,24 @@ impl Project {
             .map(|x| self.enrich_xref(&ctx, x))
             .collect();
         (total, items)
+    }
+
+    /// Xrefs filtered by endpoint/kind with listing context, under the protocol-1 envelope.
+    ///
+    /// Combines [`Project::query_xref_rows_page`] (exact `total`) with the
+    /// [`Page`] envelope: `total` is the exact match count and `items`
+    /// holds the requested page of [`XrefRow`] rows.
+    #[must_use]
+    pub fn xref_rows_envelope(
+        &self,
+        to: Option<u64>,
+        from: Option<u64>,
+        kind: Option<XrefKind>,
+        offset: usize,
+        limit: usize,
+    ) -> Page<XrefRow> {
+        let (total, rows) = self.query_xref_rows_page(to, from, kind, offset, limit);
+        page_envelope(total, offset, limit, rows)
     }
 
     /// Resolve one xref's listing context: containing function, display

@@ -1338,8 +1338,10 @@ fn xrefs(
     let p = open(binary, db, raw, fat_arch, debug)?;
     let kind = kind.map(binscout::parse_xref_kind).transpose()?;
     let (to, from) = (opt_addr(to)?, opt_addr(from)?);
-    let (total, rows) = p.query_xref_rows_page(to, from, kind, offset, limit);
-    Ok(serde_json::json!({ "total": total, "xrefs": rows }))
+    Ok(
+        serde_json::to_value(p.xref_rows_envelope(to, from, kind, offset, limit))
+            .expect("xrefs page serializes"),
+    )
 }
 
 #[allow(

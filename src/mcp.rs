@@ -1313,14 +1313,14 @@ fn run_batch_op(
                 .map(|v| parse_addr(&v))
                 .transpose()
                 .map_err(|e| e.to_string())?;
-            let (total, rows) = proj.query_xref_rows_page(
+            Ok(serde_json::to_value(proj.xref_rows_envelope(
                 to,
                 from,
                 kind,
                 a.offset.unwrap_or(0),
                 a.limit.unwrap_or(50),
-            );
-            Ok(serde_json::json!({ "total": total, "xrefs": rows }))
+            ))
+            .expect("xrefs page serializes"))
         }
         "strings" => {
             let a: BatchStrings = parse_op(tool, params)?;
@@ -1950,7 +1950,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "xrefs",
-        description = "Cross-references filtered by to/from address and kind, paged with total match count; rows carry the containing function (from_func/from_func_name), the target display name (to_name), and the string preview for string-kind rows (to_string)"
+        description = "Cross-references filtered by to/from address and kind, under the protocol-1 page envelope; rows carry the containing function (from_func/from_func_name), the target display name (to_name), and the string preview for string-kind rows (to_string)"
     )]
     async fn xrefs(&self, p: Parameters<XrefsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1969,9 +1969,14 @@ impl BinscoutMcp {
             .transpose()
             .map_err(error_data)?;
         let (to, from) = (opt_addr(to_s)?, opt_addr(from_s)?);
-        let (total, rows) =
-            proj.query_xref_rows_page(to, from, kind, offset.unwrap_or(0), limit.unwrap_or(50));
-        ok(serde_json::json!({ "total": total, "xrefs": rows }))
+        ok(serde_json::to_value(proj.xref_rows_envelope(
+            to,
+            from,
+            kind,
+            offset.unwrap_or(0),
+            limit.unwrap_or(50),
+        ))
+        .expect("xrefs page serializes"))
     }
 
     #[tool(
