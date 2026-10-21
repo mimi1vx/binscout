@@ -402,17 +402,17 @@ pub struct FunctionsParams {
     pub caller: Option<String>,
     /// Keep functions called by the function containing this address.
     pub callee: Option<String>,
-    /// Keep functions with entry at or above this address (needs range_hi).
-    /// Inclusive bounds (`entry >= lo && entry <= hi`).
+    /// Inclusive lower bound (with range_hi): keeps lo <= x <= hi.
+    /// Give one pair, not both.
     pub range_lo: Option<String>,
-    /// Keep functions with entry at or below this address (needs range_lo).
-    /// Inclusive bounds (`entry >= lo && entry <= hi`).
+    /// Inclusive upper bound (with range_lo): keeps lo <= x <= hi.
+    /// Give one pair, not both.
     pub range_hi: Option<String>,
-    /// Deprecated alias of `range_lo` (inclusive semantics, warns on
-    /// stderr). `range_lo` wins when both are given.
+    /// Half-open start (with range_end): keeps start <= x < end.
+    /// Give one pair, not both.
     pub range_start: Option<String>,
-    /// Deprecated alias of `range_hi` (inclusive semantics, warns on
-    /// stderr). `range_hi` wins when both are given.
+    /// Half-open end (with range_start): keeps start <= x < end.
+    /// Give one pair, not both.
     pub range_end: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
@@ -701,17 +701,17 @@ pub struct SearchBytesParams {
     pub pattern: String,
     /// Keep matches fully inside this section (e.g. `.text`).
     pub section: Option<String>,
-    /// Range start (`0x`-hex or decimal, needs range_end). Half-open
-    /// `[lo, hi)` over match virtual addresses.
+    /// Half-open start (with range_end): keeps start <= x < end.
+    /// Give one pair, not both.
     pub range_start: Option<String>,
-    /// Range end (`0x`-hex or decimal, needs range_start). Half-open
-    /// `[lo, hi)` over match virtual addresses.
+    /// Half-open end (with range_start): keeps start <= x < end.
+    /// Give one pair, not both.
     pub range_end: Option<String>,
-    /// Deprecated alias of `range_start` (half-open semantics, warns on
-    /// stderr). `range_start` wins when both are given.
+    /// Inclusive lower bound (with range_hi): keeps lo <= x <= hi.
+    /// Give one pair, not both.
     pub range_lo: Option<String>,
-    /// Deprecated alias of `range_end` (half-open semantics, warns on
-    /// stderr). `range_end` wins when both are given.
+    /// Inclusive upper bound (with range_lo): keeps lo <= x <= hi.
+    /// Give one pair, not both.
     pub range_hi: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
@@ -1115,6 +1115,47 @@ fn invalid_msg(e: crate::error::Error) -> String {
     }
 }
 
+/// One accepted range spelling: inclusive `[lo, hi]` or half-open `[start, end)`.
+enum RangeArg {
+    Inclusive(u64, u64),
+    HalfOpen(u64, u64),
+}
+
+/// Shared range-pair parsing for `functions` and `search_bytes`.
+fn range_arg(
+    lo: Option<String>,
+    hi: Option<String>,
+    start: Option<String>,
+    end: Option<String>,
+) -> Result<Option<RangeArg>, String> {
+    let has_lo = lo.is_some() || hi.is_some();
+    let has_half = start.is_some() || end.is_some();
+    if has_lo && has_half {
+        return Err(
+            "give either range_lo/range_hi (inclusive) or range_start/range_end (half-open), not both"
+                .to_string(),
+        );
+    }
+    if lo.is_some() != hi.is_some() {
+        return Err("range_lo and range_hi must be given together".to_string());
+    }
+    if start.is_some() != end.is_some() {
+        return Err("range_start and range_end must be given together".to_string());
+    }
+    match (lo, hi, start, end) {
+        (Some(lo), Some(hi), None, None) => Ok(Some(RangeArg::Inclusive(
+            parse_addr(&lo).map_err(|e| e.to_string())?,
+            parse_addr(&hi).map_err(|e| e.to_string())?,
+        ))),
+        (None, None, Some(start), Some(end)) => Ok(Some(RangeArg::HalfOpen(
+            parse_addr(&start).map_err(|e| e.to_string())?,
+            parse_addr(&end).map_err(|e| e.to_string())?,
+        ))),
+        (None, None, None, None) => Ok(None),
+        _ => unreachable!("pair presence checked above"),
+    }
+}
+
 /// Run one batch op against an already-open project.
 ///
 /// Mirrors the matching single tool's validation and query (per-op row
@@ -1256,14 +1297,18 @@ fn run_batch_op(
         }
         "functions" => {
             let a: BatchFunctions = parse_op(tool, params)?;
-            if a.range_start.is_some() {
-                eprintln!("warning: functions range_start is deprecated, use range_lo");
-            }
-            if a.range_end.is_some() {
-                eprintln!("warning: functions range_end is deprecated, use range_hi");
-            }
-            let lo = a.range_lo.or(a.range_start);
-            let hi = a.range_hi.or(a.range_end);
+            let range = match range_arg(a.range_lo, a.range_hi, a.range_start, a.range_end)? {
+                None => None,
+                Some(RangeArg::Inclusive(lo, hi)) => Some((lo, hi)),
+                Some(RangeArg::HalfOpen(start, end)) => {
+                    if end <= start {
+                        return Err(
+                            "empty range: range_end must be greater than range_start".to_string(),
+                        );
+                    }
+                    Some((start, end - 1))
+                }
+            };
             let filter = FunctionFilter {
                 query: a.query,
                 caller: a
@@ -1276,16 +1321,7 @@ fn run_batch_op(
                     .map(|v| parse_addr(&v))
                     .transpose()
                     .map_err(|e| e.to_string())?,
-                range: match (lo, hi) {
-                    (None, None) => None,
-                    (Some(lo), Some(hi)) => Some((
-                        parse_addr(&lo).map_err(|e| e.to_string())?,
-                        parse_addr(&hi).map_err(|e| e.to_string())?,
-                    )),
-                    _ => {
-                        return Err("range_lo and range_hi must be given together".to_string());
-                    }
-                },
+                range,
             };
             if a.envelope == Some(false) {
                 eprintln!("warning: functions envelope is always on; envelope:false is ignored");
@@ -1388,22 +1424,12 @@ fn run_batch_op(
         }
         "search_bytes" => {
             let a: BatchSearchBytes = parse_op(tool, params)?;
-            if a.range_lo.is_some() {
-                eprintln!("warning: search_bytes range_lo is deprecated, use range_start");
-            }
-            if a.range_hi.is_some() {
-                eprintln!("warning: search_bytes range_hi is deprecated, use range_end");
-            }
-            let lo = a.range_start.or(a.range_lo);
-            let hi = a.range_end.or(a.range_hi);
-            let range = match (lo, hi) {
-                (None, None) => None,
-                (Some(lo), Some(hi)) => Some((
-                    parse_addr(&lo).map_err(|e| e.to_string())?,
-                    parse_addr(&hi).map_err(|e| e.to_string())?,
-                )),
-                _ => {
-                    return Err("range_start and range_end must be given together".to_string());
+            let range = match range_arg(a.range_lo, a.range_hi, a.range_start, a.range_end)? {
+                None => None,
+                Some(RangeArg::HalfOpen(start, end)) => Some((start, end)),
+                Some(RangeArg::Inclusive(lo, hi)) => {
+                    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                    Some((lo, hi.saturating_add(1)))
                 }
             };
             proj.search_bytes(
@@ -1670,22 +1696,16 @@ impl BinscoutMcp {
 
     #[tool(
         name = "functions",
-        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit. Range is inclusive (entry >= lo and <= hi); range_start/range_end are deprecated aliases of range_lo/range_hi. Result is the protocol-1 page envelope with an exact total; rows carry calls_count, and direct callees are one callees query away (depth 1)"
+        description = "List functions with rename-resolved names, filtered by query/caller/callee/range, paged by offset/limit. range_lo/range_hi are inclusive, range_start/range_end half-open; give one pair. Result is the protocol-1 page envelope with an exact total; rows carry calls_count, and direct callees are one callees query away (depth 1)"
     )]
     async fn functions(&self, p: Parameters<FunctionsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        if p.range_start.is_some() {
-            eprintln!("warning: functions range_start is deprecated, use range_lo");
-        }
-        if p.range_end.is_some() {
-            eprintln!("warning: functions range_end is deprecated, use range_hi");
-        }
         if p.envelope == Some(false) {
             eprintln!("warning: functions envelope is always on; envelope:false is ignored");
         }
         // Cloned before the move into the open so filter errors keep their
         // post-open precedence (a missing binary still reports first).
-        let (query, caller, callee, range_lo, range_hi, alias_lo, alias_hi, offset, limit) = (
+        let (query, caller, callee, range_lo, range_hi, range_start, range_end, offset, limit) = (
             p.query.clone(),
             p.caller.clone(),
             p.callee.clone(),
@@ -1698,24 +1718,24 @@ impl BinscoutMcp {
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let lo = range_lo.or(alias_lo);
-        let hi = range_hi.or(alias_hi);
+        let range =
+            match range_arg(range_lo, range_hi, range_start, range_end).map_err(invalid_params)? {
+                None => None,
+                Some(RangeArg::Inclusive(lo, hi)) => Some((lo, hi)),
+                Some(RangeArg::HalfOpen(start, end)) => {
+                    if end <= start {
+                        return Err(invalid_params(
+                            "empty range: range_end must be greater than range_start",
+                        ));
+                    }
+                    Some((start, end - 1))
+                }
+            };
         let filter = FunctionFilter {
             query,
             caller: opt_addr(caller)?,
             callee: opt_addr(callee)?,
-            range: match (lo, hi) {
-                (None, None) => None,
-                (Some(lo), Some(hi)) => Some((
-                    parse_addr(&lo).map_err(error_data)?,
-                    parse_addr(&hi).map_err(error_data)?,
-                )),
-                _ => {
-                    return Err(invalid_params(
-                        "range_lo and range_hi must be given together",
-                    ));
-                }
-            },
+            range,
         };
         ok(serde_json::to_value(proj.functions_envelope(
             &filter,
@@ -2240,42 +2260,31 @@ impl BinscoutMcp {
 
     #[tool(
         name = "search_bytes",
-        description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count. Range is half-open [lo, hi) over match virtual addresses; range_lo/range_hi are deprecated aliases of range_start/range_end"
+        description = "Search mapped file bytes for a whitespace-separated hex pattern (two hex digits or ?? per token), filtered by section/range, paged with total match count. range_lo/range_hi are inclusive, range_start/range_end half-open; give one pair"
     )]
     async fn search_bytes(&self, p: Parameters<SearchBytesParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        if p.range_lo.is_some() {
-            eprintln!("warning: search_bytes range_lo is deprecated, use range_start");
-        }
-        if p.range_hi.is_some() {
-            eprintln!("warning: search_bytes range_hi is deprecated, use range_end");
-        }
-        let (pattern, section, range_start, range_end, alias_lo, alias_hi, offset, limit) = (
+        let (pattern, section, range_lo, range_hi, range_start, range_end, offset, limit) = (
             p.pattern.clone(),
             p.section.clone(),
-            p.range_start.clone(),
-            p.range_end.clone(),
             p.range_lo.clone(),
             p.range_hi.clone(),
+            p.range_start.clone(),
+            p.range_end.clone(),
             p.offset,
             p.limit,
         );
         let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
         let proj = entry.lock_project();
-        let lo = range_start.or(alias_lo);
-        let hi = range_end.or(alias_hi);
-        let range = match (lo, hi) {
-            (None, None) => None,
-            (Some(lo), Some(hi)) => Some((
-                parse_addr(&lo).map_err(error_data)?,
-                parse_addr(&hi).map_err(error_data)?,
-            )),
-            _ => {
-                return Err(invalid_params(
-                    "range_start and range_end must be given together",
-                ));
-            }
-        };
+        let range =
+            match range_arg(range_lo, range_hi, range_start, range_end).map_err(invalid_params)? {
+                None => None,
+                Some(RangeArg::HalfOpen(start, end)) => Some((start, end)),
+                Some(RangeArg::Inclusive(lo, hi)) => {
+                    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                    Some((lo, hi.saturating_add(1)))
+                }
+            };
         proj.search_bytes(
             &pattern,
             section.as_deref(),

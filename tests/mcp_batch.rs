@@ -476,3 +476,81 @@ fn batch_slice_unmapped_root_is_op_error() {
     assert!(results[0].get("ok").is_none(), "{:?}", results[0]);
     cleanup(&dir);
 }
+
+// Batch mirrors the single-tool range semantics: inclusive and half-open
+// pairs agree where they overlap, empty and mixed pairs are per-op errors.
+#[test]
+fn batch_range_names_carry_semantics() {
+    use common::builders::{BASIC_ENTRY_VA, TEXT_VA};
+    let dir = tmpdir("mcp-batch-range");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "r").display().to_string();
+    let entry_hex = format!("{BASIC_ENTRY_VA:#x}");
+    let entry_next = format!("{:#x}", BASIC_ENTRY_VA + 1);
+    let text_hex = format!("{TEXT_VA:#x}");
+
+    let ops = vec![
+        op(
+            "functions",
+            json!({"range_lo": entry_hex, "range_hi": entry_hex}),
+        ),
+        op(
+            "functions",
+            json!({"range_start": entry_hex, "range_end": entry_next}),
+        ),
+        op(
+            "search_bytes",
+            json!({"pattern": "55", "range_lo": text_hex, "range_hi": text_hex}),
+        ),
+        op(
+            "functions",
+            json!({"range_start": entry_hex, "range_end": entry_hex}),
+        ),
+        op(
+            "search_bytes",
+            json!({"pattern": "55", "range_start": text_hex, "range_end": text_hex}),
+        ),
+        op(
+            "functions",
+            json!({"range_lo": entry_hex, "range_hi": entry_hex, "range_start": entry_hex, "range_end": entry_next}),
+        ),
+        op(
+            "search_bytes",
+            json!({"pattern": "55", "range_lo": text_hex, "range_hi": text_hex, "range_start": text_hex, "range_end": text_hex}),
+        ),
+    ];
+    let batch = tool_once(10, "batch", json!({"binary": bin, "db": db, "ops": ops}));
+    let results = batch["results"].as_array().expect("results");
+    assert_eq!(results.len(), 7);
+
+    assert_eq!(
+        results[0]["ok"]["items"].as_array().expect("items").len(),
+        1
+    );
+    assert_eq!(results[0]["ok"], results[1]["ok"]);
+    assert_eq!(results[2]["ok"]["total"], 1);
+    assert_eq!(results[2]["ok"]["items"][0]["addr"], TEXT_VA);
+    assert!(
+        results[3]["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("empty range")),
+        "{}",
+        results[3]
+    );
+    assert!(
+        results[4]["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("empty search range")),
+        "{}",
+        results[4]
+    );
+    for r in [&results[5], &results[6]] {
+        assert!(
+            r["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("give either range_lo/range_hi")),
+            "{r}"
+        );
+    }
+    cleanup(&dir);
+}

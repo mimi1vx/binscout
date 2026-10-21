@@ -2027,3 +2027,133 @@ fn mcp_go_funcs_pages_table() {
     assert_eq!(items[0]["entry"], BASE + 0x100);
     cleanup(&dir);
 }
+
+// Range names carry semantics: `range_lo`/`range_hi` are inclusive,
+// `range_start`/`range_end` half-open, on `functions` and `search_bytes`.
+#[test]
+fn range_names_carry_semantics() {
+    use common::builders::{BASIC_ENTRY_VA, TEXT_VA};
+    let dir = tmpdir("mcp-range-semantics");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "r").display().to_string();
+    let entry_hex = format!("{BASIC_ENTRY_VA:#x}");
+    let entry_next = format!("{:#x}", BASIC_ENTRY_VA + 1);
+    let text_hex = format!("{TEXT_VA:#x}");
+
+    // Inclusive [E, E] keeps the single function.
+    let v = tool_once(
+        10,
+        "functions",
+        json!({"binary": bin, "db": db, "range_lo": entry_hex, "range_hi": entry_hex}),
+    );
+    assert_eq!(v["items"].as_array().expect("items").len(), 1);
+    assert_eq!(v["items"][0]["entry"], BASIC_ENTRY_VA);
+    // Half-open [E, E+1) keeps the same function.
+    let half = tool_once(
+        11,
+        "functions",
+        json!({"binary": bin, "db": db, "range_start": entry_hex, "range_end": entry_next}),
+    );
+    assert_eq!(v, half);
+
+    // Inclusive [M, M] keeps the 1-byte match at M.
+    let s = tool_once(
+        12,
+        "search_bytes",
+        json!({"binary": bin, "db": db, "pattern": "55", "range_lo": text_hex, "range_hi": text_hex}),
+    );
+    assert_eq!(s["total"], 1);
+    assert_eq!(s["items"][0]["addr"], TEXT_VA);
+
+    let lines = vec![
+        req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        call(
+            20,
+            "functions",
+            json!({"binary": bin, "db": db, "range_start": entry_hex, "range_end": entry_hex}),
+        ),
+        call(
+            21,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "55", "range_start": text_hex, "range_end": text_hex}),
+        ),
+        call(
+            22,
+            "functions",
+            json!({"binary": bin, "db": db, "range_lo": entry_hex, "range_hi": entry_hex, "range_start": entry_hex, "range_end": entry_next}),
+        ),
+        call(
+            23,
+            "search_bytes",
+            json!({"binary": bin, "db": db, "pattern": "55", "range_lo": text_hex, "range_hi": text_hex, "range_start": text_hex, "range_end": text_hex}),
+        ),
+    ];
+    let resps = session(&lines);
+    assert_eq!(resps.len(), 5, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    let msg = by_id[&20]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(msg.contains("empty range"), "{msg}");
+    let msg = by_id[&21]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(msg.contains("empty search range"), "{msg}");
+    for id in [22, 23] {
+        let msg = by_id[&id]["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(msg.contains("give either range_lo/range_hi"), "{msg}");
+    }
+
+    // Range pairs never warn: stderr stays free of deprecation notes.
+    let mut child = Command::new(mcp_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binscout-mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        for line in [
+            req(
+                1,
+                "initialize",
+                json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+            ),
+            serde_json::to_string(
+                &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            )
+            .expect("n"),
+            call(
+                30,
+                "functions",
+                json!({"binary": bin, "db": db, "range_lo": entry_hex, "range_hi": entry_hex}),
+            ),
+            call(
+                31,
+                "search_bytes",
+                json!({"binary": bin, "db": db, "pattern": "55", "range_start": text_hex, "range_end": entry_next}),
+            ),
+        ] {
+            writeln!(stdin, "{line}").expect("write request");
+        }
+    }
+    let out = child.wait_with_output().expect("server exits on stdin EOF");
+    assert!(out.status.success(), "server exit: {}", out.status);
+    let err = String::from_utf8(out.stderr).expect("stderr utf-8");
+    assert!(
+        !err.contains("deprecated"),
+        "no deprecation warnings: {err:?}"
+    );
+    cleanup(&dir);
+}

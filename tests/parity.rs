@@ -149,9 +149,8 @@ fn annotation_getter_readonly_and_cli_parity() {
     cleanup(&dir);
 }
 
-// Item 3: range aliases agree with the canonical names on both tools, with
-// the documented semantics (inclusive for `functions`, half-open for
-// `search_bytes`).
+// Item 3: range names carry their semantics on both tools:
+// `range_lo`/`range_hi` are inclusive, `range_start`/`range_end` half-open.
 #[test]
 fn range_aliases_and_semantics() {
     use common::builders::{BASIC_ENTRY_VA, TEXT_VA};
@@ -168,14 +167,15 @@ fn range_aliases_and_semantics() {
         json!({"binary": bin_s, "db": db, "range_lo": entry_hex, "range_hi": entry_hex}),
     );
     assert_eq!(canon["items"].as_array().expect("items").len(), 1);
-    let alias = tool_once(
+    // Half-open [entry, entry + 1) keeps the same single function.
+    let half = tool_once(
         11,
         "functions",
-        json!({"binary": bin_s, "db": db, "range_start": entry_hex, "range_end": entry_hex}),
+        json!({"binary": bin_s, "db": db, "range_start": entry_hex, "range_end": format!("{:#x}", BASIC_ENTRY_VA + 1)}),
     );
     assert_eq!(
-        canon, alias,
-        "range_start/range_end must alias range_lo/range_hi"
+        canon, half,
+        "half-open [E, E+1) must match inclusive [E, E]"
     );
 
     // Half-open over match VAs: the 3-byte frame at TEXT_VA is fully
@@ -191,14 +191,15 @@ fn range_aliases_and_semantics() {
     );
     assert_eq!(canon["total"], 1);
     assert_eq!(canon["items"][0]["addr"], TEXT_VA);
-    let alias = tool_once(
-        13,
+    // Inclusive [TEXT_VA, TEXT_VA+2] covers the same half-open window.
+    let inclusive = tool_once(
+        15,
         "search_bytes",
-        json!({"binary": bin_s, "db": db, "pattern": "55 89 e5", "range_lo": lo, "range_hi": hi}),
+        json!({"binary": bin_s, "db": db, "pattern": "55 89 e5", "range_lo": lo, "range_hi": format!("{:#x}", TEXT_VA + 2)}),
     );
     assert_eq!(
-        canon, alias,
-        "range_lo/range_hi must alias range_start/range_end"
+        canon, inclusive,
+        "inclusive [M, M+2] must match half-open [M, M+3)"
     );
     let shifted = tool_once(
         14,
