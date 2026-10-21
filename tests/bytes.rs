@@ -515,3 +515,70 @@ fn mcp_bytes_unmapped_is_protocol_error() {
     assert!(by_id[&10].get("result").is_none());
     cleanup(&dir);
 }
+
+#[test]
+fn bytes_view_values_hex_twins_integer_views() {
+    let dir = tmpdir("bytes-values-hex");
+    let wide = 0x8010_0000_0000_0001u64;
+    let p = open_raw(&dir, "w", &wide.to_le_bytes());
+    let v = p
+        .bytes_view(0, 8, BytesAs::U64, BytesEndian::Le)
+        .expect("u64 view");
+    assert_eq!(Value::Array(v.values.clone()), json!([wide]));
+    assert_eq!(v.values_hex, Some(vec!["0x8010000000000001".to_string()]));
+    let json = serde_json::to_value(&v).expect("view serializes");
+    assert_eq!(json["values_hex"], json!(["0x8010000000000001"]));
+    let ptr = p
+        .bytes_view(0, 8, BytesAs::Ptr, BytesEndian::Le)
+        .expect("ptr view");
+    assert_eq!(ptr.values_hex, Some(vec!["0x8010000000000001".to_string()]));
+    let q = open_raw(&dir, "b", &[0x90, 0x90, 0xC3]);
+    let v = q
+        .bytes_view(0, 3, BytesAs::U8, BytesEndian::Le)
+        .expect("u8 view");
+    assert_eq!(Value::Array(v.values.clone()), json!([144, 144, 195]));
+    assert_eq!(
+        v.values_hex,
+        Some(vec![
+            "0x90".to_string(),
+            "0x90".to_string(),
+            "0xc3".to_string()
+        ])
+    );
+    let s = q
+        .bytes_view(0, 3, BytesAs::CStr, BytesEndian::Le)
+        .expect("cstr view");
+    assert_eq!(s.values_hex, None);
+    let json = serde_json::to_value(&s).expect("view serializes");
+    assert!(json.get("values_hex").is_none(), "{json}");
+    cleanup(&dir);
+}
+
+#[test]
+fn cli_bytes_values_hex_shape() {
+    let dir = tmpdir("cli-bytes-hex");
+    let wide = 0x8010_0000_0000_0001u64;
+    let bin = write_bin(&dir, "w.bin", &wide.to_le_bytes());
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "w").display().to_string();
+    let d = db.as_str();
+    let (ok, v, text) = run(&[
+        "--db", d, "bytes", &bin_s, "0x0", "--len", "8", "--as", "u64",
+    ]);
+    assert!(ok, "{v}");
+    assert_eq!(text.trim_end().lines().count(), 1);
+    assert_eq!(v["values"], json!([wide]));
+    assert_eq!(v["values_hex"], json!(["0x8010000000000001"]));
+    let bin2 = write_bin(&dir, "b.bin", &[0x90, 0x90, 0xC3]);
+    let bin2_s = bin2.display().to_string();
+    let (ok, v, _) = run(&["--db", d, "bytes", &bin2_s, "0x0", "--len", "3"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["values"], json!([144, 144, 195]));
+    assert_eq!(v["values_hex"], json!(["0x90", "0x90", "0xc3"]));
+    let (ok, v, _) = run(&[
+        "--db", d, "bytes", &bin2_s, "0x0", "--len", "3", "--as", "cstr",
+    ]);
+    assert!(ok, "{v}");
+    assert!(v.get("values_hex").is_none(), "{v}");
+    cleanup(&dir);
+}

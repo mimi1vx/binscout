@@ -542,15 +542,23 @@ fn cli_bytes_as_type_renders_struct_fields() {
     assert_eq!(fields[0]["addr_hex"], "0x0");
     assert_eq!(fields[0]["bytes_hex"], "0102030405060708");
     assert_eq!(fields[0]["value"], 0x0807060504030201u64);
+    assert_eq!(fields[0]["value_hex"], "0x807060504030201");
     assert_eq!(fields[1]["value"], 0x100f0e0d0c0b0a09u64);
+    assert_eq!(fields[1]["value_hex"], "0x100f0e0d0c0b0a09");
     assert_eq!(fields[2]["name"], "wide");
     assert!(
         fields[2]["value"].is_null(),
         "wider than 8 bytes: {}",
         fields[2]
     );
+    assert!(
+        fields[2]["value_hex"].is_null(),
+        "wider than 8 bytes: {}",
+        fields[2]
+    );
     assert_eq!(fields[2]["bytes_hex"], "0102030405060708090a0b0c0d0e0f10");
     assert_eq!(fields[3]["value"], 1);
+    assert_eq!(fields[3]["value_hex"], "0x1");
 
     // Big-endian order applies to field integers too.
     let (ok, be, _) = run(&[
@@ -568,6 +576,7 @@ fn cli_bytes_as_type_renders_struct_fields() {
     ]);
     assert!(ok, "{be}");
     assert_eq!(be["fields"][0]["value"], 0x0102030405060708u64);
+    assert_eq!(be["fields"][0]["value_hex"], "0x102030405060708");
 
     // A cached open renders the same rows (loader-only path).
     let (ok, _, _) = run(&["--db", &db_s, "load", &bin_s]);
@@ -809,6 +818,7 @@ fn mcp_bytes_as_type_and_errors() {
     );
     assert_eq!(v["hint_addr"], 0x100);
     assert_eq!(v["fields"][0]["value"], 0x04030201u64);
+    assert_eq!(v["fields"][0]["value_hex"], "0x4030201");
 
     // Missing hints and short ranges are tool errors, like other bad input.
     for (id, args) in [

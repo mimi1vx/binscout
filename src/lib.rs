@@ -748,11 +748,12 @@ pub enum BytesEndian {
 ///
 /// `bytes_hex` is the range as continuous lowercase hex; `values` is the
 /// [`BytesAs`] decoding (integers as numbers, `cstr`/`utf16` as a single
-/// string row). `file_off`/`section` describe the range start only: the
-/// file offset is null when the start byte is zero-fill/BSS or otherwise
-/// unbacked, and the section is the covering file-backed section name
-/// (null for zero-fill and section-less ranges, following
-/// [`Project::search_bytes`] provenance).
+/// string row). `values_hex` twins integer `values` as exact `0x`-hex
+/// strings (u8/u16/u32/u64/ptr views; absent for string views). `file_off`/`section`
+/// describe the range start only: the file offset is null when the start byte
+/// is zero-fill/BSS or otherwise unbacked, and the section is the covering
+/// file-backed section name (null for zero-fill and section-less ranges,
+/// following [`Project::search_bytes`] provenance).
 ///
 /// JSON pairs `addr` with `addr_hex`; `file_off` stays a plain
 /// integer-or-null like the search and section views.
@@ -768,6 +769,8 @@ pub struct BytesView {
     pub bytes: Vec<u8>,
     /// Typed decoding of [`BytesView::bytes`].
     pub values: Vec<serde_json::Value>,
+    /// `0x`-hex twins of integer [`BytesView::values`] (u8/u16/u32/u64/ptr views); `None` for string views.
+    pub values_hex: Option<Vec<String>>,
 }
 
 impl BytesView {
@@ -789,7 +792,7 @@ impl serde::Serialize for BytesView {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("BytesView", 7)?;
+        let mut st = serializer.serialize_struct("BytesView", 8)?;
         st.serialize_field("addr", &self.addr)?;
         st.serialize_field("addr_hex", &crate::addr_hex(self.addr))?;
         st.serialize_field("file_off", &self.file_off)?;
@@ -797,6 +800,11 @@ impl serde::Serialize for BytesView {
         st.serialize_field("len", &self.bytes.len())?;
         st.serialize_field("bytes_hex", &self.bytes_hex())?;
         st.serialize_field("values", &self.values)?;
+        if let Some(h) = &self.values_hex {
+            st.serialize_field("values_hex", h)?;
+        } else {
+            st.skip_field("values_hex")?;
+        }
         st.end()
     }
 }
@@ -1376,25 +1384,43 @@ fn bytes_view_of(
         },
     };
     let le = endian == BytesEndian::Le;
-    let values: Vec<serde_json::Value> = match as_ {
-        BytesAs::U8 => bytes.iter().map(|&b| serde_json::Value::from(b)).collect(),
-        BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => bytes
-            .chunks_exact(width)
-            .map(|w| serde_json::Value::from(decode_int(w, le)))
-            .collect(),
+    let (values, values_hex): (Vec<serde_json::Value>, Option<Vec<String>>) = match as_ {
+        BytesAs::U8 => {
+            let ints: Vec<u64> = bytes.iter().map(|&b| u64::from(b)).collect();
+            (
+                ints.iter().map(|&n| serde_json::Value::from(n)).collect(),
+                Some(ints.iter().map(|&n| crate::addr_hex(n)).collect()),
+            )
+        }
+        BytesAs::U16 | BytesAs::U32 | BytesAs::U64 | BytesAs::Ptr => {
+            let ints: Vec<u64> = bytes
+                .chunks_exact(width)
+                .map(|w| decode_int(w, le))
+                .collect();
+            (
+                ints.iter().map(|&n| serde_json::Value::from(n)).collect(),
+                Some(ints.iter().map(|&n| crate::addr_hex(n)).collect()),
+            )
+        }
         BytesAs::CStr => {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            vec![serde_json::Value::from(
-                String::from_utf8_lossy(&bytes[..end]).into_owned(),
-            )]
+            (
+                vec![serde_json::Value::from(
+                    String::from_utf8_lossy(&bytes[..end]).into_owned(),
+                )],
+                None,
+            )
         }
         BytesAs::Utf16 => {
             let (units, _) = bytes.as_chunks::<2>();
             let units: Vec<u16> = units.iter().map(|w| decode_int(w, le) as u16).collect();
             let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-            vec![serde_json::Value::from(String::from_utf16_lossy(
-                &units[..end],
-            ))]
+            (
+                vec![serde_json::Value::from(String::from_utf16_lossy(
+                    &units[..end],
+                ))],
+                None,
+            )
         }
     };
     Ok(BytesView {
@@ -1403,6 +1429,7 @@ fn bytes_view_of(
         section: section_of_in(bin, va).map(str::to_string),
         bytes,
         values,
+        values_hex,
     })
 }
 
@@ -1413,8 +1440,9 @@ fn bytes_view_of(
 /// with the same `values` typed decoding in `endian` order, then renders
 /// the [`TypeHint`](crate::annotations::TypeHint) stored at `hint_addr`
 /// as `fields`: one row per struct field with its own `addr`/`addr_hex`
-/// twins, `bytes_hex`, and integer `value` in `endian` order (null for
-/// fields wider than 8 bytes). The result also echoes the wire hint in
+/// twins, `bytes_hex`, integer `value` in `endian` order (null for
+/// fields wider than 8 bytes), and exact `value_hex` (`0x`-hex twin, null
+/// for wide fields). The result also echoes the wire hint in
 /// `hint` and where it was read from in `hint_addr`/`hint_addr_hex`. The
 /// hint address keeps the any-address comment contract: a missing hint is
 /// [`Error::Invalid`], never silent.
@@ -1459,10 +1487,14 @@ fn bytes_view_as_type_of(
                 bytes_hex.push(char::from_digit(u32::from(*b & 0x0f), 16).expect("hex digit"));
             }
             let (addr, addr_hex) = addr_pair(va + f.offset);
-            let value = if bytes.len() <= 8 {
-                serde_json::Value::from(decode_int(bytes, le))
+            let (value, value_hex) = if bytes.len() <= 8 {
+                let n = decode_int(bytes, le);
+                (
+                    serde_json::Value::from(n),
+                    serde_json::Value::from(crate::addr_hex(n)),
+                )
             } else {
-                serde_json::Value::Null
+                (serde_json::Value::Null, serde_json::Value::Null)
             };
             serde_json::json!({
                 "name": f.name,
@@ -1472,6 +1504,7 @@ fn bytes_view_as_type_of(
                 "addr_hex": addr_hex,
                 "bytes_hex": bytes_hex,
                 "value": value,
+                "value_hex": value_hex,
             })
         })
         .collect();
@@ -3126,8 +3159,9 @@ impl Project {
     /// `endian` order, then renders the
     /// [`TypeHint`](crate::annotations::TypeHint) stored at `hint_addr` as
     /// `fields`: one row per struct field with its own `addr`/`addr_hex`
-    /// twins, `bytes_hex`, and integer `value` in `endian` order (null for
-    /// fields wider than 8 bytes). The result also echoes the wire hint in
+    /// twins, `bytes_hex`, integer `value` in `endian` order (null for
+    /// fields wider than 8 bytes), and exact `value_hex` (`0x`-hex twin,
+    /// null for wide fields). The result also echoes the wire hint in
     /// `hint` and where it was read from in `hint_addr`/`hint_addr_hex`.
     /// `len` must cover the struct size; extra bytes read normally. The
     /// hint address keeps the any-address comment contract. Read-only:

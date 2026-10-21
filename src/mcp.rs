@@ -1807,7 +1807,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "bytes",
-        description = "Read len bytes at addr with typed views and VA/file provenance; returns addr twins, file_off (null for zero-fill), section, bytes_hex, and decoded values (ranges cap at 1 MiB). as_type takes a stored type-hint address and renders its struct fields over the range start (len must cover the struct size)"
+        description = "Read len bytes at addr with typed views and VA/file provenance; returns addr twins, file_off (null for zero-fill), section, bytes_hex, decoded values plus exact values_hex twins for integer views (ranges cap at 1 MiB). as_type takes a stored type-hint address and renders its struct fields over the range start (len must cover the struct size)"
     )]
     async fn bytes(&self, p: Parameters<BytesParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
