@@ -74,6 +74,9 @@ struct CacheKey {
     db: String,
     /// Loader mapping ([`crate::db::StoredMapping::describe`]).
     mapping: String,
+    /// Debug inputs identity: canonical path, length, and mtime of each
+    /// explicit debug file; empty when none.
+    debug: String,
 }
 
 /// One cached open: validation file facts plus the project behind its own
@@ -109,6 +112,7 @@ impl ProjectEntry {
                 binary: String::new(),
                 db: String::new(),
                 mapping: String::new(),
+                debug: String::new(),
             },
             file_len: 0,
             file_mtime: SystemTime::UNIX_EPOCH,
@@ -222,6 +226,7 @@ fn open_uncached(
     db: Option<&str>,
     raw_opts: Option<crate::loader::RawOptions>,
     fat_arch: Option<&str>,
+    debug: &crate::DebugOptions,
 ) -> Result<Project, ErrorData> {
     let db_path;
     let db_ref = match db {
@@ -231,14 +236,15 @@ fn open_uncached(
         }
         None => None,
     };
-    crate::open_mapped(
-        Path::new(binary),
-        db_ref,
-        raw_opts,
-        fat_arch,
-        &crate::DebugOptions::default(),
-    )
-    .map_err(error_data)
+    crate::open_mapped(Path::new(binary), db_ref, raw_opts, fat_arch, debug).map_err(error_data)
+}
+
+/// Map optional MCP `pdb`/`debug_file` strings to [`crate::DebugOptions`].
+fn debug_options(pdb: Option<String>, debug_file: Option<String>) -> crate::DebugOptions {
+    crate::DebugOptions {
+        pdb: pdb.map(std::path::PathBuf::from),
+        debug_file: debug_file.map(std::path::PathBuf::from),
+    }
 }
 
 /// Parse an MCP `raw` object through the shared CLI/MCP validator.
@@ -323,6 +329,10 @@ pub struct BinaryParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
 }
 
 /// Parameters for paged single-binary tools (`stack_strings`, `go_funcs`).
@@ -337,6 +347,10 @@ pub struct PagedBinaryParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// First row to return.
     pub offset: Option<usize>,
     /// Max rows (capped at 1024).
@@ -355,6 +369,10 @@ pub struct StringsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Rows to skip after filtering.
     pub start: Option<usize>,
     /// Deprecated alias of `start` (warns on stderr).
@@ -396,6 +414,10 @@ pub struct FunctionsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Case-insensitive substring over the rename-resolved name.
     pub query: Option<String>,
     /// Keep functions that call the function containing this address.
@@ -434,6 +456,10 @@ pub struct AddrParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
 }
@@ -450,6 +476,10 @@ pub struct BlocksParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Function address: any address inside the function snaps to its
     /// containing entry.
     pub addr: String,
@@ -471,6 +501,10 @@ pub struct BlockInsnsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Function address: any address inside the function snaps to its
     /// containing entry.
     pub addr: String,
@@ -494,6 +528,10 @@ pub struct DiagnosticsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Only `unresolved-indirect-jump`, `unresolved-indirect-call`, or
     /// `decode-failure` sites.
     pub kind: Option<String>,
@@ -518,6 +556,10 @@ pub struct RangeParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
     /// Bytes to decode.
@@ -536,6 +578,10 @@ pub struct BytesParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Virtual address (`0x`-hex or decimal string).
     pub addr: String,
     /// Bytes to read (capped at 1 MiB).
@@ -562,6 +608,10 @@ pub struct XrefsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Only xrefs pointing at this address (`0x`-hex or decimal).
     pub to: Option<String>,
     /// Only xrefs originating at this address.
@@ -590,6 +640,10 @@ pub struct IrCoverageParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Range address (`0x`-hex or decimal string; needs `binary` and `len`).
     pub addr: Option<String>,
     /// Range length in bytes (needs `binary` and `addr`).
@@ -608,6 +662,10 @@ pub struct RenameParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Function entry address (`0x`-hex or decimal string).
     pub addr: String,
     /// New name (empty string clears).
@@ -626,6 +684,10 @@ pub struct CommentParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Address to comment (`0x`-hex or decimal string).
     pub addr: String,
     /// Comment text (empty string clears).
@@ -644,6 +706,10 @@ pub struct SetTypeHintParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Address storing the hint (`0x`-hex or decimal string, any address).
     pub addr: String,
     /// Wire hint JSON (`{"kind":"struct","name":..,"size":..,"fields":[..]}`);
@@ -663,6 +729,10 @@ pub struct DefineFuncParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Seed address (`0x`-hex or decimal string, any address accepted).
     pub addr: String,
     /// 32-bit ARM decode mode: `arm` or `thumb` (other arches reject it).
@@ -681,6 +751,10 @@ pub struct UndefineFuncParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Seed address (`0x`-hex or decimal string, any address accepted).
     pub addr: String,
 }
@@ -697,6 +771,10 @@ pub struct SearchBytesParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Whitespace-separated full-byte tokens: two hex digits or `??`.
     pub pattern: String,
     /// Keep matches fully inside this section (e.g. `.text`).
@@ -731,6 +809,10 @@ pub struct CryptoScanParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Keep only this constant (e.g. `aes-sbox`).
     pub name: Option<String>,
     /// Keep matches fully inside this section (e.g. `.rdata`).
@@ -753,6 +835,10 @@ pub struct YaraScanParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Path to the YARA rules file (local path only, never fetched).
     pub rules: String,
     /// Keep only this rule (e.g. `ransom_note`).
@@ -778,6 +864,10 @@ pub struct CallgraphParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Query address: any address inside the root function snaps to its
     /// containing entry.
     pub addr: String,
@@ -803,6 +893,10 @@ pub struct SliceParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Slice root: every returned instruction can reach this address
     /// (`0x`-hex or decimal string; any mapped address is valid, including
     /// data/string targets in no function).
@@ -828,6 +922,10 @@ pub struct AnnotationsImportParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Interchange document, as returned by `annotations_export`.
     pub document: String,
     /// Replace supplied fields on conflict instead of failing.
@@ -846,6 +944,10 @@ pub struct FlirtHintsParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Only hints for the function containing this address (`0x`-hex or
     /// decimal string).
     pub addr: Option<String>,
@@ -922,6 +1024,10 @@ pub struct PatchParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// Virtual address of the patched instruction (`0x`-hex or decimal).
     pub addr: String,
     /// Intel-syntax assembly encoded at `addr` (x86: `nop`, `ret`,
@@ -969,6 +1075,10 @@ pub struct BatchParams {
     /// Fat Mach-O slice selection (canonical `x86_64`/`x86_32`/`aarch64`/`arm32`
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
+    /// PDB path for debug names (PE only; local file, never fetched).
+    pub pdb: Option<String>,
+    /// External DWARF object path for debug names (local file, never fetched).
+    pub debug_file: Option<String>,
     /// 1..=[`MAX_BATCH_OPS`] ops, run in order over the single open.
     pub ops: Vec<BatchOp>,
 }
@@ -1175,7 +1285,16 @@ fn run_batch_op(
         .as_object()
         .ok_or_else(|| format!("op {tool:?}: params must be an object"))?;
     for key in [
-        "binary", "db", "raw", "fat_arch", "binary_a", "binary_b", "db_a", "db_b",
+        "binary",
+        "db",
+        "raw",
+        "fat_arch",
+        "pdb",
+        "debug_file",
+        "binary_a",
+        "binary_b",
+        "db_a",
+        "db_b",
     ] {
         if obj.contains_key(key) {
             return Err(format!(
@@ -1556,6 +1675,7 @@ impl BinscoutMcp {
         db: Option<&str>,
         raw_opts: Option<crate::loader::RawOptions>,
         fat_arch: Option<&str>,
+        debug: &crate::DebugOptions,
     ) -> Result<Option<(CacheKey, u64, SystemTime)>, ErrorData> {
         let bin_path = Path::new(binary);
         let (meta, canonical) = match (std::fs::metadata(bin_path), std::fs::canonicalize(bin_path))
@@ -1581,11 +1701,37 @@ impl BinscoutMcp {
             Some(d) => resolve_db_str(d),
             None => format!("{}.rsdbg.redb", canonical.display()),
         };
+        let mut debug_str = String::new();
+        if let Some(p) = debug.pdb.as_ref() {
+            let (dmeta, canon) = match (std::fs::metadata(p), std::fs::canonicalize(p)) {
+                (Ok(m), Ok(c)) => (m, c),
+                _ => return Ok(None),
+            };
+            debug_str.push_str(&format!(
+                "pdb={}:{}:{:?};",
+                canon.display(),
+                dmeta.len(),
+                dmeta.modified().ok()
+            ));
+        }
+        if let Some(p) = debug.debug_file.as_ref() {
+            let (dmeta, canon) = match (std::fs::metadata(p), std::fs::canonicalize(p)) {
+                (Ok(m), Ok(c)) => (m, c),
+                _ => return Ok(None),
+            };
+            debug_str.push_str(&format!(
+                "dbg={}:{}:{:?};",
+                canon.display(),
+                dmeta.len(),
+                dmeta.modified().ok()
+            ));
+        }
         Ok(Some((
             CacheKey {
                 binary: canonical.display().to_string(),
                 db: db_str,
                 mapping: mapping.describe(),
+                debug: debug_str,
             },
             meta.len(),
             mtime,
@@ -1602,12 +1748,13 @@ impl BinscoutMcp {
         db: Option<&str>,
         raw: Option<&RawParams>,
         fat_arch: Option<&str>,
+        debug: &crate::DebugOptions,
     ) -> Result<Arc<ProjectEntry>, ErrorData> {
         let raw_opts = raw_options(raw)?;
-        let keyed = Self::cache_key(binary, db, raw_opts, fat_arch)?;
+        let keyed = Self::cache_key(binary, db, raw_opts, fat_arch, debug)?;
         let Some((key, len, mtime)) = keyed else {
             return Ok(Arc::new(ProjectEntry::ephemeral(open_uncached(
-                binary, db, raw_opts, fat_arch,
+                binary, db, raw_opts, fat_arch, debug,
             )?)));
         };
         if let Some(hit) = self.cache.lookup(&key, len, mtime) {
@@ -1618,11 +1765,11 @@ impl BinscoutMcp {
         // misses on other files proceed.
         let db_mutex = self.db_lock(&key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        let project = open_uncached(binary, db, raw_opts, fat_arch)?;
+        let project = open_uncached(binary, db, raw_opts, fat_arch, debug)?;
         // Re-stat so the stored facts describe the opened bytes; when the
         // file changed mid-open (or vanished) the entry stays ephemeral and
         // the next call revalidates from scratch.
-        let entry = match Self::cache_key(binary, db, raw_opts, fat_arch)? {
+        let entry = match Self::cache_key(binary, db, raw_opts, fat_arch, debug)? {
             Some((_, fresh_len, fresh_mtime)) => {
                 let entry = Arc::new(ProjectEntry {
                     key,
@@ -1648,10 +1795,17 @@ impl BinscoutMcp {
         db: Option<String>,
         raw: Option<RawParams>,
         fat_arch: Option<String>,
+        debug: crate::DebugOptions,
     ) -> Result<Arc<ProjectEntry>, ErrorData> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            this.cached_entry(&binary, db.as_deref(), raw.as_ref(), fat_arch.as_deref())
+            this.cached_entry(
+                &binary,
+                db.as_deref(),
+                raw.as_ref(),
+                fat_arch.as_deref(),
+                &debug,
+            )
         })
         .await
         .map_err(join_error)?
@@ -1672,7 +1826,15 @@ impl BinscoutMcp {
     )]
     async fn project_info(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         ok(serde_json::to_value(proj.project_info()).expect("project_info serializes"))
     }
@@ -1683,7 +1845,15 @@ impl BinscoutMcp {
     )]
     async fn load(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let proj = entry.lock_project();
@@ -1716,7 +1886,15 @@ impl BinscoutMcp {
             p.offset,
             p.limit,
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let range =
             match range_arg(range_lo, range_hi, range_start, range_end).map_err(invalid_params)? {
@@ -1752,7 +1930,15 @@ impl BinscoutMcp {
     async fn func(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.func_meta(addr)
@@ -1767,7 +1953,15 @@ impl BinscoutMcp {
     async fn blocks(&self, p: Parameters<BlocksParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, offset, limit) = (p.addr.clone(), p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.func_blocks_page(addr, offset.unwrap_or(0), limit.unwrap_or(50))
@@ -1782,7 +1976,15 @@ impl BinscoutMcp {
     async fn block_insns(&self, p: Parameters<BlockInsnsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, block_s, offset, limit) = (p.addr.clone(), p.block.clone(), p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         let block = parse_addr(&block_s).map_err(error_data)?;
@@ -1798,7 +2000,15 @@ impl BinscoutMcp {
     async fn diagnostics(&self, p: Parameters<DiagnosticsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (kind_s, func_s, offset, limit) = (p.kind.clone(), p.func.clone(), p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let kind = kind_s
             .as_deref()
@@ -1818,7 +2028,15 @@ impl BinscoutMcp {
     async fn disasm(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, len) = (p.addr.clone(), p.len);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.disasm_at(addr, len)
@@ -1839,7 +2057,15 @@ impl BinscoutMcp {
             p.endian.clone(),
             p.as_type.clone(),
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         let as_type = as_type_s
@@ -1877,7 +2103,15 @@ impl BinscoutMcp {
     async fn cfg(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.cfg_of(addr).map_err(error_data).and_then(ok)
@@ -1890,7 +2124,15 @@ impl BinscoutMcp {
     async fn structure(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.structure_of(addr).map_err(error_data).and_then(ok)
@@ -1903,7 +2145,15 @@ impl BinscoutMcp {
     async fn pseudo(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.pseudo_of(addr).map_err(error_data).and_then(ok)
@@ -1916,7 +2166,15 @@ impl BinscoutMcp {
     async fn callees(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.callees_page(
@@ -1936,7 +2194,15 @@ impl BinscoutMcp {
     async fn callers(&self, p: Parameters<CallgraphParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.callers_page(
@@ -1956,7 +2222,15 @@ impl BinscoutMcp {
     async fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, depth, offset, limit) = (p.addr.clone(), p.depth, p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.slice_page(
@@ -1982,7 +2256,15 @@ impl BinscoutMcp {
             p.offset,
             p.limit,
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let kind = kind_s
             .as_deref()
@@ -2030,7 +2312,15 @@ impl BinscoutMcp {
             p.limit,
             p.with_xrefs.unwrap_or(false),
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let filter = crate::analysis::StringsFilter {
             pattern,
@@ -2054,7 +2344,15 @@ impl BinscoutMcp {
     )]
     async fn stack_strings(&self, p: Parameters<PagedBinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         ok(serde_json::to_value(
             entry
                 .lock_project()
@@ -2069,7 +2367,15 @@ impl BinscoutMcp {
     )]
     async fn symbols(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         ok(entry.lock_project().symbols_json())
     }
 
@@ -2079,7 +2385,15 @@ impl BinscoutMcp {
     )]
     async fn stats(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         entry
             .lock_project()
             .stats_json()
@@ -2093,7 +2407,15 @@ impl BinscoutMcp {
     )]
     async fn headers(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         entry
             .lock_project()
             .headers_json()
@@ -2107,7 +2429,15 @@ impl BinscoutMcp {
     )]
     async fn sections(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         ok(entry.lock_project().sections_json())
     }
 
@@ -2118,7 +2448,15 @@ impl BinscoutMcp {
     async fn ir(&self, p: Parameters<RangeParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, len) = (p.addr.clone(), p.len);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.ir_at(addr, len).map_err(error_data).and_then(ok)
@@ -2134,7 +2472,15 @@ impl BinscoutMcp {
         match (p.binary, p.addr, p.len) {
             (None, None, None) => ok(crate::ir_coverage(arch)),
             (Some(binary), Some(addr_s), Some(len)) => {
-                let entry = self.open_owned(binary, p.db, p.raw, p.fat_arch).await?;
+                let entry = self
+                    .open_owned(
+                        binary,
+                        p.db,
+                        p.raw,
+                        p.fat_arch,
+                        debug_options(p.pdb, p.debug_file),
+                    )
+                    .await?;
                 let proj = entry.lock_project();
                 let addr = parse_addr(&addr_s).map_err(error_data)?;
                 proj.ir_coverage_at(arch, addr, len)
@@ -2154,7 +2500,15 @@ impl BinscoutMcp {
     async fn rename(&self, p: Parameters<RenameParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, name) = (p.addr.clone(), p.name.clone());
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2170,7 +2524,15 @@ impl BinscoutMcp {
     async fn comment(&self, p: Parameters<CommentParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, comment) = (p.addr.clone(), p.comment.clone());
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2186,7 +2548,15 @@ impl BinscoutMcp {
     async fn set_type_hint(&self, p: Parameters<SetTypeHintParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, hint) = (p.addr.clone(), p.hint.clone());
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2202,7 +2572,15 @@ impl BinscoutMcp {
     async fn get_type_hint(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         hint_envelope(&proj, addr).and_then(ok)
@@ -2215,7 +2593,15 @@ impl BinscoutMcp {
     async fn annotation(&self, p: Parameters<AddrParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         ok(proj.annotation_json(addr))
@@ -2228,7 +2614,15 @@ impl BinscoutMcp {
     async fn define_func(&self, p: Parameters<DefineFuncParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, mode_s) = (p.addr.clone(), p.mode.clone());
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2249,7 +2643,15 @@ impl BinscoutMcp {
     async fn undefine_func(&self, p: Parameters<UndefineFuncParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let addr_s = p.addr.clone();
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2274,7 +2676,15 @@ impl BinscoutMcp {
             p.offset,
             p.limit,
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let range =
             match range_arg(range_lo, range_hi, range_start, range_end).map_err(invalid_params)? {
@@ -2303,7 +2713,15 @@ impl BinscoutMcp {
     async fn crypto_scan(&self, p: Parameters<CryptoScanParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (name, section, offset, limit) = (p.name.clone(), p.section.clone(), p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         proj.crypto_scan(
             name.as_deref(),
@@ -2328,7 +2746,15 @@ impl BinscoutMcp {
             p.offset,
             p.limit,
         );
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         proj.scan_yara(
             std::path::Path::new(&rules),
@@ -2347,7 +2773,15 @@ impl BinscoutMcp {
     )]
     async fn annotations_export(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let doc = proj.export_annotations().map_err(error_data)?;
         serde_json::from_str::<serde_json::Value>(&doc)
@@ -2372,7 +2806,15 @@ impl BinscoutMcp {
         // still holds: validation happens after the open, inside the entry
         // lock, before any write.
         let (document, overwrite) = (p.document.clone(), p.overwrite);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let db_mutex = self.db_lock(&entry.key.db);
         let _db_guard = db_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut proj = entry.lock_project();
@@ -2393,7 +2835,15 @@ impl BinscoutMcp {
     async fn flirt_hints(&self, p: Parameters<FlirtHintsParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
         let (addr_s, sigs_s, offset, limit) = (p.addr.clone(), p.sigs.clone(), p.offset, p.limit);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = opt_addr(addr_s)?;
         let extra = sigs_s
@@ -2413,7 +2863,15 @@ impl BinscoutMcp {
     )]
     async fn sig_gen(&self, p: Parameters<BinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         ok(
             serde_json::to_value(proj.generate_signatures())
@@ -2427,7 +2885,15 @@ impl BinscoutMcp {
     )]
     async fn go_funcs(&self, p: Parameters<PagedBinaryParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         proj.go_funcs_page(p.offset.unwrap_or(0), p.limit.unwrap_or(50))
             .map_err(error_data)
@@ -2454,12 +2920,14 @@ impl BinscoutMcp {
                 p.db_a.clone(),
                 p.raw.clone(),
                 p.fat_arch.clone(),
+                crate::DebugOptions::default(),
             ),
             self.open_owned(
                 p.binary_b.clone(),
                 p.db_b.clone(),
                 p.raw.clone(),
                 p.fat_arch.clone(),
+                crate::DebugOptions::default(),
             )
         );
         let (entry_a, entry_b) = (entry_a?, entry_b?);
@@ -2506,12 +2974,14 @@ impl BinscoutMcp {
                 p.db_a.clone(),
                 p.raw.clone(),
                 p.fat_arch.clone(),
+                crate::DebugOptions::default(),
             ),
             self.open_owned(
                 p.binary_b.clone(),
                 p.db_b.clone(),
                 p.raw.clone(),
                 p.fat_arch.clone(),
+                crate::DebugOptions::default(),
             )
         );
         let (entry_a, entry_b) = (entry_a?, entry_b?);
@@ -2546,7 +3016,15 @@ impl BinscoutMcp {
         if format.is_some() && out.is_none() {
             return Err(invalid_params("patch format needs out"));
         }
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb, p.debug_file),
+            )
+            .await?;
         let proj = entry.lock_project();
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         let input = match (asm, bytes) {
@@ -2588,7 +3066,15 @@ impl BinscoutMcp {
                 p.ops.len()
             )));
         }
-        let entry = self.open_owned(p.binary, p.db, p.raw, p.fat_arch).await?;
+        let entry = self
+            .open_owned(
+                p.binary,
+                p.db,
+                p.raw,
+                p.fat_arch,
+                debug_options(p.pdb.clone(), p.debug_file.clone()),
+            )
+            .await?;
         let proj = entry.lock_project();
         // Sequential under one entry lock: deterministic order, one open,
         // no concurrent mutation mid-batch. Error elements count toward
@@ -2660,10 +3146,22 @@ mod tests {
         let (binary, db_s) = open_params(&bin, &db);
         let mcp = BinscoutMcp::new();
         let first = mcp
-            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
             .expect("first open");
         let second = mcp
-            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
             .expect("second open");
         assert!(Arc::ptr_eq(&first, &second), "hit must reuse the entry");
         assert!(!db.exists(), "reads never create the sidecar");
@@ -2678,13 +3176,25 @@ mod tests {
         let (binary, db_s) = open_params(&bin, &db);
         let mcp = BinscoutMcp::new();
         let first = mcp
-            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
             .expect("first open");
         assert_eq!(first.lock_project().analysis().summary().insns, 3);
         // Same path, different length: the entry must revalidate.
         std::fs::write(&bin, [0x90, 0xC3]).expect("rewrite blob");
         let second = mcp
-            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
             .expect("second open");
         assert!(!Arc::ptr_eq(&first, &second), "edit must replace the entry");
         assert_eq!(second.lock_project().analysis().summary().insns, 2);
@@ -2709,6 +3219,7 @@ mod tests {
                 Some(&db_a.display().to_string()),
                 None,
                 None,
+                &crate::DebugOptions::default(),
             )
             .expect("auto open");
         let raw_open = mcp
@@ -2717,6 +3228,7 @@ mod tests {
                 Some(&db_a.display().to_string()),
                 Some(&raw("0x1000")),
                 None,
+                &crate::DebugOptions::default(),
             )
             .expect("raw open");
         let other_db = mcp
@@ -2725,6 +3237,7 @@ mod tests {
                 Some(&db_b.display().to_string()),
                 None,
                 None,
+                &crate::DebugOptions::default(),
             )
             .expect("other db open");
         assert!(!Arc::ptr_eq(&auto, &raw_open), "mapping splits entries");
@@ -2744,8 +3257,14 @@ mod tests {
             if i == 0 {
                 first_key = binary.clone();
             }
-            mcp.cached_entry(&binary, db_s.as_deref(), None, None)
-                .expect("open");
+            mcp.cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
+            .expect("open");
         }
         let state = mcp.cache.state.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(state.entries.len(), CACHE_CAPACITY);
@@ -2764,7 +3283,13 @@ mod tests {
         let (binary, db_s) = open_params(&bin, &db);
         let mcp = BinscoutMcp::new();
         let entry = mcp
-            .cached_entry(&binary, db_s.as_deref(), None, None)
+            .cached_entry(
+                &binary,
+                db_s.as_deref(),
+                None,
+                None,
+                &crate::DebugOptions::default(),
+            )
             .expect("open");
         let proj = entry.lock_project();
         let run = |tool: &str, params: serde_json::Value| run_batch_op(&proj, tool, &params);

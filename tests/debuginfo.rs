@@ -13,6 +13,77 @@ use binscout::analysis::DiscoveryReason;
 
 mod common;
 
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use serde_json::{Value, json};
+
+fn mcp_session(lines: &[String]) -> Vec<Value> {
+    let mut child = Command::new(common::mcp_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn binscout-mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        for line in lines {
+            writeln!(stdin, "{line}").expect("write request");
+        }
+    }
+    let out = child.wait_with_output().expect("server exits on stdin EOF");
+    assert!(out.status.success(), "server exit: {}", out.status);
+    let text = String::from_utf8(out.stdout).expect("stdout utf-8");
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|_| panic!("response line must be JSON: {l:?}"))
+        })
+        .collect()
+}
+
+fn mcp_req(id: u64, method: &str, params: Value) -> String {
+    serde_json::to_string(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+        .expect("request serializes")
+}
+
+fn mcp_call(id: u64, name: &str, args: Value) -> String {
+    mcp_req(id, "tools/call", json!({"name": name, "arguments": args}))
+}
+
+fn mcp_tool_text(resp: &Value) -> &str {
+    let result = resp
+        .get("result")
+        .unwrap_or_else(|| panic!("tool must return result: {resp}"));
+    assert_ne!(
+        result.get("isError"),
+        Some(&Value::Bool(true)),
+        "tool error: {resp}"
+    );
+    result["content"][0]["text"].as_str().expect("text content")
+}
+
+fn mcp_tool_once(tool_id: u64, tool: &str, args: Value) -> Value {
+    let lines = vec![
+        mcp_req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        mcp_call(tool_id, tool, args),
+    ];
+    let resps = mcp_session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("numeric id"), r))
+        .collect();
+    let text = mcp_tool_text(by_id[&tool_id]).to_owned();
+    serde_json::from_str(&text).expect("tool json")
+}
+
 fn put16(v: &mut [u8], off: usize, x: u16) {
     v[off..off + 2].copy_from_slice(&x.to_le_bytes());
 }
@@ -619,4 +690,299 @@ fn cli_pdb_with_raw_is_rejected() {
         .expect("run binscout");
     assert!(!out.status.success(), "--pdb with --raw must fail");
     common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_func_debug_file_names_stripped() {
+    let dir = common::tmpdir("mcp-debug-file");
+    let stripped = common::write_bin(&dir, "stripped.elf", &dwarf_elf(false));
+    let full = common::write_bin(&dir, "full.elf", &dwarf_elf(true));
+    let db = common::temp_db(&dir, "mcp");
+    let v = mcp_tool_once(
+        10,
+        "func",
+        json!({
+            "binary": stripped.display().to_string(),
+            "db": db.display().to_string(),
+            "addr": "0x400010",
+            "debug_file": full.display().to_string(),
+        }),
+    );
+    assert_eq!(v["name"], "beta");
+    assert!(
+        v["reasons"]
+            .as_array()
+            .expect("reasons array")
+            .iter()
+            .any(|r| r == "debug"),
+        "reasons include debug: {v}"
+    );
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_func_without_debug_file_is_null() {
+    let dir = common::tmpdir("mcp-debug-missing");
+    let stripped = common::write_bin(&dir, "stripped.elf", &dwarf_elf(false));
+    let db = common::temp_db(&dir, "mcp");
+    let lines = vec![
+        mcp_req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        mcp_call(
+            10,
+            "func",
+            json!({
+                "binary": stripped.display().to_string(),
+                "db": db.display().to_string(),
+                "addr": "0x400010",
+            }),
+        ),
+    ];
+    let resps = mcp_session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let resp = &resps[1];
+    if let Some(result) = resp.get("result") {
+        let text = result["content"][0]["text"].as_str().expect("text");
+        let v: Value = serde_json::from_str(text).expect("tool json");
+        assert!(v["name"].is_null(), "stripped name must be null: {v}");
+    } else {
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not found")),
+            "stripped 0x400010 stays unnamed: {resp}"
+        );
+    }
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_func_cache_separates_debug_inputs() {
+    let dir = common::tmpdir("mcp-debug-cache");
+    let stripped = common::write_bin(&dir, "stripped.elf", &dwarf_elf(false));
+    let full = common::write_bin(&dir, "full.elf", &dwarf_elf(true));
+    let db = common::temp_db(&dir, "mcp");
+    let bin = stripped.display().to_string();
+    let db_s = db.display().to_string();
+    let full_s = full.display().to_string();
+    let b = || Value::String(bin.clone());
+    let d = || Value::String(db_s.clone());
+    let lines = vec![
+        mcp_req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        mcp_call(
+            10,
+            "func",
+            json!({"binary": b(), "db": d(), "addr": "0x400010"}),
+        ),
+        mcp_call(
+            11,
+            "func",
+            json!({"binary": b(), "db": d(), "addr": "0x400010", "debug_file": full_s}),
+        ),
+    ];
+    let resps = mcp_session(&lines);
+    assert_eq!(resps.len(), 3, "{resps:?}");
+    let by_id: std::collections::HashMap<u64, &Value> = resps
+        .iter()
+        .map(|r| (r["id"].as_u64().expect("id"), r))
+        .collect();
+    let plain_resp = by_id[&10];
+    if let Some(result) = plain_resp.get("result") {
+        let text = result["content"][0]["text"].as_str().expect("text");
+        let plain: Value = serde_json::from_str(text).expect("plain json");
+        assert!(plain["name"].is_null(), "plain open stays unnamed: {plain}");
+    } else {
+        assert!(
+            plain_resp["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("not found")),
+            "plain open stays unnamed: {plain_resp}"
+        );
+    }
+    let with: Value = serde_json::from_str(mcp_tool_text(by_id[&11])).expect("debug json");
+    assert_eq!(with["name"], "beta");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_functions_pdb_matches_cli() {
+    let dir = common::tmpdir("mcp-pdb");
+    let exe = common::write_bin(&dir, "mini.exe", include_bytes!("fixtures/pdb-mini.exe"));
+    let pdb_path = dir.join("mini.pdb");
+    std::fs::write(&pdb_path, include_bytes!("fixtures/pdb-mini.pdb")).expect("write pdb");
+    let cli_db = common::temp_db(&dir, "cli");
+    let out = Command::new(common::binscout_bin())
+        .args([
+            "--db",
+            &cli_db.to_string_lossy(),
+            "--pdb",
+            &pdb_path.to_string_lossy(),
+            "functions",
+            &exe.to_string_lossy(),
+            "--limit",
+            "100",
+        ])
+        .output()
+        .expect("run binscout");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&out.stdout).expect("cli json");
+    let mut cli_names: Vec<String> = cli["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_string))
+        .collect();
+    cli_names.sort();
+    let mcp_db = common::temp_db(&dir, "mcp");
+    let v = mcp_tool_once(
+        10,
+        "functions",
+        json!({
+            "binary": exe.display().to_string(),
+            "db": mcp_db.display().to_string(),
+            "pdb": pdb_path.display().to_string(),
+            "limit": 100,
+        }),
+    );
+    let mut mcp_names: Vec<String> = v["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_string))
+        .collect();
+    mcp_names.sort();
+    assert_eq!(mcp_names, cli_names, "MCP pdb names match CLI");
+    assert!(mcp_names.iter().any(|n| n.contains("main")));
+    assert!(mcp_names.iter().any(|n| n.contains("helper")));
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_batch_envelope_debug_file() {
+    let dir = common::tmpdir("mcp-batch-debug");
+    let stripped = common::write_bin(&dir, "stripped.elf", &dwarf_elf(false));
+    let full = common::write_bin(&dir, "full.elf", &dwarf_elf(true));
+    let db = common::temp_db(&dir, "mcp");
+    let v = mcp_tool_once(
+        10,
+        "batch",
+        json!({
+            "binary": stripped.display().to_string(),
+            "db": db.display().to_string(),
+            "debug_file": full.display().to_string(),
+            "ops": [{"tool": "func", "params": {"addr": "0x400010"}}],
+        }),
+    );
+    let results = v["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ok"]["name"], "beta");
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_batch_rejects_per_op_debug_keys() {
+    let dir = common::tmpdir("mcp-batch-debug-reject");
+    let stripped = common::write_bin(&dir, "stripped.elf", &dwarf_elf(false));
+    let full = common::write_bin(&dir, "full.elf", &dwarf_elf(true));
+    let db = common::temp_db(&dir, "mcp");
+    let v = mcp_tool_once(
+        10,
+        "batch",
+        json!({
+            "binary": stripped.display().to_string(),
+            "db": db.display().to_string(),
+            "ops": [{"tool": "func", "params": {"addr": "0x400010", "debug_file": full.display().to_string()}}],
+        }),
+    );
+    let results = v["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("envelope")),
+        "per-op debug_file names the envelope: {}",
+        results[0]
+    );
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_pdb_plus_raw_errors() {
+    let dir = common::tmpdir("mcp-pdb-raw");
+    let raw = common::write_bin(&dir, "raw.bin", b"\x90\x90\xc3");
+    let pdb = common::write_bin(&dir, "x.pdb", b"not a pdb");
+    let db = common::temp_db(&dir, "mcp");
+    let lines = vec![
+        mcp_req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        mcp_call(
+            10,
+            "func",
+            json!({
+                "binary": raw.display().to_string(),
+                "db": db.display().to_string(),
+                "addr": "0x0",
+                "raw": {"arch": "x86_64", "base": "0x0"},
+                "pdb": pdb.display().to_string(),
+            }),
+        ),
+    ];
+    let resps = mcp_session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    assert!(
+        resps[1].get("error").is_some(),
+        "pdb+raw must error: {resps:?}"
+    );
+    common::cleanup(&dir);
+}
+
+#[test]
+fn mcp_tools_list_exposes_debug_params() {
+    let lines = vec![
+        mcp_req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+        ),
+        serde_json::to_string(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .expect("n"),
+        mcp_req(2, "tools/list", json!({})),
+    ];
+    let resps = mcp_session(&lines);
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    let tools = resps[1]["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .clone();
+    for name in ["func", "functions", "batch"] {
+        let tool = tools.iter().find(|t| t["name"] == name).expect(name);
+        let props = tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("props");
+        assert!(props.contains_key("pdb"), "{name} exposes pdb");
+        assert!(
+            props.contains_key("debug_file"),
+            "{name} exposes debug_file"
+        );
+    }
 }
