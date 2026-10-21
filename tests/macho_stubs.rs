@@ -6,9 +6,11 @@
 
 mod common;
 
-use binscout::analysis::{XrefKind, analyze};
+use binscout::analysis::{DiagnosticKind, XrefKind, analyze};
 use binscout::disasm::Arch;
-use binscout::loader::{BinaryFormat, ImportRef, LoadedBinary, Segment, load};
+use binscout::loader::{
+    BinaryFormat, ExportRef, ImportRef, LoadedBinary, Segment, SymbolRef, load,
+};
 
 fn put32(v: &mut [u8], off: usize, x: u32) {
     v[off..off + 4].copy_from_slice(&x.to_le_bytes());
@@ -874,4 +876,96 @@ fn chained_unknown_pointer_format_maps_nothing() {
     let bin = load(&f).expect("bogus-format image must still load");
     assert_eq!(bin.imports.len(), 3);
     assert!(bin.imports.iter().all(|i| i.address.is_none()));
+}
+
+#[test]
+fn macho_stub_jumps_are_not_unresolved() {
+    let mut bad_all: Vec<(u64, u64)> = Vec::new();
+    for (bytes, stride) in [
+        (macho_chained_arm64(), 12u64),
+        (macho_chained_x86_64(), 6u64),
+    ] {
+        let bin = load(&bytes).expect("chained fixture must load");
+        let analysis = analyze(&bin).expect("chained fixture must analyze");
+        let bad: Vec<u64> = analysis
+            .diagnostics
+            .records
+            .iter()
+            .filter(|d| d.kind == DiagnosticKind::UnresolvedIndirectJump)
+            .map(|d| d.addr)
+            .filter(|a| *a >= CHAINED_STUBS && *a < CHAINED_STUBS + 2 * stride)
+            .collect();
+        bad_all.extend(bad.into_iter().map(|a| (stride, a)));
+    }
+    assert!(
+        bad_all.is_empty(),
+        "stub-range indirect jumps stay unresolved: {bad_all:#x?}"
+    );
+}
+
+#[test]
+fn macho_header_symbol_is_not_seeded() {
+    let mut code = vec![0x90u8; 0x20];
+    code[0] = 0x06;
+    code[0x10] = 0xC3;
+    let bin = LoadedBinary {
+        format: BinaryFormat::MachO,
+        arch: Arch::X86_64,
+        entry: None,
+        segments: vec![Segment {
+            vaddr: 0x1000,
+            mem_size: code.len() as u64,
+            data: code,
+            readable: true,
+            writable: false,
+            executable: true,
+        }],
+        sections: Vec::new(),
+        imports: Vec::new(),
+        exports: vec![
+            ExportRef {
+                name: "__mh_execute_header".to_string(),
+                address: Some(0x1000),
+                ordinal: None,
+                demangled: None,
+            },
+            ExportRef {
+                name: "_real".to_string(),
+                address: Some(0x1010),
+                ordinal: None,
+                demangled: None,
+            },
+        ],
+        symbols: vec![SymbolRef {
+            name: "__mh_execute_header".to_string(),
+            address: 0x1000,
+            demangled: None,
+        }],
+        pdata_funcs: Vec::new(),
+        tls_callbacks: Vec::new(),
+        init_funcs: Vec::new(),
+        func_starts: Vec::new(),
+        debug_funcs: Vec::new(),
+        relocatable: false,
+        arm_hints: Default::default(),
+    };
+    assert!(bin.exports.iter().any(|e| e.name == "__mh_execute_header"));
+    assert!(bin.symbols.iter().any(|s| s.name == "__mh_execute_header"));
+    let analysis = analyze(&bin).expect("header fixture must analyze");
+    assert!(
+        !analysis
+            .diagnostics
+            .records
+            .iter()
+            .any(|d| d.addr == 0x1000 && d.kind == DiagnosticKind::DecodeFailure),
+        "image-base decode failure from the header symbol"
+    );
+    assert!(
+        !analysis.functions.contains_key(&0x1000),
+        "header symbol must not seed a function"
+    );
+    assert!(
+        analysis.functions.contains_key(&0x1010),
+        "ordinary export still seeds"
+    );
 }

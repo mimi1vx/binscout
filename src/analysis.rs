@@ -55,7 +55,7 @@ pub const MAX_POINTER_SEEDS: usize = 10_000;
 /// Bumped whenever [`analyze`] output for identical bytes and mappings can
 /// change; [`crate::db`] treats a stored revision mismatch as stale and
 /// re-analyzes while carrying same-mapping annotations forward.
-pub const ANALYSIS_REVISION: u32 = 14;
+pub const ANALYSIS_REVISION: u32 = 15;
 /// Cap on retained diagnostic records per [`analyze`] call.
 ///
 /// When discovery yields more sites than this, analysis continues and the
@@ -128,6 +128,10 @@ pub const MAX_SLICE_DEPTH: usize = 64;
 /// Real chains are a handful deep; past this bound the leftovers stay
 /// returning (today's behavior), never guessed noreturn.
 pub const MAX_NORETURN_ROUNDS: usize = 64;
+
+/// Largest Mach-O stub entry (`__auth_stubs` is 16 bytes, arm64 `__stubs`
+/// 12, x86-64 6).
+const MACHO_STUB_MAX: u64 = 16;
 
 /// What a cross-reference points through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2745,6 +2749,16 @@ fn pointer_seeds(space: &AddrSpace, bin: &LoadedBinary) -> Vec<(u64, Arch)> {
     out
 }
 
+// Mach-O header symbols mark the mach_header, not code.
+const MACHO_HEADER_SYMBOLS: &[&str] = &[
+    "__mh_execute_header",
+    "__mh_dylib_header",
+    "__mh_bundle_header",
+    "__mh_dylinker_header",
+    "__mh_object_header",
+    "__mh_preload_header",
+];
+
 /// Seed addresses from the entry point, exports, symbol-table entries,
 /// ARM mapping ranges, Mach-O stub entries, `.pdata`/`TLS`/init/
 /// `LC_FUNCTION_STARTS` tables, and optional pointer-scan hits resolving
@@ -2787,6 +2801,9 @@ fn authoritative_seeds(
         push(&mut seeds, addr, mode);
     }
     for exp in &bin.exports {
+        if bin.format == BinaryFormat::MachO && MACHO_HEADER_SYMBOLS.contains(&exp.name.as_str()) {
+            continue;
+        }
         if let Some(addr) = exp.address {
             let (addr, mode) = arm_seed(bin, addr);
             push(&mut seeds, addr, mode);
@@ -2797,6 +2814,9 @@ fn authoritative_seeds(
     // (Thumb bit cleared); the mode still comes from the bit and the
     // loader's Thumb-function marks (see `arm_seed`).
     for sym in &bin.symbols {
+        if bin.format == BinaryFormat::MachO && MACHO_HEADER_SYMBOLS.contains(&sym.name.as_str()) {
+            continue;
+        }
         let (addr, mode) = arm_seed(bin, sym.address);
         push(&mut seeds, addr, mode);
     }
@@ -5001,6 +5021,22 @@ pub fn analyze_with_options(
     } else {
         BTreeMap::new()
     };
+    if bin.format == BinaryFormat::MachO && !bin.relocatable {
+        let in_stub: Vec<Diagnostic> = diagnostic_set
+            .iter()
+            .filter(|d| d.kind == DiagnosticKind::UnresolvedIndirectJump)
+            .filter(|d| {
+                stubs
+                    .range(..=d.addr)
+                    .next_back()
+                    .is_some_and(|(&s, _)| d.addr - s < MACHO_STUB_MAX)
+            })
+            .copied()
+            .collect();
+        for d in in_stub {
+            diagnostic_set.remove(&d);
+        }
+    }
     // Tag decoded rows with the import each site calls through.
     for d in decoded.values_mut() {
         if let Some(i) = import_index(&slots, &stubs, d.insn.branch_target, d.insn.mem_target)
