@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/mimi1vx/binscout/compare/v0.8.0...v0.9.0) - 2026-10-21
+
+### Added
+
+- expose pdb and debug-file through MCP tools with cache identity
+- [**breaking**] range names carry semantics on functions and search_bytes
+- add aarch64 support to patch preview
+- [**breaking**] slice default depth 8 and NotFound on unmapped root
+- add values_hex twins for integer bytes views
+- add content_hash_hex twin to project_info and stats
+- [**breaking**] xrefs returns protocol-1 page envelope
+- [**breaking**] page stack_strings and go_funcs under protocol-1 envelope
+- [**breaking**] default functions and strings output to the protocol-1 page envelope
+
+### Fixed
+
+- suppress benign Mach-O stub and header diagnostics
+
+### Other
+
+- 0.9.0 page envelope everywhere, range semantics, debug params, slice/patch
+
 ## [0.8.0](https://github.com/mimi1vx/binscout/compare/v0.7.0...v0.8.0) - 2026-10-20
 
 ### Added
