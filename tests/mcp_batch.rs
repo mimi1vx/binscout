@@ -456,3 +456,23 @@ fn batch_stack_strings_pages_envelope() {
     assert_eq!(page["next_offset"], 1);
     cleanup(&dir);
 }
+
+#[test]
+fn batch_slice_unmapped_root_is_op_error() {
+    let dir = tmpdir("mcp-batch-slice-unmapped");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let ops = vec![op("slice", json!({"addr": "0xdead", "depth": 5}))];
+    let batch = tool_once(10, "batch", json!({"binary": bin, "db": db, "ops": ops}));
+    let results = batch["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0]["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("not mapped")),
+        "{:?}",
+        results[0]
+    );
+    assert!(results[0].get("ok").is_none(), "{:?}", results[0]);
+    cleanup(&dir);
+}

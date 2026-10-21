@@ -3947,14 +3947,16 @@ impl Project {
     /// `depth` bounds the walk to that many reverse hops (direct
     /// predecessors are depth 1, zero yields an empty page); values
     /// past [`crate::analysis::MAX_SLICE_DEPTH`] are [`Error::Invalid`].
-    /// Any address is a valid root (data/string targets lie in no
-    /// function); rows order by address with the shortest distance in
-    /// `depth`, and only the selected page resolves containing
-    /// functions and names, so per-page work scales with the page.
-    /// Read-only: never writes the binary or the sidecar.
+    /// Any mapped address is a valid root (data/string targets lie in no
+    /// function); unmapped roots are [`Error::NotFound`]; rows order by
+    /// address with the shortest distance in `depth`, and only the
+    /// selected page resolves containing functions and names, so per-page
+    /// work scales with the page. Read-only: never writes the binary or
+    /// the sidecar.
     ///
     /// # Errors
     /// [`Error::Invalid`] when `depth` exceeds the hop cap.
+    /// [`Error::NotFound`] when `addr` is not mapped.
     pub fn slice_page(
         &self,
         addr: u64,
@@ -3966,6 +3968,11 @@ impl Project {
             return Err(Error::Invalid(format!(
                 "depth {depth} exceeds {}",
                 crate::analysis::MAX_SLICE_DEPTH
+            )));
+        }
+        if self.bytes_at(addr, 1).is_err() {
+            return Err(Error::NotFound(format!(
+                "slice root {addr:#x} is not mapped"
             )));
         }
         let reached = self.analysis.slice_to(addr, depth);

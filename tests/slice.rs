@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
-use binscout::analysis::{MAX_SLICE_DEPTH, analyze_raw};
+use binscout::analysis::{DEFAULT_SLICE_DEPTH, MAX_SLICE_DEPTH, analyze_raw};
 use binscout::disasm::Arch;
 use binscout::loader::RawOptions;
 
@@ -164,7 +164,7 @@ fn slice_traces_pe_string_refs_to_loader_entry() {
     );
 
     // Depth zero is an empty page; over-cap depth is Invalid; an
-    // unreferenced address is an empty page, not an error.
+    // unmapped root is NotFound.
     let empty = p
         .slice_page(BASIC_STRING_VA, 0, 0, 50)
         .expect("depth-0 page");
@@ -177,8 +177,11 @@ fn slice_traces_pe_string_refs_to_loader_entry() {
         matches!(err, binscout::error::Error::Invalid(_)),
         "got {err:?}"
     );
-    let bare = p.slice_page(0xdead, 5, 0, 10).expect("bare page");
-    assert_eq!(bare.total, 0);
+    let err = p.slice_page(0xdead, 5, 0, 10).unwrap_err();
+    assert!(
+        matches!(err, binscout::error::Error::NotFound(_)),
+        "got {err:?}"
+    );
     assert!(
         !temp_db(&dir, common::builders::BASIC_NAME).exists(),
         "reads never create the sidecar"
@@ -281,11 +284,11 @@ fn cli_slice_envelope_parity_and_errors() {
     assert_eq!(v["items"].as_array().expect("items").len(), 3);
     assert_eq!(v["next_offset"], 3);
 
-    // Unreferenced roots are empty pages; bad addresses and over-cap
+    // Unmapped roots are JSON errors; bad addresses and over-cap
     // depths are JSON errors.
     let (ok, v) = run(&["--db", d, "slice", &bin, "0xdead", "--depth", "5"]);
-    assert!(ok, "{v}");
-    assert_eq!(v["total"], 0);
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(v["kind"], "not_found", "{v}");
     let (ok, v) = run(&["--db", d, "slice", &bin, "zz", "--depth", "5"]);
     assert!(!ok && v.get("error").is_some(), "{v}");
     let (ok, v) = run(&[
@@ -302,6 +305,46 @@ fn cli_slice_envelope_parity_and_errors() {
         !std::path::Path::new(d).exists(),
         "slice reads never create the sidecar"
     );
+    cleanup(&dir);
+}
+
+#[test]
+fn cli_slice_mapped_without_refs_is_empty() {
+    use common::builders::DATA_VA;
+    let dir = tmpdir("cli-slice-empty");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME)
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let d = db.as_str();
+    let root = format!("{DATA_VA:#x}");
+    let (ok, v) = run(&["--db", d, "slice", &bin, &root, "--depth", "5"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["total"], 0);
+    assert_eq!(v["items"].as_array().expect("items").len(), 0);
+    cleanup(&dir);
+}
+
+#[test]
+fn cli_slice_default_depth_is_eight() {
+    use common::builders::BASIC_STRING_VA;
+    assert_eq!(DEFAULT_SLICE_DEPTH, 8);
+    let dir = tmpdir("cli-slice-default");
+    let bin = common::write_fixture(&dir, common::builders::BASIC_NAME)
+        .display()
+        .to_string();
+    let db = temp_db(&dir, "basic").display().to_string();
+    let d = db.as_str();
+    let marker_hex = format!("{BASIC_STRING_VA:#x}");
+    let (ok, v) = run(&["--db", d, "slice", &bin, &marker_hex]);
+    assert!(ok, "{v}");
+    for row in v["items"].as_array().expect("items") {
+        let depth = row["depth"].as_u64().expect("depth");
+        assert!(depth <= 8, "default depth stays within 8: {v}");
+    }
+    let (ok, explicit) = run(&["--db", d, "slice", &bin, &marker_hex, "--depth", "8"]);
+    assert!(ok, "{explicit}");
+    assert_eq!(v, explicit, "omitted --depth must match --depth 8");
     cleanup(&dir);
 }
 

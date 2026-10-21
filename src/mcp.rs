@@ -804,11 +804,11 @@ pub struct SliceParams {
     /// or a `lipo` alias like `arm64`); required for fat containers.
     pub fat_arch: Option<String>,
     /// Slice root: every returned instruction can reach this address
-    /// (`0x`-hex or decimal string; any address is valid, including
+    /// (`0x`-hex or decimal string; any mapped address is valid, including
     /// data/string targets in no function).
     pub addr: String,
     /// Max reverse hops from the root (direct predecessors are depth 1;
-    /// defaults to the 64-hop cap).
+    /// defaults to 8; max 64).
     pub depth: Option<usize>,
     /// First row to return.
     pub offset: Option<usize>,
@@ -1378,7 +1378,7 @@ fn run_batch_op(
             let addr = parse_addr(&a.addr).map_err(|e| e.to_string())?;
             proj.slice_page(
                 addr,
-                a.depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
+                a.depth.unwrap_or(crate::analysis::DEFAULT_SLICE_DEPTH),
                 a.offset.unwrap_or(0),
                 a.limit.unwrap_or(50),
             )
@@ -1930,7 +1930,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "slice",
-        description = "Backward slice of one address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors, out to depth hops (direct predecessors are depth 1), ordered by address with shortest distance, paged under the protocol-1 envelope. Any address is a valid root"
+        description = "Backward slice of one address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors, out to depth hops (direct predecessors are depth 1), ordered by address with shortest distance, paged under the protocol-1 envelope. Any mapped address is a valid root; unmapped roots error. depth defaults to 8 (max 64)."
     )]
     async fn slice(&self, p: Parameters<SliceParams>) -> Result<String, ErrorData> {
         let p = all_params(p);
@@ -1940,7 +1940,7 @@ impl BinscoutMcp {
         let addr = parse_addr(&addr_s).map_err(error_data)?;
         proj.slice_page(
             addr,
-            depth.unwrap_or(crate::analysis::MAX_SLICE_DEPTH),
+            depth.unwrap_or(crate::analysis::DEFAULT_SLICE_DEPTH),
             offset.unwrap_or(0),
             limit.unwrap_or(50),
         )

@@ -121,6 +121,9 @@ pub const MAX_CALL_DEPTH: usize = 64;
 /// over the instruction set. Mirrors [`MAX_CALL_DEPTH`]: direct
 /// predecessors are depth 1, zero yields an empty set.
 pub const MAX_SLICE_DEPTH: usize = 64;
+/// Default `slice` depth for the CLI and MCP: wide enough for a few hops
+/// of xrefs, narrow enough to stay readable.
+pub const DEFAULT_SLICE_DEPTH: usize = 8;
 /// Cap on noreturn propagation rounds per `plan_noreturn` call.
 ///
 /// Each round marks every dirty function whose entry can no longer reach

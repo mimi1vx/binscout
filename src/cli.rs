@@ -198,13 +198,14 @@ pub enum Cmd {
     },
     /// Backward slice of one address: every instruction that can reach
     /// it by following xref edges (any kind) and intra-function CFG
-    /// predecessors backward out to `--depth` hops. Any address is a
-    /// valid root (data/string targets lie in no function).
+    /// predecessors backward out to `--depth` hops. Any mapped address
+    /// is a valid root (data/string targets lie in no function).
     Slice {
         binary: PathBuf,
         addr: String,
-        /// Max reverse hops from the root (direct predecessors are depth 1).
-        #[arg(long, default_value_t = binscout::analysis::MAX_SLICE_DEPTH)]
+        /// Max reverse hops from the root (direct predecessors are depth 1;
+        /// defaults to 8).
+        #[arg(long, default_value_t = binscout::analysis::DEFAULT_SLICE_DEPTH)]
         depth: usize,
         #[arg(long, default_value_t = 0)]
         offset: usize,
