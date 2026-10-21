@@ -1,29 +1,34 @@
 //! Patch export: assemble replacement bytes at a VA without writing the binary.
 //!
 //! A patch covers exactly one instruction: the first decode at the target
-//! address sets the boundary, the replacement (assembled `--asm` or literal
-//! `--bytes`) must fit inside it, and shorter replacements are padded with
-//! single-byte NOPs. The result is a [`PatchPreview`] (`va`, `file_off`,
-//! `old_hex`, `new_hex`, `size_ok`); an optional `--out` file carries the
-//! same bytes as JSON or IPS. The analyzed binary is never written: the
-//! output path must differ from it (see [`reject_output_is_binary`]) and
-//! overflowing or non-file-backed patches are refused outright.
+//! address sets the boundary (aarch64 instructions are always 4 bytes), the
+//! replacement (assembled `--asm` or literal `--bytes`) must fit inside it,
+//! and shorter x86 replacements are padded with single-byte NOPs. The result
+//! is a [`PatchPreview`] (`va`, `file_off`, `old_hex`, `new_hex`,
+//! `size_ok`); an optional `--out` file carries the same bytes as JSON or
+//! IPS. The analyzed binary is never written: the output path must differ
+//! from it (see [`reject_output_is_binary`]) and overflowing or
+//! non-file-backed patches are refused outright.
 
 use serde::Serialize;
 
 use crate::disasm::Arch;
 use crate::error::{Error, Result};
 
-/// Single-byte NOP used to pad short replacements up to the instruction
-/// boundary (x86 only, like the rest of this module).
+/// Single-byte NOP used to pad short x86 replacements up to the
+/// instruction boundary.
 pub const X86_NOP: u8 = 0x90;
 
+/// A64 `nop` (little-endian bytes of 0xD503201F).
+pub const AARCH64_NOP: [u8; 4] = [0x1f, 0x20, 0x03, 0xd5];
+
 /// Replacement source for [`crate::Project::patch_preview`]: assembled
-/// Intel-syntax text or literal bytes.
+/// x86 or aarch64 text or literal bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchInput {
-    /// Small x86 subset (`nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`),
-    /// encoded at the target address (see [`assemble_x86`]).
+    /// Small x86 (`nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`) or aarch64
+    /// (`nop`, `ret`, `brk #IMM`, `b ADDR`, `bl ADDR`) subset, encoded at
+    /// the target address (see [`assemble_x86`] and [`assemble_aarch64`]).
     Asm(String),
     /// Literal replacement bytes (see [`parse_patch_bytes`]).
     Bytes(Vec<u8>),
@@ -198,6 +203,65 @@ pub fn assemble_x86(arch: Arch, va: u64, text: &str) -> Result<Vec<u8>> {
         .map_err(|e| Error::Invalid(format!("cannot encode {text:?} at {va:#x}: {e}")))
 }
 
+/// Assemble one `--asm` line at `va` for aarch64 (little-endian).
+///
+/// Only the hot-fix subset is supported: bare `nop`/`ret`, `brk #IMM`
+/// (`#` optional, 16-bit immediate), and `b ADDR`/`bl ADDR` (absolute
+/// targets in `0x`-hex or decimal, encoded relative to `va`). Anything
+/// else is an error naming the subset; use [`parse_patch_bytes`] for
+/// arbitrary encodings.
+///
+/// # Errors
+/// [`Error::Invalid`] on unknown mnemonics, bad immediates, or branch
+/// targets that are misaligned or out of the ±128MiB range.
+pub fn assemble_aarch64(va: u64, text: &str) -> Result<Vec<u8>> {
+    let text = text.trim();
+    let (head, tail) = match text.find(char::is_whitespace) {
+        Some(i) => (text[..i].to_string(), text[i..].trim().to_string()),
+        None => (text.to_string(), String::new()),
+    };
+    let word = match head.to_ascii_lowercase().as_str() {
+        "nop" if tail.is_empty() => 0xD503_201Fu32,
+        "ret" if tail.is_empty() => 0xD65F_03C0u32,
+        "brk" if !tail.is_empty() && !tail.contains(char::is_whitespace) => {
+            let imm_text = tail.strip_prefix('#').unwrap_or(&tail);
+            let imm = crate::parse_addr(imm_text)?;
+            if imm > 0xFFFF {
+                return Err(Error::Invalid(format!(
+                    "brk immediate {imm_text:?} out of range (expected 0..=0xFFFF)"
+                )));
+            }
+            0xD420_0000u32 | ((imm as u32) << 5)
+        }
+        "b" | "bl" if !tail.is_empty() && !tail.contains(char::is_whitespace) => {
+            let target = crate::parse_addr(&tail)?;
+            let off = target as i64 - va as i64;
+            if off % 4 != 0 {
+                return Err(Error::Invalid(format!(
+                    "branch target {target:#x} from {va:#x} is misaligned (offset {off} is not a multiple of 4)"
+                )));
+            }
+            if !(-(1 << 27)..=(1 << 27) - 4).contains(&off) {
+                return Err(Error::Invalid(format!(
+                    "branch target {target:#x} from {va:#x} is out of range (offset {off} exceeds ±128MiB)"
+                )));
+            }
+            let base = if head.eq_ignore_ascii_case("b") {
+                0x1400_0000u32
+            } else {
+                0x9400_0000u32
+            };
+            base | (((off >> 2) & 0x03FF_FFFF) as u32)
+        }
+        _ => {
+            return Err(Error::Invalid(format!(
+                "unsupported --asm {text:?}: expected nop, ret, brk #IMM, b ADDR, or bl ADDR (use --bytes for arbitrary encodings)"
+            )));
+        }
+    };
+    Ok(word.to_le_bytes().to_vec())
+}
+
 /// Encode one IPS patch record: `PATCH` + 24-bit big-endian offset +
 /// 16-bit big-endian length + data + `EOF`.
 ///
@@ -320,6 +384,48 @@ mod tests {
                 "{bad:?} must fail"
             );
         }
+    }
+
+    #[test]
+    fn aarch64_encodes_fixed_brk_and_branches() {
+        assert_eq!(
+            assemble_aarch64(0x1000, "nop").expect("nop"),
+            vec![0x1f, 0x20, 0x03, 0xd5]
+        );
+        assert_eq!(
+            assemble_aarch64(0x1000, "  RET ").expect("ret"),
+            vec![0xc0, 0x03, 0x5f, 0xd6]
+        );
+        assert_eq!(
+            assemble_aarch64(0x1000, "brk #0").expect("brk 0"),
+            vec![0x00, 0x00, 0x20, 0xd4]
+        );
+        assert_eq!(
+            assemble_aarch64(0x1000, "brk 0x3e8").expect("brk imm"),
+            vec![0x00, 0x7d, 0x20, 0xd4]
+        );
+        assert_eq!(
+            assemble_aarch64(0x1000, "b 0x1010").expect("b"),
+            vec![0x04, 0x00, 0x00, 0x14]
+        );
+        assert_eq!(
+            assemble_aarch64(0x1000, "bl 0xff0").expect("bl"),
+            vec![0xfc, 0xff, 0xff, 0x97]
+        );
+        for bad in ["", "mov x0, 0", "b", "b 0x1 0x2", "nop 5", "brk #0x10000"] {
+            assert!(
+                matches!(assemble_aarch64(0x1000, bad), Err(Error::Invalid(_))),
+                "{bad:?} must fail"
+            );
+        }
+        assert!(matches!(
+            assemble_aarch64(0x1000, "b 0x1002"),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            assemble_aarch64(0x1000, "b 0x10001000"),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]

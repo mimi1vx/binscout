@@ -3221,18 +3221,21 @@ impl Project {
 
     /// Assemble a one-instruction patch preview at `va` without writing anything.
     ///
-    /// The first decode at `va` sets the instruction boundary; the
-    /// replacement ([`crate::patch::PatchInput::Asm`] via the iced-x86 encoder,
+    /// The first decode at `va` sets the instruction boundary (aarch64
+    /// instructions are always 4 bytes); the replacement
+    /// ([`crate::patch::PatchInput::Asm`] via the x86 or aarch64 assembler,
     /// or [`crate::patch::PatchInput::Bytes`] literally) must fit inside it,
-    /// and shorter replacements are padded with single-byte NOPs. The result carries
-    /// the original and replacement bytes plus `size_ok` and the file
-    /// offset, or null when the address is not file-backed. Read-only:
-    /// never writes the binary or the sidecar.
+    /// and shorter x86 replacements are padded with single-byte NOPs. The
+    /// result carries the original and replacement bytes plus `size_ok` and
+    /// the file offset, or null when the address is not file-backed.
+    /// Read-only: never writes the binary or the sidecar.
     ///
     /// # Errors
-    /// [`Error::Unsupported`] on non-x86 binaries, [`Error::NotFound`]
-    /// when `va` is unmapped, [`Error::Invalid`] on undecodable bytes or
-    /// bad replacement text (see [`crate::patch::assemble_x86`] and
+    /// [`Error::Unsupported`] on non-x86/non-aarch64 binaries,
+    /// [`Error::NotFound`] when `va` is unmapped, [`Error::Invalid`] on
+    /// undecodable bytes, misaligned aarch64 addresses, or bad replacement
+    /// text (see [`crate::patch::assemble_x86`],
+    /// [`crate::patch::assemble_aarch64`], and
     /// [`crate::patch::parse_patch_bytes`]).
     pub fn patch_preview(
         &self,
@@ -3240,45 +3243,76 @@ impl Project {
         input: &crate::patch::PatchInput,
     ) -> Result<crate::patch::PatchPreview> {
         let arch = self.binary.arch;
-        if !arch.is_x86() {
-            return Err(Error::Unsupported(format!(
-                "patch is x86-only (binary arch is {})",
-                crate::db::arch_name(arch)
-            )));
-        }
-        // x86 instructions are at most 15 bytes; shrink from there so a
-        // short tail near a segment end still decodes.
-        let mut window = None;
-        for len in (1..=15usize).rev() {
-            if let Ok(bytes) = self.bytes_at(va, len) {
-                window = Some(bytes);
-                break;
+        if arch.is_x86() {
+            // x86 instructions are at most 15 bytes; shrink from there so a
+            // short tail near a segment end still decodes.
+            let mut window = None;
+            for len in (1..=15usize).rev() {
+                if let Ok(bytes) = self.bytes_at(va, len) {
+                    window = Some(bytes);
+                    break;
+                }
             }
+            let window =
+                window.ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
+            let first = crate::disasm::disasm_first(arch, &window, va)?
+                .ok_or_else(|| Error::Invalid(format!("no bytes at {va:#x}")))?;
+            let old_len = first.size as usize;
+            let old = window[..old_len].to_vec();
+            let raw = match input {
+                crate::patch::PatchInput::Asm(text) => crate::patch::assemble_x86(arch, va, text)?,
+                crate::patch::PatchInput::Bytes(bytes) => bytes.clone(),
+            };
+            let (new, size_ok) = if raw.len() <= old_len {
+                let mut padded = raw;
+                padded.resize(old_len, crate::patch::X86_NOP);
+                (padded, true)
+            } else {
+                (raw, false)
+            };
+            return Ok(crate::patch::PatchPreview {
+                addr: va,
+                file_off: self.file_off_of(va),
+                old,
+                new,
+                size_ok,
+            });
         }
-        let window =
-            window.ok_or_else(|| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
-        let first = crate::disasm::disasm_first(arch, &window, va)?
-            .ok_or_else(|| Error::Invalid(format!("no bytes at {va:#x}")))?;
-        let old_len = first.size as usize;
-        let old = window[..old_len].to_vec();
-        let raw = match input {
-            crate::patch::PatchInput::Asm(text) => crate::patch::assemble_x86(arch, va, text)?,
-            crate::patch::PatchInput::Bytes(bytes) => bytes.clone(),
-        };
-        let (new, size_ok) = if raw.len() <= old_len {
-            let mut padded = raw;
-            padded.resize(old_len, crate::patch::X86_NOP);
-            (padded, true)
-        } else {
-            (raw, false)
-        };
-        Ok(crate::patch::PatchPreview {
-            addr: va,
-            file_off: self.file_off_of(va),
-            old,
-            new,
-            size_ok,
-        })
+        if arch == crate::disasm::Arch::Aarch64 {
+            if !va.is_multiple_of(4) {
+                return Err(Error::Invalid(format!(
+                    "aarch64 patch address {va:#x} is not 4-byte aligned"
+                )));
+            }
+            let old = self
+                .bytes_at(va, 4)
+                .map_err(|_| Error::NotFound(format!("no bytes mapped at {va:#x}")))?;
+            let raw = match input {
+                crate::patch::PatchInput::Asm(text) => crate::patch::assemble_aarch64(va, text)?,
+                crate::patch::PatchInput::Bytes(bytes) => bytes.clone(),
+            };
+            if !raw.len().is_multiple_of(4) {
+                return Err(Error::Invalid(
+                    "aarch64 replacement must be a multiple of 4 bytes".to_string(),
+                ));
+            }
+            let (new, size_ok) = if raw.len() == 4 {
+                (raw, true)
+            } else {
+                (raw, false)
+            };
+            return Ok(crate::patch::PatchPreview {
+                addr: va,
+                file_off: self.file_off_of(va),
+                old,
+                new,
+                size_ok,
+            });
+        }
+        Err(Error::Unsupported(format!(
+            "patch supports x86 and aarch64 (binary arch is {})",
+            crate::db::arch_name(arch)
+        )))
     }
 
     /// Write a [`crate::patch::PatchPreview`] to `out` as JSON or IPS.

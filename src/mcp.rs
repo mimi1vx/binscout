@@ -924,8 +924,9 @@ pub struct PatchParams {
     pub fat_arch: Option<String>,
     /// Virtual address of the patched instruction (`0x`-hex or decimal).
     pub addr: String,
-    /// Intel-syntax assembly encoded at `addr` (x86 only; one of `nop`,
-    /// `ret`, `int3`, `jmp ADDR`, `call ADDR`); exactly one of `asm`/`bytes`.
+    /// Intel-syntax assembly encoded at `addr` (x86: `nop`, `ret`,
+    /// `int3`, `jmp ADDR`, `call ADDR`; aarch64: `nop`, `ret`, `brk #IMM`,
+    /// `b ADDR`, `bl ADDR`); exactly one of `asm`/`bytes`.
     pub asm: Option<String>,
     /// Literal bytes as whitespace-separated hex pairs (`"90 90"`);
     /// exactly one of `asm`/`bytes`.
@@ -2522,7 +2523,7 @@ impl BinscoutMcp {
 
     #[tool(
         name = "patch",
-        description = "Assemble replacement bytes at one x86 address and export the patch (va, file_off, old_hex, new_hex, size_ok) without writing the binary. Exactly one of asm (one of nop, ret, int3, jmp ADDR, call ADDR, encoded at addr) or bytes (whitespace-separated hex pairs); shorter replacements NOP-pad to the instruction boundary, longer ones report size_ok:false. Out optionally writes a json/ips patch file that must differ from the binary"
+        description = "Assemble replacement bytes at one x86 or aarch64 address and export the patch (va, file_off, old_hex, new_hex, size_ok) without writing the binary. Exactly one of asm (x86: nop, ret, int3, jmp ADDR, call ADDR; aarch64: nop, ret, brk #IMM, b ADDR, bl ADDR, encoded at addr) or bytes (whitespace-separated hex pairs); shorter replacements NOP-pad to the instruction boundary, longer ones report size_ok:false. Out optionally writes a json/ips patch file that must differ from the binary"
     )]
     async fn patch(&self, p: Parameters<PatchParams>) -> Result<String, ErrorData> {
         let p = all_params(p);

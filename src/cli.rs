@@ -504,8 +504,9 @@ pub enum Cmd {
     Patch {
         binary: PathBuf,
         addr: String,
-        /// Intel-syntax assembly encoded at `addr` (x86 only; one of
-        /// `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`).
+        /// Intel-syntax assembly encoded at `addr` (x86: `nop`, `ret`,
+        /// `int3`, `jmp ADDR`, `call ADDR`; aarch64: `nop`, `ret`, `brk #IMM`,
+        /// `b ADDR`, `bl ADDR`).
         #[arg(long, conflicts_with = "bytes", required_unless_present = "bytes")]
         asm: Option<String>,
         /// Literal bytes as whitespace-separated hex pairs (`"90 90"`).

@@ -121,16 +121,16 @@ fn patch_bytes_overflow_reports_not_ok() {
 
 #[test]
 fn patch_rejects_non_x86_arch() {
-    let dir = tmpdir("patch-arm");
-    let bin = write_bin(&dir, "a.bin", &[0x00, 0x00, 0x00, 0x00]);
+    let dir = tmpdir("patch-riscv");
+    let bin = write_bin(&dir, "r.bin", &[0x00, 0x00, 0x00, 0x00]);
     let bin_s = bin.display().to_string();
-    let db = temp_db(&dir, "a").display().to_string();
+    let db = temp_db(&dir, "r").display().to_string();
     let (ok, v) = run(&[
         "--db".to_string(),
         db,
         "--raw".to_string(),
         "--arch".to_string(),
-        "aarch64".to_string(),
+        "riscv64".to_string(),
         "--base".to_string(),
         "0x1000".to_string(),
         "patch".to_string(),
@@ -141,6 +141,140 @@ fn patch_rejects_non_x86_arch() {
     ]);
     assert!(!ok && v.get("error").is_some(), "{v}");
     assert_eq!(v["kind"], "unsupported", "{v}");
+    cleanup(&dir);
+}
+
+/// Raw aarch64 `nop; ret` at `0x1000` plus a temp DB path.
+fn aarch64_case(tag: &str) -> (String, String, std::path::PathBuf) {
+    let dir = tmpdir(tag);
+    let bin = write_bin(
+        &dir,
+        "a.bin",
+        &[0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6],
+    );
+    let db = temp_db(&dir, "a");
+    (bin.display().to_string(), db.display().to_string(), dir)
+}
+
+/// Raw aarch64 patch argv for `bin`/`addr` plus caller `extra` flags.
+fn aarch64_args(bin: &str, db: &str, addr: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "--db".to_string(),
+        db.to_string(),
+        "--raw".to_string(),
+        "--arch".to_string(),
+        "aarch64".to_string(),
+        "--base".to_string(),
+        "0x1000".to_string(),
+        "patch".to_string(),
+        bin.to_string(),
+        addr.to_string(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args
+}
+
+#[test]
+fn patch_aarch64_asm_fixed_and_branch_insns() {
+    let (bin, db, dir) = aarch64_case("patch-a64-asm");
+    for (asm, new_hex) in [
+        ("nop", "1f2003d5"),
+        ("ret", "c0035fd6"),
+        ("brk #0", "000020d4"),
+        ("b 0x1010", "04000014"),
+        ("bl 0xff0", "fcffff97"),
+    ] {
+        let (ok, v) = run(&aarch64_args(&bin, &db, "0x1000", &["--asm", asm]));
+        assert!(ok, "{asm}: {v}");
+        assert_eq!(v["old_hex"], "1f2003d5", "{asm}");
+        assert_eq!(v["new_hex"], new_hex, "{asm}");
+        assert_eq!(v["size_ok"], true, "{asm}");
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn patch_aarch64_rejects_bad_branch_targets() {
+    let (bin, db, dir) = aarch64_case("patch-a64-branch");
+    for asm in ["b 0x1002", "bl 0x1003"] {
+        let (ok, v) = run(&aarch64_args(&bin, &db, "0x1000", &["--asm", asm]));
+        assert!(!ok && v.get("error").is_some(), "{asm:?}: {v}");
+        assert_eq!(v["kind"], "invalid", "{asm:?}: {v}");
+    }
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x1000",
+        &["--asm", "b 0x10001000"],
+    ));
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(v["kind"], "invalid", "{v}");
+    cleanup(&dir);
+}
+
+#[test]
+fn patch_aarch64_bytes_length_and_align() {
+    let (bin, db, dir) = aarch64_case("patch-a64-bytes");
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x1000",
+        &["--bytes", "c0 03 5f d6"],
+    ));
+    assert!(ok, "{v}");
+    assert_eq!(v["new_hex"], "c0035fd6");
+    assert_eq!(v["size_ok"], true);
+    let (ok, v) = run(&aarch64_args(&bin, &db, "0x1000", &["--bytes", "90"]));
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(v["kind"], "invalid", "{v}");
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x1000",
+        &["--bytes", "1f 20 03 d5 1f 20 03 d5"],
+    ));
+    assert!(ok, "{v}");
+    assert_eq!(v["new_hex"], "1f2003d51f2003d5");
+    assert_eq!(v["size_ok"], false);
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x1002",
+        &["--bytes", "c0 03 5f d6"],
+    ));
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(v["kind"], "invalid", "{v}");
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x2000",
+        &["--bytes", "c0 03 5f d6"],
+    ));
+    assert!(!ok && v.get("error").is_some(), "{v}");
+    assert_eq!(v["kind"], "not_found", "{v}");
+    cleanup(&dir);
+}
+
+#[test]
+fn patch_aarch64_out_writes_ips_without_touching_binary() {
+    let (bin, db, dir) = aarch64_case("patch-a64-out");
+    let before = std::fs::read(&bin).expect("read fixture");
+    let ips_out = dir.join("p.ips").display().to_string();
+    let (ok, v) = run(&aarch64_args(
+        &bin,
+        &db,
+        "0x1000",
+        &["--asm", "nop", "--out", &ips_out, "--format", "ips"],
+    ));
+    assert!(ok, "{v}");
+    assert_eq!(v["format"], "ips");
+    assert!(
+        std::fs::read(&ips_out)
+            .expect("read ips")
+            .starts_with(b"PATCH")
+    );
+    assert_eq!(std::fs::read(&bin).expect("reread"), before);
+    assert!(!Path::new(&db).exists(), "patch must not save");
     cleanup(&dir);
 }
 
