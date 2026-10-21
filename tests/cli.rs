@@ -245,6 +245,31 @@ fn stats_prints_db_size_and_counts() {
 }
 
 #[test]
+fn load_and_stats_carry_content_hash_hex() {
+    let dir = tmpdir("hash-hex");
+    let bin = write_fixture(&dir, "pe32-basic.exe");
+    let bin_s = bin.display().to_string();
+    let db = temp_db(&dir, "hash-hex").display().to_string();
+    let d = db.as_str();
+
+    let (ok, v) = run(&["--db", d, "load", &bin_s]);
+    assert!(ok, "{v}");
+    let hash = v["content_hash"].as_u64().expect("u64 hash");
+    assert_eq!(
+        v["content_hash_hex"].as_str(),
+        Some(format!("{hash:#x}").as_str())
+    );
+    let (ok, v) = run(&["--db", d, "stats", &bin_s]);
+    assert!(ok, "{v}");
+    let hash = v["content_hash"].as_u64().expect("u64 hash");
+    assert_eq!(
+        v["content_hash_hex"].as_str(),
+        Some(format!("{hash:#x}").as_str())
+    );
+    cleanup(&dir);
+}
+
+#[test]
 fn failures_are_json_envelopes() {
     let (bin, db, _dir, dir) = raw_case("errors");
     let d = db.as_str();

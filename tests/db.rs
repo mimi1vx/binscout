@@ -172,6 +172,38 @@ fn project_info_is_json_with_matching_counts() {
 }
 
 #[test]
+fn content_hash_hex_twin_is_exact() {
+    let dir = tmpdir("hash-hex");
+    let bytes = minimal_elf();
+    let (bin, db) = write_fixture(&dir, "h.bin", &bytes);
+
+    let p = Project::open_with_db(&bin, &db).expect("open");
+    let info = p.project_info();
+    let v = serde_json::to_value(&info).expect("project_info serializes");
+    let hash = v["content_hash"].as_u64().expect("u64 hash");
+    assert_eq!(
+        v["content_hash_hex"].as_str(),
+        Some(format!("{hash:#x}").as_str())
+    );
+    let stats = p.stats_json().expect("stats");
+    assert_eq!(
+        stats["content_hash_hex"].as_str(),
+        Some(format!("{hash:#x}").as_str())
+    );
+
+    let mut high = info.clone();
+    high.content_hash = 0x8010_0000_0000_0001;
+    let hv = serde_json::to_value(&high).expect("serializes");
+    assert_eq!(hv["content_hash_hex"], "0x8010000000000001");
+    let s = serde_json::to_string(&high).expect("string");
+    assert!(
+        s.contains("\"content_hash_hex\":\"0x8010000000000001\""),
+        "{s}"
+    );
+    cleanup(&dir);
+}
+
+#[test]
 fn rename_unknown_function_errors_and_clears() {
     let dir = tmpdir("rename");
     let bytes = minimal_elf();

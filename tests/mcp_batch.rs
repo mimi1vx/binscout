@@ -355,6 +355,29 @@ fn batch_parity_across_read_tools() {
     cleanup(&dir);
 }
 
+/// Batch `project_info` and `stats` carry the exact `content_hash_hex` twin.
+#[test]
+fn batch_project_info_and_stats_carry_hash_hex() {
+    let dir = tmpdir("mcp-batch-hash-hex");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "hash-hex").display().to_string();
+
+    let ops = vec![op("project_info", json!({})), op("stats", json!({}))];
+    let batch = tool_once(10, "batch", json!({"binary": bin, "db": db, "ops": ops}));
+    let results = batch["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    for r in results {
+        let ok = &r["ok"];
+        let hash = ok["content_hash"].as_u64().expect("u64 hash: {r}");
+        assert_eq!(
+            ok["content_hash_hex"].as_str(),
+            Some(format!("{hash:#x}").as_str()),
+            "{r}"
+        );
+    }
+    cleanup(&dir);
+}
+
 /// `nop` x 1500, then `jmp +0` x 1200, then `ret`: one function whose full
 /// `cfg` export (~150 KiB) overflows the 1 MiB batch cap after a few ops,
 /// so the tail returns limit/skipped errors instead of values.

@@ -576,8 +576,9 @@ pub fn seeds_hash(seeds: &BTreeMap<u64, FuncSeed>) -> u64 {
 /// Agent-facing project summary; always JSON-serializable (M6 CLI/MCP).
 ///
 /// JSON pairs `entry` with `entry_hex` (`null` on both sides when the
-/// container names no entry) and `base` with `base_hex` (`null` on both
-/// sides in auto mode).
+/// container names no entry), `base` with `base_hex` (`null` on both
+/// sides in auto mode), and `content_hash` with `content_hash_hex`
+/// (exact `0x`-hex; the number can lose precision in f64 JSON clients).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ProjectInfo {
     /// Analyzed binary path.
@@ -671,7 +672,7 @@ impl Serialize for ProjectInfo {
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = serializer.serialize_struct("ProjectInfo", 28)?;
+        let mut st = serializer.serialize_struct("ProjectInfo", 29)?;
         st.serialize_field("binary", &self.binary)?;
         st.serialize_field("db_path", &self.db_path)?;
         st.serialize_field("version", &self.version)?;
@@ -684,6 +685,7 @@ impl Serialize for ProjectInfo {
         st.serialize_field("entry", &self.entry)?;
         st.serialize_field("entry_hex", &self.entry.map(crate::addr_hex))?;
         st.serialize_field("content_hash", &self.content_hash)?;
+        st.serialize_field("content_hash_hex", &crate::addr_hex(self.content_hash))?;
         st.serialize_field("size", &self.size)?;
         st.serialize_field("supported", &self.supported)?;
         st.serialize_field("reason", &self.reason)?;

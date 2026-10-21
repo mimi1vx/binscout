@@ -593,6 +593,20 @@ fn stats_reports_db_size_and_counts() {
 }
 
 #[test]
+fn project_info_carries_content_hash_hex() {
+    let dir = tmpdir("mcp-hash-hex");
+    let bin = write_fixture(&dir, "pe32-basic.exe").display().to_string();
+    let db = temp_db(&dir, "hash-hex").display().to_string();
+
+    let info = tool_once(10, "project_info", json!({"binary": bin, "db": db}));
+    let hex = info["content_hash_hex"].as_str().expect("hex string");
+    assert!(hex.starts_with("0x"), "{info}");
+    let hash = info["content_hash"].as_u64().expect("u64 hash");
+    assert_eq!(hex, format!("{hash:#x}"));
+    cleanup(&dir);
+}
+
+#[test]
 fn functions_filters_and_mid_function_snap() {
     // One session, but every call is order-independent: the server may run
     // requests concurrently, so no call may depend on another's writes.
