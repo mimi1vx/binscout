@@ -50,7 +50,7 @@ Every command prints exactly one JSON value to stdout. Runtime failures print
 errors for unknown flags/subcommands still go to stderr with exit 2.)
 
 ```sh
-binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] <command> <binary> [args]
+binscout [--db PATH] [--raw --arch ARCH --base ADDR [--entry ADDR]] [--fat-arch ARCH] [--pdb PATH] [--debug-file PATH] <command> <binary> [args]
 ```
 
 `--db` overrides the sidecar DB (default `<binary>.rsdbg.redb`,
@@ -67,7 +67,7 @@ inputs and exclusive with `--raw`.
 | Command | Example | Output |
 |---|---|---|
 | `load` | `binscout load fw.elf` | project info (`protocol`, `mode`, `arch`, `base`, diagnostic totals, `analysis_revision`); caches the analysis snapshot |
-| `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; filter with `--query` (case-insensitive name substring), `--caller`/`--callee` (addresses resolving to call-graph neighbors), `--range LO HI` (inclusive); page with `--offset`/`--limit` |
+| `functions` | `binscout functions fw.elf --query main --limit 50` | function rows, renames resolved; filter with `--query` (case-insensitive name substring), `--caller`/`--callee` (addresses resolving to call-graph neighbors), `--range LO HI` (inclusive); page with `--offset`/`--limit` under the page envelope; rows carry `calls_count` instead of the `calls` target array |
 | `func` | `binscout func fw.elf 0x400000` | compact metadata: entry, name, block/insn/call counts, discovery `reasons` |
 | `blocks` | `binscout blocks fw.elf 0x400000 --limit 50` | block summaries of the containing function, paged under the page envelope |
 | `block-insns` | `binscout block-insns fw.elf 0x400000 0x400000` | one block's instructions in address order, paged |
@@ -78,9 +78,12 @@ inputs and exclusive with `--raw`.
 | `pseudo` | `binscout pseudo fw.elf 0x400000` | approximate pseudo-C of one function: one lossy C-like line per IR row plus assembled text, with an approximation warning |
 | `callees` | `binscout callees fw.elf 0x400000 --depth 5` | transitive callees out to `--depth` hops (direct are depth 1), ordered by entry with shortest distance, paged under the page envelope |
 | `callers` | `binscout callers fw.elf 0x400000 --depth 5` | transitive callers out to `--depth` hops, ordered by entry with shortest distance, paged under the page envelope |
-| `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1), ordered by address with shortest distance, paged under the page envelope |
-| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `inferred-code`), paged with `--offset`/`--limit` behind a `{"total", "xrefs"}` envelope |
-| `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default), `--decode` (`xor:<byte>`, `add:<byte>`, or `rot:<0-7>`, read-only in-memory transform with original offsets); paged by `--start`/`--limit` |
+| `slice` | `binscout slice fw.elf 0x400000 --depth 5` | backward slice of an address: every instruction that can reach it via xref edges (any kind) and intra-function CFG predecessors out to `--depth` hops (direct are depth 1, default 8), ordered by address with shortest distance, paged under the page envelope; unmapped roots are a `NotFound` error |
+| `xrefs` | `binscout xrefs fw.elf --to 0x400000 --kind code` | cross-references filtered by `--to`/`--from`/`--kind` (`code`, `data`, `string`, `import`, `inferred-code`), paged with `--offset`/`--limit` under the protocol-1 page envelope (`items`) with an exact `total` |
+| `strings` | `binscout strings fw.elf --pattern SAVE --min-len 6 --limit 20` | extracted strings by address; `--pattern` (substring or `regex:` expression), `--min-len`, `--section`, `--include-code` (executable-memory hits hidden by default), `--decode` (`xor:<byte>`, `add:<byte>`, or `rot:<0-7>`, read-only in-memory transform with original offsets); paged by `--start`/`--limit` under the page envelope |
+| `stack-strings` | `binscout stack-strings fw.elf --limit 20` | recovered stack-constructed strings with function and address, paged under the page envelope |
+| `go-funcs` | `binscout go-funcs fw.elf --limit 20` | Go functions from the `pclntab` table, paged under the page envelope; empty table reads as an empty page |
+| `bytes` | `binscout bytes fw.elf 0x400000 --len 32 --as u16` | raw bytes with VA/file provenance plus `bytes_hex` and typed `values` (`u8`/`u16`/`u32`/`u64`/`ptr`/`cstr`/`utf16`); integer views carry the exact `0x`-hex twin `values_hex` |
 | `symbols` | `binscout symbols fw.elf` | imports and exports; Mach-O imports carry the `address` of their `__stubs` entry (null when unmapped), and each mapped stub seeds its own import-named function |
 | `sections` | `binscout sections fw.elf` | section table: name, `vaddr` (flat VA = `IMAGE_BASE + RVA` on PE), in-memory/file sizes, permissions |
 | `ir` | `binscout ir fw.elf 0x400000 32` | P-code-inspired lift of the range (`error_at` on trailing bad bytes, ranges cap at 1 MiB) |
@@ -92,6 +95,7 @@ inputs and exclusive with `--raw`.
 | `annotations-export` | `binscout annotations-export fw.elf` | portable annotation document (revision, SHA-256, size, mapping, sorted rows); read-only |
 | `annotations-import` | `binscout annotations-import fw.elf --input doc.json [--overwrite]` | atomically merge a document; returns `rows`/`changed`, default fails on conflicts |
 | `diff` | `binscout diff old.elf new.elf [--db-a A.redb --db-b B.redb]` | function-level diff between two binaries (`matched`/`added`/`removed`/`changed` with match reason); both projects open read-only, never creating or modifying a sidecar; the global `--raw` mapping or `--fat-arch` selection (if any) applies to both, with per-side `--db-a`/`--db-b` instead of the global `--db` |
+| `patch` | `binscout patch fw.elf 0x400000 --asm "jmp 0x401020"` | assemble replacement bytes at one x86 address (`nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`) or aarch64 address (`nop`, `ret`, `brk #IMM`, `b ADDR`, `bl ADDR`; 4-aligned, byte count a multiple of 4) and export the patch (`va`, `old_hex`, `new_hex`, `size_ok`); never writes the binary or the sidecar |
 
 Paged lists cap at 1024 rows. Addresses accept `0x`-hex or decimal strings.
 
@@ -101,15 +105,19 @@ omitting the flag leaves that field alone.
 
 ## MCP server
 
-`binscout-mcp` serves 30 tools over stdio (newline-delimited JSON-RPC):
+`binscout-mcp` serves 43 tools over stdio (newline-delimited JSON-RPC):
 `project_info`, `load`, `functions`, `func`, `blocks`, `block_insns`,
 `diagnostics`, `disasm`, `bytes`, `cfg`, `structure`, `pseudo`,
-`callees`, `callers`, `slice`, `xrefs`, `strings`, `symbols`, `stats`,
-`sections`, `ir`, `ir_coverage`, `flirt_hints`, `rename`, `comment`, `search_bytes`,
-`crypto_scan`,
-`annotations_export`, `annotations_import`, `diff`. Each takes `binary` plus
+`callees`, `callers`, `slice`, `xrefs`, `strings`, `stack_strings`,
+`symbols`, `stats`,
+`sections`, `ir`, `ir_coverage`, `flirt_hints`, `sig_gen`, `go_funcs`,
+`headers`, `rename`, `annotation`, `comment`, `set_type_hint`,
+`get_type_hint`, `define_func`, `undefine_func`, `search_bytes`,
+`crypto_scan`, `scan_yara`,
+`annotations_export`, `annotations_import`, `diff`, `diff_func`,
+`patch`, `batch`. Each takes `binary` plus
 optional `db` (and an optional `raw` mapping object or `fat_arch` slice
-selection on binary-taking
+selection plus optional `pdb`/`debug_file` debug inputs on binary-taking
 tools) and returns one JSON document as text; failures are tool errors.
 
 ```json

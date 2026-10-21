@@ -52,8 +52,8 @@ $ binscout xrefs fw.exe --to 0x402100 --kind string
 ```
 
 `xrefs` filters by `--to` / `--from` / `--kind` (`code`, `data`,
-`string`, `import`, `inferred-code`, case-insensitive) and pages behind a
-`{"total", "xrefs"}` envelope. Rows carry `from` / `from_hex`,
+`string`, `import`, `inferred-code`, case-insensitive) and pages under
+the protocol-1 page envelope (`items`) with an exact `total`. Rows carry `from` / `from_hex`,
 `to` / `to_hex`, and `kind`, plus listing context: `from_func` /
 `from_func_hex` with its rename-resolved `from_func_name`,
 `to_name` (function or import display name), and `to_string` (the

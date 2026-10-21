@@ -64,7 +64,7 @@ binary-taking command (CLI flags or the MCP `raw` object):
 
 ```sh
 $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/blob.redb
-{"analysis_revision":7,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/blob.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":15,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":3978597713856454298,"content_hash_hex":"0x3736d18a8e985e9a","db_path":"/tmp/blob.redb","debug_funcs":0,"diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.8.0","xrefs":0}
 ```
 
 `arch` is one of `x86_64`, `x86_32`, `aarch64`, `arm32`, `thumb`,
@@ -195,10 +195,10 @@ in `inferred_edges` (never `edges`), `func` counts them, and
 the slot:
 
 ```sh
-$ binscout --raw --arch x86_64 --base 0x400000 cfg blob.bin --db /tmp/blob.redb 0x400000
-{"containing_entry":4194304,"containing_entry_hex":"0x400000","edges":[],"entry":4194304,"entry_hex":"0x400000","inferred_edges":[[4194304,4194322]],"nodes":[{"end":4194310,"end_hex":"0x400006","insns":1,"start":4194304,"start_hex":"0x400000","succs":[]},{"end":4194325,"end_hex":"0x400015","insns":3,"start":4194322,"start_hex":"0x400012","succs":[]}]}
-$ binscout --raw --arch x86_64 --base 0x400000 xrefs blob.bin --db /tmp/blob.redb
-{"total":2,"xrefs":[{"from":4194304,"from_hex":"0x400000","kind":"Data","to":4194314,"to_hex":"0x40000a"},{"from":4194304,"from_hex":"0x400000","kind":"inferred-code","to":4194322,"to_hex":"0x400012"}]}
+$ binscout --raw --arch x86_64 --base 0x400000 cfg jump.bin --db /tmp/jump.redb 0x400000
+{"containing_entry":4194304,"containing_entry_hex":"0x400000","edges":[],"entry":4194304,"entry_hex":"0x400000","inferred_edges":[[4194304,4194322]],"nodes":[{"end":4194310,"end_hex":"0x400006","insns":1,"start":4194304,"start_hex":"0x400000","succs":[]},{"end":4194323,"end_hex":"0x400013","insns":1,"start":4194322,"start_hex":"0x400012","succs":[]}],"query_addr":4194304,"query_addr_hex":"0x400000"}
+$ binscout --raw --arch x86_64 --base 0x400000 xrefs jump.bin --db /tmp/jump.redb
+{"items":[{"from":4194304,"from_func":4194304,"from_func_hex":"0x400000","from_func_name":null,"from_hex":"0x400000","kind":"Data","to":4194314,"to_hex":"0x40000a","to_name":null,"to_string":null},{"from":4194304,"from_func":4194304,"from_func_hex":"0x400000","from_func_name":null,"from_hex":"0x400000","kind":"inferred-code","to":4194322,"to_hex":"0x400012","to_name":"func@0x400012","to_string":null}],"limit":50,"next_offset":null,"offset":0,"protocol":1,"total":2}
 ```
 
 Caps are one edge per single-slot site and 2–8 consecutive
@@ -208,38 +208,61 @@ unresolved rather than partially recovered); 100,000 per project;
 exhaustion keeps the site unresolved with `inferred_truncated`
 set and the excess in `inferred_omitted`.
 
-## Opt-in envelope preview (protocol-2 track)
+## 0.9.0: page envelope everywhere
 
-`functions` and `strings` still return bare arrays by default, but both
-accept an opt-in envelope: `--envelope` on the CLI, `envelope: true` on
-the MCP tools. The envelope is the protocol-1 page shape with an exact
-`total`, so agents learn the match count without paging to the end:
+`functions`, `strings`, `stack_strings`, `go_funcs`, and `xrefs`
+now always return the protocol-1 page envelope (`protocol`,
+`total`, `offset`, `limit`, `next_offset`, `items`) on the CLI,
+the MCP tools, and `batch` ops. Before (0.8.0 defaults) and after,
+same queries:
 
 ```sh
-$ binscout functions fw.elf --envelope --limit 1
-{"items":[{"blocks":1,"calls_count":0,"entry":4198400,"entry_hex":"0x401000","id":"func@0x401000","insns":3,"name":"main"}],"limit":1,"next_offset":1,"offset":0,"protocol":1,"total":2}
-$ binscout strings fw.elf --envelope --limit 0
-{"items":[],"limit":0,"next_offset":null,"offset":0,"protocol":1,"total":5}
+$ binscout functions fw.exe --limit 1
+[{"blocks":1,"calls":[],"entry":4198400,"entry_hex":"0x401000","id":"func@0x401000","insns":5,"name":"basic_entry","noreturn":false}]
+$ binscout functions fw.exe --limit 1
+{"items":[{"blocks":1,"calls_count":0,"entry":4198400,"entry_hex":"0x401000","id":"func@0x401000","insns":5,"name":"basic_entry","noreturn":false}],"limit":1,"next_offset":null,"offset":0,"protocol":1,"total":1}
+$ binscout strings fw.exe --limit 1
+[{"encoding":"Ascii","executable":false,"offset":52,"section":".rdata","vaddr":4202548,"vaddr_hex":"0x402034","value":"basic.dll"}]
+$ binscout strings fw.exe --limit 1
+{"items":[{"encoding":"Ascii","executable":false,"offset":52,"section":".rdata","vaddr":4202548,"vaddr_hex":"0x402034","value":"basic.dll"}],"limit":1,"next_offset":1,"offset":0,"protocol":1,"total":4}
+$ binscout xrefs fw.exe --to 0x402100 --limit 1
+{"total":4,"xrefs":[{"from":4198403,"from_func":4198400,"from_func_hex":"0x401000","from_func_name":"basic_entry","from_hex":"0x401003","kind":"Data","to":4202752,"to_hex":"0x402100","to_name":null,"to_string":null}]}
+$ binscout xrefs fw.exe --to 0x402100 --limit 1
+{"items":[{"from":4198403,"from_func":4198400,"from_func_hex":"0x401000","from_func_name":"basic_entry","from_hex":"0x401003","kind":"Data","to":4202752,"to_hex":"0x402100","to_name":null,"to_string":null}],"limit":1,"next_offset":1,"offset":0,"protocol":1,"total":4}
 ```
 
-Planned breaking changes, staged behind this flag so no default output
-moves until the version bump:
+What moved:
 
 - `functions` rows trade the unbounded `calls` target array for
-  `calls_count` (envelope rows already do this; the legacy bare array
-  keeps `calls`). Direct callees remain one `callees` query away
+  `calls_count`. Direct callees remain one `callees` query away
   (`depth` 1 orders the same targets by entry with their distance).
-- `functions` and `strings` adopt the page envelope as their default
-  shape (`xrefs` keeps its own `{"total", "xrefs"}` wrapper until the
-  same migration aligns it).
+- `strings` keeps `--start`/`--limit` (`--offset` stays a
+  deprecated alias that warns on stderr); the rows now page under
+  the envelope with an exact `total`.
+- `stack_strings` and `go_funcs` gain `--offset`/`--limit` and
+  page under the envelope (empty table still reads as an empty
+  `items` page, not a bare `[]`).
+- `xrefs` moves from the old total-plus-`xrefs` wrapper to `items` (row fields
+  unchanged).
+- `--envelope` on the CLI and `envelope` on the MCP tools are
+  accepted but ignored: output is always the envelope.
+  The CLI flag is hidden; MCP `envelope: false` warns on stderr
+  and still returns the envelope.
+
+Range names carry semantics on `functions` and `search_bytes`
+(MCP tools and `batch` ops): `range_lo`/`range_hi` is inclusive
+(`lo <= x <= hi`), `range_start`/`range_end` is half-open
+(`start <= x < end`). Give exactly one pair per call: mixing the
+pairs is an error, and each pair must be given together. The
+per-tool CLI `--range` semantics are unchanged: inclusive
+`LO..=HI` over entries on `functions` (see above), half-open
+`[LO, HI)` over match addresses on `search-bytes` (see
+[Byte-pattern search](#byte-pattern-search)).
 
 Additive and already shipped (no migration needed): `cfg`,
 `structure`, `pseudo` (and the library `func_detail`) echo the
-requested address in `query_addr`/`query_addr_hex`; `functions`
-accepts `range_start`/`range_end` as aliases of its inclusive
-`range_lo`/`range_hi`, `search_bytes` accepts `range_lo`/`range_hi`
-as aliases of its half-open `range_start`/`range_end` (canonical
-names win, aliases warn on stderr); the MCP `annotation` tool reads
-the current rename/comment row (CLI `annotate` without flags parity),
-read-only. The type-hint API stays a comment-channel convention (see
+requested address in `query_addr`/`query_addr_hex`; the MCP
+`annotation` tool reads the current rename/comment row (CLI
+`annotate` without flags parity), read-only. The type-hint API
+stays a comment-channel convention (see
 [JSON protocol](json-protocol.md)); it is out of scope for this track.

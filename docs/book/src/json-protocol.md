@@ -12,9 +12,13 @@ unchanged.
 Real example — opening the repo's `tests/fixtures/raw-x64.bin`:
 
 ```sh
-$ binscout load tests/fixtures/raw-x64.bin
-{"analysis_revision":7,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"tests/fixtures/raw-x64.bin.rsdbg.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+$ binscout load tests/fixtures/raw-x64.bin --db /tmp/blob.redb
+{"analysis_revision":15,"annotations":0,"arch":"x86_64","base":null,"base_hex":null,"binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":3978597713856454298,"content_hash_hex":"0x3736d18a8e985e9a","db_path":"/tmp/blob.redb","debug_funcs":0,"diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"auto","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.8.0","xrefs":0}
 ```
+
+`content_hash_hex` is the exact `0x`-hex twin of `content_hash`
+(for f64-precision clients); both appear on `project_info` and
+`stats` alongside `content_sha256` on `stats`.
 
 `mode` is `"auto"` or `"raw"`; `base`/`base_hex` are null in auto
 mode. `protocol` is the wire revision below; `analysis_revision` is
@@ -151,10 +155,13 @@ Intentional breaking changes, each with migration notes:
   block-with-instructions dump (before/after below). Use `blocks` plus
   `block_insns` for bounded inspection; `cfg` remains the explicit
   full-graph export and can still be large.
-- New paged queries (`blocks`, `block_insns`, `diagnostics`,
-  `search-bytes`) use the envelope above.
+- Paged queries (`functions`, `strings`, `stack_strings`,
+  `go_funcs`, `xrefs`, `blocks`, `block_insns`, `diagnostics`,
+  `search-bytes`, `callees`, `callers`, `slice`, `flirt_hints`)
+  use the envelope above.
 - `project_info` and `stats` gain additive fields only (`protocol`,
-  mapping identity, diagnostic totals); no existing field changes.
+  mapping identity, diagnostic totals, `content_hash_hex` alongside
+  `content_hash`); no existing field changes.
 
 Before — `func` today embeds every instruction of every block:
 
@@ -186,23 +193,23 @@ still snaps to the canonical `entry`:
  "inferred_edges": 0, "reasons": ["entry"], "noreturn": false}
 ```
 
-Function rows (the bare-array `functions` list, the opt-in envelope
-preview, `func` detail, and `func-meta`) carry an additive `noreturn`
+Function rows (the `functions` list, `func` detail, and
+`func-meta`) carry an additive `noreturn`
 bool: true when no path from the entry reaches a return. Calls to
 known-noreturn imports (`exit`, `abort`, `ExitProcess`, and similar)
 cut the fall-through CFG edge and record a `noreturn-cut` diagnostic;
 wrappers around them propagate to a bounded fixpoint.
 
-Explicitly unchanged in this contract (no style churn): the bare-array
-`functions` list with `--offset`/`--limit` (plus the opt-in
-`--envelope`/`envelope` preview with an exact `total` and compact
-`calls_count` rows, see [migration](migration.md)); the `{"total", "xrefs"}`
-`xrefs` envelope shape (rows gain the additive `from_func`/
+Explicitly unchanged in this contract (no style churn): the
+`functions` list pages under the envelope with `--offset`/`--limit`
+(`--envelope`/`envelope` are accepted but ignored, compact
+`calls_count` rows, see [migration](migration.md)); `xrefs` pages
+under the envelope with `items` (rows gain the additive `from_func`/
 `from_func_hex`/`from_func_name`/`to_name`/`to_string` context fields,
-no existing field changes); the bare-array `strings` list with
-`--start`/`--limit` (`--offset` stays a deprecated alias that warns on
-stderr; plus the opt-in `--envelope`/`envelope` preview with an exact
-`total`; `--with-xrefs` adds the bounded per-row `xrefs` reference list, omitted
+no existing field changes); the `strings` list pages under the
+envelope with `--start`/`--limit` (`--offset` stays a deprecated
+alias that warns on stderr; `--envelope`/`envelope` are accepted but
+ignored; `--with-xrefs` adds the bounded per-row `xrefs` reference list, omitted
 without the flag);
 `symbols` exports keep their shape while imports carry additive
 `address`/`address_hex` (the call pointer: the Mach-O `__stubs` entry,
@@ -229,8 +236,8 @@ range cap; `cfg` node/edge shape (plus the additive `query_addr` echo of
 the requested address on `cfg`/`structure`/`pseudo`); `annotate` read/write semantics
 (`rename` only on known function entries, `comment` on any address,
 empty string clears, 8 KiB text cap); all exit codes and error
-channels. A future alignment of the grandfathered list shapes would
-bump `protocol`.
+channels. The 0.9.0 alignment of the grandfathered list shapes
+shipped at `protocol` 1: same envelope, additive rows, no bump.
 
 ## Query contracts
 
@@ -259,7 +266,7 @@ Explicit raw mode never falls back to another mode on failure.
 
 ```sh
 $ binscout --raw --arch x86_64 --base 0x400000 load tests/fixtures/raw-x64.bin --db /tmp/raw.redb
-{"analysis_revision":7,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":13197063251454239466,"db_path":"/tmp/raw.redb","diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.5.1","xrefs":0}
+{"analysis_revision":15,"annotations":0,"arch":"x86_64","base":4194304,"base_hex":"0x400000","binary":"tests/fixtures/raw-x64.bin","blocks":1,"content_hash":3978597713856454298,"content_hash_hex":"0x3736d18a8e985e9a","db_path":"/tmp/raw.redb","debug_funcs":0,"diagnostics":0,"diagnostics_omitted":0,"diagnostics_truncated":false,"entry":null,"entry_hex":null,"format":"raw","functions":1,"inferred_omitted":0,"inferred_truncated":false,"insns":3,"mode":"raw","protocol":1,"reason":null,"size":3,"strings":0,"supported":true,"version":"0.8.0","xrefs":0}
 ```
 
 Same bytes under a different mapping never reuse cached layouts: the
@@ -325,11 +332,13 @@ binscout slice B ADDR [--depth N] [--offset N] [--limit N]
 ```
 
 MCP tool `slice` (`binary`, `db`?, `raw`?, `addr`, `depth?`,
-`offset?`, `limit?`). `ADDR` is any address (data/string targets lie in
-no function, which is a valid root, not an error); `depth` bounds the
-reverse walk over xref edges of every kind plus intra-function CFG
-predecessors to that many hops (direct predecessors are depth 1, zero
-yields an empty page, past the 64-hop cap is an `Invalid` error).
+`offset?`, `limit?`). Any mapped address is a valid
+root (data/string targets lie in no function, which is still a valid
+root, not an error); unmapped roots are a `NotFound` error. `depth`
+bounds the reverse walk over xref edges of every kind plus
+intra-function CFG predecessors to that many hops (direct
+predecessors are depth 1, zero yields an empty page, past the 64-hop
+cap is an `Invalid` error); it defaults to 8 when omitted.
 Items order by address with the shortest distance in `depth`, each
 carrying `addr`/`addr_hex`, the containing function (`func`/`func_hex`,
 null when in no function) plus its rename-resolved `name`, paged under
@@ -434,17 +443,17 @@ the sidecar.
 ### `go-funcs`
 
 ```sh
-binscout go-funcs B
+binscout go-funcs B [--offset N] [--limit N]
 ```
 
-MCP tool `go_funcs` (`binary`, `db`?, `raw`?). Recovers Go functions
-from the `pclntab` table (`f0`/`f1`/`fa`/`fb` magics for Go 1.18+ back
+MCP tool `go_funcs` (`binary`, `db`?, `raw`?, `offset?`,
+`limit?`). Recovers Go functions from the `pclntab` table (`f0`/`f1`/`fa`/`fb` magics for Go 1.18+ back
 to 1.2, little-endian): linker names plus exact entry/end ranges from
-`functab`/`funcnametab`, in functab order. Prefers the `.gopclntab`
-section and otherwise scans readable segments for the magic, so
-stripped (section-less) binaries still resolve; 1.18+ PCs anchor at
-the `.text` VA (or the lowest executable segment). Empty array when no
-table is located; a located-but-corrupt table (or a big-endian table)
+`functab`/`funcnametab`, in functab order, paged under the envelope.
+Prefers the `.gopclntab` section and otherwise scans readable segments
+for the magic, so stripped (section-less) binaries still resolve; 1.18+ PCs anchor at
+the `.text` VA (or the lowest executable segment). No located
+table reads as an empty `items` page, not a bare `[]`; a located-but-corrupt table (or a big-endian table)
 errors. Read-only: never writes the binary or the sidecar.
 
 ### `ir-coverage`
@@ -473,8 +482,8 @@ binscout xrefs B [--to ADDR] [--from ADDR] [--kind KIND] [--offset N] [--limit N
 MCP tool `xrefs` (`binary`, `db`?, `raw`?, `to`?, `from`?, `kind?`,
 `offset?`, `limit?`). `kind` is one of `code`, `data`, `string`,
 `import`, `inferred-code` (case-insensitive); anything else is an
-`Invalid` error. Filtering precedes pagination behind the
-`{"total", "xrefs"}` envelope; an offset past the end is a normal
+`Invalid` error. Filtering precedes pagination under the page
+envelope with `items`; an offset past the end is a normal
 empty page. Every row carries the stored triple (`from`/`from_hex`,
 `to`/`to_hex`, `kind`) plus additive listing context, so agents skip
 the follow-up lookups: `from_func`/`from_func_hex` (the entry of the
@@ -487,11 +496,8 @@ context builds once per call and rows reuse the sorted xref storage
 plus binary searches, so per-page work scales with the page.
 
 ```sh
-$ binscout xrefs fw.exe --to 0x402100 --kind string
-{"total": 2, "xrefs": [
-  {"from": 4198400, "from_hex": "0x401000", "kind": "String", "to": 4202496, "to_hex": "0x402100",
-   "from_func": 4198400, "from_func_hex": "0x401000", "from_func_name": "main",
-   "to_name": null, "to_string": "SAVE%d.GAM is invalid"}]}
+$ binscout xrefs tests/fixtures/pe32-basic.exe --to 0x402100 --kind string --limit 2 --db /tmp/p.redb
+{"items":[{"from":4198403,"from_func":4198400,"from_func_hex":"0x401000","from_func_name":"basic_entry","from_hex":"0x401003","kind":"String","to":4202752,"to_hex":"0x402100","to_name":null,"to_string":"SAVE%d.GAM is invalid"},{"from":4198408,"from_func":4198400,"from_func_hex":"0x401000","from_func_name":"basic_entry","from_hex":"0x401008","kind":"String","to":4202752,"to_hex":"0x402100","to_name":null,"to_string":"SAVE%d.GAM is invalid"}],"limit":2,"next_offset":null,"offset":0,"protocol":1,"total":2}
 ```
 
 ### `strings`
@@ -502,7 +508,8 @@ binscout strings B [--pattern P] [--min-len N] [--section S] [--include-code] [-
 
 MCP tool `strings` (`binary`, `db`?, `raw`?, `pattern`?, `min_len`?,
 `section`?, `include_code`?, `decode`?, `with_xrefs`?, `start`?,
-`limit`?). Without `--with-xrefs` rows are the bare string hits
+`limit`?). Rows page under the envelope with an exact `total`.
+Without `--with-xrefs` rows are the string hits
 (`offset`, `vaddr`/`vaddr_hex`, `encoding`, `value`, `section`,
 `executable`); with it, every row additionally carries `xrefs`: the
 instructions referring to that string's start, each with
@@ -522,12 +529,13 @@ binscout search-bytes B PATTERN [--section S] [--range LO HI] [--offset N] [--li
 ```
 
 MCP tool `search_bytes` (`binary`, `db`?, `raw`?, `pattern`,
-`section`?, `range_start`?, `range_end`?, `offset?`, `limit?`).
-`range_lo`/`range_hi` are deprecated aliases of
-`range_start`/`range_end` (same half-open semantics, warning on
-stderr); the canonical names win when both are given. `functions`
-keeps the opposite pairing: its inclusive `range_lo`/`range_hi`
-bounds accept `range_start`/`range_end` as deprecated aliases.
+`section`?, `range_lo`?, `range_hi`?, `range_start`?, `range_end`?,
+`offset?`, `limit?`). `range_lo`/`range_hi` bound the inclusive
+`[lo, hi]` range; `range_start`/`range_end` bound the half-open
+`[lo, hi)` range. Give exactly one pair per call: mixing the pairs is
+an error, and each pair must be given together. `functions` offers
+the same two spellings with the same inclusive/half-open meanings,
+over entries rather than match addresses; see [migration](migration.md).
 `PATTERN` is a positional whitespace-separated full-byte token
 string, each two hex digits (case-insensitive) or a `??` wildcard
 (e.g. `48 8B ?? ??`). Empty, all-wildcard, odd-length, non-hex, or
@@ -562,7 +570,9 @@ typed `values` decoding (`u8` default; `u16`, `u32`, `u64`, `ptr`
 for pointer-width integers, `cstr` for one NUL-terminated lossy UTF-8
 string, `utf16` for one NUL-terminated lossy UTF-16 string);
 `endian` (`le` default, `be`) orders multi-byte units. Trailing
-partial units are dropped. `file_off` is the range start's file
+partial units are dropped. Integer views (`u8`/`u16`/`u32`/`u64`/`ptr`)
+carry `values_hex`: the exact `0x`-hex twin of each decoded `values`
+entry (absent on the `cstr`/`utf16` string views). `file_off` is the range start's file
 offset (null when the start byte is zero-fill or otherwise
 unbacked); `section` is the covering file-backed section name (null
 for zero-fill and section-less ranges); `bytes_hex` is the range as
@@ -572,7 +582,7 @@ raw mappings use the blob offset). Querying never writes a sidecar.
 
 ```sh
 $ binscout bytes fw.elf 0x401000 --len 3 --as u16 --endian be
-{"addr":4198400,"addr_hex":"0x401000","bytes_hex":"5589e5","file_off":512,"len":3,"section":".text","values":[21897]}
+{"addr":4198400,"addr_hex":"0x401000","bytes_hex":"5589e5","file_off":512,"len":3,"section":".text","values":[21897],"values_hex":["0x5589"]}
 ```
 
 ### `headers`
@@ -719,7 +729,8 @@ persist exactly like `comment`. `bytes B ADDR --len N --as-type H`
 renders the hint stored at `H` as struct `fields` over the range start
 (`--len` must cover the struct size; extra bytes read normally; each
 field carries its own `addr`/`addr_hex` twins, `bytes_hex`, and the
-endian-decoded integer `value`, null past 8 bytes). `pseudo` and
+endian-decoded integer `value` with its exact `0x`-hex twin
+`value_hex` (both null past 8 bytes). `pseudo` and
 `disasm` do not consume hints yet: `[reg+off]` stays unannotated until
 the structured-IR work this rendering depends on lands.
 
@@ -748,7 +759,7 @@ Resolved edges carry their provenance separately from direct flow:
 
 ```json
 {"containing_entry": 4194304, "containing_entry_hex": "0x400000", "edges": [], "entry": 4194304, "entry_hex": "0x400000", "inferred_edges": [[4194304, 4194322]], "nodes": [{"end": 4194310, "end_hex": "0x400006", "insns": 1, "start": 4194304, "start_hex": "0x400000", "succs": []}, {"end": 4194325, "end_hex": "0x400015", "insns": 3, "start": 4194322, "start_hex": "0x400012", "succs": []}]}
-{"total": 2, "xrefs": [
+{"items": [
   {"from": 4194304, "from_hex": "0x400000", "kind": "Data", "to": 4194314, "to_hex": "0x40000a"},
   {"from": 4194304, "from_hex": "0x400000", "kind": "inferred-code", "to": 4194322, "to_hex": "0x400012"}]}
 ```
@@ -772,7 +783,7 @@ thunks resolve to `import`-kind xrefs whose `to` is the import's slot
 address — the same address the `symbols` import row carries:
 
 ```json
-{"total": 2, "xrefs": [
+{"items": [
   {"from": 4198400, "from_hex": "0x401000", "kind": "Data", "to": 4202496, "to_hex": "0x402100"},
   {"from": 4198400, "from_hex": "0x401000", "kind": "Import", "to": 4202496, "to_hex": "0x402100"}]}
 ```
@@ -792,15 +803,20 @@ binscout patch B ADDR --asm "jmp 0x401020" | --bytes "90 90" [--out fix.json --f
 ```
 
 MCP tool `patch` (`binary`, `db`?, `raw`?, `addr`, `asm`?/`bytes`?,
-`out`?, `format`?). Assembles replacement bytes at one x86 address
+`out`?, `format`?). Assembles replacement bytes at one x86 or
+aarch64 address
 and exports the patch without writing the binary. Exactly one of
-`asm` (one of `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`, encoded
+`asm` (x86: one of `nop`, `ret`, `int3`, `jmp ADDR`, `call ADDR`;
+aarch64: one of `nop`, `ret`, `brk #IMM`, `b ADDR`, `bl ADDR`;
+encoded
 at the address so branch displacements are exact) or `bytes`
 (whitespace-separated hex pairs) is required. The first decode at
 the address sets the instruction boundary: shorter replacements
-NOP-pad to it, longer ones report `size_ok: false`. `file_off` is
+NOP-pad to it, longer ones report `size_ok: false`. Aarch64
+replacements must be a multiple of 4 bytes at a 4-aligned address.
+`file_off` is
 the file offset (null when the address is not file-backed);
-non-x86 binaries are `Unsupported`, undecodable or unmapped
+non-x86/non-aarch64 binaries are `Unsupported`, undecodable or unmapped
 addresses error. `out` writes the patch as `json` (default: the
 preview fields plus `arch`) or `ips` (`PATCH` + one 24-bit-offset
 record + `EOF`); the path must differ from the binary, and
