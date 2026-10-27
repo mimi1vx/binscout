@@ -19,8 +19,8 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use fallible_iterator::FallibleIterator as _;
 use object::{Object, ObjectSection};
+use pdb::FallibleIterator as _;
 
 use super::{
     BinaryFormat, MAX_MAPPED_BYTES, MAX_NAME_BYTES, Section, Segment, account_meta,

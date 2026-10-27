@@ -243,19 +243,19 @@ name = "rustc-hash"
 version = "2"
 reason = "blocked on upstream: cranelift 0.135 pulls rustc-hash 2 while rowan 0.17 (via yara-x-parser) pins rustc-hash 1; unresolvable by cargo update"
 
-# fallible-iterator 0.2 vs 0.3: pdb 0.8 and binscout pin 0.2 while gimli 0.32
-# (via walrus/yara-x) pulls 0.3. Unfixable by `cargo update` (bumping
-# binscout's own pin cannot move pdb's).
+# fallible-iterator 0.2 vs 0.3: pdb 0.8 pins 0.2 (binscout uses the
+# pdb::FallibleIterator re-export, no direct pin) while gimli 0.32
+# (via walrus/yara-x) pulls 0.3. Unfixable by `cargo update`.
 # Upstream: https://github.com/VirtuosoAI/yara-x
 [[bans.skip]]
 name = "fallible-iterator"
 version = "0.2"
-reason = "blocked on upstream: pdb 0.8 and binscout pin fallible-iterator 0.2 while gimli 0.32 (via walrus/yara-x) pulls 0.3; unresolvable by cargo update"
+reason = "blocked on upstream: pdb 0.8 pins fallible-iterator 0.2 while gimli 0.32 (via walrus/yara-x) pulls 0.3; unresolvable by cargo update"
 
 [[bans.skip]]
 name = "fallible-iterator"
 version = "0.3"
-reason = "blocked on upstream: gimli 0.32 (via walrus/yara-x) pulls fallible-iterator 0.3 while pdb 0.8 and binscout pin 0.2; unresolvable by cargo update"
+reason = "blocked on upstream: gimli 0.32 (via walrus/yara-x) pulls fallible-iterator 0.3 while pdb 0.8 pins 0.2; unresolvable by cargo update"
 
 # foldhash 0.1 vs 0.2 is fallout of the hashbrown multi-line split above:
 # hashbrown 0.15 (via petgraph) pulls foldhash 0.1 while hashbrown 0.16/0.17

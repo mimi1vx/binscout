@@ -176,7 +176,6 @@ dependencies = [
  "anyhow",
  "clap",
  "cpp_demangle",
- "fallible-iterator 0.3.0",
  "gimli 0.34.0",
  "iced-x86",
  "memchr",

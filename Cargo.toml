@@ -15,7 +15,6 @@ exclude = [".beads/"]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 cpp_demangle = "0.5"
-fallible-iterator = "0.3"
 gimli = { version = "0.34", default-features = false, features = ["endian-reader", "read", "std"] }
 iced-x86 = { version = "1.21", features = ["code_asm"] }
 memchr = "2"
