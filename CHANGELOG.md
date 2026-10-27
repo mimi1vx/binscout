@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/mimi1vx/binscout/compare/v0.9.0...v0.9.1) - 2026-10-27
+
+### Other
+
+- *(deps)* bump yaxpeax-arch
+- *(deps)* bump gimli from 0.33.0 to 0.34.0
+
 ## [0.9.0](https://github.com/mimi1vx/binscout/compare/v0.8.0...v0.9.0) - 2026-10-21
 
 ### Added
