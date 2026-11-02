@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/mimi1vx/binscout/compare/v0.9.0...v0.9.1) - 2026-11-02
+
+### Fixed
+
+- raise MCP stdio line cap above max annotation transfer
+- use pdb re-export for FallibleIterator, drop direct pin
+
+### Other
+
+- *(deps)* bump wasmtime to 48.0.8
+- *(deps)* bump the cargo-minor-patch group with 2 updates
+- *(deps)* bump fallible-iterator from 0.2.0 to 0.3.0
+- *(deps)* bump yaxpeax-arch
+- *(deps)* bump gimli from 0.33.0 to 0.34.0
+
 ## [0.9.0](https://github.com/mimi1vx/binscout/compare/v0.8.0...v0.9.0) - 2026-10-21
 
 ### Added
