@@ -175,7 +175,7 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
- "cpp_demangle",
+ "cpp_demangle 0.6.0",
  "gimli 0.34.0",
  "iced-x86",
  "memchr",
@@ -373,6 +373,15 @@ name = "cpp_demangle"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0667304c32ea56cb4cd6d2d7c0cfe9a2f8041229db8c033af7f8d69492429def"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "cpp_demangle"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b0fa7b695ebf7023a5af95490233db9d2987c212ce56ec1cf831763f9deaf80"
 dependencies = [
  "cfg-if",
 ]
@@ -2222,7 +2231,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de252f4aedfff6c2054ea5bea2454878a931c56e2553c6356b581e5e30a7e4e"
 dependencies = [
  "anyhow",
- "cpp_demangle",
+ "cpp_demangle 0.5.1",
  "cranelift-bforest",
  "cranelift-bitset",
  "cranelift-entity",
