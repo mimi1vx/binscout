@@ -19,7 +19,7 @@ gimli = { version = "0.34", default-features = false, features = ["endian-reader
 iced-x86 = { version = "1.21", features = ["code_asm"] }
 memchr = "2"
 msvc-demangler = "0.11"
-object = "0.40"
+object = "0.41"
 pdb = "0.8"
 petgraph = "0.8"
 powerpc = "0.4"
