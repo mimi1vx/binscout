@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/mimi1vx/binscout/compare/v0.9.1...v0.9.2) - 2026-11-23
+
+### Fixed
+
+- *(deps)* bump wasmtime to 48.0.10 for RUSTSEC-2026-0566..0573
+
+### Other
+
+- *(deps)* bump object from 0.40.0 to 0.41.0
+- *(deps)* bump the cargo-minor-patch group with 3 updates
+- *(deps)* bump EmbarkStudios/cargo-deny-action
+- *(deps)* bump cpp_demangle from 0.5.1 to 0.6.0
+- *(deps)* bump the cargo-minor-patch group across 1 directory with 4 updates
+
 ## [0.9.1](https://github.com/mimi1vx/binscout/compare/v0.9.0...v0.9.1) - 2026-11-02
 
 ### Fixed
